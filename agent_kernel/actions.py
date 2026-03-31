@@ -1,0 +1,4 @@
+RESPOND = "respond"
+CODE_EXECUTE = "code_execute"
+
+ALLOWED_ACTIONS = {RESPOND, CODE_EXECUTE}

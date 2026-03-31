@@ -1,0 +1,16 @@
+__pycache__/
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ruff_cache/
+docs.md
+other_repos/
+var/
+trajectories/
+workspace/
+*.json
+asi.md
+agi.md
+tolbert.md
+config/
