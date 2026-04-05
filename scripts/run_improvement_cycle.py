@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
 from pathlib import Path
+import os
+import signal
 import subprocess
 import tempfile
 import re
@@ -20,13 +22,20 @@ from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import (
     ImprovementCycleRecord,
     ImprovementPlanner,
+    ImprovementSearchBudget,
+    ImprovementVariant,
     staged_candidate_artifact_path,
     snapshot_artifact_state,
     stamp_artifact_experiment_variant,
     stamp_artifact_generation_context,
 )
 from agent_kernel.runtime_supervision import atomic_write_json, terminate_process_tree
-from agent_kernel.subsystems import active_artifact_path_for_subsystem, base_subsystem_for, generate_candidate_artifact
+from agent_kernel.subsystems import (
+    active_artifact_path_for_subsystem,
+    base_subsystem_for,
+    default_variant_definitions,
+    generate_candidate_artifact,
+)
 from evals.harness import run_eval, scoped_improvement_cycle_config
 from evals.metrics import EvalMetrics
 
@@ -54,12 +63,144 @@ _CURRENT_TASK_CONTEXT_COMPILE_SUBPHASE_BUDGETS = {
     "verifier_query": 1.0,
 }
 _CURRENT_TASK_CONTEXT_COMPILE_UNKNOWN_SUBPHASE_BUDGET_SECONDS = 1.0
+_PLANNING_STAGE_TIMEOUT_SECONDS = max(
+    0.0,
+    float(os.getenv("AGENT_KERNEL_IMPROVEMENT_PLANNING_TIMEOUT_SECONDS", "30") or 0.0),
+)
+
+
+class _PlanningStageTimeout(RuntimeError):
+    def __init__(self, stage: str, timeout_seconds: float) -> None:
+        super().__init__(f"planning stage {stage} exceeded {timeout_seconds:.1f}s")
+        self.stage = str(stage).strip()
+        self.timeout_seconds = float(timeout_seconds)
 
 
 def _progress(progress_label: str | None, message: str) -> None:
     if not progress_label:
         return
     print(f"[cycle:{progress_label}] {message}", file=sys.stderr, flush=True)
+
+
+def _call_with_planning_timeout(stage: str, callback, *, timeout_seconds: float | None = None):
+    resolved_timeout = _PLANNING_STAGE_TIMEOUT_SECONDS if timeout_seconds is None else max(0.0, float(timeout_seconds))
+    if resolved_timeout <= 0.0 or not hasattr(signal, "setitimer"):
+        return callback()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def _handle_alarm(_signum, _frame):
+        raise _PlanningStageTimeout(stage, resolved_timeout)
+
+    signal.signal(signal.SIGALRM, _handle_alarm)
+    signal.setitimer(signal.ITIMER_REAL, resolved_timeout)
+    try:
+        return callback()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _fallback_default_variants(
+    planner: ImprovementPlanner,
+    target,
+    metrics: EvalMetrics,
+) -> list[ImprovementVariant]:
+    variants: list[ImprovementVariant] = []
+    for item in default_variant_definitions(
+        target.subsystem,
+        target,
+        metrics,
+        capability_modules_path=planner.capability_modules_path,
+    ):
+        expected_gain = float(item.get("expected_gain", 0.0) or 0.0)
+        estimated_cost = max(1, int(item.get("estimated_cost", 1) or 1))
+        variants.append(
+            ImprovementVariant(
+                subsystem=target.subsystem,
+                variant_id=str(item.get("variant_id", "")).strip(),
+                description=str(item.get("description", "")).strip(),
+                expected_gain=expected_gain,
+                estimated_cost=estimated_cost,
+                score=round(expected_gain / estimated_cost, 4),
+                controls=dict(item.get("controls", {})) if isinstance(item.get("controls", {}), dict) else {},
+            )
+        )
+    return [variant for variant in variants if variant.variant_id]
+
+
+def _select_variants_for_campaign(
+    *,
+    planner: ImprovementPlanner,
+    target,
+    metrics: EvalMetrics,
+    requested_variant_width: int,
+    adaptive_search: bool,
+    progress_label: str | None,
+) -> tuple[ImprovementSearchBudget, list[ImprovementVariant], dict[str, object]]:
+    planning_info: dict[str, object] = {
+        "fallback_used": False,
+        "fallback_reason": "",
+        "fallback_stage": "",
+        "timeout_seconds": _PLANNING_STAGE_TIMEOUT_SECONDS,
+    }
+    resolved_requested_width = max(1, int(requested_variant_width))
+    try:
+        variant_budget = _call_with_planning_timeout(
+            "variant_budget",
+            lambda: planner.recommend_variant_budget(target, metrics, max_width=resolved_requested_width),
+        )
+        resolved_variant_width = variant_budget.width if adaptive_search else resolved_requested_width
+        if resolved_variant_width <= 1:
+            selected_variants = [
+                _call_with_planning_timeout(
+                    "variant_select",
+                    lambda: planner.choose_variant(target, metrics),
+                )
+            ]
+        else:
+            ranked_variants = _call_with_planning_timeout(
+                "variant_rank",
+                lambda: planner.rank_variants(target, metrics),
+            )
+            selected_variants = list(ranked_variants[:resolved_variant_width])
+            if not selected_variants:
+                selected_variants = [
+                    _call_with_planning_timeout(
+                        "variant_select",
+                        lambda: planner.choose_variant(target, metrics),
+                    )
+                ]
+        return variant_budget, selected_variants, planning_info
+    except _PlanningStageTimeout as exc:
+        fallback_variants = _fallback_default_variants(planner, target, metrics)
+        if not fallback_variants:
+            raise
+        selected_variants = fallback_variants[:resolved_requested_width]
+        if not selected_variants:
+            selected_variants = [fallback_variants[0]]
+        planning_info.update(
+            {
+                "fallback_used": True,
+                "fallback_reason": "planning_timeout",
+                "fallback_stage": exc.stage,
+                "timeout_seconds": exc.timeout_seconds,
+            }
+        )
+        _progress(
+            progress_label,
+            f"variant_search degraded subsystem={target.subsystem} "
+            f"reason=planning_timeout stage={exc.stage} timeout_seconds={exc.timeout_seconds:.1f}",
+        )
+        variant_budget = ImprovementSearchBudget(
+            scope="variant",
+            width=len(selected_variants),
+            max_width=resolved_requested_width,
+            strategy="timeout_fallback",
+            top_score=float(selected_variants[0].score if selected_variants else 0.0),
+            selected_ids=[variant.variant_id for variant in selected_variants],
+            reasons=[f"fallback default variants after planning timeout in stage={exc.stage}"],
+        )
+        return variant_budget, selected_variants, planning_info
 
 
 def _variant_generation_kwargs(variant, *, capability_modules_path: Path | None = None) -> dict[str, object]:
@@ -95,6 +236,11 @@ def _variant_generation_kwargs(variant, *, capability_modules_path: Path | None 
     if subsystem == "tolbert_model":
         return {
             "focus": str(controls.get("focus", "")).strip() or None,
+        }
+    if subsystem == "qwen_adapter":
+        return {
+            "focus": str(controls.get("focus", "")).strip() or None,
+            "base_model_name": str(controls.get("base_model_name", "")).strip() or None,
         }
     if subsystem == "policy":
         return {
@@ -180,7 +326,7 @@ def _generate_candidate_artifact(
     )
 
     if artifact:
-        stamp_artifact_experiment_variant(Path(artifact), variant)
+        stamp_artifact_experiment_variant(Path(artifact), variant, runtime_config=config)
         stamp_artifact_generation_context(
             Path(artifact),
             cycle_id=cycle_id,
@@ -189,6 +335,7 @@ def _generate_candidate_artifact(
             prior_active_artifact_path=prior_active_artifact_path,
             prior_retained_cycle_id=prior_retained_cycle_id or None,
             prior_retained_artifact_snapshot_path=prior_retained_snapshot_path,
+            runtime_config=config,
         )
     return {
         "artifact": artifact,
@@ -259,8 +406,7 @@ def _normalize_excluded_subsystems(values: list[str] | None) -> set[str]:
 def _filter_experiments_by_subsystem(experiments, *, excluded_subsystems: set[str]):
     if not excluded_subsystems:
         return list(experiments)
-    filtered = [experiment for experiment in experiments if experiment.subsystem not in excluded_subsystems]
-    return filtered if filtered else list(experiments)
+    return [experiment for experiment in experiments if experiment.subsystem not in excluded_subsystems]
 
 
 def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> dict[str, object]:
@@ -529,10 +675,10 @@ def _observation_child_entry(payload_path: Path) -> None:
         )
     except Exception as exc:
         if result_path:
-            atomic_write_json(result_path, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            atomic_write_json(result_path, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, config=config)
         raise
     if result_path:
-        atomic_write_json(result_path, {"ok": True, "metrics": _json_ready(asdict(metrics))})
+        atomic_write_json(result_path, {"ok": True, "metrics": _json_ready(asdict(metrics))}, config=config)
 
 
 def _metrics_from_child_payload(payload: object) -> EvalMetrics | None:
@@ -636,6 +782,13 @@ def _without_generated_curriculum(eval_kwargs: dict[str, object]) -> dict[str, o
     return degraded
 
 
+def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
+    normalized = str(error_text).strip().lower()
+    if not normalized:
+        return False
+    return "tolbert service failed to become ready" in normalized or "tolbert service exited before startup ready" in normalized
+
+
 def _run_observation_eval(
     *,
     config: KernelConfig,
@@ -661,17 +814,34 @@ def _run_observation_eval(
             tolbert_context_compile_budget_seconds=max(0.25, stage_budget_seconds),
         )
     if budget_seconds <= 0.0:
-        return {
-            "mode": "in_process",
-            "metrics": run_eval(config=active_config, progress_label=progress_label, **eval_kwargs),
-            "timed_out": False,
-            "timeout_reason": "",
-            "returncode": 0,
-            "error": "",
-            "partial_summary": {},
-            "current_task_timeout_budget_seconds": 0.0,
-            "current_task_timeout_budget_source": "none",
-        }
+        try:
+            return {
+                "mode": "in_process",
+                "metrics": run_eval(config=active_config, progress_label=progress_label, **eval_kwargs),
+                "timed_out": False,
+                "timeout_reason": "",
+                "returncode": 0,
+                "error": "",
+                "partial_summary": {},
+                "current_task_timeout_budget_seconds": 0.0,
+                "current_task_timeout_budget_source": "none",
+            }
+        except Exception as exc:
+            return {
+                "mode": "in_process",
+                "metrics": None,
+                "timed_out": False,
+                "timeout_reason": "",
+                "returncode": 1,
+                "error": str(exc),
+                "partial_summary": {},
+                "current_task_timeout_budget_seconds": 0.0,
+                "current_task_timeout_budget_source": "none",
+                "last_progress_line": "",
+                "last_progress_phase": "",
+                "last_progress_task_id": "",
+                "last_progress_benchmark_family": "",
+            }
 
     with tempfile.TemporaryDirectory(prefix="agentkernel_autonomous_observe_") as tmp_dir:
         scratch = Path(tmp_dir)
@@ -689,6 +859,7 @@ def _run_observation_eval(
                 "result_path": str(result_path),
                 "progress_path": str(progress_path),
             },
+            config=active_config,
         )
         cmd = [sys.executable, str(Path(__file__).resolve()), "--_observation-child-payload", str(payload_path)]
         with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
@@ -873,6 +1044,7 @@ def _reconcile_incomplete_cycles(
                 candidate_artifact_path=candidate_artifact_path,
                 active_artifact_path=active_artifact_path,
             ),
+            govern_exports=False,
         )
         planner.append_cycle_record(
             config.improvement_cycles_path,
@@ -888,6 +1060,7 @@ def _reconcile_incomplete_cycles(
                 candidate_artifact_path=candidate_artifact_path,
                 active_artifact_path=active_artifact_path,
             ),
+            govern_exports=False,
         )
         reconciled.append(summary)
         _progress(
@@ -936,6 +1109,7 @@ def _record_finalize_failure(
             candidate_artifact_path=str(artifact_path),
             active_artifact_path=str(active_artifact_path),
         ),
+        govern_exports=False,
     )
     planner.append_cycle_record(
         config.improvement_cycles_path,
@@ -951,6 +1125,7 @@ def _record_finalize_failure(
             candidate_artifact_path=str(artifact_path),
             active_artifact_path=str(active_artifact_path),
         ),
+        govern_exports=False,
     )
     _progress(
         progress_label,
@@ -1059,12 +1234,55 @@ def main() -> None:
     ).strip() or "none"
     observation_retried_without_generated_curriculum = False
     observation_retry_warning = ""
+    observation_retried_without_tolbert_context = False
+    observation_tolbert_retry_warning = ""
     initial_observation_timeout_reason = observation_timeout_reason
     initial_observation_last_progress_line = observation_last_progress_line
     initial_observation_last_progress_phase = observation_last_progress_phase
     initial_observation_last_progress_task_id = observation_last_progress_task_id
     initial_observation_last_progress_benchmark_family = observation_last_progress_benchmark_family
     initial_observation_partial_summary = observation_partial_summary
+    if (
+        metrics is None
+        and not observation_timed_out
+        and bool(config.use_tolbert_context)
+        and _is_retryable_tolbert_startup_failure(observation_error)
+    ):
+        observation_retried_without_tolbert_context = True
+        observation_tolbert_retry_warning = (
+            "retrying observation without tolbert context after startup failure "
+            f"with fresh observation budget {max_observation_seconds:.1f}s"
+        )
+        _progress(progress_label, f"phase=observe retry={observation_tolbert_retry_warning}")
+        observation_result = _run_observation_eval(
+            config=replace(config, use_tolbert_context=False),
+            eval_kwargs=eval_kwargs,
+            progress_label=progress_label,
+            max_observation_seconds=max_observation_seconds,
+        )
+        observation_elapsed_seconds = round(time.monotonic() - observation_started_monotonic, 4)
+        observation_completed_at = datetime.now(timezone.utc)
+        metrics = observation_result.get("metrics")
+        observation_timed_out = bool(observation_result.get("timed_out"))
+        observation_timeout_reason = str(observation_result.get("timeout_reason", "")).strip()
+        observation_error = str(observation_result.get("error", "")).strip()
+        observation_last_progress_line = str(observation_result.get("last_progress_line", "")).strip()
+        observation_last_progress_phase = str(observation_result.get("last_progress_phase", "")).strip()
+        observation_last_progress_task_id = str(observation_result.get("last_progress_task_id", "")).strip()
+        observation_last_progress_benchmark_family = str(
+            observation_result.get("last_progress_benchmark_family", "")
+        ).strip()
+        observation_partial_summary = (
+            dict(observation_result.get("partial_summary", {}))
+            if isinstance(observation_result.get("partial_summary", {}), dict)
+            else {}
+        )
+        observation_current_task_timeout_budget_seconds = float(
+            observation_result.get("current_task_timeout_budget_seconds", 0.0) or 0.0
+        )
+        observation_current_task_timeout_budget_source = str(
+            observation_result.get("current_task_timeout_budget_source", "none")
+        ).strip() or "none"
     remaining_observation_seconds = (
         max(0.0, float(max_observation_seconds) - float(observation_elapsed_seconds))
         if max_observation_seconds > 0.0
@@ -1121,6 +1339,12 @@ def main() -> None:
             if initial_observation_timeout_reason
             else "recovered by retrying without generated curriculum"
         )
+    if metrics is not None and observation_retried_without_tolbert_context:
+        observation_warning = (
+            f"{initial_observation_timeout_reason}; recovered by retrying without tolbert context"
+            if initial_observation_timeout_reason
+            else "recovered by retrying without tolbert context"
+        )
     if not observation_warning and observation_budget_exceeded:
         observation_warning = (
             f"observation exceeded budget {max_observation_seconds:.1f}s "
@@ -1172,6 +1396,8 @@ def main() -> None:
                     "observation_last_progress_benchmark_family": observation_last_progress_benchmark_family,
                     "observation_retried_without_generated_curriculum": observation_retried_without_generated_curriculum,
                     "observation_retry_warning": observation_retry_warning,
+                    "observation_retried_without_tolbert_context": observation_retried_without_tolbert_context,
+                    "observation_tolbert_retry_warning": observation_tolbert_retry_warning,
                     "observation_initial_timeout_reason": initial_observation_timeout_reason,
                     "observation_initial_last_progress_line": initial_observation_last_progress_line,
                     "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
@@ -1187,6 +1413,7 @@ def main() -> None:
                     ),
                 },
             ),
+            govern_exports=False,
         )
         raise SystemExit(observation_warning or "observation failed before metrics were produced")
     priority_family_allocation_summary = _priority_family_allocation_summary(metrics, eval_kwargs)
@@ -1209,22 +1436,39 @@ def main() -> None:
         excluded_subsystems=excluded_subsystems,
     )
     outputs: list[str] = []
+    if excluded_subsystems and not ranked_experiments:
+        _progress(
+            progress_label,
+            "campaign skipped reason=all_ranked_experiments_excluded "
+            f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
+        )
+    elif excluded_subsystems and not campaign:
+        _progress(
+            progress_label,
+            "campaign skipped reason=all_portfolio_candidates_excluded "
+            f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
+        )
 
     for index, target in enumerate(campaign, start=1):
         _progress(progress_label, f"campaign {index}/{len(campaign)} select subsystem={target.subsystem}")
+        _progress(progress_label, f"campaign_plan start subsystem={target.subsystem}")
         cycle_id = _cycle_id_for_experiment(target.subsystem)
         active_artifact_path_obj = active_artifact_path_for_subsystem(config, target.subsystem)
         target_portfolio = dict(target.evidence.get("portfolio", {})) if isinstance(target.evidence, dict) else {}
         campaign_breadth_pressure = float(target_portfolio.get("campaign_breadth_pressure", 0.0) or 0.0)
-        variant_budget = planner.recommend_variant_budget(target, metrics, max_width=max(1, args.variant_width))
-        resolved_variant_width = variant_budget.width if args.adaptive_search else max(1, args.variant_width)
-        if resolved_variant_width <= 1:
-            selected_variants = [planner.choose_variant(target, metrics)]
-        else:
-            ranked_variants = planner.rank_variants(target, metrics)
-            selected_variants = ranked_variants[: resolved_variant_width]
-            if not selected_variants:
-                selected_variants = [planner.choose_variant(target, metrics)]
+        variant_budget, selected_variants, variant_planning_info = _select_variants_for_campaign(
+            planner=planner,
+            target=target,
+            metrics=metrics,
+            requested_variant_width=max(1, args.variant_width),
+            adaptive_search=args.adaptive_search,
+            progress_label=progress_label,
+        )
+        _progress(
+            progress_label,
+            f"campaign_plan complete subsystem={target.subsystem} "
+            f"variant_strategy={variant_budget.strategy} selected_variants={len(selected_variants)}",
+        )
         _progress(
             progress_label,
             f"variant_search start subsystem={target.subsystem} "
@@ -1271,6 +1515,7 @@ def main() -> None:
                     "campaign_budget": {
                         "width": campaign_budget.width,
                         "max_width": campaign_budget.max_width,
+                        "strategy": campaign_budget.strategy,
                         "top_score": campaign_budget.top_score,
                         "selected_ids": campaign_budget.selected_ids,
                         "reasons": campaign_budget.reasons,
@@ -1278,10 +1523,12 @@ def main() -> None:
                     "variant_budget": {
                         "width": variant_budget.width,
                         "max_width": variant_budget.max_width,
+                        "strategy": variant_budget.strategy,
                         "top_score": variant_budget.top_score,
                         "selected_ids": variant_budget.selected_ids,
                         "reasons": variant_budget.reasons,
                     },
+                    "variant_planning_info": dict(variant_planning_info),
                     "campaign_breadth_pressure": campaign_breadth_pressure,
                     "campaign_recent_activity": dict(target_portfolio.get("recent_activity", {}))
                     if isinstance(target_portfolio.get("recent_activity", {}), dict)
@@ -1332,11 +1579,13 @@ def main() -> None:
                     "observation_last_progress_phase": observation_last_progress_phase,
                     "observation_last_progress_task_id": observation_last_progress_task_id,
                     "observation_last_progress_benchmark_family": observation_last_progress_benchmark_family,
-                    "observation_retried_without_generated_curriculum": observation_retried_without_generated_curriculum,
-                    "observation_retry_warning": observation_retry_warning,
-                    "observation_initial_timeout_reason": initial_observation_timeout_reason,
-                    "observation_initial_last_progress_line": initial_observation_last_progress_line,
-                    "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
+                "observation_retried_without_generated_curriculum": observation_retried_without_generated_curriculum,
+                "observation_retry_warning": observation_retry_warning,
+                "observation_retried_without_tolbert_context": observation_retried_without_tolbert_context,
+                "observation_tolbert_retry_warning": observation_tolbert_retry_warning,
+                "observation_initial_timeout_reason": initial_observation_timeout_reason,
+                "observation_initial_last_progress_line": initial_observation_last_progress_line,
+                "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
                     "observation_initial_last_progress_task_id": initial_observation_last_progress_task_id,
                     "observation_initial_last_progress_benchmark_family": initial_observation_last_progress_benchmark_family,
                     "observation_current_task_timeout_budget_seconds": observation_current_task_timeout_budget_seconds,
@@ -1349,6 +1598,7 @@ def main() -> None:
                     ),
                 },
             ),
+            govern_exports=False,
         )
         planner.append_cycle_record(
             config.improvement_cycles_path,
@@ -1435,6 +1685,7 @@ def main() -> None:
                     "campaign_budget": {
                         "width": campaign_budget.width,
                         "max_width": campaign_budget.max_width,
+                        "strategy": campaign_budget.strategy,
                         "top_score": campaign_budget.top_score,
                         "selected_ids": campaign_budget.selected_ids,
                         "reasons": campaign_budget.reasons,
@@ -1442,10 +1693,12 @@ def main() -> None:
                     "variant_budget": {
                         "width": variant_budget.width,
                         "max_width": variant_budget.max_width,
+                        "strategy": variant_budget.strategy,
                         "top_score": variant_budget.top_score,
                         "selected_ids": variant_budget.selected_ids,
                         "reasons": variant_budget.reasons,
                     },
+                    "variant_planning_info": dict(variant_planning_info),
                     "protocol": "autonomous",
                     "protocol_strategy": "planner_scored",
                     "protocol_match_id": protocol_match_id,
@@ -1453,6 +1706,7 @@ def main() -> None:
                     "scope_id": _sanitize_scope_id(scope_id) if scope_id else "",
                 },
             ),
+            govern_exports=False,
         )
 
         prior_retained_record = planner.prior_retained_artifact_record(
@@ -1543,6 +1797,7 @@ def main() -> None:
                     candidate_artifact_path=artifact,
                     active_artifact_path=str(active_artifact_path_obj),
                 ),
+                govern_exports=False,
             )
             preview = None
             if artifact and len(selected_variants) > 1:
@@ -1624,6 +1879,7 @@ def main() -> None:
                         candidate_artifact_path=artifact,
                         active_artifact_path=str(active_artifact_path_obj),
                     ),
+                    govern_exports=False,
                 )
             generated_variants.append(
                 {
@@ -1676,6 +1932,7 @@ def main() -> None:
                     candidate_artifact_path=str(selected_variant_entry["artifact"]),
                     active_artifact_path=str(active_artifact_path_obj),
                 ),
+                govern_exports=False,
             )
 
         artifact = str(selected_variant_entry["artifact"])

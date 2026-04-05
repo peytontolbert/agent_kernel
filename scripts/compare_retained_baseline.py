@@ -167,6 +167,87 @@ def main() -> None:
             "generated_kind_delta generated_kind=failure_recovery "
             f"pass_rate_delta={float(evidence['failure_recovery_pass_rate_delta']):.2f}"
         )
+    long_horizon_summary = evidence.get("long_horizon_summary", {})
+    if isinstance(long_horizon_summary, dict):
+        long_horizon_task_count = int(long_horizon_summary.get("baseline_task_count", 0) or 0) + int(
+            long_horizon_summary.get("candidate_task_count", 0) or 0
+        )
+        if long_horizon_task_count > 0:
+            world_feedback = long_horizon_summary.get("world_feedback", {})
+            if not isinstance(world_feedback, dict):
+                world_feedback = {}
+            print(
+                "long_horizon_delta "
+                f"pass_rate_delta={float(long_horizon_summary.get('pass_rate_delta', 0.0) or 0.0):.2f} "
+                f"novel_valid_command_rate_delta={float(long_horizon_summary.get('novel_valid_command_rate_delta', 0.0) or 0.0):.2f} "
+                f"progress_calibration_mae_gain={float(world_feedback.get('progress_calibration_mae_gain', 0.0) or 0.0):.2f}"
+            )
+    validation_family_summary = evidence.get("validation_family_summary", {})
+    if isinstance(validation_family_summary, dict):
+        validation_task_count = int(validation_family_summary.get("baseline_primary_task_count", 0) or 0) + int(
+            validation_family_summary.get("candidate_primary_task_count", 0) or 0
+        )
+        validation_generated_count = int(validation_family_summary.get("baseline_generated_task_count", 0) or 0) + int(
+            validation_family_summary.get("candidate_generated_task_count", 0) or 0
+        )
+        validation_feedback_steps = int(
+            validation_family_summary.get("baseline_world_feedback_step_count", 0) or 0
+        ) + int(validation_family_summary.get("candidate_world_feedback_step_count", 0) or 0)
+        if validation_task_count > 0 or validation_generated_count > 0 or validation_feedback_steps > 0:
+            world_feedback = validation_family_summary.get("world_feedback", {})
+            if not isinstance(world_feedback, dict):
+                world_feedback = {}
+            print(
+                "validation_family_delta "
+                f"primary_pass_rate_delta={float(validation_family_summary.get('primary_pass_rate_delta', 0.0) or 0.0):.2f} "
+                f"generated_pass_rate_delta={float(validation_family_summary.get('generated_pass_rate_delta', 0.0) or 0.0):.2f} "
+                f"novel_valid_command_rate_delta={float(validation_family_summary.get('novel_valid_command_rate_delta', 0.0) or 0.0):.2f} "
+                f"progress_calibration_mae_gain={float(world_feedback.get('progress_calibration_mae_gain', 0.0) or 0.0):.2f}"
+            )
+    shared_repo_bundle_summary = evidence.get("shared_repo_bundle_summary", {})
+    if isinstance(shared_repo_bundle_summary, dict):
+        shared_repo_candidate_count = int(
+            shared_repo_bundle_summary.get("baseline_shared_repo_candidate_count", 0) or 0
+        ) + int(shared_repo_bundle_summary.get("candidate_shared_repo_candidate_count", 0) or 0)
+        if shared_repo_candidate_count > 0:
+            print(
+                "shared_repo_bundle_delta "
+                f"baseline_complete_candidate_count={int(shared_repo_bundle_summary.get('baseline_shared_repo_complete_candidate_count', 0) or 0)} "
+                f"current_complete_candidate_count={int(shared_repo_bundle_summary.get('candidate_shared_repo_complete_candidate_count', 0) or 0)} "
+                f"complete_candidate_delta={int(shared_repo_bundle_summary.get('shared_repo_complete_candidate_count_delta', 0) or 0)} "
+                f"baseline_worker_candidate_count={int(shared_repo_bundle_summary.get('baseline_shared_repo_worker_candidate_count', 0) or 0)} "
+                f"current_worker_candidate_count={int(shared_repo_bundle_summary.get('candidate_shared_repo_worker_candidate_count', 0) or 0)} "
+                f"worker_candidate_delta={int(shared_repo_bundle_summary.get('shared_repo_worker_candidate_count_delta', 0) or 0)} "
+                f"baseline_complete_integrator_candidate_count={int(shared_repo_bundle_summary.get('baseline_shared_repo_complete_integrator_candidate_count', 0) or 0)} "
+                f"current_complete_integrator_candidate_count={int(shared_repo_bundle_summary.get('candidate_shared_repo_complete_integrator_candidate_count', 0) or 0)} "
+                f"complete_integrator_candidate_delta={int(shared_repo_bundle_summary.get('shared_repo_complete_integrator_candidate_count_delta', 0) or 0)} "
+                f"baseline_incomplete_integrator_candidate_count={int(shared_repo_bundle_summary.get('baseline_shared_repo_incomplete_integrator_candidate_count', 0) or 0)} "
+                f"current_incomplete_integrator_candidate_count={int(shared_repo_bundle_summary.get('candidate_shared_repo_incomplete_integrator_candidate_count', 0) or 0)} "
+                f"incomplete_integrator_candidate_delta={int(shared_repo_bundle_summary.get('shared_repo_incomplete_integrator_candidate_count_delta', 0) or 0)} "
+                f"bundle_coherence_delta={int(shared_repo_bundle_summary.get('candidate_bundle_coherence_delta', 0) or 0)}"
+            )
+    retrieval_reuse_summary = evidence.get("retrieval_reuse_summary", {})
+    if isinstance(retrieval_reuse_summary, dict):
+        retrieval_procedure_count = int(retrieval_reuse_summary.get("baseline_procedure_count", 0) or 0) + int(
+            retrieval_reuse_summary.get("candidate_procedure_count", 0) or 0
+        )
+        if retrieval_procedure_count > 0:
+            print(
+                "retrieval_reuse_delta "
+                f"baseline_retrieval_backed_procedure_count={int(retrieval_reuse_summary.get('baseline_retrieval_backed_procedure_count', 0) or 0)} "
+                f"current_retrieval_backed_procedure_count={int(retrieval_reuse_summary.get('candidate_retrieval_backed_procedure_count', 0) or 0)} "
+                f"retrieval_backed_procedure_delta={int(retrieval_reuse_summary.get('retrieval_backed_procedure_count_delta', 0) or 0)} "
+                f"baseline_trusted_retrieval_procedure_count={int(retrieval_reuse_summary.get('baseline_trusted_retrieval_procedure_count', 0) or 0)} "
+                f"current_trusted_retrieval_procedure_count={int(retrieval_reuse_summary.get('candidate_trusted_retrieval_procedure_count', 0) or 0)} "
+                f"trusted_retrieval_procedure_delta={int(retrieval_reuse_summary.get('trusted_retrieval_procedure_count_delta', 0) or 0)} "
+                f"baseline_verified_retrieval_command_count={int(retrieval_reuse_summary.get('baseline_verified_retrieval_command_count', 0) or 0)} "
+                f"current_verified_retrieval_command_count={int(retrieval_reuse_summary.get('candidate_verified_retrieval_command_count', 0) or 0)} "
+                f"verified_retrieval_command_delta={int(retrieval_reuse_summary.get('verified_retrieval_command_count_delta', 0) or 0)} "
+                f"baseline_selected_retrieval_span_count={int(retrieval_reuse_summary.get('baseline_selected_retrieval_span_count', 0) or 0)} "
+                f"current_selected_retrieval_span_count={int(retrieval_reuse_summary.get('candidate_selected_retrieval_span_count', 0) or 0)} "
+                f"selected_retrieval_span_delta={int(retrieval_reuse_summary.get('selected_retrieval_span_count_delta', 0) or 0)} "
+                f"retrieval_reuse_delta={int(retrieval_reuse_summary.get('retrieval_reuse_delta', 0) or 0)}"
+            )
     for family in sorted(proposal_gate_failures):
         print(
             f"family_proposal_gate_failure benchmark_family={family} "

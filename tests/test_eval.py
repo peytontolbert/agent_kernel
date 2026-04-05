@@ -1,11 +1,16 @@
 import json
 from io import StringIO
+import os
+from pathlib import Path
 import sys
 import threading
 import time
 
+import evals.harness as harness_module
 from agent_kernel.config import KernelConfig
 from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
+from agent_kernel.task_bank import TaskBank
+from agent_kernel.trust import build_unattended_trust_ledger
 from evals.harness import (
     _limit_tasks_for_compare,
     compare_abstraction_transfer_modes,
@@ -189,6 +194,134 @@ def test_eval_reports_capability_breakdown(tmp_path):
     assert metrics.generated_total == 0
 
 
+def test_run_tasks_with_progress_flushes_callbacks_before_unattended_report_write(monkeypatch, tmp_path):
+    task = TaskSpec(
+        task_id="report_order_task",
+        prompt="order",
+        workspace_subdir="report_order_task",
+        metadata={"benchmark_family": "repository"},
+    )
+    events: list[str] = []
+
+    class FakeKernel:
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+    monkeypatch.setattr(
+        harness_module,
+        "write_unattended_task_report",
+        lambda **kwargs: events.append("report"),
+    )
+
+    results = harness_module._run_tasks_with_progress(
+        [task],
+        FakeKernel(),
+        progress_label=None,
+        report_config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            run_reports_dir=tmp_path / "reports",
+        ),
+        on_task_complete=lambda *_args: events.append("task_complete"),
+        on_result=lambda *_args: events.append("result"),
+    )
+
+    assert len(results) == 1
+    assert events == ["task_complete", "result", "report"]
+
+
+def test_run_eval_can_write_unattended_reports_for_trust(monkeypatch, tmp_path):
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="repository_shadow_task",
+                    prompt="Create hello.txt.",
+                    workspace_subdir="repository_shadow_task",
+                    expected_files=["hello.txt"],
+                    metadata={"benchmark_family": "repository", "capability": "file_write"},
+                )
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            workspace = tmp_path / "workspace" / task.workspace_subdir
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace.joinpath("hello.txt").write_text("hello\n", encoding="utf-8")
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(workspace),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="write file",
+                        action="code_execute",
+                        content="printf 'hello\\n' > hello.txt",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True, "reasons": []},
+                    )
+                ],
+                termination_reason="success",
+                task_metadata=dict(task.metadata),
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        run_reports_dir=tmp_path / "reports",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust_ledger.json",
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("repository",),
+        unattended_trust_min_distinct_families=1,
+    )
+
+    metrics = run_eval(
+        config=config,
+        task_limit=1,
+        priority_benchmark_families=["repository"],
+        write_unattended_reports=True,
+    )
+
+    reports = sorted(config.run_reports_dir.glob("*.json"))
+    assert metrics.total == 1
+    assert len(reports) == 1
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["report_kind"] == "unattended_task_report"
+    assert payload["benchmark_family"] == "repository"
+    ledger = build_unattended_trust_ledger(config)
+    assert ledger["reports_considered"] == 1
+    assert ledger["overall_assessment"]["status"] == "trusted"
+
+
 def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
     class FakeTaskBank:
         def __init__(self, config=None):
@@ -201,7 +334,7 @@ def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
                     prompt="wf",
                     workspace_subdir="world_feedback_task",
                     expected_files=["hello.txt"],
-                    metadata={"benchmark_family": "workflow", "capability": "file_write"},
+                    metadata={"benchmark_family": "workflow", "capability": "file_write", "difficulty": "long_horizon"},
                 )
             ]
 
@@ -217,23 +350,29 @@ def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
                 workspace=str(tmp_path / "workspace" / task.workspace_subdir),
                 success=True,
                 steps=[
-                    StepRecord(
-                        index=1,
-                        thought="wf",
-                        action="code_execute",
-                        content="printf 'hello\\n' > hello.txt",
+                        StepRecord(
+                            index=1,
+                            thought="wf",
+                            action="code_execute",
+                            content="printf 'hello\\n' > hello.txt",
                         selected_skill_id=None,
                         command_result=None,
-                        verification={"passed": True, "reasons": []},
-                        state_progress_delta=0.6,
-                        state_regression_count=0,
-                        state_transition={"no_progress": False},
+                            verification={"passed": True, "reasons": []},
+                            active_subgoal="materialize expected artifact report.txt",
+                            acting_role="executor",
+                            world_model_horizon="long_horizon",
+                            state_progress_delta=0.6,
+                            state_regression_count=0,
+                            state_transition={"no_progress": False},
                         proposal_metadata={
                             "hybrid_total_score": 4.0,
                             "hybrid_world_progress_score": 0.8,
                             "hybrid_world_risk_score": 0.2,
                             "hybrid_decoder_world_progress_score": 0.9,
                             "hybrid_decoder_world_risk_score": 0.1,
+                            "hybrid_trusted_retrieval_alignment": 0.7,
+                            "hybrid_graph_environment_alignment": 0.5,
+                            "hybrid_transfer_novelty": 1.0,
                         },
                         latent_state_summary={
                             "learned_world_state": {
@@ -268,8 +407,20 @@ def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
     assert metrics.world_feedback_summary["step_count"] == 1
     assert metrics.world_feedback_summary["progress_calibration_mae"] >= 0.0
     assert metrics.world_feedback_by_benchmark_family["workflow"]["step_count"] == 1
+    assert metrics.world_feedback_by_difficulty["long_horizon"]["step_count"] == 1
+    assert metrics.long_horizon_persistence_summary["productive_long_horizon_step_rate"] == 1.0
+    assert metrics.transfer_alignment_summary["transfer_step_count"] == 1
+    assert metrics.transfer_alignment_summary["graph_environment_alignment_mean"] == 0.5
+    assert metrics.proposal_metrics_by_difficulty["long_horizon"]["task_count"] == 1
+    step_payload = metrics.task_trajectories["world_feedback_task"]["steps"][0]
+    assert step_payload["world_model_horizon"] == "long_horizon"
+    assert step_payload["active_subgoal"] == "materialize expected artifact report.txt"
+    assert step_payload["acting_role"] == "executor"
     step_feedback = metrics.task_trajectories["world_feedback_task"]["steps"][0]["world_feedback"]
     assert step_feedback["progress_signal"] == 0.9
+    assert step_feedback["trusted_retrieval_alignment"] == 0.7
+    assert step_feedback["graph_environment_alignment"] == 0.5
+    assert step_feedback["transfer_novelty"] == 1.0
     assert step_feedback["observed_progress"] == 1.0
 
 
@@ -401,6 +552,466 @@ def test_limit_tasks_for_compare_can_prefer_low_cost_tasks_within_family():
     assert [task.task_id for task in selected] == ["a_cheap_seed"]
 
 
+def test_limit_tasks_for_compare_prefers_light_supervision_contract_tasks_before_retrieval_tails():
+    retrieval_tail = TaskSpec(
+        task_id="project_retrieval_tail",
+        prompt="Reuse a prior project pattern.",
+        workspace_subdir="project_retrieval_tail",
+        success_command="true",
+        expected_files=["out.txt"],
+        metadata={
+            "benchmark_family": "project",
+            "difficulty": "retrieval",
+            "requires_retrieval": True,
+            "source_task": "deployment_manifest_task",
+            "light_supervision_candidate": False,
+        },
+    )
+    primary = TaskSpec(
+        task_id="project_primary",
+        prompt="Write a verifier-clean project artifact.",
+        workspace_subdir="project_primary",
+        success_command="test -f out.txt",
+        expected_files=["out.txt"],
+        metadata={
+            "benchmark_family": "project",
+            "difficulty": "bounded",
+            "light_supervision_candidate": True,
+        },
+    )
+
+    selected = _limit_tasks_for_compare(
+        [retrieval_tail, primary],
+        1,
+        priority_families=["project"],
+    )
+
+    assert [task.task_id for task in selected] == ["project_primary"]
+
+
+def test_limit_tasks_for_compare_prefers_executable_project_tasks_over_retrieval_companions():
+    tasks = [
+        TaskSpec(
+            task_id="deployment_manifest_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="deployment_manifest_retrieval_task",
+            max_steps=12,
+            metadata={
+                "benchmark_family": "project",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "deployment_manifest_task",
+            },
+        ),
+        TaskSpec(
+            task_id="deployment_manifest_task",
+            prompt="deployment manifest",
+            workspace_subdir="deployment_manifest_task",
+            max_steps=12,
+            metadata={"benchmark_family": "project", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="project_release_cutover_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="project_release_cutover_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "project",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "project_release_cutover_task",
+            },
+        ),
+        TaskSpec(
+            task_id="project_release_cutover_task",
+            prompt="project release cutover",
+            workspace_subdir="project_release_cutover_task",
+            max_steps=18,
+            metadata={"benchmark_family": "project", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="release_packet_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="release_packet_retrieval_task",
+            max_steps=12,
+            metadata={
+                "benchmark_family": "project",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "release_packet_task",
+            },
+        ),
+        TaskSpec(
+            task_id="release_packet_task",
+            prompt="release packet",
+            workspace_subdir="release_packet_task",
+            max_steps=12,
+            metadata={"benchmark_family": "project", "difficulty": "long_horizon"},
+        ),
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        3,
+        priority_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert {task.task_id for task in selected} == {
+        "deployment_manifest_task",
+        "release_packet_task",
+        "project_release_cutover_task",
+    }
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+
+
+def test_limit_tasks_for_compare_prefers_executable_required_integration_tasks_over_retrieval_companions():
+    tasks = [
+        TaskSpec(
+            task_id="incident_matrix_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="incident_matrix_retrieval_task",
+            max_steps=5,
+            metadata={
+                "benchmark_family": "integration",
+                "difficulty": "retrieval",
+                "requires_retrieval": True,
+                "source_task": "incident_matrix_task",
+            },
+        ),
+        TaskSpec(
+            task_id="incident_matrix_task",
+            prompt="incident matrix",
+            workspace_subdir="incident_matrix_task",
+            max_steps=5,
+            metadata={"benchmark_family": "integration", "difficulty": "multi_system"},
+        ),
+        TaskSpec(
+            task_id="queue_failover_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="queue_failover_retrieval_task",
+            max_steps=5,
+            metadata={
+                "benchmark_family": "integration",
+                "difficulty": "multi_system",
+                "requires_retrieval": True,
+                "source_task": "queue_failover_task",
+            },
+        ),
+        TaskSpec(
+            task_id="queue_failover_task",
+            prompt="queue failover",
+            workspace_subdir="queue_failover_task",
+            max_steps=5,
+            metadata={"benchmark_family": "integration", "difficulty": "multi_system"},
+        ),
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        2,
+        priority_families=["integration"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["integration"],
+    )
+
+    assert {task.task_id for task in selected} == {
+        "incident_matrix_task",
+        "queue_failover_task",
+    }
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+
+
+def test_limit_tasks_for_compare_uses_five_low_cost_integration_primaries_before_retrieval_or_long_horizon():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "integration"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        5,
+        priority_families=["integration"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["integration"],
+    )
+
+    assert [task.task_id for task in selected] == [
+        "incident_matrix_task",
+        "service_mesh_task",
+        "queue_failover_task",
+        "bridge_handoff_task",
+        "replica_cutover_task",
+    ]
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+    assert "integration_failover_drill_task" not in {task.task_id for task in selected}
+
+
+def test_limit_tasks_for_compare_uses_five_low_cost_repository_primaries_before_retrieval_or_long_horizon():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "repository"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        5,
+        priority_families=["repository"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["repository"],
+    )
+
+    assert [task.task_id for task in selected] == [
+        "repository_guardrail_sync_task",
+        "repository_audit_packet_task",
+        "service_release_task",
+        "schema_alignment_task",
+        "repo_sync_matrix_task",
+    ]
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+    assert "repository_migration_wave_task" not in {task.task_id for task in selected}
+
+
+def test_limit_tasks_for_compare_uses_five_low_cost_repo_chore_primaries_before_retrieval():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "repo_chore"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        5,
+        priority_families=["repo_chore"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["repo_chore"],
+    )
+
+    assert [task.task_id for task in selected] == [
+        "repo_notice_review_task",
+        "repo_packet_review_task",
+        "repo_guardrail_review_task",
+        "repo_cleanup_review_task",
+        "repo_patch_review_task",
+    ]
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+    assert {
+        "repo_cleanup_review_retrieval_task",
+        "repo_patch_review_retrieval_task",
+    }.isdisjoint({task.task_id for task in selected})
+
+
+def test_limit_tasks_for_compare_uses_cleaner_repo_sandbox_primaries_before_known_unstable_roots():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "repo_sandbox"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        8,
+        priority_families=["repo_sandbox"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["repo_sandbox"],
+    )
+
+    assert [task.task_id for task in selected] == [
+        "git_release_train_worker_api_task",
+        "git_release_train_worker_docs_task",
+        "git_release_train_worker_ops_task",
+        "git_release_train_conflict_worker_docs_task",
+        "git_release_train_conflict_worker_api_task",
+        "git_release_train_conflict_worker_ops_task",
+        "git_parallel_merge_acceptance_task",
+        "git_repo_test_repair_task",
+    ]
+    assert {
+        "git_conflict_worker_status_task",
+        "git_parallel_worker_api_task",
+        "git_parallel_worker_docs_task",
+        "git_generated_conflict_resolution_task",
+    }.isdisjoint({task.task_id for task in selected})
+
+
+def test_limit_tasks_for_compare_widens_repo_sandbox_before_acceptance_tail():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "repo_sandbox"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        10,
+        priority_families=["repo_sandbox"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["repo_sandbox"],
+    )
+
+    selected_ids = {task.task_id for task in selected}
+    assert "git_conflict_worker_status_task" in selected_ids
+    assert "git_release_train_acceptance_task" not in selected_ids
+    assert "git_release_train_conflict_acceptance_task" not in selected_ids
+
+
+def test_limit_tasks_for_compare_prefers_clean_repo_sandbox_retrieval_before_unstable_bridge_tail():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "repo_sandbox"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        12,
+        priority_families=["repo_sandbox"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["repo_sandbox"],
+    )
+
+    selected_ids = [task.task_id for task in selected]
+    assert "git_repo_test_repair_retrieval_task" in selected_ids
+    assert "git_repo_status_review_retrieval_task" in selected_ids
+    assert "git_parallel_worker_api_task" not in selected_ids
+    assert "git_parallel_worker_docs_task" not in selected_ids
+    assert "git_generated_conflict_resolution_task" not in selected_ids
+    assert "git_release_train_acceptance_task" not in selected_ids
+    assert "git_release_train_conflict_acceptance_task" not in selected_ids
+
+
+def test_limit_tasks_for_compare_keeps_prioritized_families_at_front_of_round_robin():
+    tasks = [
+        TaskSpec(
+            task_id="bounded_a",
+            prompt="bounded",
+            workspace_subdir="bounded_a",
+            success_command="true",
+            metadata={"benchmark_family": "bounded"},
+        ),
+        TaskSpec(
+            task_id="project_a",
+            prompt="project",
+            workspace_subdir="project_a",
+            success_command="true",
+            metadata={"benchmark_family": "project"},
+        ),
+        TaskSpec(
+            task_id="repository_a",
+            prompt="repository",
+            workspace_subdir="repository_a",
+            success_command="true",
+            metadata={"benchmark_family": "repository"},
+        ),
+        TaskSpec(
+            task_id="integration_a",
+            prompt="integration",
+            workspace_subdir="integration_a",
+            success_command="true",
+            metadata={"benchmark_family": "integration"},
+        ),
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        3,
+        priority_families=["project", "repository"],
+    )
+
+    assert [task.metadata["benchmark_family"] for task in selected] == [
+        "project",
+        "repository",
+        "bounded",
+    ]
+
+
+def test_run_eval_defaults_bounded_sampling_to_real_world_families(monkeypatch, tmp_path):
+    seen = {}
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="hello_task",
+                    prompt="hello",
+                    workspace_subdir="hello_task",
+                    expected_files=["hello.txt"],
+                    metadata={"benchmark_family": "micro", "difficulty": "seed"},
+                ),
+                TaskSpec(
+                    task_id="workflow_ready",
+                    prompt="workflow",
+                    workspace_subdir="workflow_ready",
+                    expected_files=["out.txt"],
+                    metadata={"benchmark_family": "workflow", "difficulty": "bounded"},
+                ),
+                TaskSpec(
+                    task_id="repo_branch_fix",
+                    prompt="repo sandbox",
+                    workspace_subdir="repo_branch_fix",
+                    expected_files=["reports/fix.txt"],
+                    metadata={"benchmark_family": "repo_sandbox", "difficulty": "git_test_repair"},
+                ),
+                TaskSpec(
+                    task_id="service_patch",
+                    prompt="repository",
+                    workspace_subdir="service_patch",
+                    expected_files=["src/service.py"],
+                    metadata={"benchmark_family": "repository", "difficulty": "cross_component"},
+                ),
+                TaskSpec(
+                    task_id="tool_sync",
+                    prompt="tooling",
+                    workspace_subdir="tool_sync",
+                    expected_files=["tool/report.txt"],
+                    metadata={"benchmark_family": "tooling", "difficulty": "cross_tool"},
+                ),
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            seen.setdefault("task_ids", []).append(task.task_id)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories",
+        ),
+        task_limit=3,
+    )
+
+    assert metrics.total == 3
+    assert seen["task_ids"] == ["repo_branch_fix", "service_patch", "tool_sync"]
+    assert "micro" not in metrics.total_by_benchmark_family
+
+
 def test_run_eval_writes_partial_progress_snapshot(monkeypatch, tmp_path):
     class FakeTaskBank:
         def __init__(self, config=None):
@@ -444,8 +1055,14 @@ def test_run_eval_writes_partial_progress_snapshot(monkeypatch, tmp_path):
                         action="code_execute",
                         content="true" if success else "false",
                         selected_skill_id=None,
+                        selected_retrieval_span_id=(
+                            "learning:success_skill:workflow_ready" if success else None
+                        ),
                         command_result=None,
                         proposal_source="retrieval" if success else "",
+                        decision_source=(
+                            "trusted_retrieval_carryover_direct" if success else ""
+                        ),
                         retrieval_influenced=success,
                         trust_retrieval=success,
                         path_confidence=0.2 if not success else 0.9,
@@ -488,6 +1105,19 @@ def test_run_eval_writes_partial_progress_snapshot(monkeypatch, tmp_path):
     assert payload["last_completed_task_id"] == "workflow_ready"
     assert payload["passed_by_benchmark_family"]["workflow"] == 1
     assert payload["completed_task_summaries"]["repository_retry"]["termination_reason"] == "step_limit"
+    assert payload["retrieval_selected_steps"] == 1
+    assert payload["retrieval_influenced_steps"] == 1
+    assert payload["trusted_retrieval_steps"] == 1
+    assert payload["selected_retrieval_span_ids"] == ["learning:success_skill:workflow_ready"]
+    assert payload["last_selected_retrieval_span_id"] == "learning:success_skill:workflow_ready"
+    assert payload["retrieval_influenced_task_ids"] == ["workflow_ready"]
+    assert (
+        payload["completed_task_summaries"]["workflow_ready"]["last_selected_retrieval_span_id"]
+        == "learning:success_skill:workflow_ready"
+    )
+    assert payload["completed_task_summaries"]["workflow_ready"]["trusted_retrieval_carryover_steps"] == 1
+    assert payload["completed_task_summaries"]["workflow_ready"]["trusted_retrieval_carryover_verified_steps"] == 1
+    assert metrics.task_outcomes["workflow_ready"]["trusted_retrieval_carryover_verified_steps"] == 1
 
 
 def test_run_eval_progress_snapshot_tracks_inflight_current_task(monkeypatch, tmp_path):
@@ -1772,6 +2402,130 @@ def test_eval_can_include_failure_generated_curriculum_tasks(tmp_path):
     assert metrics.generated_passed_by_kind["failure_recovery"] == metrics.total
 
 
+def test_run_eval_surfaces_contract_clean_failure_recovery_eval_slice(monkeypatch, tmp_path):
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="repository_primary",
+                    prompt="repository primary",
+                    workspace_subdir="repository_primary",
+                    success_command="test -f out.txt",
+                    expected_files=["out.txt"],
+                    metadata={
+                        "benchmark_family": "repository",
+                        "difficulty": "long_horizon",
+                        "light_supervision_candidate": True,
+                    },
+                )
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config
+            self._forced_failure = policy is not None
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            generated_failure = str(task.metadata.get("curriculum_kind", "")).strip() == "failure_recovery"
+            success = generated_failure or not self._forced_failure
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=success,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="step",
+                        action="code_execute",
+                        content="true" if success else "false",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": success, "reasons": []},
+                        failure_signals=[] if success else ["no_state_progress"],
+                        state_regression_count=0 if success else 1,
+                        world_model_horizon="long_horizon",
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success" if success else "repeated_failed_action",
+            )
+
+        def close(self):
+            return None
+
+    def fake_schedule(self, episodes, *, curriculum_kind):
+        del self, curriculum_kind
+        return list(episodes[:1])
+
+    def fake_generate(self, episode):
+        del self, episode
+        return TaskSpec(
+            task_id="repository_contract_clean_recovery",
+            prompt="repair repository state",
+            workspace_subdir="repository_contract_clean_recovery",
+            success_command="test -f out.txt",
+            expected_files=["out.txt"],
+            max_steps=14,
+            metadata={
+                "benchmark_family": "repository",
+                "difficulty": "long_horizon",
+                "curriculum_kind": "failure_recovery",
+                "contract_clean_failure_recovery_origin": True,
+                "contract_clean_failure_recovery_origin_family": "repository",
+                "contract_clean_failure_recovery_step_floor": 12,
+            },
+        )
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness.CurriculumEngine.schedule_generated_seed_episodes", fake_schedule)
+    monkeypatch.setattr("evals.harness.CurriculumEngine.generate_followup_task", fake_generate)
+
+    progress_path = tmp_path / "partial_progress_recovery.json"
+    metrics = run_eval(
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories",
+        ),
+        include_generated=False,
+        include_failure_generated=True,
+        progress_snapshot_path=progress_path,
+    )
+
+    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert metrics.generated_passed == 1
+    assert metrics.generated_by_kind["failure_recovery"] == 1
+    assert metrics.contract_clean_failure_recovery_summary == {
+        "task_count": 1,
+        "success_count": 1,
+        "clean_success_count": 1,
+        "long_horizon_task_count": 1,
+        "long_horizon_success_count": 1,
+        "total_steps": 1,
+        "max_step_floor": 12,
+        "pass_rate": 1.0,
+        "clean_success_rate": 1.0,
+        "long_horizon_pass_rate": 1.0,
+        "average_steps": 1.0,
+        "average_step_floor": 12.0,
+        "distinct_origin_benchmark_families": 1,
+    }
+    assert metrics.contract_clean_failure_recovery_by_origin_benchmark_family["repository"]["task_count"] == 1
+    assert metrics.contract_clean_failure_recovery_by_origin_benchmark_family["repository"]["long_horizon_pass_rate"] == 1.0
+    assert payload["contract_clean_failure_recovery_summary"]["task_count"] == 1
+    assert payload["contract_clean_failure_recovery_summary"]["long_horizon_pass_rate"] == 1.0
+    assert payload["contract_clean_failure_recovery_by_origin_benchmark_family"]["repository"]["average_step_floor"] == 12.0
+
+
 def test_eval_isolates_generated_failure_episodes_from_primary_trajectory_store(tmp_path):
     config = KernelConfig(
         provider="mock",
@@ -1823,6 +2577,4798 @@ def test_eval_uses_curriculum_seed_scheduler_for_generated_tasks(monkeypatch, tm
     assert metrics.generated_by_kind["failure_recovery"] == 1
 
 
+def test_eval_can_reuse_primary_seed_documents_for_generated_success_without_primary_rerun(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    config.trajectories_root.joinpath("repo_success.json").write_text(
+        json.dumps(
+            {
+                "task_id": "repo_success",
+                "prompt": "Create repo handoff.",
+                "workspace": str(tmp_path / "workspace" / "repo_success"),
+                "success": True,
+                "task_metadata": {"benchmark_family": "repository"},
+                "task_contract": {"metadata": {"benchmark_family": "repository"}},
+                "summary": {"executed_commands": ["mkdir -p repo && printf 'ok\\n' > repo/status.txt"]},
+                "termination_reason": "success",
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return []
+
+    class FakeKernel:
+        run_count = 0
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            FakeKernel.run_count += 1
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+    )
+
+    assert FakeKernel.run_count == 1
+    assert metrics.total == 0
+    assert metrics.generated_total == 1
+    assert metrics.generated_by_kind["adjacent_success"] == 1
+
+
+def test_eval_generated_success_followup_skips_primary_bootstrap_components(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    config.trajectories_root.joinpath("repo_success.json").write_text(
+        json.dumps(
+            {
+                "task_id": "repo_success",
+                "prompt": "Create repo handoff.",
+                "workspace": str(tmp_path / "workspace" / "repo_success"),
+                "success": True,
+                "task_metadata": {"benchmark_family": "repository"},
+                "task_contract": {"metadata": {"benchmark_family": "repository"}},
+                "termination_reason": "success",
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class ExplodingTaskBank:
+        def __init__(self, config=None):
+            raise AssertionError(f"generated-only followup should not initialize TaskBank: {config}")
+
+    class FakeKernel:
+        init_configs = []
+
+        def __init__(self, config=None, policy=None):
+            del policy
+            FakeKernel.init_configs.append(config)
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", ExplodingTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+    )
+
+    assert metrics.total == 0
+    assert metrics.generated_total == 1
+    assert len(FakeKernel.init_configs) == 1
+    assert FakeKernel.init_configs[0].trajectories_root.name == "generated_success"
+
+
+def test_eval_generated_success_can_skip_historical_seed_fallback(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+
+    def explode_seed_load(_root):
+        raise AssertionError("historical generated-success seed fallback should be disabled")
+
+    monkeypatch.setattr("evals.harness._load_generated_success_seed_episodes", explode_seed_load)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+        allow_generated_success_seed_fallback=False,
+    )
+
+    assert metrics.total == 0
+    assert metrics.generated_total == 0
+    assert metrics.generated_passed == 0
+
+
+def test_eval_generated_success_can_cap_schedule_materialization(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+
+    seed_episodes = [
+        EpisodeRecord(
+            task_id="seed_a",
+            prompt="a",
+            workspace=str(tmp_path / "workspace" / "seed_a"),
+            success=True,
+            steps=[],
+            task_metadata={"benchmark_family": "repository"},
+            task_contract={"metadata": {"benchmark_family": "repository"}},
+            termination_reason="success",
+        ),
+        EpisodeRecord(
+            task_id="seed_b",
+            prompt="b",
+            workspace=str(tmp_path / "workspace" / "seed_b"),
+            success=True,
+            steps=[],
+            task_metadata={"benchmark_family": "project"},
+            task_contract={"metadata": {"benchmark_family": "project"}},
+            termination_reason="success",
+        ),
+    ]
+
+    class FakeEngine:
+        generated_from: list[str] = []
+
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, episodes, *, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(episodes)
+
+        def generate_followup_task(self, episode):
+            FakeEngine.generated_from.append(episode.task_id)
+            return TaskSpec(
+                task_id=f"{episode.task_id}_adjacent",
+                prompt=f"follow up {episode.task_id}",
+                workspace_subdir=f"{episode.task_id}_adjacent",
+                metadata=dict(episode.task_metadata),
+            )
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            FakeKernel.run_task_ids.append(task.task_id)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr(
+        "evals.harness._load_generated_success_seed_episodes",
+        lambda root, workspace_root=None: list(seed_episodes),
+    )
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        allow_generated_success_seed_fallback=False,
+        max_generated_success_schedule_tasks=1,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+    )
+
+    assert metrics.total == 0
+    assert metrics.generated_total == 0
+    assert FakeEngine.generated_from == []
+    assert FakeKernel.run_task_ids == []
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+        max_generated_success_schedule_tasks=1,
+    )
+
+    assert metrics.generated_total == 1
+    assert FakeEngine.generated_from == ["seed_a"]
+    assert FakeKernel.run_task_ids == ["seed_a_adjacent"]
+
+
+def test_eval_generated_success_seed_fallback_can_filter_to_workspace_root(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_a",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+
+    seed_docs = [
+        {
+            "task_id": "scope_repo_success",
+            "prompt": "repo",
+            "workspace": str(config.workspace_root / "scope_repo_success"),
+            "success": True,
+            "task_metadata": {"benchmark_family": "repository"},
+            "task_contract": {"metadata": {"benchmark_family": "repository"}},
+            "termination_reason": "success",
+        },
+        {
+            "task_id": "other_scope_success",
+            "prompt": "other",
+            "workspace": str(tmp_path / "workspace" / "scope_b" / "other_scope_success"),
+            "success": True,
+            "task_metadata": {"benchmark_family": "project"},
+            "task_contract": {"metadata": {"benchmark_family": "project"}},
+            "termination_reason": "success",
+        },
+    ]
+
+    class FakeEngine:
+        generated_from: list[str] = []
+
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, episodes, *, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(episodes)
+
+        def generate_followup_task(self, episode):
+            FakeEngine.generated_from.append(episode.task_id)
+            return TaskSpec(
+                task_id=f"{episode.task_id}_adjacent",
+                prompt="follow up",
+                workspace_subdir=f"{episode.task_id}_adjacent",
+                metadata=dict(episode.task_metadata),
+            )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness.iter_episode_documents", lambda root: list(seed_docs))
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(config.trajectories_root),
+        generated_success_seed_workspace_root=str(config.workspace_root),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    assert metrics.generated_total == 1
+    assert FakeEngine.generated_from == ["scope_repo_success"]
+
+
+def test_eval_generated_success_seed_bundle_file_can_filter_to_workspace_root(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_a",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps({"episodes": []}),
+        encoding="utf-8",
+    )
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "scope_repo_success",
+                        "prompt": "repo",
+                        "workspace": str(config.workspace_root / "scope_repo_success"),
+                        "success": True,
+                        "task_metadata": {"benchmark_family": "repository"},
+                        "task_contract": {"metadata": {"benchmark_family": "repository"}},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "other_scope_success",
+                        "prompt": "other",
+                        "workspace": str(tmp_path / "workspace" / "scope_b" / "other_scope_success"),
+                        "success": True,
+                        "task_metadata": {"benchmark_family": "project"},
+                        "task_contract": {"metadata": {"benchmark_family": "project"}},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        generated_from: list[str] = []
+
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, episodes, *, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(episodes)
+
+        def generate_followup_task(self, episode):
+            FakeEngine.generated_from.append(episode.task_id)
+            return TaskSpec(
+                task_id=f"{episode.task_id}_adjacent",
+                prompt="follow up",
+                workspace_subdir=f"{episode.task_id}_adjacent",
+                metadata=dict(episode.task_metadata),
+            )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_workspace_root=str(config.workspace_root),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    assert metrics.generated_total == 1
+    assert FakeEngine.generated_from == ["scope_repo_success"]
+
+
+def test_eval_generated_success_seed_bundle_file_can_filter_to_relative_workspace_root(monkeypatch, tmp_path):
+    workspace_root = tmp_path / "workspace" / "scope_a"
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=workspace_root,
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "scope_repo_success",
+                        "prompt": "repo",
+                        "workspace": str(workspace_root / "scope_repo_success"),
+                        "success": True,
+                        "task_metadata": {"benchmark_family": "repository"},
+                        "task_contract": {"metadata": {"benchmark_family": "repository"}},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "other_scope_success",
+                        "prompt": "other",
+                        "workspace": str(tmp_path / "workspace" / "scope_b" / "other_scope_success"),
+                        "success": True,
+                        "task_metadata": {"benchmark_family": "project"},
+                        "task_contract": {"metadata": {"benchmark_family": "project"}},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        generated_from: list[str] = []
+
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, episodes, *, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(episodes)
+
+        def generate_followup_task(self, episode):
+            FakeEngine.generated_from.append(episode.task_id)
+            return TaskSpec(
+                task_id=f"{episode.task_id}_adjacent",
+                prompt="follow up",
+                workspace_subdir=f"{episode.task_id}_adjacent",
+                metadata=dict(episode.task_metadata),
+            )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    relative_workspace_root = os.path.relpath(workspace_root, Path.cwd())
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_workspace_root=str(relative_workspace_root),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    assert metrics.generated_total == 1
+    assert FakeEngine.generated_from == ["scope_repo_success"]
+
+
+def test_eval_generated_success_seed_bundle_file_falls_back_when_workspace_filter_misses(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_a",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "scope_repo_success",
+                        "prompt": "repo",
+                        "workspace": str(config.workspace_root / "scope_repo_success"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "project",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "shared_repo_integrator",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "project",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "shared_repo_integrator",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        generated_from: list[str] = []
+
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, episodes, *, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(episodes)
+
+        def generate_followup_task(self, episode):
+            FakeEngine.generated_from.append(episode.task_id)
+            return TaskSpec(
+                task_id=f"{episode.task_id}_adjacent",
+                prompt="follow up",
+                workspace_subdir=f"{episode.task_id}_adjacent",
+                metadata=dict(episode.task_metadata),
+            )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_workspace_root=str(tmp_path / "workspace" / "scope_other"),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    assert metrics.generated_total == 1
+    assert FakeEngine.generated_from == ["scope_repo_success"]
+
+
+def test_eval_generated_success_keeps_long_horizon_surface_diversity(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_a",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "worker_success",
+                        "prompt": "worker",
+                        "workspace": str(config.workspace_root / "worker_success"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "project",
+                            "origin_benchmark_family": "repo_sandbox",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "shared_repo_synthetic_worker",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "project",
+                                "origin_benchmark_family": "repo_sandbox",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "shared_repo_synthetic_worker",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "integrator_success",
+                        "prompt": "integrator",
+                        "workspace": str(config.workspace_root / "integrator_success"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "project",
+                            "origin_benchmark_family": "repo_sandbox",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "shared_repo_integrator",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "project",
+                                "origin_benchmark_family": "repo_sandbox",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "shared_repo_integrator",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "project_success",
+                        "prompt": "project",
+                        "workspace": str(config.workspace_root / "project_success"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "project",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "project_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "project",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "project_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        run_task_surfaces: list[str] = []
+        run_task_ids: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            FakeKernel.run_task_ids.append(task.task_id)
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+    )
+
+    assert metrics.generated_total == 3
+    assert metrics.generated_by_benchmark_family == {"repository": 2, "project": 1}
+    assert FakeKernel.run_task_surfaces == [
+        "repository_worker_bundle",
+        "repository_integrator_bundle",
+        "project_release_bundle",
+    ]
+    assert FakeKernel.run_task_ids == [
+        "worker_success_repository_adjacent",
+        "integrator_success_repository_adjacent",
+        "project_success_project_adjacent",
+    ]
+
+
+def test_eval_generated_success_promotes_raw_repo_sandbox_seeds_to_long_horizon_repository_followups(
+    monkeypatch, tmp_path
+):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_repo_sandbox",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_repo_sandbox_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_parallel_worker_api_task",
+                        "prompt": "worker",
+                        "workspace": str(config.workspace_root / "git_parallel_worker_api_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_worker_branch",
+                            "workflow_guard": {
+                                "requires_git": True,
+                                "shared_repo_id": "repo_sandbox_parallel_merge",
+                                "target_branch": "main",
+                                "worker_branch": "worker/api-status",
+                                "claimed_paths": ["src/api_status.txt"],
+                            },
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_worker_branch",
+                                "workflow_guard": {
+                                    "requires_git": True,
+                                    "shared_repo_id": "repo_sandbox_parallel_merge",
+                                    "target_branch": "main",
+                                    "worker_branch": "worker/api-status",
+                                    "claimed_paths": ["src/api_status.txt"],
+                                },
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task",
+                        "prompt": "integrator",
+                        "workspace": str(config.workspace_root / "git_parallel_merge_acceptance_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_parallel_merge",
+                            "shared_repo_order": 1,
+                            "workflow_guard": {
+                                "requires_git": True,
+                                "shared_repo_id": "repo_sandbox_parallel_merge",
+                                "target_branch": "main",
+                            },
+                            "semantic_verifier": {
+                                "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                            },
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_parallel_merge",
+                                "shared_repo_order": 1,
+                                "workflow_guard": {
+                                    "requires_git": True,
+                                    "shared_repo_id": "repo_sandbox_parallel_merge",
+                                    "target_branch": "main",
+                                },
+                                "semantic_verifier": {
+                                    "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                                },
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_repo_status_review_task",
+                        "prompt": "review",
+                        "workspace": str(config.workspace_root / "git_repo_status_review_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_workflow",
+                            "workflow_guard": {"requires_git": True},
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_workflow",
+                                "workflow_guard": {"requires_git": True},
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        run_task_surfaces: list[str] = []
+        run_task_ids: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            FakeKernel.run_task_ids.append(task.task_id)
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+    )
+
+    assert metrics.generated_total == 3
+    assert metrics.generated_by_benchmark_family == {"repository": 3}
+    assert FakeKernel.run_task_surfaces == [
+        "repository_worker_bundle",
+        "repository_integrator_bundle",
+        "repository_validation_bundle",
+    ]
+    assert FakeKernel.run_task_ids == [
+        "git_parallel_worker_api_task_repository_adjacent",
+        "git_parallel_merge_acceptance_task_repository_adjacent",
+        "git_repo_status_review_task_repository_adjacent",
+    ]
+
+
+def test_eval_generated_success_prefers_complete_shared_repo_worker_bundle_before_integrator(
+    monkeypatch, tmp_path
+):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace" / "scope_repo_sandbox",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_repo_bundle_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_parallel_worker_api_task",
+                        "prompt": "worker api",
+                        "workspace": str(config.workspace_root / "git_parallel_worker_api_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_worker_branch",
+                            "workflow_guard": {
+                                "requires_git": True,
+                                "shared_repo_id": "repo_sandbox_parallel_merge",
+                                "target_branch": "main",
+                                "worker_branch": "worker/api-status",
+                            },
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_worker_branch",
+                                "workflow_guard": {
+                                    "requires_git": True,
+                                    "shared_repo_id": "repo_sandbox_parallel_merge",
+                                    "target_branch": "main",
+                                    "worker_branch": "worker/api-status",
+                                },
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_worker_docs_task",
+                        "prompt": "worker docs",
+                        "workspace": str(config.workspace_root / "git_parallel_worker_docs_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_worker_branch",
+                            "workflow_guard": {
+                                "requires_git": True,
+                                "shared_repo_id": "repo_sandbox_parallel_merge",
+                                "target_branch": "main",
+                                "worker_branch": "worker/docs-status",
+                            },
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_worker_branch",
+                                "workflow_guard": {
+                                    "requires_git": True,
+                                    "shared_repo_id": "repo_sandbox_parallel_merge",
+                                    "target_branch": "main",
+                                    "worker_branch": "worker/docs-status",
+                                },
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task",
+                        "prompt": "integrator",
+                        "workspace": str(config.workspace_root / "git_parallel_merge_acceptance_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_parallel_merge",
+                            "shared_repo_order": 1,
+                            "workflow_guard": {
+                                "requires_git": True,
+                                "shared_repo_id": "repo_sandbox_parallel_merge",
+                                "target_branch": "main",
+                            },
+                            "semantic_verifier": {
+                                "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                            },
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_parallel_merge",
+                                "shared_repo_order": 1,
+                                "workflow_guard": {
+                                    "requires_git": True,
+                                    "shared_repo_id": "repo_sandbox_parallel_merge",
+                                    "target_branch": "main",
+                                },
+                                "semantic_verifier": {
+                                    "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                                },
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_repo_status_review_task",
+                        "prompt": "review",
+                        "workspace": str(config.workspace_root / "git_repo_status_review_task"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_sandbox",
+                            "difficulty": "git_workflow",
+                            "workflow_guard": {"requires_git": True},
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_sandbox",
+                                "difficulty": "git_workflow",
+                                "workflow_guard": {"requires_git": True},
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            FakeKernel.run_task_ids.append(task.task_id)
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        max_generated_success_schedule_tasks=3,
+    )
+
+    assert metrics.generated_total == 3
+    assert FakeKernel.run_task_surfaces == [
+        "repository_worker_bundle",
+        "repository_worker_bundle",
+        "repository_integrator_bundle",
+    ]
+    assert FakeKernel.run_task_ids == [
+        "git_parallel_worker_api_task_repository_adjacent",
+        "git_parallel_worker_docs_task_repository_adjacent",
+        "git_parallel_merge_acceptance_task_repository_adjacent",
+    ]
+
+
+def test_eval_can_emit_current_cycle_generated_success_seed_bundle(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    seed_output_path = tmp_path / "reports" / "generated_success_seeds.json"
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="repo_seed",
+                    prompt="repo",
+                    workspace_subdir="repo_seed",
+                    metadata={"benchmark_family": "repository"},
+                ),
+                TaskSpec(
+                    task_id="project_fail",
+                    prompt="project",
+                    workspace_subdir="project_fail",
+                    metadata={"benchmark_family": "project"},
+                ),
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            success = task.task_id == "repo_seed"
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=success,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="run",
+                        action="code_execute",
+                        content=f"printf '{task.task_id}\\n' > status.txt",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": success, "reasons": []},
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success" if success else "policy_terminated",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_generated=False,
+        generated_success_seed_output_path=str(seed_output_path),
+    )
+
+    assert metrics.total == 2
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["repo_seed"]
+    assert payload["episodes"][0]["summary"]["executed_commands"] == ["printf 'repo_seed\\n' > status.txt"]
+
+
+def test_eval_generated_success_can_emit_next_wave_seed_bundle_from_generated_results(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "repository_seed",
+                        "prompt": "repo",
+                        "workspace": str(config.workspace_root / "repository_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repository",
+                            "origin_benchmark_family": "project",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "repository_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repository",
+                                "origin_benchmark_family": "project",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "repository_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["repository_seed_workflow_adjacent"]
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "workflow"
+
+
+def test_eval_generated_success_seed_bundle_persists_observed_runtime(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed",
+                        "prompt": "workflow",
+                        "workspace": str(config.workspace_root / "workflow_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        time.sleep(0.02)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata=dict(task.metadata),
+            task_contract={"metadata": dict(task.metadata)},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert float(episode["task_metadata"]["observed_runtime_seconds"]) > 0.0
+    assert episode["task_metadata"]["observed_runtime_phase"] == "generated_success"
+    assert float(episode["summary"]["observed_runtime_seconds"]) > 0.0
+    assert episode["summary"]["observed_runtime_phase"] == "generated_success"
+
+
+def test_eval_generated_success_flushes_completion_snapshot_before_seed_bundle_persistence(
+    monkeypatch,
+    tmp_path,
+):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    seed_bundle_path = tmp_path / "reports" / "generated_success_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    progress_path = tmp_path / "reports" / "generated_success_progress.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "shared_repo_seed",
+                        "prompt": "seed",
+                        "workspace": str(config.workspace_root / "shared_repo_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "project",
+                            "long_horizon_coding_surface": "shared_repo_integrator",
+                        },
+                        "task_contract": {"metadata": {"benchmark_family": "project"}},
+                        "summary": {},
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+
+        def schedule_generated_seed_episodes(self, results, curriculum_kind):
+            assert curriculum_kind == "adjacent_success"
+            return list(results)
+
+        def generate_followup_task(self, result):
+            del result
+            return TaskSpec(
+                task_id="git_parallel_merge_acceptance_task__worker__worker_docs-status_repository_adjacent",
+                prompt="followup",
+                workspace_subdir="followup_task",
+                metadata={"benchmark_family": "repository", "curriculum_kind": "adjacent_success"},
+            )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True, progress_callback=None):
+            del clean_workspace
+            assert callable(progress_callback)
+            progress_callback(
+                {
+                    "event": "step_complete",
+                    "step_index": 1,
+                    "step_stage": "step_complete",
+                    "completed_steps": 1,
+                    "decision_action": "code_execute",
+                    "verification_passed": True,
+                    "step_elapsed_seconds": 0.01,
+                }
+            )
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="step",
+                        action="code_execute",
+                        content="true",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True, "reasons": []},
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    bundle_write_started = threading.Event()
+    release_bundle_write = threading.Event()
+    bundle_write_calls = {"count": 0}
+
+    def fake_write_success_seed_bundle(output_path, **kwargs):
+        del output_path, kwargs
+        bundle_write_calls["count"] += 1
+        if bundle_write_calls["count"] == 1:
+            bundle_write_started.set()
+            release_bundle_write.wait(timeout=2.0)
+
+    monkeypatch.setattr("evals.harness.CurriculumEngine", FakeEngine)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._write_success_seed_bundle", fake_write_success_seed_bundle)
+
+    metrics_holder: dict[str, object] = {}
+
+    def _run_eval_in_thread():
+        metrics_holder["metrics"] = run_eval(
+            config=config,
+            include_primary_tasks=False,
+            include_generated=True,
+            generated_success_seed_documents_path=str(seed_bundle_path),
+            generated_success_seed_output_path=str(seed_output_path),
+            allow_generated_success_seed_fallback=True,
+            max_generated_success_schedule_tasks=1,
+            progress_snapshot_path=progress_path,
+        )
+
+    thread = threading.Thread(target=_run_eval_in_thread)
+    thread.start()
+    assert bundle_write_started.wait(timeout=1.0)
+
+    snapshot = {}
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if progress_path.exists():
+            snapshot = json.loads(progress_path.read_text(encoding="utf-8"))
+            if snapshot.get("completed_generated_tasks") == 1:
+                break
+        time.sleep(0.02)
+
+    assert snapshot.get("phase") == "generated_success"
+    assert snapshot.get("completed_generated_tasks") == 1
+    assert snapshot.get("generated_passed") == 1
+    assert (
+        snapshot.get("last_completed_generated_task_id")
+        == "git_parallel_merge_acceptance_task__worker__worker_docs-status_repository_adjacent"
+    )
+    assert snapshot.get("last_completed_generated_benchmark_family") == "repository"
+    assert snapshot.get("current_task_id") == ""
+
+    release_bundle_write.set()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert metrics_holder["metrics"].generated_total == 1
+    assert metrics_holder["metrics"].generated_passed == 1
+
+
+def test_eval_generated_success_seed_bundle_aggregates_runtime_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed_prior_a",
+                        "prompt": "workflow prior a",
+                        "workspace": str(config.workspace_root / "workflow_seed_prior_a"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                            "observed_runtime_seconds": 2.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                                "observed_runtime_seconds": 2.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 2.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "workflow_seed_prior_b",
+                        "prompt": "workflow prior b",
+                        "workspace": str(config.workspace_root / "workflow_seed_prior_b"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                            "observed_runtime_seconds": 4.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                                "observed_runtime_seconds": 4.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 4.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 5.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 5.0}},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert float(episode["task_metadata"]["observed_runtime_prior_seconds"]) >= 3.0
+    assert int(episode["task_metadata"]["observed_runtime_prior_count"]) >= 3
+    runtime_priors = payload["runtime_priors"]
+    assert any(float(row["mean_seconds"]) >= 3.0 for row in runtime_priors.values())
+
+
+def test_eval_generated_success_seed_bundle_aggregates_outcome_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed_prior_a",
+                        "prompt": "workflow prior a",
+                        "workspace": str(config.workspace_root / "workflow_seed_prior_a"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                            "observed_runtime_seconds": 2.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                                "observed_runtime_seconds": 2.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 2.0},
+                        "termination_reason": "success",
+                    }
+                ],
+                "outcome_priors": {
+                    "workflow:workflow_release_bundle:workflow_release": {
+                        "count": 4.0,
+                        "success_rate": 0.5,
+                        "timeout_rate": 0.25,
+                        "budget_exceeded_rate": 0.25,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=False,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 3.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 3.0}},
+            termination_reason="time_budget_exceeded",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert payload["episodes"] == []
+    outcome_priors = payload["outcome_priors"]
+    assert any(float(row["success_rate"]) < 0.7 for row in outcome_priors.values())
+    assert any(float(row["budget_exceeded_rate"]) > 0.0 for row in outcome_priors.values())
+
+
+def test_eval_generated_success_seed_bundle_aggregates_family_policy_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed_prior_a",
+                        "prompt": "workflow prior a",
+                        "workspace": str(config.workspace_root / "workflow_seed_prior_a"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "observed_runtime_seconds": 2.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "observed_runtime_seconds": 2.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 2.0},
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 3.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 3.0}},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert float(episode["task_metadata"]["observed_runtime_family_prior_seconds"]) >= 2.0
+    assert int(episode["task_metadata"]["observed_runtime_family_prior_count"]) >= 2
+    assert float(episode["task_metadata"]["observed_success_family_branch_prior_rate"]) > 0.5
+    assert int(episode["task_metadata"]["observed_outcome_family_prior_count"]) >= 2
+    emitted_family = str(episode["task_metadata"]["benchmark_family"])
+    assert emitted_family in payload["runtime_family_priors"]
+    assert any(str(key).startswith(f"{emitted_family}:") for key in payload["runtime_family_branch_priors"])
+    assert emitted_family in payload["outcome_family_priors"]
+    assert any(str(key).startswith(f"{emitted_family}:") for key in payload["outcome_family_branch_priors"])
+
+
+def test_eval_generated_success_seed_bundle_aggregates_late_wave_branch_policy_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave9_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave10_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "oversight_cleanup_seed",
+                        "prompt": "oversight cleanup",
+                        "workspace": str(config.workspace_root / "oversight_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "oversight",
+                            "origin_benchmark_family": "governance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "observed_runtime_seconds": 2.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "oversight",
+                                "origin_benchmark_family": "governance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "observed_runtime_seconds": 2.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 2.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "adjudication_cleanup_seed",
+                        "prompt": "adjudication cleanup",
+                        "workspace": str(config.workspace_root / "adjudication_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "adjudication",
+                            "origin_benchmark_family": "assurance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "observed_runtime_seconds": 4.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "adjudication",
+                                "origin_benchmark_family": "assurance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "observed_runtime_seconds": 4.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 4.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 3.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 3.0}},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert float(episode["task_metadata"]["observed_runtime_late_wave_branch_prior_seconds"]) >= 2.5
+    assert int(episode["task_metadata"]["observed_runtime_late_wave_branch_prior_count"]) >= 3
+    assert float(episode["task_metadata"]["observed_success_late_wave_branch_prior_rate"]) > 0.5
+    assert int(episode["task_metadata"]["observed_outcome_late_wave_branch_prior_count"]) >= 3
+    assert "cleanup" in payload["runtime_late_wave_branch_priors"]
+    assert "cleanup" in payload["outcome_late_wave_branch_priors"]
+
+
+def test_eval_generated_success_seed_bundle_aggregates_late_wave_phase_policy_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave10_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "assurance_mid_cleanup_seed",
+                        "prompt": "assurance mid cleanup",
+                        "workspace": str(config.workspace_root / "assurance_mid_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 11,
+                            "observed_runtime_seconds": 3.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "assurance",
+                                "origin_benchmark_family": "oversight",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "lineage_depth": 11,
+                                "observed_runtime_seconds": 3.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 3.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "adjudication_late_cleanup_seed",
+                        "prompt": "adjudication late cleanup",
+                        "workspace": str(config.workspace_root / "adjudication_late_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "adjudication",
+                            "origin_benchmark_family": "assurance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 5.0,
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "adjudication",
+                                "origin_benchmark_family": "assurance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "lineage_depth": 15,
+                                "observed_runtime_seconds": 5.0,
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 5.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 4.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 4.0}},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert float(episode["task_metadata"]["observed_runtime_late_wave_phase_prior_seconds"]) >= 3.0
+    assert int(episode["task_metadata"]["observed_runtime_late_wave_phase_prior_count"]) >= 2
+    assert float(episode["task_metadata"]["observed_success_late_wave_phase_prior_rate"]) > 0.5
+    assert int(episode["task_metadata"]["observed_outcome_late_wave_phase_prior_count"]) >= 2
+    assert episode["task_metadata"]["observed_lineage_phase"] in {"early", "mid", "late"}
+    assert any(str(key).startswith("cleanup:") for key in payload["runtime_late_wave_phase_priors"])
+    assert any(str(key).startswith("cleanup:") for key in payload["outcome_late_wave_phase_priors"])
+
+
+def test_eval_generated_success_seed_bundle_aggregates_late_wave_phase_state_policy_priors(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave10_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "assurance_late_cleanup_productive_seed",
+                        "prompt": "assurance late cleanup productive",
+                        "workspace": str(config.workspace_root / "assurance_late_cleanup_productive_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 4.0,
+                            "observed_scheduler_state": "productive",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "assurance",
+                                "origin_benchmark_family": "oversight",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                                "lineage_branch_kind": "cleanup",
+                                "lineage_depth": 15,
+                                "observed_runtime_seconds": 4.0,
+                                "observed_scheduler_state": "productive",
+                            }
+                        },
+                        "summary": {"observed_runtime_seconds": 4.0, "observed_scheduler_state": "productive"},
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        report_config=None,
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress, report_config
+        assert phase == "generated_success"
+        task = tasks[0]
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata={**dict(task.metadata), "observed_runtime_seconds": 5.0},
+            task_contract={"metadata": {**dict(task.metadata), "observed_runtime_seconds": 5.0}},
+            termination_reason="success",
+        )
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        return [result]
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert episode["task_metadata"]["observed_scheduler_state"] == "productive"
+    assert float(episode["task_metadata"]["observed_runtime_late_wave_phase_state_prior_seconds"]) >= 4.0
+    assert int(episode["task_metadata"]["observed_runtime_late_wave_phase_state_prior_count"]) >= 1
+    assert float(episode["task_metadata"]["observed_success_late_wave_phase_state_prior_rate"]) >= 1.0
+    assert int(episode["task_metadata"]["observed_outcome_late_wave_phase_state_prior_count"]) >= 1
+    assert any(str(key).endswith(":productive") for key in payload["runtime_late_wave_phase_state_priors"])
+    assert any(str(key).endswith(":productive") for key in payload["outcome_late_wave_phase_state_priors"])
+
+
+def test_eval_generated_success_seed_bundle_recency_weights_late_wave_phase_state_priors(monkeypatch, tmp_path):
+    from evals import harness as eval_harness
+
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "old_stalled_seed",
+                        "prompt": "old stalled",
+                        "workspace": str(tmp_path / "workspace" / "old_stalled_seed"),
+                        "success": False,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 8.0,
+                            "observed_scheduler_state": "stalled",
+                            "observed_recorded_at": 1000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 1000.0}},
+                        "summary": {"observed_runtime_seconds": 8.0, "observed_scheduler_state": "stalled", "observed_recorded_at": 1000.0},
+                        "termination_reason": "time_budget_exceeded",
+                    },
+                    {
+                        "task_id": "fresh_productive_seed",
+                        "prompt": "fresh productive",
+                        "workspace": str(tmp_path / "workspace" / "fresh_productive_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 2.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 100000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 100000.0}},
+                        "summary": {"observed_runtime_seconds": 2.0, "observed_scheduler_state": "productive", "observed_recorded_at": 100000.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("evals.harness.time.time", lambda: 100000.0)
+    eval_harness._write_success_seed_bundle(
+        str(seed_output_path),
+        primary_tasks=[],
+        primary_results=[],
+        generated_tasks=[],
+        generated_results=[],
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    productive = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":productive"))
+    stalled = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":stalled"))
+    assert float(productive["count"]) > float(stalled["count"])
+
+
+def test_eval_generated_success_seed_bundle_tracks_phase_state_recency_support_count(monkeypatch, tmp_path):
+    from evals import harness as eval_harness
+
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "fresh_productive_seed_a",
+                        "prompt": "fresh productive a",
+                        "workspace": str(tmp_path / "workspace" / "fresh_productive_seed_a"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 2.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 100000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 100000.0}},
+                        "summary": {"observed_runtime_seconds": 2.0, "observed_scheduler_state": "productive", "observed_recorded_at": 100000.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "fresh_productive_seed_b",
+                        "prompt": "fresh productive b",
+                        "workspace": str(tmp_path / "workspace" / "fresh_productive_seed_b"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "observed_runtime_seconds": 3.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 99990.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 99990.0}},
+                        "summary": {"observed_runtime_seconds": 3.0, "observed_scheduler_state": "productive", "observed_recorded_at": 99990.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("evals.harness.time.time", lambda: 100000.0)
+    eval_harness._write_success_seed_bundle(
+        str(seed_output_path),
+        primary_tasks=[],
+        primary_results=[],
+        generated_tasks=[],
+        generated_results=[],
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    productive = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":productive"))
+    assert float(productive["support_count"]) >= 2.0
+
+
+def test_eval_generated_success_seed_bundle_tracks_phase_state_dispersion_count(monkeypatch, tmp_path):
+    from evals import harness as eval_harness
+
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "assurance_cleanup_seed",
+                        "prompt": "assurance cleanup",
+                        "workspace": str(tmp_path / "workspace" / "assurance_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["validation", "governance", "oversight", "assurance"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 2.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 100000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 100000.0}},
+                        "summary": {"observed_runtime_seconds": 2.0, "observed_scheduler_state": "productive", "observed_recorded_at": 100000.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "adjudication_cleanup_seed",
+                        "prompt": "adjudication cleanup",
+                        "workspace": str(tmp_path / "workspace" / "adjudication_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "adjudication",
+                            "origin_benchmark_family": "assurance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["governance", "oversight", "assurance", "adjudication"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 3.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 99990.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 99990.0}},
+                        "summary": {"observed_runtime_seconds": 3.0, "observed_scheduler_state": "productive", "observed_recorded_at": 99990.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("evals.harness.time.time", lambda: 100000.0)
+    eval_harness._write_success_seed_bundle(
+        str(seed_output_path),
+        primary_tasks=[],
+        primary_results=[],
+        generated_tasks=[],
+        generated_results=[],
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    productive = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":productive"))
+    assert float(productive["dispersion_count"]) >= 2.0
+
+
+def test_eval_generated_success_seed_bundle_tracks_phase_state_directional_dispersion_count(monkeypatch, tmp_path):
+    from evals import harness as eval_harness
+
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "assurance_cleanup_seed",
+                        "prompt": "assurance cleanup",
+                        "workspace": str(tmp_path / "workspace" / "assurance_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["validation", "governance", "oversight", "assurance"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 2.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 100000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 100000.0}},
+                        "summary": {"observed_runtime_seconds": 2.0, "observed_scheduler_state": "productive", "observed_recorded_at": 100000.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "adjudication_cleanup_seed",
+                        "prompt": "adjudication cleanup",
+                        "workspace": str(tmp_path / "workspace" / "adjudication_cleanup_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "adjudication",
+                            "origin_benchmark_family": "assurance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["governance", "oversight", "assurance", "adjudication"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 3.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 99990.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 99990.0}},
+                        "summary": {"observed_runtime_seconds": 3.0, "observed_scheduler_state": "productive", "observed_recorded_at": 99990.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "assurance_cleanup_seed_lateral",
+                        "prompt": "assurance cleanup lateral",
+                        "workspace": str(tmp_path / "workspace" / "assurance_cleanup_seed_lateral"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["validation", "governance", "oversight", "assurance"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 2.5,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 99980.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 99980.0}},
+                        "summary": {"observed_runtime_seconds": 2.5, "observed_scheduler_state": "productive", "observed_recorded_at": 99980.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("evals.harness.time.time", lambda: 100000.0)
+    eval_harness._write_success_seed_bundle(
+        str(seed_output_path),
+        primary_tasks=[],
+        primary_results=[],
+        generated_tasks=[],
+        generated_results=[],
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    productive = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":productive"))
+    assert float(productive["dispersion_count"]) >= 2.0
+    assert float(productive["directional_dispersion_count"]) >= 2.0
+
+
+def test_eval_generated_success_seed_bundle_tracks_phase_state_phase_transition_count(monkeypatch, tmp_path):
+    from evals import harness as eval_harness
+
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_output_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "assurance_mid_to_late_seed",
+                        "prompt": "assurance mid to late",
+                        "workspace": str(tmp_path / "workspace" / "assurance_mid_to_late_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 14,
+                            "lineage_families": ["validation", "governance", "oversight", "assurance"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 2.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 100000.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 100000.0}},
+                        "summary": {"observed_runtime_seconds": 2.0, "observed_scheduler_state": "productive", "observed_recorded_at": 100000.0},
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "adjudication_late_seed",
+                        "prompt": "adjudication late",
+                        "workspace": str(tmp_path / "workspace" / "adjudication_late_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "adjudication",
+                            "origin_benchmark_family": "assurance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "adjudication_cleanup_ruling_bundle",
+                            "lineage_branch_kind": "cleanup",
+                            "lineage_depth": 15,
+                            "lineage_families": ["governance", "oversight", "assurance", "adjudication"],
+                            "lineage_branch_kinds": ["cleanup", "cleanup", "cleanup", "cleanup"],
+                            "observed_runtime_seconds": 3.0,
+                            "observed_scheduler_state": "productive",
+                            "observed_recorded_at": 99990.0,
+                        },
+                        "task_contract": {"metadata": {"observed_recorded_at": 99990.0}},
+                        "summary": {"observed_runtime_seconds": 3.0, "observed_scheduler_state": "productive", "observed_recorded_at": 99990.0},
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("evals.harness.time.time", lambda: 100000.0)
+    eval_harness._write_success_seed_bundle(
+        str(seed_output_path),
+        primary_tasks=[],
+        primary_results=[],
+        generated_tasks=[],
+        generated_results=[],
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    productive = next(v for k, v in payload["outcome_late_wave_phase_state_priors"].items() if str(k).endswith(":productive"))
+    assert float(productive["phase_transition_count"]) >= 1.0
+
+
+def test_eval_generated_success_can_emit_third_wave_seed_bundle_from_generated_results(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed",
+                        "prompt": "workflow",
+                        "workspace": str(config.workspace_root / "workflow_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["workflow_seed_tooling_adjacent"]
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "tooling"
+
+
+def test_eval_generated_success_persists_seed_bundle_before_generated_timeout(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave2_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "workflow_seed",
+                        "prompt": "workflow",
+                        "workspace": str(config.workspace_root / "workflow_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "workflow",
+                            "origin_benchmark_family": "repository",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "workflow_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "workflow",
+                                "origin_benchmark_family": "repository",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "workflow_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def close(self):
+            return None
+
+    def fake_run_tasks_with_progress(
+        tasks,
+        kernel,
+        *,
+        progress_label,
+        phase="",
+        on_result=None,
+        on_task_start=None,
+        on_task_progress=None,
+        on_task_complete=None,
+    ):
+        del kernel, progress_label, on_task_progress
+        if phase != "generated_success":
+            return []
+        assert len(tasks) == 1
+        task = tasks[0]
+        result = EpisodeRecord(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+            success=True,
+            steps=[],
+            task_metadata=dict(task.metadata),
+            task_contract={"metadata": dict(task.metadata)},
+            termination_reason="success",
+        )
+        if on_task_start is not None:
+            on_task_start(task, 1, 1)
+        if on_task_complete is not None:
+            on_task_complete(task, result, 1, 1)
+        if on_result is not None:
+            on_result(task, result, 1, 1)
+        raise RuntimeError("simulated generated timeout after first completion")
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+    monkeypatch.setattr("evals.harness._run_tasks_with_progress", fake_run_tasks_with_progress)
+
+    try:
+        run_eval(
+            config=config,
+            include_primary_tasks=False,
+            include_generated=True,
+            generated_success_seed_documents_path=str(seed_bundle_path),
+            generated_success_seed_output_path=str(seed_output_path),
+            allow_generated_success_seed_fallback=True,
+            max_generated_success_schedule_tasks=1,
+        )
+    except RuntimeError as exc:
+        assert "simulated generated timeout" in str(exc)
+    else:
+        raise AssertionError("expected generated-success timeout simulation")
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["workflow_seed_tooling_adjacent"]
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "tooling"
+
+
+def test_eval_generated_success_can_emit_fourth_wave_seed_bundle_from_generated_results(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave3_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave4_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "tooling_seed",
+                        "prompt": "tooling",
+                        "workspace": str(config.workspace_root / "tooling_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "tooling",
+                            "origin_benchmark_family": "workflow",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "tooling_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "tooling",
+                                "origin_benchmark_family": "workflow",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "tooling_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["tooling_seed_integration_adjacent"]
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "integration"
+
+
+def test_eval_generated_success_can_emit_fifth_wave_seed_bundle_from_generated_results(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave4_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave5_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "integration_seed",
+                        "prompt": "integration",
+                        "workspace": str(config.workspace_root / "integration_seed"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "integration",
+                            "origin_benchmark_family": "tooling",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "integration_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "integration",
+                                "origin_benchmark_family": "tooling",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "integration_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert [episode["task_id"] for episode in payload["episodes"]] == ["integration_seed_repo_chore_adjacent"]
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "repo_chore"
+
+
+def test_eval_generated_success_diversifies_repo_chore_terminal_variants(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave4_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave5_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent",
+                        "prompt": "integration cleanup",
+                        "workspace": str(config.workspace_root / "integration_seed_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "integration",
+                            "origin_benchmark_family": "tooling",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "integration_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "integration",
+                                "origin_benchmark_family": "tooling",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "integration_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent",
+                        "prompt": "integration audit",
+                        "workspace": str(config.workspace_root / "integration_seed_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "integration",
+                            "origin_benchmark_family": "tooling",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "integration_release_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "integration",
+                                "origin_benchmark_family": "tooling",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "integration_release_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "repo_chore_cleanup_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "repo_chore_audit_bundle"
+
+
+def test_eval_generated_success_bridges_repo_chore_into_validation(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave5_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave6_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent",
+                        "prompt": "repo chore cleanup",
+                        "workspace": str(config.workspace_root / "repo_chore_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_chore",
+                            "origin_benchmark_family": "integration",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "repo_chore_cleanup_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_chore",
+                                "origin_benchmark_family": "integration",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "repo_chore_cleanup_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent",
+                        "prompt": "repo chore audit",
+                        "workspace": str(config.workspace_root / "repo_chore_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "repo_chore",
+                            "origin_benchmark_family": "integration",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "repo_chore_audit_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "repo_chore",
+                                "origin_benchmark_family": "integration",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "repo_chore_audit_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "validation"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "validation"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "validation_cleanup_gate_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "validation_audit_gate_bundle"
+
+
+def test_eval_generated_success_bridges_validation_into_governance(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave6_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave7_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent",
+                        "prompt": "validation cleanup",
+                        "workspace": str(config.workspace_root / "validation_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "validation",
+                            "origin_benchmark_family": "repo_chore",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "validation_cleanup_gate_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "validation",
+                                "origin_benchmark_family": "repo_chore",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "validation_cleanup_gate_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent",
+                        "prompt": "validation audit",
+                        "workspace": str(config.workspace_root / "validation_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "validation",
+                            "origin_benchmark_family": "repo_chore",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "validation_audit_gate_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "validation",
+                                "origin_benchmark_family": "repo_chore",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "validation_audit_gate_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "governance"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "governance"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "governance_cleanup_review_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "governance_audit_review_bundle"
+
+
+def test_eval_generated_success_bridges_validation_integrator_into_governance(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave6_integrator_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave7_integrator_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent",
+                        "prompt": "validation integrator cleanup",
+                        "workspace": str(config.workspace_root / "validation_integrator_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "validation",
+                            "origin_benchmark_family": "repo_chore",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "validation_integrator_cleanup_gate_bundle",
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "shared_repo_integrator_bundle",
+                                "repository_integrator_bundle",
+                                "workflow_release_bundle",
+                                "tooling_release_bundle",
+                                "integration_release_bundle",
+                                "repo_chore_cleanup_bundle",
+                                "validation_integrator_cleanup_gate_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "project_release",
+                                "workflow_release",
+                                "tooling_release",
+                                "integration_release",
+                                "cleanup",
+                                "cleanup",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "validation",
+                                "origin_benchmark_family": "repo_chore",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "validation_integrator_cleanup_gate_bundle",
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "shared_repo_integrator_bundle",
+                                    "repository_integrator_bundle",
+                                    "workflow_release_bundle",
+                                    "tooling_release_bundle",
+                                    "integration_release_bundle",
+                                    "repo_chore_cleanup_bundle",
+                                    "validation_integrator_cleanup_gate_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "project_release",
+                                    "workflow_release",
+                                    "tooling_release",
+                                    "integration_release",
+                                    "cleanup",
+                                    "cleanup",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent",
+                        "prompt": "validation integrator audit",
+                        "workspace": str(config.workspace_root / "validation_integrator_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "validation",
+                            "origin_benchmark_family": "repo_chore",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "validation_integrator_audit_gate_bundle",
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "shared_repo_integrator_bundle",
+                                "repository_integrator_bundle",
+                                "workflow_release_bundle",
+                                "tooling_release_bundle",
+                                "integration_release_bundle",
+                                "repo_chore_audit_bundle",
+                                "validation_integrator_audit_gate_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "project_release",
+                                "workflow_release",
+                                "tooling_release",
+                                "integration_release",
+                                "audit",
+                                "audit",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "validation",
+                                "origin_benchmark_family": "repo_chore",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "validation_integrator_audit_gate_bundle",
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "shared_repo_integrator_bundle",
+                                    "repository_integrator_bundle",
+                                    "workflow_release_bundle",
+                                    "tooling_release_bundle",
+                                    "integration_release_bundle",
+                                    "repo_chore_audit_bundle",
+                                    "validation_integrator_audit_gate_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "project_release",
+                                    "workflow_release",
+                                    "tooling_release",
+                                    "integration_release",
+                                    "audit",
+                                    "audit",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "governance"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "governance"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "governance_integrator_cleanup_review_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "governance_integrator_audit_review_bundle"
+
+
+def test_eval_generated_success_bridges_governance_into_oversight(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave7_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave8_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent",
+                        "prompt": "governance cleanup",
+                        "workspace": str(config.workspace_root / "governance_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "governance",
+                            "origin_benchmark_family": "validation",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "governance_cleanup_review_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "governance",
+                                "origin_benchmark_family": "validation",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "governance_cleanup_review_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent",
+                        "prompt": "governance audit",
+                        "workspace": str(config.workspace_root / "governance_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "governance",
+                            "origin_benchmark_family": "validation",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "governance_audit_review_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "governance",
+                                "origin_benchmark_family": "validation",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "governance_audit_review_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "oversight"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "oversight"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "oversight_cleanup_crosscheck_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "oversight_audit_crosscheck_bundle"
+
+
+def test_eval_generated_success_bridges_governance_integrator_into_oversight(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave7_integrator_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave8_integrator_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent",
+                        "prompt": "governance integrator cleanup",
+                        "workspace": str(config.workspace_root / "governance_integrator_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "governance",
+                            "origin_benchmark_family": "validation",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "governance_integrator_cleanup_review_bundle",
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "shared_repo_integrator_bundle",
+                                "repository_integrator_bundle",
+                                "workflow_release_bundle",
+                                "tooling_release_bundle",
+                                "integration_release_bundle",
+                                "repo_chore_cleanup_bundle",
+                                "validation_integrator_cleanup_gate_bundle",
+                                "governance_integrator_cleanup_review_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "project_release",
+                                "workflow_release",
+                                "tooling_release",
+                                "integration_release",
+                                "cleanup",
+                                "cleanup",
+                                "cleanup",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "governance",
+                                "origin_benchmark_family": "validation",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "governance_integrator_cleanup_review_bundle",
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "shared_repo_integrator_bundle",
+                                    "repository_integrator_bundle",
+                                    "workflow_release_bundle",
+                                    "tooling_release_bundle",
+                                    "integration_release_bundle",
+                                    "repo_chore_cleanup_bundle",
+                                    "validation_integrator_cleanup_gate_bundle",
+                                    "governance_integrator_cleanup_review_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "project_release",
+                                    "workflow_release",
+                                    "tooling_release",
+                                    "integration_release",
+                                    "cleanup",
+                                    "cleanup",
+                                    "cleanup",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent",
+                        "prompt": "governance integrator audit",
+                        "workspace": str(config.workspace_root / "governance_integrator_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "governance",
+                            "origin_benchmark_family": "validation",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "governance_integrator_audit_review_bundle",
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "shared_repo_integrator_bundle",
+                                "repository_integrator_bundle",
+                                "workflow_release_bundle",
+                                "tooling_release_bundle",
+                                "integration_release_bundle",
+                                "repo_chore_audit_bundle",
+                                "validation_integrator_audit_gate_bundle",
+                                "governance_integrator_audit_review_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "project_release",
+                                "workflow_release",
+                                "tooling_release",
+                                "integration_release",
+                                "audit",
+                                "audit",
+                                "audit",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "governance",
+                                "origin_benchmark_family": "validation",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "governance_integrator_audit_review_bundle",
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "shared_repo_integrator_bundle",
+                                    "repository_integrator_bundle",
+                                    "workflow_release_bundle",
+                                    "tooling_release_bundle",
+                                    "integration_release_bundle",
+                                    "repo_chore_audit_bundle",
+                                    "validation_integrator_audit_gate_bundle",
+                                    "governance_integrator_audit_review_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "project_release",
+                                    "workflow_release",
+                                    "tooling_release",
+                                    "integration_release",
+                                    "audit",
+                                    "audit",
+                                    "audit",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "oversight"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "oversight"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "oversight_integrator_cleanup_crosscheck_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "oversight_integrator_audit_crosscheck_bundle"
+
+
+def test_eval_generated_success_bridges_oversight_into_assurance(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave8_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave9_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "git_generated_conflict_resolution_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent_oversight_adjacent",
+                        "prompt": "oversight cleanup",
+                        "workspace": str(config.workspace_root / "oversight_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "oversight",
+                            "origin_benchmark_family": "governance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "oversight",
+                                "origin_benchmark_family": "governance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                    {
+                        "task_id": "git_parallel_merge_acceptance_task_repository_adjacent_workflow_adjacent_tooling_adjacent_integration_adjacent_repo_chore_adjacent_validation_adjacent_governance_adjacent_oversight_adjacent",
+                        "prompt": "oversight audit",
+                        "workspace": str(config.workspace_root / "oversight_audit"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "oversight",
+                            "origin_benchmark_family": "governance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "oversight_audit_crosscheck_bundle",
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "oversight",
+                                "origin_benchmark_family": "governance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "oversight_audit_crosscheck_bundle",
+                            }
+                        },
+                        "termination_reason": "success",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=2,
+        task_limit=2,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 2
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "assurance"
+    assert payload["episodes"][1]["task_metadata"]["benchmark_family"] == "assurance"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "assurance_cleanup_cert_bundle"
+    assert payload["episodes"][1]["task_metadata"]["long_horizon_coding_surface"] == "assurance_audit_cert_bundle"
+
+
+def test_eval_generated_success_seed_bundle_persists_lineage_metadata(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave8_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave9_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "cleanup_seed",
+                        "prompt": "oversight cleanup",
+                        "workspace": str(config.workspace_root / "oversight_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "oversight",
+                            "origin_benchmark_family": "governance",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                            "lineage_families": ["project", "repository", "governance", "oversight"],
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "repository_release_bundle",
+                                "governance_cleanup_review_bundle",
+                                "oversight_cleanup_crosscheck_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "cleanup",
+                                "cleanup",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "oversight",
+                                "origin_benchmark_family": "governance",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "oversight_cleanup_crosscheck_bundle",
+                                "lineage_families": ["project", "repository", "governance", "oversight"],
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "repository_release_bundle",
+                                    "governance_cleanup_review_bundle",
+                                    "oversight_cleanup_crosscheck_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "cleanup",
+                                    "cleanup",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+        task_limit=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    episode = payload["episodes"][0]
+    assert episode["task_metadata"]["lineage_families"][-1] == "assurance"
+    assert episode["task_metadata"]["lineage_surfaces"][-1] == "assurance_cleanup_cert_bundle"
+    assert episode["task_metadata"]["lineage_branch_kinds"][-1] == "cleanup"
+    assert episode["task_contract"]["metadata"]["lineage_families"][-1] == "assurance"
+
+
+def test_eval_generated_success_bridges_assurance_into_adjudication(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path = tmp_path / "reports" / "generated_success_wave10_seeds.json"
+    seed_output_path = tmp_path / "reports" / "generated_success_wave11_seeds.json"
+    seed_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_bundle_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "task_id": "generic_assurance_cleanup_tail",
+                        "prompt": "assurance cleanup",
+                        "workspace": str(config.workspace_root / "assurance_cleanup"),
+                        "success": True,
+                        "task_metadata": {
+                            "benchmark_family": "assurance",
+                            "origin_benchmark_family": "oversight",
+                            "difficulty": "long_horizon",
+                            "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                            "lineage_families": [
+                                "project",
+                                "repository",
+                                "workflow",
+                                "tooling",
+                                "integration",
+                                "repo_chore",
+                                "validation",
+                                "governance",
+                                "oversight",
+                                "assurance",
+                            ],
+                            "lineage_surfaces": [
+                                "project_release_bundle",
+                                "repository_release_bundle",
+                                "workflow_release_bundle",
+                                "tooling_release_bundle",
+                                "integration_release_bundle",
+                                "repo_chore_cleanup_bundle",
+                                "validation_cleanup_gate_bundle",
+                                "governance_cleanup_review_bundle",
+                                "oversight_cleanup_crosscheck_bundle",
+                                "assurance_cleanup_cert_bundle",
+                            ],
+                            "lineage_branch_kinds": [
+                                "project_release",
+                                "project_release",
+                                "workflow_release",
+                                "tooling_release",
+                                "integration_release",
+                                "cleanup",
+                                "cleanup",
+                                "cleanup",
+                                "cleanup",
+                                "cleanup",
+                            ],
+                        },
+                        "task_contract": {
+                            "metadata": {
+                                "benchmark_family": "assurance",
+                                "origin_benchmark_family": "oversight",
+                                "difficulty": "long_horizon",
+                                "long_horizon_coding_surface": "assurance_cleanup_cert_bundle",
+                                "lineage_families": [
+                                    "project",
+                                    "repository",
+                                    "workflow",
+                                    "tooling",
+                                    "integration",
+                                    "repo_chore",
+                                    "validation",
+                                    "governance",
+                                    "oversight",
+                                    "assurance",
+                                ],
+                                "lineage_surfaces": [
+                                    "project_release_bundle",
+                                    "repository_release_bundle",
+                                    "workflow_release_bundle",
+                                    "tooling_release_bundle",
+                                    "integration_release_bundle",
+                                    "repo_chore_cleanup_bundle",
+                                    "validation_cleanup_gate_bundle",
+                                    "governance_cleanup_review_bundle",
+                                    "oversight_cleanup_crosscheck_bundle",
+                                    "assurance_cleanup_cert_bundle",
+                                ],
+                                "lineage_branch_kinds": [
+                                    "project_release",
+                                    "project_release",
+                                    "workflow_release",
+                                    "tooling_release",
+                                    "integration_release",
+                                    "cleanup",
+                                    "cleanup",
+                                    "cleanup",
+                                    "cleanup",
+                                    "cleanup",
+                                ],
+                            }
+                        },
+                        "termination_reason": "success",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        include_primary_tasks=False,
+        include_generated=True,
+        generated_success_seed_documents_path=str(seed_bundle_path),
+        generated_success_seed_output_path=str(seed_output_path),
+        allow_generated_success_seed_fallback=True,
+        max_generated_success_schedule_tasks=1,
+        task_limit=1,
+    )
+
+    payload = json.loads(seed_output_path.read_text(encoding="utf-8"))
+    assert metrics.generated_total == 1
+    assert payload["episodes"][0]["task_metadata"]["benchmark_family"] == "adjudication"
+    assert payload["episodes"][0]["task_metadata"]["long_horizon_coding_surface"] == "adjudication_cleanup_ruling_bundle"
+    assert payload["episodes"][0]["task_metadata"]["lineage_depth"] == 11
+
+
+def test_run_eval_surfaces_shared_repo_synthetic_workers_for_project_priority(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="plain_project_task",
+                    prompt="plain project",
+                    workspace_subdir="plain_project_task",
+                    metadata={"benchmark_family": "project"},
+                ),
+                TaskSpec(
+                    task_id="shared_repo_integrator",
+                    prompt="shared repo integrator",
+                    workspace_subdir="shared_repo_integrator",
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/a"],
+                        },
+                    },
+                ),
+            ]
+
+        def parallel_worker_tasks(self, task_id, *, target_worker_count=None):
+            del target_worker_count
+            if task_id != "shared_repo_integrator":
+                return []
+            return [
+                TaskSpec(
+                    task_id="shared_repo_worker",
+                    prompt="shared repo worker",
+                    workspace_subdir="shared_repo_worker",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/status.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [
+                            {
+                                "edit_kind": "line_replace",
+                                "path": "src/status.txt",
+                                "line_number": 1,
+                                "old_text": "pending",
+                                "new_text": "ready",
+                                "edit_score": 42.0,
+                            }
+                        ],
+                    },
+                )
+            ]
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_families: list[str] = []
+        run_task_origins: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_ids.append(task.task_id)
+            FakeKernel.run_task_families.append(str(metadata.get("benchmark_family", "")))
+            FakeKernel.run_task_origins.append(str(metadata.get("origin_benchmark_family", "")))
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        task_limit=1,
+        priority_benchmark_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert metrics.total == 1
+    assert FakeKernel.run_task_ids == ["shared_repo_worker"]
+    assert FakeKernel.run_task_families == ["project"]
+    assert FakeKernel.run_task_origins == ["repo_sandbox"]
+    assert FakeKernel.run_task_surfaces == ["shared_repo_synthetic_worker"]
+
+
+def test_run_eval_surfaces_shared_repo_integrators_for_project_priority(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="shared_repo_integrator",
+                    prompt="shared repo integrator",
+                    workspace_subdir="shared_repo_integrator",
+                    suggested_commands=[
+                        "git merge --no-ff worker/a -m 'merge worker/a' && tests/test_a.sh && mkdir -p reports && printf 'passed\\n' > reports/test_report.txt"
+                    ],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "shared_repo_order": 1,
+                        "workflow_guard": {"shared_repo_id": "repo-a", "target_branch": "main"},
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/a"],
+                            "expected_changed_paths": ["src/a.txt", "reports/test_report.txt"],
+                        },
+                    },
+                )
+            ]
+
+        def parallel_worker_tasks(self, task_id, *, target_worker_count=None):
+            del task_id, target_worker_count
+            return []
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_ids.append(task.task_id)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        task_limit=1,
+        priority_benchmark_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert metrics.total == 1
+    assert FakeKernel.run_task_ids == ["shared_repo_integrator"]
+    assert FakeKernel.run_task_surfaces == ["shared_repo_integrator"]
+
+
+def test_run_eval_reserves_shared_repo_integrator_coverage_for_project_priority(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="shared_repo_integrator",
+                    prompt="shared repo integrator",
+                    workspace_subdir="shared_repo_integrator",
+                    suggested_commands=[
+                        "git merge --no-ff worker/a -m 'merge worker/a' && git merge --no-ff worker/b -m 'merge worker/b'"
+                    ],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "shared_repo_order": 1,
+                        "workflow_guard": {"shared_repo_id": "repo-a", "target_branch": "main"},
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/a", "worker/b"],
+                            "expected_changed_paths": ["src/a.txt", "src/b.txt", "reports/test_report.txt"],
+                        },
+                    },
+                ),
+            ]
+
+        def parallel_worker_tasks(self, task_id, *, target_worker_count=None):
+            del target_worker_count
+            if task_id != "shared_repo_integrator":
+                return []
+            return [
+                TaskSpec(
+                    task_id="shared_repo_worker_a",
+                    prompt="shared repo worker a",
+                    workspace_subdir="shared_repo_worker_a",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/a.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [
+                            {
+                                "edit_kind": "line_replace",
+                                "path": "src/a.txt",
+                                "line_number": 1,
+                                "old_text": "pending",
+                                "new_text": "ready",
+                                "edit_score": 40.0,
+                            }
+                        ],
+                        "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/a"},
+                    },
+                ),
+                TaskSpec(
+                    task_id="shared_repo_worker_b",
+                    prompt="shared repo worker b",
+                    workspace_subdir="shared_repo_worker_b",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/b.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [
+                            {
+                                "edit_kind": "line_replace",
+                                "path": "src/b.txt",
+                                "line_number": 1,
+                                "old_text": "pending",
+                                "new_text": "ready",
+                                "edit_score": 39.0,
+                            }
+                        ],
+                        "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/b"},
+                    },
+                ),
+                TaskSpec(
+                    task_id="shared_repo_worker_c",
+                    prompt="shared repo worker c",
+                    workspace_subdir="shared_repo_worker_c",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/c.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [
+                            {
+                                "edit_kind": "line_replace",
+                                "path": "src/c.txt",
+                                "line_number": 1,
+                                "old_text": "pending",
+                                "new_text": "ready",
+                                "edit_score": 38.0,
+                            }
+                        ],
+                        "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/c"},
+                    },
+                ),
+            ]
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_ids.append(task.task_id)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        task_limit=3,
+        priority_benchmark_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert metrics.total == 3
+    assert "shared_repo_integrator" in FakeKernel.run_task_ids
+    assert FakeKernel.run_task_ids == [
+        "shared_repo_worker_a",
+        "shared_repo_worker_b",
+        "shared_repo_integrator",
+    ]
+    assert FakeKernel.run_task_surfaces.count("shared_repo_integrator") == 1
+    assert FakeKernel.run_task_surfaces.count("shared_repo_synthetic_worker") == 2
+
+
+def test_run_eval_keeps_incomplete_shared_repo_bundle_on_workers_until_all_required_branches_fit(
+    monkeypatch, tmp_path
+):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="shared_repo_integrator",
+                    prompt="shared repo integrator",
+                    workspace_subdir="shared_repo_integrator",
+                    suggested_commands=[
+                        "git merge --no-ff worker/a -m 'merge worker/a' && git merge --no-ff worker/b -m 'merge worker/b'"
+                    ],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "shared_repo_order": 1,
+                        "workflow_guard": {"shared_repo_id": "repo-a", "target_branch": "main"},
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/a", "worker/b"],
+                            "expected_changed_paths": ["src/a.txt", "src/b.txt", "reports/test_report.txt"],
+                        },
+                    },
+                ),
+            ]
+
+        def parallel_worker_tasks(self, task_id, *, target_worker_count=None):
+            del target_worker_count
+            if task_id != "shared_repo_integrator":
+                return []
+            return [
+                TaskSpec(
+                    task_id="shared_repo_worker_a",
+                    prompt="shared repo worker a",
+                    workspace_subdir="shared_repo_worker_a",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/a.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [{"path": "src/a.txt"}],
+                        "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/a"},
+                    },
+                ),
+                TaskSpec(
+                    task_id="shared_repo_worker_b",
+                    prompt="shared repo worker b",
+                    workspace_subdir="shared_repo_worker_b",
+                    suggested_commands=["sed -i '1s#pending#ready#' src/b.txt"],
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "synthetic_worker": True,
+                        "synthetic_edit_plan": [{"path": "src/b.txt"}],
+                        "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/b"},
+                    },
+                ),
+            ]
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            FakeKernel.run_task_ids.append(task.task_id)
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        task_limit=2,
+        priority_benchmark_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert metrics.total == 2
+    assert FakeKernel.run_task_ids == ["shared_repo_worker_a", "shared_repo_worker_b"]
+    assert FakeKernel.run_task_surfaces == [
+        "shared_repo_synthetic_worker",
+        "shared_repo_synthetic_worker",
+    ]
+
+
+def test_run_eval_keeps_shared_repo_bundle_coherent_for_project_priority(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        skills_path=tmp_path / "skills" / "command_skills.json",
+    )
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="shared_repo_integrator_a",
+                    prompt="shared repo integrator a",
+                    workspace_subdir="shared_repo_integrator_a",
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "shared_repo_order": 1,
+                        "workflow_guard": {"shared_repo_id": "repo-a", "target_branch": "main"},
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/a", "worker/b"],
+                            "expected_changed_paths": ["src/a.txt", "src/b.txt"],
+                        },
+                    },
+                ),
+                TaskSpec(
+                    task_id="shared_repo_integrator_b",
+                    prompt="shared repo integrator b",
+                    workspace_subdir="shared_repo_integrator_b",
+                    metadata={
+                        "benchmark_family": "repo_sandbox",
+                        "shared_repo_order": 1,
+                        "workflow_guard": {"shared_repo_id": "repo-b", "target_branch": "main"},
+                        "semantic_verifier": {
+                            "required_merged_branches": ["worker/c"],
+                            "expected_changed_paths": ["src/c.txt"],
+                        },
+                    },
+                ),
+            ]
+
+        def parallel_worker_tasks(self, task_id, *, target_worker_count=None):
+            del target_worker_count
+            if task_id == "shared_repo_integrator_a":
+                return [
+                    TaskSpec(
+                        task_id="shared_repo_worker_a",
+                        prompt="shared repo worker a",
+                        workspace_subdir="shared_repo_worker_a",
+                        metadata={
+                            "benchmark_family": "repo_sandbox",
+                            "synthetic_worker": True,
+                            "synthetic_edit_plan": [{"path": "src/a.txt"}],
+                            "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/a"},
+                        },
+                    ),
+                    TaskSpec(
+                        task_id="shared_repo_worker_b",
+                        prompt="shared repo worker b",
+                        workspace_subdir="shared_repo_worker_b",
+                        metadata={
+                            "benchmark_family": "repo_sandbox",
+                            "synthetic_worker": True,
+                            "synthetic_edit_plan": [{"path": "src/b.txt"}],
+                            "workflow_guard": {"shared_repo_id": "repo-a", "worker_branch": "worker/b"},
+                        },
+                    ),
+                ]
+            if task_id == "shared_repo_integrator_b":
+                return [
+                    TaskSpec(
+                        task_id="shared_repo_worker_c",
+                        prompt="shared repo worker c",
+                        workspace_subdir="shared_repo_worker_c",
+                        metadata={
+                            "benchmark_family": "repo_sandbox",
+                            "synthetic_worker": True,
+                            "synthetic_edit_plan": [{"path": "src/c.txt"}],
+                            "workflow_guard": {"shared_repo_id": "repo-b", "worker_branch": "worker/c"},
+                        },
+                    ),
+                ]
+            return []
+
+    class FakeKernel:
+        run_task_ids: list[str] = []
+        run_task_repo_ids: list[str] = []
+        run_task_surfaces: list[str] = []
+
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, clean_workspace=True):
+            del clean_workspace
+            metadata = dict(task.metadata)
+            workflow_guard = dict(metadata.get("workflow_guard", {}) or {})
+            FakeKernel.run_task_ids.append(task.task_id)
+            FakeKernel.run_task_repo_ids.append(str(workflow_guard.get("shared_repo_id", "")))
+            FakeKernel.run_task_surfaces.append(str(metadata.get("long_horizon_coding_surface", "")))
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=metadata,
+                task_contract={"metadata": metadata},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("evals.harness.TaskBank", FakeTaskBank)
+    monkeypatch.setattr("evals.harness.AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=config,
+        task_limit=3,
+        priority_benchmark_families=["project"],
+        prefer_low_cost_tasks=True,
+    )
+
+    assert metrics.total == 3
+    assert FakeKernel.run_task_ids == [
+        "shared_repo_worker_a",
+        "shared_repo_worker_b",
+        "shared_repo_integrator_a",
+    ]
+    assert FakeKernel.run_task_repo_ids == ["repo-a", "repo-a", "repo-a"]
+    assert FakeKernel.run_task_surfaces.count("shared_repo_integrator") == 1
+    assert FakeKernel.run_task_surfaces.count("shared_repo_synthetic_worker") == 2
+
+
 def test_eval_emits_progress_for_generated_curriculum_phases(tmp_path, monkeypatch):
     config = KernelConfig(
         provider="mock",
@@ -1840,6 +7386,7 @@ def test_eval_emits_progress_for_generated_curriculum_phases(tmp_path, monkeypat
         include_generated=True,
         include_failure_generated=True,
         progress_label="generated-progress",
+        task_limit=1,
     )
 
     output = stream.getvalue()
@@ -1852,3 +7399,5 @@ def test_eval_emits_progress_for_generated_curriculum_phases(tmp_path, monkeypat
     assert "[eval:generated-progress] phase=generated_failure_seed task 1/" in output
     assert "[eval:generated-progress] phase=generated_failure total=" in output
     assert "[eval:generated-progress] phase=generated_failure task 1/" in output
+    assert "[eval:generated-progress] phase=metrics_finalize start" in output
+    assert "[eval:generated-progress] phase=metrics_finalize complete" in output

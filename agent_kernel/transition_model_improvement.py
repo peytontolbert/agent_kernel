@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 
+from .improvement_catalog import catalog_string_set
 from .improvement_common import (
     build_standard_proposal_artifact,
     ensure_proposals,
@@ -16,31 +17,11 @@ from .improvement_common import (
 )
 
 
-_TRANSITION_SIGNALS = {"no_state_progress", "state_regression"}
-_TRANSITION_MODEL_GENERATION_FOCI = {
-    "balanced",
-    "repeat_avoidance",
-    "regression_guard",
-    "recovery_bias",
-}
+_TRANSITION_SIGNALS = catalog_string_set("transition_model", "signals")
+_TRANSITION_MODEL_GENERATION_FOCI = catalog_string_set("transition_model", "generation_foci")
 _SHELL_TOKEN_RE = re.compile(r"""'[^']*'|"[^"]*"|&&|\|\||>>|<<|[|;<>]|[^\s]+""")
-_PATH_LIKE_SUFFIXES = {
-    ".cfg",
-    ".csv",
-    ".env",
-    ".http",
-    ".ini",
-    ".json",
-    ".md",
-    ".py",
-    ".sh",
-    ".sql",
-    ".toml",
-    ".txt",
-    ".yaml",
-    ".yml",
-}
-_PATH_TARGET_COMMANDS = {"cat", "mkdir", "mv", "rm", "touch", "unlink"}
+_PATH_LIKE_SUFFIXES = catalog_string_set("transition_model", "path_like_suffixes")
+_PATH_TARGET_COMMANDS = catalog_string_set("transition_model", "path_target_commands")
 
 
 def transition_model_controls(
@@ -50,11 +31,19 @@ def transition_model_controls(
     baseline: dict[str, object] | None = None,
 ) -> dict[str, object]:
     signal_counts = summary.get("signal_counts", {}) if isinstance(summary.get("signal_counts", {}), dict) else {}
+    regression_evidence = int(signal_counts.get("state_regression", 0)) > 0 or int(summary.get("regression_path_count", 0) or 0) > 0
+    difficulty_counts = summary.get("difficulty_counts", {}) if isinstance(summary.get("difficulty_counts", {}), dict) else {}
+    long_horizon_evidence = (
+        int(difficulty_counts.get("long_horizon", 0) or 0) > 0
+        or int(summary.get("long_horizon_signature_count", 0) or 0) > 0
+    )
     controls: dict[str, object] = {
         "repeat_command_penalty": 4,
         "regressed_path_command_penalty": 3,
         "recovery_command_bonus": 2,
         "progress_command_bonus": 2,
+        "long_horizon_repeat_command_penalty": 1,
+        "long_horizon_progress_command_bonus": 1,
         "max_signatures": 12,
     }
     if isinstance(baseline, dict):
@@ -62,16 +51,19 @@ def transition_model_controls(
     if int(signal_counts.get("no_state_progress", 0)) > 0:
         controls["repeat_command_penalty"] = max(int(controls["repeat_command_penalty"]), 5)
         controls["progress_command_bonus"] = max(int(controls["progress_command_bonus"]), 3)
-    if int(signal_counts.get("state_regression", 0)) > 0:
+    if regression_evidence:
         controls["regressed_path_command_penalty"] = max(int(controls["regressed_path_command_penalty"]), 4)
         controls["recovery_command_bonus"] = max(int(controls["recovery_command_bonus"]), 3)
     if focus == "repeat_avoidance":
         controls["repeat_command_penalty"] = max(int(controls["repeat_command_penalty"]), 6)
-    elif focus == "regression_guard":
+    elif focus == "regression_guard" and regression_evidence:
         controls["regressed_path_command_penalty"] = max(int(controls["regressed_path_command_penalty"]), 5)
     elif focus == "recovery_bias":
         controls["recovery_command_bonus"] = max(int(controls["recovery_command_bonus"]), 4)
         controls["progress_command_bonus"] = max(int(controls["progress_command_bonus"]), 4)
+    if long_horizon_evidence:
+        controls["long_horizon_repeat_command_penalty"] = max(int(controls["long_horizon_repeat_command_penalty"]), 3)
+        controls["long_horizon_progress_command_bonus"] = max(int(controls["long_horizon_progress_command_bonus"]), 2)
     try:
         controls["max_signatures"] = max(1, int(controls.get("max_signatures", 12)))
     except (TypeError, ValueError):
@@ -123,6 +115,8 @@ def retained_transition_model_controls(payload: object) -> dict[str, object]:
         "regressed_path_command_penalty",
         "recovery_command_bonus",
         "progress_command_bonus",
+        "long_horizon_repeat_command_penalty",
+        "long_horizon_progress_command_bonus",
         "max_signatures",
     ):
         if key not in controls:
@@ -143,9 +137,14 @@ def retained_transition_model_signatures(payload: object) -> list[dict[str, obje
 def transition_model_summary(memory_root: Path) -> dict[str, object]:
     documents = _list_documents(memory_root)
     signal_counts: dict[str, int] = {}
+    difficulty_counts: dict[str, int] = {}
     unique_commands: set[str] = set()
     regression_paths: set[str] = set()
+    long_horizon_signature_count = 0
     for document in documents:
+        difficulty = _document_difficulty(document)
+        if difficulty:
+            difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
         summary = document.get("summary", {})
         if isinstance(summary, dict):
             for signal in summary.get("transition_failures", []):
@@ -156,6 +155,8 @@ def transition_model_summary(memory_root: Path) -> dict[str, object]:
             signal = str(signature.get("signal", "")).strip()
             if signal:
                 signal_counts[signal] = signal_counts.get(signal, 0) + 1
+            if str(signature.get("difficulty", "")).strip() == "long_horizon":
+                long_horizon_signature_count += 1
             command = str(signature.get("command", "")).strip()
             if command:
                 unique_commands.add(command)
@@ -166,13 +167,15 @@ def transition_model_summary(memory_root: Path) -> dict[str, object]:
     return {
         "document_count": len(documents),
         "signal_counts": signal_counts,
+        "difficulty_counts": difficulty_counts,
         "signature_command_count": len(unique_commands),
         "regression_path_count": len(regression_paths),
+        "long_horizon_signature_count": long_horizon_signature_count,
     }
 
 
 def transition_failure_signatures(memory_root: Path, *, max_signatures: int = 12) -> list[dict[str, object]]:
-    aggregated: dict[tuple[str, str], dict[str, object]] = {}
+    aggregated: dict[tuple[str, str, str], dict[str, object]] = {}
     for document in _list_documents(memory_root):
         for signature in _document_transition_signatures(document):
             signal = str(signature.get("signal", "")).strip()
@@ -180,7 +183,9 @@ def transition_failure_signatures(memory_root: Path, *, max_signatures: int = 12
             if signal not in _TRANSITION_SIGNALS or not command:
                 continue
             command_pattern = transition_model_command_pattern(command) or command
-            key = (signal, command_pattern)
+            benchmark_family = str(signature.get("benchmark_family", "")).strip()
+            difficulty = str(signature.get("difficulty", "")).strip()
+            key = (signal, command_pattern, benchmark_family, difficulty)
             entry = aggregated.setdefault(
                 key,
                 {
@@ -188,6 +193,8 @@ def transition_failure_signatures(memory_root: Path, *, max_signatures: int = 12
                     "signal": signal,
                     "command": command,
                     "command_pattern": command_pattern,
+                    "benchmark_family": benchmark_family,
+                    "difficulty": difficulty,
                     "support": 0,
                     "regressions": [],
                     "_representative_support": 0,
@@ -224,6 +231,8 @@ def transition_failure_signatures(memory_root: Path, *, max_signatures: int = 12
 def _document_transition_signatures(document: dict[str, object]) -> list[dict[str, object]]:
     fragments = document.get("fragments", [])
     signatures: list[dict[str, object]] = []
+    benchmark_family = _document_benchmark_family(document)
+    difficulty = _document_difficulty(document)
     if isinstance(fragments, list) and fragments:
         commands_by_step: dict[int, str] = {}
         regressions_by_step: dict[int, list[str]] = {}
@@ -266,6 +275,8 @@ def _document_transition_signatures(document: dict[str, object]) -> list[dict[st
                     {
                         "signal": signal,
                         "command": command,
+                        "benchmark_family": benchmark_family,
+                        "difficulty": difficulty,
                         "regressions": regressions_by_step.get(step_index, []),
                         "support": 1,
                     }
@@ -290,6 +301,8 @@ def _document_transition_signatures(document: dict[str, object]) -> list[dict[st
             {
                 "signal": normalized,
                 "command": fallback_command,
+                "benchmark_family": benchmark_family,
+                "difficulty": difficulty,
                 "regressions": [],
                 "support": 1,
             }
@@ -333,6 +346,8 @@ def _normalize_signatures(signatures: object) -> list[dict[str, object]]:
                 "signal": signal,
                 "command": command,
                 "command_pattern": command_pattern,
+                "benchmark_family": str(item.get("benchmark_family", "")).strip(),
+                "difficulty": str(item.get("difficulty", "")).strip(),
                 "support": support,
                 "regressions": regressions,
             }
@@ -346,12 +361,14 @@ def _merged_transition_signatures(
     *,
     max_signatures: int,
 ) -> list[dict[str, object]]:
-    merged: dict[tuple[str, str], dict[str, object]] = {}
+    merged: dict[tuple[str, str, str], dict[str, object]] = {}
     for source in (baseline, extracted):
         for signature in _normalize_signatures(source):
             key = (
                 str(signature.get("signal", "")),
                 str(signature.get("command_pattern", "")) or str(signature.get("command", "")),
+                str(signature.get("benchmark_family", "")).strip(),
+                str(signature.get("difficulty", "")).strip(),
             )
             entry = merged.setdefault(
                 key,
@@ -360,6 +377,8 @@ def _merged_transition_signatures(
                     "signal": key[0],
                     "command": str(signature.get("command", "")),
                     "command_pattern": key[1],
+                    "benchmark_family": key[2],
+                    "difficulty": key[3],
                     "support": 0,
                     "regressions": [],
                     "_representative_support": 0,
@@ -382,6 +401,10 @@ def _merged_transition_signatures(
                 entry["_representative_support"] = signature_support
             if not str(entry.get("signature_id", "")).strip():
                 entry["signature_id"] = str(signature.get("signature_id", "")).strip()
+            if not str(entry.get("benchmark_family", "")).strip():
+                entry["benchmark_family"] = str(signature.get("benchmark_family", "")).strip()
+            if not str(entry.get("difficulty", "")).strip():
+                entry["difficulty"] = str(signature.get("difficulty", "")).strip()
     signatures = []
     for entry in merged.values():
         entry.pop("_representative_support", None)
@@ -394,6 +417,7 @@ def _merged_transition_signatures(
 
 def _proposals(summary: dict[str, object], focus: str) -> list[dict[str, object]]:
     signal_counts = summary.get("signal_counts", {}) if isinstance(summary.get("signal_counts", {}), dict) else {}
+    regression_evidence = int(signal_counts.get("state_regression", 0)) > 0 or int(summary.get("regression_path_count", 0) or 0) > 0
     proposals: list[dict[str, object]] = []
     if int(signal_counts.get("no_state_progress", 0)) > 0 or focus == "repeat_avoidance":
         proposals.append(
@@ -404,7 +428,7 @@ def _proposals(summary: dict[str, object], focus: str) -> list[dict[str, object]
                 "suggestion": "Penalize repeated stalled commands and bias action selection toward materially different recovery actions.",
             }
         )
-    if int(signal_counts.get("state_regression", 0)) > 0 or focus == "regression_guard":
+    if regression_evidence:
         proposals.append(
             {
                 "area": "regression_guard",
@@ -420,6 +444,16 @@ def _proposals(summary: dict[str, object], focus: str) -> list[dict[str, object]
                 "priority": 4,
                 "reason": "the runtime should respond to recent bad transitions with recovery-biased command scoring",
                 "suggestion": "Raise the score of cleanup and progress-restoring commands when the latest state transition regressed or stalled.",
+            }
+        )
+    difficulty_counts = summary.get("difficulty_counts", {}) if isinstance(summary.get("difficulty_counts", {}), dict) else {}
+    if int(difficulty_counts.get("long_horizon", 0) or 0) > 0:
+        proposals.append(
+            {
+                "area": "long_horizon_alignment",
+                "priority": 5,
+                "reason": "long-horizon episodes are present but transition signatures do not yet sufficiently distinguish durable progress from repeated stalls",
+                "suggestion": "Bind retained bad-transition signatures to long-horizon tasks and increase the advantage of progress-restoring commands over repeated local retries.",
             }
         )
     return ensure_proposals(
@@ -508,3 +542,45 @@ def _looks_like_path(token: str) -> bool:
 def _signature_id(signal: str, command: str) -> str:
     digest = hashlib.sha1(f"{signal}\n{command}".encode("utf-8")).hexdigest()[:12]
     return f"transition:{signal}:{digest}"
+
+
+def _document_benchmark_family(document: dict[str, object]) -> str:
+    task_metadata = document.get("task_metadata", {})
+    if isinstance(task_metadata, dict):
+        family = str(task_metadata.get("benchmark_family", "")).strip()
+        if family:
+            return family
+    task_contract = document.get("task_contract", {})
+    if isinstance(task_contract, dict):
+        metadata = task_contract.get("metadata", {})
+        if isinstance(metadata, dict):
+            family = str(metadata.get("benchmark_family", "")).strip()
+            if family:
+                return family
+    summary = document.get("summary", {})
+    if isinstance(summary, dict):
+        family = str(summary.get("benchmark_family", "")).strip()
+        if family:
+            return family
+    return ""
+
+
+def _document_difficulty(document: dict[str, object]) -> str:
+    task_metadata = document.get("task_metadata", {})
+    if isinstance(task_metadata, dict):
+        difficulty = str(task_metadata.get("difficulty", task_metadata.get("task_difficulty", ""))).strip()
+        if difficulty:
+            return difficulty
+    task_contract = document.get("task_contract", {})
+    if isinstance(task_contract, dict):
+        metadata = task_contract.get("metadata", {})
+        if isinstance(metadata, dict):
+            difficulty = str(metadata.get("difficulty", metadata.get("task_difficulty", ""))).strip()
+            if difficulty:
+                return difficulty
+    summary = document.get("summary", {})
+    if isinstance(summary, dict):
+        difficulty = str(summary.get("difficulty", summary.get("task_difficulty", ""))).strip()
+        if difficulty:
+            return difficulty
+    return ""

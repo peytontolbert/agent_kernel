@@ -10,8 +10,9 @@ from .improvement_common import (
     retained_mapping_section,
     retention_gate_preset,
 )
+from .kernel_catalog import kernel_catalog_string_list
 
-_DEFAULT_REQUIRED_FAMILIES = ["repo_chore", "repo_sandbox", "project", "repository", "integration"]
+_DEFAULT_REQUIRED_FAMILIES = kernel_catalog_string_list("trust", "default_required_benchmark_families")
 
 
 def trust_behavior_controls(

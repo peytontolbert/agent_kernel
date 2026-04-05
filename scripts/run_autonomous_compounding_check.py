@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import os
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -14,8 +15,9 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.curriculum_improvement import retained_curriculum_controls
 from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
-from agent_kernel.improvement_common import retention_gate_preset
+from agent_kernel.improvement_common import build_standard_proposal_artifact, retention_gate_preset
 from agent_kernel.prompt_improvement import resolve_improvement_planner_controls, retained_improvement_planner_controls
 
 DEFAULT_NON_REPLAY_TRANSFER_FAMILIES = ("workflow", "project", "repository", "tooling", "integration")
@@ -30,6 +32,135 @@ ALLOCATION_CONFIDENCE_MIN_RUNS = 3
 ALLOCATION_CONFIDENCE_TARGET_PRIORITY_TASKS = 12
 ALLOCATION_CONFIDENCE_HISTORY_WINDOW = 3
 ALLOCATION_CONFIDENCE_HISTORY_WEIGHT = 0.5
+AUTONOMOUS_FRONTIER_TASK_LIMIT_FLOOR = 2
+AUTONOMOUS_FRONTIER_TASK_LIMIT_MAX = 4
+AUTONOMOUS_FRONTIER_MISSING_FAMILY_WEIGHT_BONUS = 3.0
+AUTONOMOUS_FRONTIER_UNSAMPLED_PRESSURE_WEIGHT_BONUS = 2.5
+AUTONOMOUS_FRONTIER_UNDER_SAMPLED_WEIGHT_BONUS = 1.5
+AUTONOMOUS_FRONTIER_UNSAMPLED_TARGET_WEIGHT_BONUS = 1.0
+AUTONOMOUS_FRONTIER_GENERALIZATION_WEIGHT_BONUS = 1.0
+AUTONOMOUS_SEED_FINGERPRINT_MAX_FILES = 256
+AUTONOMOUS_SEED_FINGERPRINT_MAX_DIRECTORIES = 256
+AUTONOMOUS_SEED_FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024
+AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_FILES = 256
+AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_DIRECTORIES = 256
+AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _status_path(config: KernelConfig) -> Path:
+    return config.improvement_reports_dir / "autonomous_compounding_status.json"
+
+
+def _ordered_unique_strings(*groups: object) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for values in groups:
+        if isinstance(values, str):
+            candidates = [values]
+        elif isinstance(values, (list, tuple, set)):
+            candidates = [str(value) for value in values]
+        else:
+            candidates = []
+        for value in candidates:
+            normalized = str(value).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
+
+
+def _load_json_payload(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _string_list(payload: dict[str, object], key: str) -> list[str]:
+    values = payload.get(key, [])
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _effective_active_run_snapshot(
+    *,
+    config: KernelConfig,
+    active_run: dict[str, object] | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    prior_payload = _load_json_payload(_status_path(config))
+    prior_active_run = prior_payload.get("active_run", {})
+    if not isinstance(prior_active_run, dict):
+        prior_active_run = {}
+    effective_active_run = dict(prior_active_run)
+    if isinstance(active_run, dict):
+        effective_active_run.update(active_run)
+
+    child_status_payload = effective_active_run.get("child_status", {})
+    if not isinstance(child_status_payload, dict):
+        child_status_payload = {}
+    if not child_status_payload:
+        inherited_child_status = prior_active_run.get("child_status", {})
+        if isinstance(inherited_child_status, dict):
+            child_status_payload = dict(inherited_child_status)
+
+    child_status_path_value = str(effective_active_run.get("child_status_path", "")).strip()
+    if not child_status_path_value:
+        child_status_path_value = str(prior_active_run.get("child_status_path", "")).strip()
+    if child_status_path_value:
+        effective_active_run["child_status_path"] = child_status_path_value
+    if not child_status_payload and child_status_path_value:
+        child_status_payload = _load_json_payload(Path(child_status_path_value))
+    if child_status_payload:
+        effective_active_run["child_status"] = child_status_payload
+
+    return effective_active_run, prior_payload
+
+
+def _retained_child_sampling_snapshot(
+    *,
+    prior_payload: dict[str, object],
+    active_run: dict[str, object],
+    requested_priority_benchmark_families: list[str],
+) -> dict[str, list[str]]:
+    child_status = active_run.get("child_status", {})
+    if not isinstance(child_status, dict):
+        child_status = {}
+    if not child_status:
+        return {
+            "families_sampled": _string_list(prior_payload, "families_sampled"),
+            "families_never_sampled": _string_list(prior_payload, "families_never_sampled"),
+            "pressure_families_without_sampling": _string_list(prior_payload, "pressure_families_without_sampling"),
+        }
+
+    sampled = _ordered_unique_strings(
+        _string_list(prior_payload, "families_sampled"),
+        _string_list(child_status, "families_sampled"),
+    )
+    priority_families = _ordered_unique_strings(
+        requested_priority_benchmark_families,
+        _string_list(active_run, "priority_benchmark_families"),
+        _string_list(child_status, "priority_benchmark_families"),
+    )
+    if priority_families:
+        sampled_set = set(sampled)
+        unsampled = [family for family in priority_families if family not in sampled_set]
+    else:
+        unsampled = _ordered_unique_strings(
+            _string_list(prior_payload, "pressure_families_without_sampling"),
+            _string_list(prior_payload, "families_never_sampled"),
+            _string_list(child_status, "priority_families_without_sampling"),
+            _string_list(child_status, "pressure_families_without_sampling"),
+        )
+    return {
+        "families_sampled": sampled,
+        "families_never_sampled": unsampled,
+        "pressure_families_without_sampling": unsampled,
+    }
 
 
 def _match_id(index: int) -> str:
@@ -39,6 +170,10 @@ def _match_id(index: int) -> str:
 def _run_root(config: KernelConfig, *, run_match_id: str) -> Path:
     safe_match_id = run_match_id.replace(":", "_")
     return config.improvement_reports_dir / ".autonomous_compounding" / safe_match_id
+
+
+def _child_run_status_path(run_root: Path) -> Path:
+    return run_root / "trajectories" / "improvement" / "reports" / "repeated_improvement_status.json"
 
 
 def _runtime_feature_env(config: KernelConfig) -> dict[str, str]:
@@ -614,11 +749,50 @@ def _copy_file(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
-def _copy_tree(src: Path, dst: Path) -> None:
+def _copy_tree(
+    src: Path,
+    dst: Path,
+    *,
+    max_files: int = 0,
+    max_directories: int = 0,
+    max_bytes: int = 0,
+) -> None:
     if not src.exists():
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    if max_files <= 0 and max_directories <= 0 and max_bytes <= 0:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        return
+    copied_files = 0
+    copied_directories = 0
+    copied_bytes = 0
+    dst.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        copied_directories += 1
+        dirs.sort()
+        files.sort()
+        if max_directories > 0 and copied_directories > max_directories:
+            dirs[:] = []
+            break
+        root_path = Path(root)
+        relative_root = root_path.relative_to(src)
+        target_root = dst / relative_root if str(relative_root) != "." else dst
+        target_root.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            if max_files > 0 and copied_files >= max_files:
+                dirs[:] = []
+                break
+            if max_bytes > 0 and copied_bytes >= max_bytes:
+                dirs[:] = []
+                break
+            source_file = root_path / name
+            target_file = target_root / name
+            shutil.copy2(source_file, target_file)
+            copied_files += 1
+            copied_bytes += int(source_file.stat().st_size)
+        else:
+            continue
+        break
 
 
 def _sha256_for_file(path: Path) -> str:
@@ -645,21 +819,47 @@ def _fingerprint_path(path: Path) -> dict[str, object]:
         }
     digest = hashlib.sha256()
     file_count = 0
+    directory_count = 0
     total_bytes = 0
-    for child in sorted(candidate for candidate in resolved.rglob("*") if candidate.is_file()):
-        relative = child.relative_to(resolved).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(_sha256_for_file(child).encode("ascii"))
-        digest.update(b"\0")
-        file_count += 1
-        total_bytes += int(child.stat().st_size)
+    truncated = False
+    for root, dirs, files in os.walk(resolved):
+        directory_count += 1
+        dirs.sort()
+        files.sort()
+        if directory_count > AUTONOMOUS_SEED_FINGERPRINT_MAX_DIRECTORIES:
+            truncated = True
+            dirs[:] = []
+            break
+        root_path = Path(root)
+        for name in files:
+            if (
+                file_count >= AUTONOMOUS_SEED_FINGERPRINT_MAX_FILES
+                or total_bytes >= AUTONOMOUS_SEED_FINGERPRINT_MAX_BYTES
+            ):
+                truncated = True
+                dirs[:] = []
+                break
+            child = root_path / name
+            relative = child.relative_to(resolved).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(_sha256_for_file(child).encode("ascii"))
+            digest.update(b"\0")
+            file_count += 1
+            total_bytes += int(child.stat().st_size)
+        if truncated:
+            break
     return {
         "exists": True,
         "type": "directory",
         "digest": digest.hexdigest(),
         "file_count": file_count,
+        "directory_count": directory_count,
         "size_bytes": total_bytes,
+        "truncated": truncated,
+        "max_files": AUTONOMOUS_SEED_FINGERPRINT_MAX_FILES,
+        "max_directories": AUTONOMOUS_SEED_FINGERPRINT_MAX_DIRECTORIES,
+        "max_size_bytes": AUTONOMOUS_SEED_FINGERPRINT_MAX_BYTES,
     }
 
 
@@ -713,6 +913,8 @@ def _retention_criteria_manifest(
     priority_benchmark_family_weights: dict[str, float],
     priority_benchmark_family_weight_source: str,
     priority_benchmark_family_allocation_compensation: dict[str, object],
+    autonomous_frontier_curriculum_pressure: dict[str, object],
+    priority_benchmark_family_live_routing: dict[str, object],
 ) -> dict[str, object]:
     subsystems = (
         "benchmark",
@@ -744,6 +946,8 @@ def _retention_criteria_manifest(
             "priority_benchmark_family_weights": priority_benchmark_family_weights,
             "priority_benchmark_family_weight_source": priority_benchmark_family_weight_source,
             "priority_benchmark_family_allocation_compensation": priority_benchmark_family_allocation_compensation,
+            "priority_benchmark_family_live_routing": priority_benchmark_family_live_routing,
+            "autonomous_frontier_curriculum_pressure": autonomous_frontier_curriculum_pressure,
             "include_episode_memory": bool(args.include_episode_memory),
             "include_skill_memory": bool(args.include_skill_memory),
             "include_skill_transfer": bool(args.include_skill_transfer),
@@ -767,10 +971,309 @@ def _manifest_fingerprint(manifest: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _autonomous_frontier_curriculum_pressure(
+    *,
+    priority_benchmark_families: list[str],
+    priority_benchmark_family_allocation_compensation: dict[str, object],
+    prior_claim_gate_summary: dict[str, object] | None,
+) -> dict[str, object]:
+    summary = prior_claim_gate_summary.get("family_transfer_summary", {}) if isinstance(prior_claim_gate_summary, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    timeline = prior_claim_gate_summary.get("family_transfer_timeline", {}) if isinstance(prior_claim_gate_summary, dict) else {}
+    if not isinstance(timeline, dict):
+        timeline = {}
+    ranking = prior_claim_gate_summary.get("family_transfer_investment_ranking", {}) if isinstance(prior_claim_gate_summary, dict) else {}
+    if not isinstance(ranking, dict):
+        ranking = {}
+    frontier_expansion = (
+        prior_claim_gate_summary.get("frontier_expansion_summary", {}) if isinstance(prior_claim_gate_summary, dict) else {}
+    )
+    if not isinstance(frontier_expansion, dict):
+        frontier_expansion = {}
+    target_families = _ordered_unique_strings(
+        priority_benchmark_families,
+        ranking.get("ranked_families_by_transfer_investment", []),
+        DEFAULT_NON_REPLAY_TRANSFER_FAMILIES,
+    )
+    target_family_set = set(target_families)
+    missing_observation_families = [
+        family for family in _ordered_unique_strings(summary.get("families_missing_observation", [])) if family in target_family_set
+    ]
+    without_retained_gain_families = [
+        family for family in _ordered_unique_strings(summary.get("families_without_retained_gain", [])) if family in target_family_set
+    ]
+    declining_transfer_families = [
+        family
+        for family in _ordered_unique_strings(
+            summary.get("families_with_negative_retained_delta", []),
+            timeline.get("families_with_declining_repeated_retained_gain", []),
+            timeline.get("families_with_declining_repeated_return_on_cost", []),
+            timeline.get("families_with_costly_non_declining_repeated_retained_gain", []),
+        )
+        if family in target_family_set
+    ]
+    persistent_gain_families = [
+        family
+        for family in _ordered_unique_strings(timeline.get("families_with_cost_acceptable_non_declining_repeated_retained_gain", []))
+        if family in target_family_set
+    ]
+    under_sampled_families = [
+        family
+        for family in _ordered_unique_strings(priority_benchmark_family_allocation_compensation.get("positive_gap_families", []))
+        if family in target_family_set
+    ]
+    unsampled_target_families = [
+        family
+        for family in _ordered_unique_strings(frontier_expansion.get("families_never_sampled", []))
+        if family in target_family_set
+    ]
+    unsampled_pressure_families = [
+        family
+        for family in _ordered_unique_strings(frontier_expansion.get("pressure_families_without_sampling", []))
+        if family in target_family_set
+    ]
+    generalization_priority_families = _ordered_unique_strings(
+        without_retained_gain_families,
+        declining_transfer_families,
+    )
+    priority_families = _ordered_unique_strings(
+        missing_observation_families,
+        unsampled_pressure_families,
+        under_sampled_families,
+        unsampled_target_families,
+        generalization_priority_families,
+        persistent_gain_families,
+        target_families,
+    )
+    missing_families = _ordered_unique_strings(
+        missing_observation_families,
+        unsampled_pressure_families,
+        under_sampled_families,
+        unsampled_target_families,
+    )
+    retention_priority_families = _ordered_unique_strings(without_retained_gain_families, declining_transfer_families)
+    higher_pressure = bool(missing_families or retention_priority_families or generalization_priority_families)
+    controls = {
+        "frontier_priority_families": priority_families,
+        "frontier_missing_families": missing_families,
+        "frontier_retention_priority_families": retention_priority_families,
+        "frontier_generalization_priority_families": generalization_priority_families,
+        "frontier_priority_family_bonus": 3 if priority_families else 2,
+        "frontier_missing_family_bonus": 5 if missing_families else 4,
+        "frontier_retention_priority_bonus": 4 if retention_priority_families else 2,
+        "frontier_generalization_bonus": 4 if generalization_priority_families else 3,
+        "frontier_outward_branch_bonus": 3 if higher_pressure else 2,
+        "frontier_lineage_breadth_bonus": 2 if generalization_priority_families else 1,
+        "frontier_harder_task_bonus": 4 if higher_pressure else 2,
+        "frontier_min_lineage_depth": 2 if retention_priority_families else (1 if missing_families else 0),
+        "max_generated_adjacent_tasks": max(4, min(6, len(priority_families) + 1)),
+    }
+    return {
+        "target_non_replay_families": target_families,
+        "priority_families": priority_families,
+        "missing_observation_families": missing_observation_families,
+        "under_sampled_families": under_sampled_families,
+        "unsampled_target_families": unsampled_target_families,
+        "unsampled_pressure_families": unsampled_pressure_families,
+        "without_retained_gain_families": without_retained_gain_families,
+        "declining_transfer_families": declining_transfer_families,
+        "persistent_gain_families": persistent_gain_families,
+        "generalization_priority_families": generalization_priority_families,
+        "controls": controls,
+    }
+
+
+def _autonomous_frontier_live_priority_routing(
+    *,
+    task_limit: int,
+    task_limit_source: str,
+    priority_benchmark_families: list[str],
+    priority_benchmark_family_weights: dict[str, float],
+    priority_benchmark_family_weight_source: str,
+    autonomous_frontier_curriculum_pressure: dict[str, object],
+) -> tuple[int, str, list[str], dict[str, float], str, dict[str, object]]:
+    pressure = autonomous_frontier_curriculum_pressure if isinstance(autonomous_frontier_curriculum_pressure, dict) else {}
+    missing_families = _ordered_unique_strings(pressure.get("missing_observation_families", []))
+    unsampled_pressure_families = _ordered_unique_strings(pressure.get("unsampled_pressure_families", []))
+    under_sampled_families = _ordered_unique_strings(pressure.get("under_sampled_families", []))
+    unsampled_target_families = _ordered_unique_strings(pressure.get("unsampled_target_families", []))
+    generalization_priority_families = _ordered_unique_strings(pressure.get("generalization_priority_families", []))
+    routed_families = _ordered_unique_strings(
+        missing_families,
+        unsampled_pressure_families,
+        under_sampled_families,
+        unsampled_target_families,
+        generalization_priority_families,
+        pressure.get("priority_families", []),
+        priority_benchmark_families,
+        DEFAULT_NON_REPLAY_TRANSFER_FAMILIES,
+    )
+    base_weights = {
+        family: float(priority_benchmark_family_weights.get(family, 0.0) or 0.0)
+        for family in routed_families
+    }
+    default_rank_weights = _rank_weighted_priority_family_weights(routed_families)
+    for family in routed_families:
+        if base_weights[family] <= 0.0:
+            base_weights[family] = float(default_rank_weights.get(family, 1.0) or 1.0)
+    weight_bonus_by_family: dict[str, float] = {}
+    routed_weights: dict[str, float] = {}
+    for family in routed_families:
+        bonus = 0.0
+        if family in missing_families:
+            bonus += AUTONOMOUS_FRONTIER_MISSING_FAMILY_WEIGHT_BONUS
+        if family in unsampled_pressure_families:
+            bonus += AUTONOMOUS_FRONTIER_UNSAMPLED_PRESSURE_WEIGHT_BONUS
+        if family in under_sampled_families:
+            bonus += AUTONOMOUS_FRONTIER_UNDER_SAMPLED_WEIGHT_BONUS
+        if family in unsampled_target_families:
+            bonus += AUTONOMOUS_FRONTIER_UNSAMPLED_TARGET_WEIGHT_BONUS
+        if family in generalization_priority_families:
+            bonus += AUTONOMOUS_FRONTIER_GENERALIZATION_WEIGHT_BONUS
+        if bonus > 0.0:
+            weight_bonus_by_family[family] = round(bonus, 6)
+        routed_weights[family] = round(base_weights[family] + bonus, 6)
+    routing_pressure_families = _ordered_unique_strings(
+        missing_families,
+        unsampled_pressure_families,
+        under_sampled_families,
+        unsampled_target_families,
+        generalization_priority_families,
+    )
+    pressure_weight_floor_by_family: dict[str, float] = {}
+    if routing_pressure_families:
+        highest_non_pressure_weight = max(
+            [routed_weights[family] for family in routed_families if family not in routing_pressure_families] or [0.0]
+        )
+        pressure_family_count = len(routing_pressure_families)
+        for index, family in enumerate(routing_pressure_families):
+            minimum_weight = round(highest_non_pressure_weight + float(max(1, pressure_family_count - index)), 6)
+            if routed_weights[family] >= minimum_weight:
+                continue
+            additional_bonus = round(minimum_weight - routed_weights[family], 6)
+            routed_weights[family] = minimum_weight
+            weight_bonus_by_family[family] = round(weight_bonus_by_family.get(family, 0.0) + additional_bonus, 6)
+            pressure_weight_floor_by_family[family] = minimum_weight
+    effective_task_limit = max(0, int(task_limit))
+    effective_task_limit_source = str(task_limit_source)
+    task_limit_floor = 0
+    if effective_task_limit > 0 and routing_pressure_families:
+        task_limit_floor = min(
+            AUTONOMOUS_FRONTIER_TASK_LIMIT_MAX,
+            max(AUTONOMOUS_FRONTIER_TASK_LIMIT_FLOOR, len(routing_pressure_families)),
+        )
+        if effective_task_limit < task_limit_floor:
+            effective_task_limit = task_limit_floor
+            effective_task_limit_source = f"{effective_task_limit_source}_and_autonomous_frontier_pressure_floor"
+    effective_weight_source = str(priority_benchmark_family_weight_source)
+    if weight_bonus_by_family:
+        effective_weight_source = f"{effective_weight_source}_and_autonomous_frontier_pressure"
+    return (
+        effective_task_limit,
+        effective_task_limit_source,
+        routed_families,
+        routed_weights,
+        effective_weight_source,
+        {
+            "routing_pressure_families": routing_pressure_families,
+            "missing_observation_families": missing_families,
+            "unsampled_pressure_families": unsampled_pressure_families,
+            "under_sampled_families": under_sampled_families,
+            "unsampled_target_families": unsampled_target_families,
+            "generalization_priority_families": generalization_priority_families,
+            "weight_bonus_by_family": weight_bonus_by_family,
+            "pressure_weight_floor_by_family": pressure_weight_floor_by_family,
+            "base_weight_by_family": {family: round(base_weights[family], 6) for family in routed_families},
+            "routed_weight_by_family": routed_weights,
+            "task_limit_floor": task_limit_floor,
+            "task_limit_floor_applied": bool(task_limit_floor and effective_task_limit == task_limit_floor),
+        },
+    )
+
+
+def _write_scoped_curriculum_proposals(
+    *,
+    config: KernelConfig,
+    scoped_path: Path,
+    autonomous_frontier_curriculum_pressure: dict[str, object],
+) -> dict[str, object]:
+    current_payload = _load_json_payload(config.curriculum_proposals_path)
+    baseline_controls = retained_curriculum_controls(current_payload)
+    controls = dict(baseline_controls)
+    derived_controls = autonomous_frontier_curriculum_pressure.get("controls", {})
+    if isinstance(derived_controls, dict):
+        controls.update(derived_controls)
+    priority_families = _ordered_unique_strings(autonomous_frontier_curriculum_pressure.get("priority_families", []))
+    generalization_priority_families = _ordered_unique_strings(
+        autonomous_frontier_curriculum_pressure.get("generalization_priority_families", [])
+    )
+    missing_families = _ordered_unique_strings(autonomous_frontier_curriculum_pressure.get("missing_observation_families", []))
+    proposals: list[dict[str, object]] = []
+    if missing_families:
+        proposals.append(
+            {
+                "area": "coding_frontier",
+                "priority": 6,
+                "reason": f"autonomous compounding still lacks live transfer observation on {', '.join(missing_families[:3])}",
+                "suggestion": "Generate outward long-horizon followups that open those missing coding families before repeating already-observed lanes.",
+            }
+        )
+    if generalization_priority_families:
+        proposals.append(
+            {
+                "area": "coding_frontier",
+                "priority": 6,
+                "reason": f"retained gains remain narrow or unstable on {', '.join(generalization_priority_families[:3])}",
+                "suggestion": "Prefer harder outward-branch followups in those families so retention pressure rewards generalization, not replay of the same narrow seed shape.",
+            }
+        )
+    elif priority_families:
+        proposals.append(
+            {
+                "area": "coding_frontier",
+                "priority": 5,
+                "reason": f"next autonomous batch should keep pressure on {priority_families[0]} before re-saturating easier lanes",
+                "suggestion": "Spend generated-success budget on broader repo and workflow settings first, then deepen the strongest lineages by one harder step.",
+            }
+        )
+    retained = current_payload if str(current_payload.get("artifact_kind", "")).strip() == "curriculum_proposal_set" else {}
+    retained_proposals = list(retained.get("proposals", [])) if isinstance(retained.get("proposals", []), list) else []
+    artifact = build_standard_proposal_artifact(
+        artifact_kind="curriculum_proposal_set",
+        generation_focus=str(retained.get("generation_focus", "balanced") or "balanced"),
+        retention_gate=dict(retained.get("retention_gate", retention_gate_preset("curriculum"))),
+        control_schema=str(retained.get("control_schema", "curriculum_behavior_controls_v3") or "curriculum_behavior_controls_v3"),
+        controls=controls,
+        proposals=[*proposals, *retained_proposals],
+        extra_sections={
+            "autonomous_frontier_curriculum_pressure": autonomous_frontier_curriculum_pressure,
+        },
+    )
+    artifact["lifecycle_state"] = "retained"
+    artifact["retention_decision"] = {"state": "retain"}
+    scoped_path.parent.mkdir(parents=True, exist_ok=True)
+    scoped_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    return artifact
+
+
 def _seed_runtime(config: KernelConfig, env: dict[str, str]) -> None:
-    _copy_tree(config.trajectories_root, Path(env["AGENT_KERNEL_TRAJECTORIES_ROOT"]))
-    _copy_tree(config.run_checkpoints_dir, Path(env["AGENT_KERNEL_RUN_CHECKPOINTS_DIR"]))
-    _copy_tree(config.unattended_workspace_snapshot_root, Path(env["AGENT_KERNEL_UNATTENDED_WORKSPACE_SNAPSHOT_ROOT"]))
+    bounded_seed_kwargs = {
+        "max_files": AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_FILES,
+        "max_directories": AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_DIRECTORIES,
+        "max_bytes": AUTONOMOUS_TRAJECTORY_SEED_COPY_MAX_BYTES,
+    }
+    _copy_tree(
+        config.trajectories_root,
+        Path(env["AGENT_KERNEL_TRAJECTORIES_ROOT"]),
+        **bounded_seed_kwargs,
+    )
+    _copy_tree(config.run_checkpoints_dir, Path(env["AGENT_KERNEL_RUN_CHECKPOINTS_DIR"]), **bounded_seed_kwargs)
+    _copy_tree(
+        config.unattended_workspace_snapshot_root,
+        Path(env["AGENT_KERNEL_UNATTENDED_WORKSPACE_SNAPSHOT_ROOT"]),
+        **bounded_seed_kwargs,
+    )
     _copy_file(config.skills_path, Path(env["AGENT_KERNEL_SKILLS_PATH"]))
     _copy_file(config.operator_classes_path, Path(env["AGENT_KERNEL_OPERATOR_CLASSES_PATH"]))
     _copy_file(config.tool_candidates_path, Path(env["AGENT_KERNEL_TOOL_CANDIDATES_PATH"]))
@@ -867,40 +1370,54 @@ def _run_once(
     args: argparse.Namespace,
     run_match_id: str,
     run_index: int,
-    task_limit: int,
-    task_limit_source: str,
-    priority_benchmark_families: list[str],
     priority_benchmark_family_source: str,
-    priority_benchmark_family_weights: dict[str, float],
     priority_benchmark_family_weight_source: str,
     priority_benchmark_family_allocation_compensation: dict[str, object],
+    autonomous_frontier_curriculum_pressure: dict[str, object],
+    routed_task_limit: int,
+    routed_task_limit_source: str,
+    routed_priority_benchmark_families: list[str],
+    routed_priority_benchmark_family_weights: dict[str, float],
+    routed_priority_benchmark_family_weight_source: str,
+    priority_benchmark_family_live_routing: dict[str, object],
 ) -> dict[str, object]:
     seed_manifest = _seed_manifest(config)
     retention_criteria_manifest = _retention_criteria_manifest(
         config,
         args,
-        task_limit=task_limit,
-        task_limit_source=task_limit_source,
-        priority_benchmark_families=priority_benchmark_families,
+        task_limit=routed_task_limit,
+        task_limit_source=routed_task_limit_source,
+        priority_benchmark_families=routed_priority_benchmark_families,
         priority_benchmark_family_source=priority_benchmark_family_source,
-        priority_benchmark_family_weights=priority_benchmark_family_weights,
-        priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+        priority_benchmark_family_weights=routed_priority_benchmark_family_weights,
+        priority_benchmark_family_weight_source=routed_priority_benchmark_family_weight_source,
         priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+        autonomous_frontier_curriculum_pressure=autonomous_frontier_curriculum_pressure,
+        priority_benchmark_family_live_routing=priority_benchmark_family_live_routing,
     )
     root = _run_root(config, run_match_id=run_match_id)
     env_overrides = _run_env(config, root)
     _seed_runtime(config, env_overrides)
+    _write_scoped_curriculum_proposals(
+        config=config,
+        scoped_path=Path(env_overrides["AGENT_KERNEL_CURRICULUM_PROPOSALS_PATH"]),
+        autonomous_frontier_curriculum_pressure=autonomous_frontier_curriculum_pressure,
+    )
     env = dict(os.environ)
     env.update(env_overrides)
+    env["AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH"] = str(_status_path(config))
+    env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX"] = str(run_index)
+    env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID"] = run_match_id
+    env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUNTIME_ROOT"] = str(root)
     completed = subprocess.run(
         _run_command(
             repo_root,
             args,
             run_match_id=run_match_id,
             run_index=run_index,
-            task_limit=task_limit,
-            priority_benchmark_families=priority_benchmark_families,
-            priority_benchmark_family_weights=priority_benchmark_family_weights,
+            task_limit=routed_task_limit,
+            priority_benchmark_families=routed_priority_benchmark_families,
+            priority_benchmark_family_weights=routed_priority_benchmark_family_weights,
         ),
         cwd=repo_root,
         capture_output=True,
@@ -936,6 +1453,13 @@ def _run_once(
         "seed_fingerprint": _manifest_fingerprint(seed_manifest),
         "retention_criteria_manifest": retention_criteria_manifest,
         "retention_criteria_fingerprint": _manifest_fingerprint(retention_criteria_manifest),
+        "task_limit": routed_task_limit,
+        "task_limit_source": routed_task_limit_source,
+        "priority_benchmark_families": routed_priority_benchmark_families,
+        "priority_benchmark_family_weights": routed_priority_benchmark_family_weights,
+        "priority_benchmark_family_weight_source": routed_priority_benchmark_family_weight_source,
+        "priority_benchmark_family_live_routing": priority_benchmark_family_live_routing,
+        "autonomous_frontier_curriculum_pressure": autonomous_frontier_curriculum_pressure,
     }
 
 
@@ -1342,6 +1866,194 @@ def _family_transfer_investment_ranking(results: list[dict[str, object]]) -> dic
     }
 
 
+def _frontier_expansion_summary(results: list[dict[str, object]]) -> dict[str, object]:
+    target_families: list[str] = []
+    pressure_families: list[str] = []
+    missing_observation_priority_families: list[str] = []
+    generalization_priority_families: list[str] = []
+    required_sampled_family_count = 0
+    sampled_run_counts_by_family: dict[str, int] = {}
+    sampled_task_totals_by_family: dict[str, int] = {}
+    signal_run_counts_by_family: dict[str, int] = {}
+    retained_gain_run_counts_by_family: dict[str, int] = {}
+    runs_with_broad_sampling: list[int] = []
+    runs_missing_broad_sampling: list[int] = []
+    runs_missing_pressure_sampling: list[int] = []
+    runs_missing_missing_family_sampling: list[int] = []
+    runs_missing_generalization_sampling: list[int] = []
+
+    for result in results:
+        run_index = int(result.get("run_index", 0) or 0)
+        retention_manifest = result.get("retention_criteria_manifest", {})
+        if not isinstance(retention_manifest, dict):
+            retention_manifest = {}
+        run_parameters = retention_manifest.get("run_parameters", {})
+        if not isinstance(run_parameters, dict):
+            run_parameters = {}
+        target_families = _ordered_unique_strings(target_families, run_parameters.get("priority_benchmark_families", []))
+        pressure = run_parameters.get("autonomous_frontier_curriculum_pressure", {})
+        if not isinstance(pressure, dict):
+            pressure = {}
+        target_families = _ordered_unique_strings(target_families, pressure.get("target_non_replay_families", []))
+        pressure_families = _ordered_unique_strings(
+            pressure_families,
+            pressure.get("priority_families", []),
+            pressure.get("unsampled_pressure_families", []),
+        )
+        missing_observation_priority_families = _ordered_unique_strings(
+            missing_observation_priority_families,
+            pressure.get("missing_observation_families", []),
+            pressure.get("unsampled_target_families", []),
+        )
+        generalization_priority_families = _ordered_unique_strings(
+            generalization_priority_families,
+            pressure.get("generalization_priority_families", []),
+        )
+
+        report_payload = result.get("report_payload", {})
+        if not isinstance(report_payload, dict):
+            report_payload = {}
+        allocation_summary = report_payload.get("priority_family_allocation_summary", {})
+        if not isinstance(allocation_summary, dict):
+            allocation_summary = {}
+        actual_counts = allocation_summary.get("aggregated_task_counts", {})
+        if not isinstance(actual_counts, dict):
+            actual_counts = {}
+        priority_yield_summary = report_payload.get("priority_family_yield_summary", {})
+        if not isinstance(priority_yield_summary, dict):
+            priority_yield_summary = {}
+        family_yield_summaries = priority_yield_summary.get("family_summaries", {})
+        if not isinstance(family_yield_summaries, dict):
+            family_yield_summaries = {}
+        sampled_families: list[str] = []
+        signaled_families: list[str] = []
+        retained_gain_families: list[str] = []
+        for family in _ordered_unique_strings(target_families):
+            raw_count = actual_counts.get(family, 0)
+            try:
+                task_count = max(0, int(raw_count or 0))
+            except (TypeError, ValueError):
+                task_count = 0
+            if task_count > 0:
+                sampled_families.append(family)
+                sampled_run_counts_by_family[family] = int(sampled_run_counts_by_family.get(family, 0)) + 1
+                sampled_task_totals_by_family[family] = int(sampled_task_totals_by_family.get(family, 0)) + task_count
+            family_yield = family_yield_summaries.get(family, {})
+            if not isinstance(family_yield, dict):
+                family_yield = {}
+            observed_decisions = max(0, int(family_yield.get("observed_decisions", 0) or 0))
+            retained_positive_delta_decisions = max(
+                0,
+                int(family_yield.get("retained_positive_delta_decisions", 0) or 0),
+            )
+            if observed_decisions > 0:
+                signaled_families.append(family)
+                signal_run_counts_by_family[family] = int(signal_run_counts_by_family.get(family, 0)) + 1
+            if retained_positive_delta_decisions > 0:
+                retained_gain_families.append(family)
+                retained_gain_run_counts_by_family[family] = int(retained_gain_run_counts_by_family.get(family, 0)) + 1
+        required_sampled_family_count = max(required_sampled_family_count, min(2, len(_ordered_unique_strings(target_families))))
+        if len(sampled_families) >= required_sampled_family_count:
+            runs_with_broad_sampling.append(run_index)
+        else:
+            runs_missing_broad_sampling.append(run_index)
+        if pressure_families and not any(family in sampled_families for family in pressure_families):
+            runs_missing_pressure_sampling.append(run_index)
+        if missing_observation_priority_families and not any(
+            family in sampled_families for family in missing_observation_priority_families
+        ):
+            runs_missing_missing_family_sampling.append(run_index)
+        if generalization_priority_families and not any(
+            family in sampled_families for family in generalization_priority_families
+        ):
+            runs_missing_generalization_sampling.append(run_index)
+
+    target_families = _ordered_unique_strings(target_families, DEFAULT_NON_REPLAY_TRANSFER_FAMILIES)
+    sampled_families = [
+        family
+        for family in target_families
+        if int(sampled_run_counts_by_family.get(family, 0) or 0) > 0
+    ]
+    families_never_sampled = [family for family in target_families if family not in sampled_families]
+    pressure_families_with_sampling = [
+        family
+        for family in pressure_families
+        if int(sampled_run_counts_by_family.get(family, 0) or 0) > 0
+    ]
+    pressure_families_without_sampling = [
+        family for family in pressure_families if family not in pressure_families_with_sampling
+    ]
+    return {
+        "runs_checked": len(results),
+        "target_non_replay_families": target_families,
+        "required_sampled_family_count": required_sampled_family_count,
+        "distinct_target_families_sampled": len(sampled_families),
+        "families_sampled": sampled_families,
+        "families_never_sampled": families_never_sampled,
+        "sampled_run_counts_by_family": {
+            family: int(sampled_run_counts_by_family.get(family, 0) or 0) for family in target_families
+        },
+        "sampled_task_totals_by_family": {
+            family: int(sampled_task_totals_by_family.get(family, 0) or 0) for family in target_families
+        },
+        "signal_run_counts_by_family": {
+            family: int(signal_run_counts_by_family.get(family, 0) or 0) for family in target_families
+        },
+        "retained_gain_run_counts_by_family": {
+            family: int(retained_gain_run_counts_by_family.get(family, 0) or 0) for family in target_families
+        },
+        "pressure_families": pressure_families,
+        "pressure_families_with_sampling": pressure_families_with_sampling,
+        "pressure_families_without_sampling": pressure_families_without_sampling,
+        "missing_observation_priority_families": missing_observation_priority_families,
+        "generalization_priority_families": generalization_priority_families,
+        "runs_with_broad_priority_sampling": runs_with_broad_sampling,
+        "runs_missing_broad_priority_sampling": runs_missing_broad_sampling,
+        "runs_missing_priority_pressure_sampling": runs_missing_pressure_sampling,
+        "runs_missing_missing_family_sampling": runs_missing_missing_family_sampling,
+        "runs_missing_generalization_sampling": runs_missing_generalization_sampling,
+    }
+
+
+def _required_family_clean_task_root_breadth_summary(results: list[dict[str, object]]) -> dict[str, object]:
+    family_run_missing: dict[str, list[int]] = {}
+    family_run_counts: dict[str, list[int]] = {}
+    family_run_thresholds: dict[str, list[int]] = {}
+    for result in results:
+        run_index = int(result.get("run_index", 0) or 0)
+        report_payload = result.get("report_payload", {})
+        if not isinstance(report_payload, dict):
+            report_payload = {}
+        trust_breadth_summary = report_payload.get("trust_breadth_summary", {})
+        if not isinstance(trust_breadth_summary, dict):
+            trust_breadth_summary = {}
+        required_counts = trust_breadth_summary.get("required_family_clean_task_root_counts", {})
+        if not isinstance(required_counts, dict):
+            required_counts = {}
+        missing_families = [
+            str(value).strip()
+            for value in trust_breadth_summary.get("missing_required_family_clean_task_root_breadth", [])
+            if str(value).strip()
+        ]
+        threshold = max(0, int(trust_breadth_summary.get("family_breadth_min_distinct_task_roots", 0) or 0))
+        for family in missing_families:
+            family_run_missing.setdefault(family, []).append(run_index)
+            family_run_counts.setdefault(family, []).append(max(0, int(required_counts.get(family, 0) or 0)))
+            family_run_thresholds.setdefault(family, []).append(threshold)
+    families = sorted(family_run_missing)
+    return {
+        "families_missing_clean_task_root_breadth": families,
+        "missing_family_run_indices": {family: family_run_missing[family] for family in families},
+        "required_family_clean_task_root_counts": {
+            family: min(family_run_counts.get(family, [0])) if family_run_counts.get(family) else 0
+            for family in families
+        },
+        "family_breadth_min_distinct_task_roots": max(
+            [max(values) for values in family_run_thresholds.values() if values] or [0]
+        ),
+    }
+
+
 def _priority_family_allocation_audit(
     results: list[dict[str, object]],
     *,
@@ -1686,6 +2398,8 @@ def _claim_gate_summary(
     family_transfer_summary = _family_transfer_summary(results)
     family_transfer_timeline = _family_transfer_timeline(results)
     family_transfer_investment_ranking = _family_transfer_investment_ranking(results)
+    frontier_expansion_summary = _frontier_expansion_summary(results)
+    required_family_clean_task_root_breadth = _required_family_clean_task_root_breadth_summary(results)
     priority_family_allocation_audit = _priority_family_allocation_audit(
         results,
         confidence_controls=confidence_controls,
@@ -1728,10 +2442,16 @@ def _claim_gate_summary(
         blockers.append("non_replay_transfer_family_observation_too_narrow")
     if family_transfer_summary["distinct_target_families_with_retained_gain"] < required_transfer_family_count:
         blockers.append("non_replay_transfer_retained_gain_too_narrow")
+    if frontier_expansion_summary["distinct_target_families_sampled"] < required_transfer_family_count:
+        blockers.append("autonomous_frontier_sampling_too_narrow")
+    if frontier_expansion_summary["pressure_families_without_sampling"]:
+        blockers.append("autonomous_frontier_priority_pressure_not_exercised")
     if not family_transfer_timeline["families_with_non_declining_repeated_retained_gain"]:
         blockers.append("non_replay_transfer_retained_gain_not_persistent_over_time")
     elif not family_transfer_timeline["families_with_cost_acceptable_non_declining_repeated_retained_gain"]:
         blockers.append("non_replay_transfer_return_on_cost_too_low")
+    if required_family_clean_task_root_breadth["families_missing_clean_task_root_breadth"]:
+        blockers.append("required_family_clean_task_root_breadth_too_narrow")
     retained_cycle_spread = 0.0 if not retained_cycles else max(retained_cycles) - min(retained_cycles)
     retained_pass_rate_delta_spread = (
         0.0 if not retained_pass_deltas else max(retained_pass_deltas) - min(retained_pass_deltas)
@@ -1755,6 +2475,8 @@ def _claim_gate_summary(
         "family_transfer_summary": family_transfer_summary,
         "family_transfer_timeline": family_transfer_timeline,
         "family_transfer_investment_ranking": family_transfer_investment_ranking,
+        "frontier_expansion_summary": frontier_expansion_summary,
+        "required_family_clean_task_root_breadth": required_family_clean_task_root_breadth,
         "priority_family_allocation_audit": priority_family_allocation_audit,
         "autonomous_compounding_claim_ready": not blockers,
         "blockers": blockers,
@@ -1811,6 +2533,113 @@ def _summary(
     }
 
 
+def _write_status(
+    *,
+    config: KernelConfig,
+    args: argparse.Namespace,
+    started_at: str,
+    state: str,
+    task_limit: int,
+    task_limit_source: str,
+    priority_benchmark_families: list[str],
+    priority_benchmark_family_source: str,
+    priority_benchmark_family_weights: dict[str, float],
+    priority_benchmark_family_weight_source: str,
+    priority_benchmark_family_allocation_compensation: dict[str, object],
+    results: list[dict[str, object]],
+    confidence_controls: dict[str, float] | None = None,
+    active_run: dict[str, object] | None = None,
+    final_report_path: Path | None = None,
+) -> Path:
+    effective_active_run, prior_payload = _effective_active_run_snapshot(
+        config=config,
+        active_run=active_run,
+    )
+    summary = _summary(results, confidence_controls=confidence_controls) if results else {}
+    claim_gate_summary = summary.get("claim_gate_summary", {}) if isinstance(summary, dict) else {}
+    if not isinstance(claim_gate_summary, dict):
+        claim_gate_summary = {}
+    frontier_expansion_summary = claim_gate_summary.get("frontier_expansion_summary", {})
+    if not isinstance(frontier_expansion_summary, dict):
+        frontier_expansion_summary = {}
+    retained_child_snapshot = _retained_child_sampling_snapshot(
+        prior_payload=prior_payload,
+        active_run=effective_active_run,
+        requested_priority_benchmark_families=priority_benchmark_families,
+    )
+    families_sampled = _string_list(frontier_expansion_summary, "families_sampled")
+    if not families_sampled:
+        families_sampled = retained_child_snapshot["families_sampled"]
+    families_never_sampled = _string_list(frontier_expansion_summary, "families_never_sampled")
+    if not families_never_sampled:
+        families_never_sampled = retained_child_snapshot["families_never_sampled"]
+    pressure_families_without_sampling = _string_list(frontier_expansion_summary, "pressure_families_without_sampling")
+    if not pressure_families_without_sampling:
+        pressure_families_without_sampling = retained_child_snapshot["pressure_families_without_sampling"]
+    family_transfer_summary = claim_gate_summary.get("family_transfer_summary", {})
+    if not isinstance(family_transfer_summary, dict):
+        family_transfer_summary = {}
+    latest_completed_run = results[-1] if results else {}
+    completed_run_summaries = [
+        {
+            "run_index": int(result.get("run_index", 0) or 0),
+            "run_match_id": str(result.get("run_match_id", "")).strip(),
+            "returncode": int(result.get("returncode", 0) or 0),
+            "report_path": str(result.get("report_path", "")).strip(),
+            "task_limit": int(result.get("task_limit", 0) or 0),
+            "task_limit_source": str(result.get("task_limit_source", "")).strip(),
+            "priority_benchmark_families": list(result.get("priority_benchmark_families", []))
+            if isinstance(result.get("priority_benchmark_families", []), list)
+            else [],
+        }
+        for result in results
+    ]
+    payload = {
+        "spec_version": "asi_v1",
+        "report_kind": "autonomous_compounding_status",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": started_at,
+        "state": state,
+        "runs_requested": max(1, args.runs),
+        "runs_completed": len(results),
+        "runs_remaining": max(0, max(1, args.runs) - len(results)),
+        "cycles_per_run": max(1, args.cycles),
+        "requested_task_limit": task_limit,
+        "requested_task_limit_source": task_limit_source,
+        "requested_priority_benchmark_families": priority_benchmark_families,
+        "priority_benchmark_family_source": priority_benchmark_family_source,
+        "requested_priority_benchmark_family_weights": priority_benchmark_family_weights,
+        "requested_priority_benchmark_family_weight_source": priority_benchmark_family_weight_source,
+        "priority_benchmark_family_allocation_compensation": priority_benchmark_family_allocation_compensation,
+        "active_run": effective_active_run,
+        "latest_completed_run": (
+            {
+                "run_index": int(latest_completed_run.get("run_index", 0) or 0),
+                "run_match_id": str(latest_completed_run.get("run_match_id", "")).strip(),
+                "report_path": str(latest_completed_run.get("report_path", "")).strip(),
+                "returncode": int(latest_completed_run.get("returncode", 0) or 0),
+            }
+            if latest_completed_run
+            else {}
+        ),
+        "completed_runs": completed_run_summaries,
+        "partial_summary": summary,
+        "partial_frontier_expansion_summary": frontier_expansion_summary,
+        "partial_family_transfer_summary": family_transfer_summary,
+        "pressure_families_without_sampling": pressure_families_without_sampling,
+        "families_sampled": families_sampled,
+        "families_never_sampled": families_never_sampled,
+        "partial_blockers": list(claim_gate_summary.get("blockers", []))
+        if isinstance(claim_gate_summary.get("blockers", []), list)
+        else [],
+        "final_report_path": str(final_report_path) if final_report_path is not None else "",
+    }
+    status_path = _status_path(config)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return status_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
@@ -1850,15 +2679,79 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     results: list[dict[str, object]] = []
-    for index in range(1, max(1, args.runs) + 1):
-        run_match_id = _match_id(index)
-        results.append(
-            _run_once(
-                repo_root=repo_root,
+    started_at = datetime.now(timezone.utc).isoformat()
+    active_run_status: dict[str, object] = {}
+    interrupted_signal_name = ""
+
+    def _handle_interrupt(signum: int, _frame: object) -> None:
+        nonlocal interrupted_signal_name
+        try:
+            interrupted_signal_name = signal.Signals(signum).name
+        except ValueError:
+            interrupted_signal_name = str(signum)
+        raise KeyboardInterrupt
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    signal.signal(signal.SIGTERM, _handle_interrupt)
+    _write_status(
+        config=config,
+        args=args,
+        started_at=started_at,
+        state="starting",
+        task_limit=task_limit,
+        task_limit_source=task_limit_source,
+        priority_benchmark_families=priority_benchmark_families,
+        priority_benchmark_family_source=priority_benchmark_family_source,
+        priority_benchmark_family_weights=priority_benchmark_family_weights,
+        priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+        priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+        results=results,
+        confidence_controls=allocation_confidence_controls,
+    )
+    try:
+        for index in range(1, max(1, args.runs) + 1):
+            run_match_id = _match_id(index)
+            prior_claim_gate_summary = _latest_prior_compounding_claim_gate_summary(config)
+            autonomous_frontier_curriculum_pressure = _autonomous_frontier_curriculum_pressure(
+                priority_benchmark_families=priority_benchmark_families,
+                priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+                prior_claim_gate_summary=prior_claim_gate_summary,
+            )
+            (
+                routed_task_limit,
+                routed_task_limit_source,
+                routed_priority_benchmark_families,
+                routed_priority_benchmark_family_weights,
+                routed_priority_benchmark_family_weight_source,
+                priority_benchmark_family_live_routing,
+            ) = _autonomous_frontier_live_priority_routing(
+                task_limit=task_limit,
+                task_limit_source=task_limit_source,
+                priority_benchmark_families=priority_benchmark_families,
+                priority_benchmark_family_weights=priority_benchmark_family_weights,
+                priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+                autonomous_frontier_curriculum_pressure=autonomous_frontier_curriculum_pressure,
+            )
+            active_run_status = {
+                "run_index": index,
+                "run_match_id": run_match_id,
+                "runtime_root": str(_run_root(config, run_match_id=run_match_id)),
+                "child_status_path": str(_child_run_status_path(_run_root(config, run_match_id=run_match_id))),
+                "task_limit": routed_task_limit,
+                "task_limit_source": routed_task_limit_source,
+                "priority_benchmark_families": routed_priority_benchmark_families,
+                "priority_benchmark_family_weights": routed_priority_benchmark_family_weights,
+                "priority_benchmark_family_weight_source": routed_priority_benchmark_family_weight_source,
+                "priority_benchmark_family_live_routing": priority_benchmark_family_live_routing,
+                "autonomous_frontier_curriculum_pressure": autonomous_frontier_curriculum_pressure,
+            }
+            _write_status(
                 config=config,
                 args=args,
-                run_match_id=run_match_id,
-                run_index=index,
+                started_at=started_at,
+                state="running",
                 task_limit=task_limit,
                 task_limit_source=task_limit_source,
                 priority_benchmark_families=priority_benchmark_families,
@@ -1866,8 +2759,69 @@ def main() -> None:
                 priority_benchmark_family_weights=priority_benchmark_family_weights,
                 priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
                 priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+                results=results,
+                confidence_controls=allocation_confidence_controls,
+                active_run=active_run_status,
             )
+            results.append(
+                    _run_once(
+                        repo_root=repo_root,
+                        config=config,
+                        args=args,
+                        run_match_id=run_match_id,
+                        run_index=index,
+                        priority_benchmark_family_source=priority_benchmark_family_source,
+                        priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+                        priority_benchmark_family_weight_source=routed_priority_benchmark_family_weight_source,
+                        autonomous_frontier_curriculum_pressure=autonomous_frontier_curriculum_pressure,
+                        routed_task_limit=routed_task_limit,
+                        routed_task_limit_source=routed_task_limit_source,
+                        routed_priority_benchmark_families=routed_priority_benchmark_families,
+                        routed_priority_benchmark_family_weights=routed_priority_benchmark_family_weights,
+                        routed_priority_benchmark_family_weight_source=routed_priority_benchmark_family_weight_source,
+                        priority_benchmark_family_live_routing=priority_benchmark_family_live_routing,
+                    )
+                )
+            active_run_status = {}
+            _write_status(
+                config=config,
+                args=args,
+                started_at=started_at,
+                state="running" if index < max(1, args.runs) else "finalizing",
+                task_limit=task_limit,
+                task_limit_source=task_limit_source,
+                priority_benchmark_families=priority_benchmark_families,
+                priority_benchmark_family_source=priority_benchmark_family_source,
+                priority_benchmark_family_weights=priority_benchmark_family_weights,
+                priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+                priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+                results=results,
+                confidence_controls=allocation_confidence_controls,
+            )
+    except KeyboardInterrupt:
+        interrupted_active_run = dict(active_run_status)
+        if interrupted_signal_name:
+            interrupted_active_run["interrupted_signal"] = interrupted_signal_name
+        _write_status(
+            config=config,
+            args=args,
+            started_at=started_at,
+            state="aborted",
+            task_limit=task_limit,
+            task_limit_source=task_limit_source,
+            priority_benchmark_families=priority_benchmark_families,
+            priority_benchmark_family_source=priority_benchmark_family_source,
+            priority_benchmark_family_weights=priority_benchmark_family_weights,
+            priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+            priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+            results=results,
+            confidence_controls=allocation_confidence_controls,
+            active_run=interrupted_active_run,
         )
+        raise SystemExit(130)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
     summary = _summary(results, confidence_controls=allocation_confidence_controls)
     report = {
@@ -1876,13 +2830,31 @@ def main() -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "runs_requested": max(1, args.runs),
         "cycles_per_run": max(1, args.cycles),
-        "task_limit": task_limit,
-        "task_limit_source": task_limit_source,
-        "priority_benchmark_families": priority_benchmark_families,
+        "task_limit": results[0].get("task_limit", task_limit) if results else task_limit,
+        "task_limit_source": results[0].get("task_limit_source", task_limit_source) if results else task_limit_source,
+        "requested_task_limit": task_limit,
+        "requested_task_limit_source": task_limit_source,
+        "priority_benchmark_families": (
+            results[0].get("priority_benchmark_families", priority_benchmark_families) if results else priority_benchmark_families
+        ),
         "priority_benchmark_family_source": priority_benchmark_family_source,
-        "priority_benchmark_family_weights": priority_benchmark_family_weights,
-        "priority_benchmark_family_weight_source": priority_benchmark_family_weight_source,
+        "priority_benchmark_family_weights": (
+            results[0].get("priority_benchmark_family_weights", priority_benchmark_family_weights)
+            if results
+            else priority_benchmark_family_weights
+        ),
+        "priority_benchmark_family_weight_source": (
+            results[0].get("priority_benchmark_family_weight_source", priority_benchmark_family_weight_source)
+            if results
+            else priority_benchmark_family_weight_source
+        ),
         "priority_benchmark_family_allocation_compensation": priority_benchmark_family_allocation_compensation,
+        "priority_benchmark_family_live_routing": (
+            results[0].get("priority_benchmark_family_live_routing", {}) if results else {}
+        ),
+        "autonomous_frontier_curriculum_pressure": (
+            results[0].get("autonomous_frontier_curriculum_pressure", {}) if results else {}
+        ),
         "summary": summary,
         "runs": results,
     }
@@ -1891,6 +2863,22 @@ def main() -> None:
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    _write_status(
+        config=config,
+        args=args,
+        started_at=started_at,
+        state="finished",
+        task_limit=task_limit,
+        task_limit_source=task_limit_source,
+        priority_benchmark_families=priority_benchmark_families,
+        priority_benchmark_family_source=priority_benchmark_family_source,
+        priority_benchmark_family_weights=priority_benchmark_family_weights,
+        priority_benchmark_family_weight_source=priority_benchmark_family_weight_source,
+        priority_benchmark_family_allocation_compensation=priority_benchmark_family_allocation_compensation,
+        results=results,
+        confidence_controls=allocation_confidence_controls,
+        final_report_path=report_path,
+    )
 
     planner = ImprovementPlanner(
         memory_root=config.trajectories_root,
@@ -1914,13 +2902,33 @@ def main() -> None:
             metrics_summary={
                 "runs_requested": max(1, args.runs),
                 "cycles_per_run": max(1, args.cycles),
-                "task_limit": task_limit,
-                "task_limit_source": task_limit_source,
-                "priority_benchmark_families": priority_benchmark_families,
+                "task_limit": results[0].get("task_limit", task_limit) if results else task_limit,
+                "task_limit_source": results[0].get("task_limit_source", task_limit_source) if results else task_limit_source,
+                "requested_task_limit": task_limit,
+                "requested_task_limit_source": task_limit_source,
+                "priority_benchmark_families": (
+                    results[0].get("priority_benchmark_families", priority_benchmark_families)
+                    if results
+                    else priority_benchmark_families
+                ),
                 "priority_benchmark_family_source": priority_benchmark_family_source,
-                "priority_benchmark_family_weights": priority_benchmark_family_weights,
-                "priority_benchmark_family_weight_source": priority_benchmark_family_weight_source,
+                "priority_benchmark_family_weights": (
+                    results[0].get("priority_benchmark_family_weights", priority_benchmark_family_weights)
+                    if results
+                    else priority_benchmark_family_weights
+                ),
+                "priority_benchmark_family_weight_source": (
+                    results[0].get("priority_benchmark_family_weight_source", priority_benchmark_family_weight_source)
+                    if results
+                    else priority_benchmark_family_weight_source
+                ),
                 "priority_benchmark_family_allocation_compensation": priority_benchmark_family_allocation_compensation,
+                "priority_benchmark_family_live_routing": (
+                    results[0].get("priority_benchmark_family_live_routing", {}) if results else {}
+                ),
+                "autonomous_frontier_curriculum_pressure": (
+                    results[0].get("autonomous_frontier_curriculum_pressure", {}) if results else {}
+                ),
                 "successful_runs": summary["successful_runs"],
                 "runs_with_retention": summary["runs_with_retention"],
                 "autonomous_compounding_viable": summary["autonomous_compounding_viable"],

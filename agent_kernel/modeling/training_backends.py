@@ -162,3 +162,58 @@ def tolbert_artifact_training_env(payload: dict[str, Any]) -> dict[str, str]:
             if str(value).strip()
         )
     return env
+
+
+def qwen_artifact_training_env(payload: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+    if str(payload.get("artifact_kind", "")).strip() != "qwen_adapter_bundle":
+        return {}
+    env: dict[str, str] = {}
+    base_model_name = str(payload.get("base_model_name", "")).strip()
+    if base_model_name:
+        env["AGENTKERNEL_QWEN_BASE_MODEL_NAME"] = base_model_name
+    training_objective = str(payload.get("training_objective", "")).strip()
+    if training_objective:
+        env["AGENTKERNEL_QWEN_TRAINING_OBJECTIVE"] = training_objective
+    dataset_manifest = payload.get("training_dataset_manifest", {})
+    if isinstance(dataset_manifest, dict):
+        for key, env_name in (
+            ("manifest_path", "AGENTKERNEL_QWEN_DATASET_MANIFEST_PATH"),
+            ("train_dataset_path", "AGENTKERNEL_QWEN_TRAIN_DATASET_PATH"),
+            ("eval_dataset_path", "AGENTKERNEL_QWEN_EVAL_DATASET_PATH"),
+        ):
+            value = str(dataset_manifest.get(key, "")).strip()
+            if value:
+                env[env_name] = value
+    runtime_paths = payload.get("runtime_paths", {})
+    if isinstance(runtime_paths, dict):
+        for key, env_name in (
+            ("adapter_output_dir", "AGENTKERNEL_QWEN_ADAPTER_OUTPUT_DIR"),
+            ("merged_output_dir", "AGENTKERNEL_QWEN_MERGED_OUTPUT_DIR"),
+            ("adapter_manifest_path", "AGENTKERNEL_QWEN_ADAPTER_MANIFEST_PATH"),
+        ):
+            value = str(runtime_paths.get(key, "")).strip()
+            if value:
+                env[env_name] = value
+    supported_families = payload.get("supported_benchmark_families", [])
+    if isinstance(supported_families, list):
+        normalized = [
+            str(value).strip()
+            for value in supported_families
+            if str(value).strip()
+        ]
+        if normalized:
+            env["AGENTKERNEL_QWEN_SUPPORTED_BENCHMARK_FAMILIES"] = ",".join(normalized)
+    return env
+
+
+def artifact_training_env(payload: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+    kind = str(payload.get("artifact_kind", "")).strip()
+    if kind == "tolbert_model_bundle":
+        return tolbert_artifact_training_env(payload)
+    if kind == "qwen_adapter_bundle":
+        return qwen_artifact_training_env(payload)
+    return {}

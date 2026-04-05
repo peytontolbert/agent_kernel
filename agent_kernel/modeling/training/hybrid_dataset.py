@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import math
+import os
+import shutil
 from typing import Any
 
 from agent_kernel.config import KernelConfig
@@ -14,6 +16,18 @@ from ..tolbert.tokenization import (
     encode_decoder_sequence,
     hashed_id,
 )
+
+
+def _should_write_dataset_shards() -> bool:
+    return os.getenv("AGENT_KERNEL_STORAGE_WRITE_DATASET_SHARDS", "0") == "1"
+
+
+def _sync_jsonl_shards(output_dir: Path, stem: str, rows: list[dict[str, Any]]) -> list[Path]:
+    if _should_write_dataset_shards():
+        return _write_jsonl_shards(output_dir, stem, rows)
+    if output_dir.exists():
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return []
 
 
 def build_hybrid_training_examples(
@@ -30,6 +44,8 @@ def build_hybrid_training_examples(
         task_metadata = payload.get("task_metadata", {})
         if not isinstance(task_metadata, dict):
             task_metadata = {}
+        task_difficulty = _task_difficulty(task_metadata)
+        is_long_horizon = task_difficulty == "long_horizon"
         family_id = hashed_id(str(task_metadata.get("benchmark_family", "bounded")), config.family_vocab_size)
         path_level_ids = [
             hashed_id(str(value), config.path_vocab_size)
@@ -74,6 +90,17 @@ def build_hybrid_training_examples(
             )
             remaining = max(1, len(future_steps))
             remaining_pass_rate = future_passes / remaining
+            example_weight = _example_weight(
+                is_long_horizon=is_long_horizon,
+                remaining_steps=remaining,
+                future_progress=future_progress,
+                remaining_pass_rate=remaining_pass_rate,
+                trusted_retrieval_alignment=world_feedback["trusted_retrieval_alignment"],
+                graph_environment_alignment=world_feedback["graph_environment_alignment"],
+                transfer_novelty=world_feedback["transfer_novelty"],
+            )
+            safe_transfer_bonus = max(0.0, world_feedback["graph_environment_alignment"])
+            unsafe_transfer_penalty = max(0.0, -world_feedback["graph_environment_alignment"])
             local_failure = (
                 1.0 if list(step.get("failure_signals", [])) else 0.0
             ) + (1.0 if not bool(verification.get("passed", False)) else 0.0)
@@ -81,11 +108,16 @@ def build_hybrid_training_examples(
                 (0.65 if bool(verification.get("passed", False)) else 0.0)
                 + (0.20 * remaining_pass_rate)
                 + (0.15 * _sigmoid_unit(float(step.get("state_progress_delta", 0.0) or 0.0)))
+                + (0.10 * world_feedback["trusted_retrieval_alignment"])
+                + (0.05 * safe_transfer_bonus)
+                - (0.10 * unsafe_transfer_penalty)
             )
             risk_target = _clamp01(
                 0.45 * min(1.0, local_failure)
                 + 0.35 * min(1.0, future_regressions / max(1, remaining))
                 + 0.20 * (1.0 if bool(step.get("no_progress", False)) else 0.0)
+                + (0.20 * unsafe_transfer_penalty)
+                + (0.10 * world_feedback["transfer_novelty"] * max(0.0, 1.0 - safe_transfer_bonus))
             )
             value_target = _clamp01(
                 (0.40 if success else 0.0)
@@ -94,6 +126,9 @@ def build_hybrid_training_examples(
                 - (0.20 * min(1.0, future_regressions / max(1, remaining)))
                 + (0.05 * world_feedback["progress_signal"])
                 - (0.05 * world_feedback["risk_signal"])
+                + (0.05 * world_feedback["trusted_retrieval_alignment"])
+                + (0.05 * safe_transfer_bonus)
+                - (0.05 * unsafe_transfer_penalty)
             )
             stop_target = 1.0 if index == len(steps) - 1 and success and bool(verification.get("passed", False)) else 0.0
             score_target = _clamp01(
@@ -103,6 +138,9 @@ def build_hybrid_training_examples(
                 + (0.10 * _sigmoid_unit(future_progress))
                 + (0.05 * stop_target)
                 + (0.05 * _sigmoid_unit(world_feedback["hybrid_total_score"]))
+                + (0.05 * world_feedback["trusted_retrieval_alignment"])
+                + (0.05 * safe_transfer_bonus)
+                - (0.10 * unsafe_transfer_penalty)
             )
             world_target = _world_target_distribution(
                 step=step,
@@ -134,6 +172,8 @@ def build_hybrid_training_examples(
                         float(future_progress),
                         float(future_regressions),
                     ],
+                    "task_difficulty": task_difficulty,
+                    "example_weight": example_weight,
                     "world_target": world_target,
                     "world_feedback": world_feedback,
                 }
@@ -157,12 +197,41 @@ def materialize_hybrid_training_dataset(
         config=config,
         decoder_vocab=decoder_vocab,
     )
+    difficulty_counts: dict[str, int] = {}
+    long_horizon_example_count = 0
+    weighted_example_total = 0.0
+    long_horizon_weighted_total = 0.0
+    trusted_retrieval_aligned_example_count = 0
+    transfer_novelty_example_count = 0
+    environment_safe_example_count = 0
+    for example in examples:
+        difficulty = str(example.get("task_difficulty", "")).strip() or "seed"
+        difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
+        weight = float(example.get("example_weight", 1.0) or 1.0)
+        world_feedback = dict(example.get("world_feedback", {})) if isinstance(example.get("world_feedback", {}), dict) else {}
+        weighted_example_total += weight
+        if difficulty == "long_horizon":
+            long_horizon_example_count += 1
+            long_horizon_weighted_total += weight
+        if float(world_feedback.get("trusted_retrieval_alignment", 0.0) or 0.0) > 0.0:
+            trusted_retrieval_aligned_example_count += 1
+        if float(world_feedback.get("transfer_novelty", 0.0) or 0.0) > 0.0:
+            transfer_novelty_example_count += 1
+        if float(world_feedback.get("graph_environment_alignment", 0.0) or 0.0) > 0.0:
+            environment_safe_example_count += 1
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("".join(json.dumps(example) + "\n" for example in examples), encoding="utf-8")
-    shard_paths = _write_jsonl_shards(output_path.parent / f"{output_path.stem}_shards", output_path.stem, examples)
+    shard_paths = _sync_jsonl_shards(output_path.parent / f"{output_path.stem}_shards", output_path.stem, examples)
     manifest = {
         "artifact_kind": "tolbert_hybrid_training_dataset",
         "example_count": len(examples),
+        "difficulty_counts": dict(sorted(difficulty_counts.items())),
+        "long_horizon_example_count": long_horizon_example_count,
+        "average_example_weight": round(weighted_example_total / max(1, len(examples)), 4),
+        "long_horizon_weighted_example_share": round(long_horizon_weighted_total / max(1.0, weighted_example_total), 4),
+        "trusted_retrieval_aligned_example_count": trusted_retrieval_aligned_example_count,
+        "transfer_novelty_example_count": transfer_novelty_example_count,
+        "environment_safe_example_count": environment_safe_example_count,
         "dataset_path": str(output_path),
         "shard_paths": [str(path) for path in shard_paths],
         "decoder_vocab_path": str(decoder_vocab_path),
@@ -199,9 +268,9 @@ def _step_scalar_features(step: dict[str, Any], config: HybridTolbertSSMConfig) 
         float(step.get("state_regression_count", 0.0) or 0.0),
         1.0 if bool(step.get("retrieval_influenced", False)) else 0.0,
         1.0 if bool(step.get("retrieval_ranked_skill", False)) else 0.0,
-        min(1.0, float(step.get("available_skill_count", 0) or 0) / 5.0),
-        min(1.0, float(step.get("retrieval_candidate_count", 0) or 0) / 5.0),
-        min(1.0, float(step.get("retrieval_evidence_count", 0) or 0) / 5.0),
+        world_feedback["trusted_retrieval_alignment"],
+        max(-1.0, min(1.0, world_feedback["graph_environment_alignment"])),
+        world_feedback["transfer_novelty"],
         1.0 if str(step.get("action", "")) == "code_execute" else 0.0,
         1.0 if str(step.get("action", "")) == "respond" else 0.0,
         1.0 if bool(verification.get("passed", False)) else 0.0,
@@ -221,6 +290,35 @@ def _regression_count(step: dict[str, Any]) -> float:
         return float(step.get("state_regression_count", transition.get("regression_count", 0)) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _task_difficulty(task_metadata: dict[str, Any]) -> str:
+    return str(task_metadata.get("difficulty", task_metadata.get("task_difficulty", "seed"))).strip() or "seed"
+
+
+def _example_weight(
+    *,
+    is_long_horizon: bool,
+    remaining_steps: int,
+    future_progress: float,
+    remaining_pass_rate: float,
+    trusted_retrieval_alignment: float,
+    graph_environment_alignment: float,
+    transfer_novelty: float,
+) -> float:
+    if not is_long_horizon:
+        return 1.0
+    bonus = min(
+        2.0,
+        (0.3 * math.log1p(max(1, remaining_steps)))
+        + (0.35 * min(1.0, max(0.0, future_progress)))
+        + (0.25 * max(0.0, min(1.0, remaining_pass_rate))),
+    )
+    bonus += 0.20 * max(0.0, trusted_retrieval_alignment)
+    bonus += 0.15 * max(0.0, graph_environment_alignment)
+    if transfer_novelty > 0.0:
+        bonus += 0.15 * (0.5 + max(0.0, graph_environment_alignment))
+    return round(1.0 + bonus, 4)
 
 
 def _world_target_distribution(
@@ -264,12 +362,16 @@ def _world_target_distribution(
             scores[4] += 0.15 * world_feedback["decoder_world_progress_score"]
     if len(scores) > 5:
         scores[5] += 1.0 if trusted else 0.0
+        scores[5] += 0.50 * world_feedback["trusted_retrieval_alignment"]
     if len(scores) > 6:
         scores[6] += 1.0 if (future_regressions > 0 or no_progress or risk_band in {"blocked", "regressive"}) else 0.0
         scores[6] += 0.20 * world_feedback["decoder_world_risk_score"]
+        scores[6] += 0.35 * max(0.0, -world_feedback["graph_environment_alignment"])
+        scores[6] += 0.15 * world_feedback["transfer_novelty"]
     if len(scores) > 7:
         scores[7] += 1.0 if risk_band == "stable" and progress_band not in {"advancing", "improving"} else 0.0
         scores[7] += 0.10 * max(0.0, 1.0 - world_feedback["decoder_world_entropy_mean"])
+        scores[7] += 0.25 * max(0.0, world_feedback["graph_environment_alignment"])
     total = sum(max(0.0, value) for value in scores)
     if total <= 0.0:
         return [1.0 / len(scores)] * len(scores)
@@ -307,6 +409,21 @@ def _world_feedback_summary(step: dict[str, Any]) -> dict[str, Any]:
         ),
         0.0,
     )
+    trusted_retrieval_alignment = max(
+        _float_value(learned.get("trusted_retrieval_alignment"), 0.0),
+        _float_value(proposal.get("hybrid_trusted_retrieval_alignment"), 0.0),
+    )
+    graph_environment_alignment = _float_value(
+        proposal.get(
+            "hybrid_graph_environment_alignment",
+            learned.get("graph_environment_alignment", 0.0),
+        ),
+        0.0,
+    )
+    transfer_novelty = max(
+        _float_value(learned.get("transfer_novelty"), 0.0),
+        _float_value(proposal.get("hybrid_transfer_novelty"), 0.0),
+    )
     return {
         "progress_signal": progress_signal,
         "risk_signal": risk_signal,
@@ -336,6 +453,9 @@ def _world_feedback_summary(step: dict[str, Any]) -> dict[str, Any]:
             _float_value(proposal.get("hybrid_transition_regression"), 0.0),
         ),
         "hybrid_total_score": _float_value(proposal.get("hybrid_total_score"), 0.0),
+        "trusted_retrieval_alignment": max(0.0, min(1.0, trusted_retrieval_alignment)),
+        "graph_environment_alignment": max(-1.0, min(1.0, graph_environment_alignment)),
+        "transfer_novelty": max(0.0, min(1.0, transfer_novelty)),
         "source": str(learned.get("source", "")).strip(),
         "model_family": str(
             proposal.get("hybrid_model_family", learned.get("model_family", ""))

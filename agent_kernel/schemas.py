@@ -193,6 +193,7 @@ class StepRecord:
     trust_retrieval: bool = False
     retrieval_direct_candidate_count: int = 0
     active_subgoal: str = ""
+    subgoal_diagnoses: dict[str, Any] = field(default_factory=dict)
     acting_role: str = "executor"
     world_model_horizon: str = ""
     state_progress_delta: float = 0.0
@@ -224,6 +225,7 @@ class EpisodeRecord:
     graph_summary: dict[str, Any] = field(default_factory=dict)
     universe_summary: dict[str, Any] = field(default_factory=dict)
     world_model_summary: dict[str, Any] = field(default_factory=dict)
+    history_archive: dict[str, Any] = field(default_factory=dict)
     termination_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -238,6 +240,7 @@ class EpisodeRecord:
             "graph_summary": self.graph_summary,
             "universe_summary": self.universe_summary,
             "world_model_summary": self.world_model_summary,
+            "history_archive": self.history_archive,
             "termination_reason": self.termination_reason,
             "steps": [asdict(step) for step in self.steps],
         }

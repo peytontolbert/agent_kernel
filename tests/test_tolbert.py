@@ -18,7 +18,7 @@ from agent_kernel.tolbert import (
     _discover_v2_paper_research_runtime_paths,
     _paper_research_runtime_paths,
 )
-from agent_kernel.schemas import TaskSpec
+from agent_kernel.schemas import ContextPacket, StepRecord, TaskSpec
 
 
 class FakeTolbertClient:
@@ -157,6 +157,71 @@ class CapturingTolbertClient(FakeTolbertClient):
         return super().query(**kwargs)
 
 
+class SparseTolbertClient:
+    def __init__(self) -> None:
+        self.last_request: dict[str, object] | None = None
+
+    def query(
+        self,
+        *,
+        query_text,
+        timeout_seconds=None,
+        branch_results,
+        global_results,
+        confidence_threshold,
+        top_branches,
+        branch_confidence_margin,
+        low_confidence_widen_threshold,
+        ancestor_branch_levels,
+        low_confidence_branch_multiplier,
+        low_confidence_global_multiplier,
+    ):
+        del (
+            timeout_seconds,
+            branch_results,
+            global_results,
+            confidence_threshold,
+            top_branches,
+            branch_confidence_margin,
+            low_confidence_widen_threshold,
+            ancestor_branch_levels,
+            low_confidence_branch_multiplier,
+            low_confidence_global_multiplier,
+        )
+        self.last_request = {"query_text": query_text}
+        return {
+            "backend": "tolbert_brain_service",
+            "index_shards": ["joint-paper-cache"],
+            "level_focus": "repo",
+            "selected_branch_level": 2,
+            "branch_candidates": [],
+            "path_prediction": {
+                "tree_version": "tol_v1",
+                "decode_mode": "greedy_hierarchical_decode",
+                "levels": [1, 2],
+                "predicted_level_ids": {"1": 0, "2": 0},
+                "confidence_by_level": {"1": 0.85, "2": 0.76},
+                "labels_by_level": {"1": "Tooling", "2": "Tasks"},
+                "fallbacks": [],
+            },
+            "retrieval": {
+                "branch_scoped": [
+                    {
+                        "span_id": "task:unrelated:suggested:1",
+                        "text": "printf 'unrelated\\n' > unrelated.txt",
+                        "source_id": "unrelated",
+                        "span_type": "agent:command_template",
+                        "score": 0.8,
+                        "node_path": [0, 0, 0],
+                        "metadata": {"span_type": "agent:command_template", "task_id": "unrelated_task"},
+                    }
+                ],
+                "fallback_scoped": [],
+                "global": [],
+            },
+        }
+
+
 class FakeResearchTolbertClient:
     def __init__(self) -> None:
         self.calls = 0
@@ -238,6 +303,21 @@ class DelayedTolbertClient(FakeTolbertClient):
         return super().query(**{key: value for key, value in kwargs.items() if key != "timeout_seconds"})
 
 
+def _monotonic_sequence(values: list[float]):
+    iterator = iter(values)
+    last_value = values[-1]
+
+    def _next() -> float:
+        nonlocal last_value
+        try:
+            last_value = next(iterator)
+        except StopIteration:
+            pass
+        return last_value
+
+    return _next
+
+
 def test_tolbert_compiler_uses_real_decode_contract(tmp_path: Path) -> None:
     nodes_path = tmp_path / "nodes.jsonl"
     spans_path = tmp_path / "spans.jsonl"
@@ -307,6 +387,7 @@ def test_tolbert_compiler_penalizes_declared_distractor_tasks(tmp_path: Path) ->
         use_tolbert_context=True,
         tolbert_branch_results=1,
         tolbert_global_results=0,
+        learning_artifacts_path=tmp_path / "learning" / "run_learning_artifacts.json",
     )
     compiler = TolbertContextCompiler(
         config=config,
@@ -354,6 +435,7 @@ def test_tolbert_compiler_enriches_guidance_with_learning_candidates(tmp_path: P
     )
     config = KernelConfig(
         provider="mock",
+        storage_backend="json",
         use_tolbert_context=True,
         tolbert_branch_results=1,
         tolbert_global_results=0,
@@ -398,6 +480,7 @@ def test_tolbert_compiler_surfaces_memory_source_on_learning_guidance(tmp_path: 
     )
     config = KernelConfig(
         provider="mock",
+        storage_backend="json",
         use_tolbert_context=True,
         tolbert_branch_results=1,
         tolbert_global_results=0,
@@ -421,6 +504,78 @@ def test_tolbert_compiler_surfaces_memory_source_on_learning_guidance(tmp_path: 
 
     assert "printf 'episode memory\\n' > memory.txt" in packet.control["retrieval_guidance"]["recommended_commands"]
     assert any("via episode memory" in item for item in packet.control["retrieval_guidance"]["evidence"])
+
+
+def test_tolbert_compiler_prefers_trusted_retrieval_backed_learning_guidance(tmp_path: Path) -> None:
+    class EmptyRetrievalClient(FakeTolbertClient):
+        def query(self, **kwargs):
+            payload = super().query(**kwargs)
+            payload["retrieval"] = {"branch_scoped": [], "fallback_scoped": [], "global": []}
+            return payload
+
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:generic-family",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "other_workflow_task",
+                        "benchmark_family": "workflow",
+                        "procedure": {"commands": ["printf 'generic memory\\n' > result.txt"]},
+                        "support_count": 6,
+                    },
+                    {
+                        "candidate_id": "learning:trusted-retrieval",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "seed_workflow_task",
+                        "benchmark_family": "workflow",
+                        "procedure": {"commands": ["printf 'retrieval memory\\n' > result.txt"]},
+                        "retrieval_backed": True,
+                        "retrieval_selected_steps": 1,
+                        "retrieval_influenced_steps": 1,
+                        "trusted_retrieval_steps": 1,
+                        "retrieval_backed_commands": ["printf 'retrieval memory\\n' > result.txt"],
+                        "support_count": 1,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        storage_backend="json",
+        use_tolbert_context=True,
+        tolbert_branch_results=0,
+        tolbert_global_results=0,
+        learning_artifacts_path=learning_path,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=EmptyRetrievalClient(),
+    )
+    task = TaskSpec(
+        task_id="target_workflow_task",
+        prompt="Use learned workflow memory to create result.txt.",
+        workspace_subdir="target_workflow_task",
+        success_command="test -f result.txt",
+        max_steps=3,
+        metadata={"benchmark_family": "workflow"},
+    )
+
+    packet = compiler.compile(AgentState(task=task))
+
+    assert packet.control["retrieval_guidance"]["recommended_commands"][0] == "printf 'retrieval memory\\n' > result.txt"
+    assert any(
+        "trusted retrieval-backed success_skill_candidate" in item
+        for item in packet.control["retrieval_guidance"]["evidence"]
+    )
 
 
 def test_tolbert_compiler_uses_applicable_transfer_learning_candidates(tmp_path: Path) -> None:
@@ -447,6 +602,7 @@ def test_tolbert_compiler_uses_applicable_transfer_learning_candidates(tmp_path:
     )
     config = KernelConfig(
         provider="mock",
+        storage_backend="json",
         use_tolbert_context=True,
         tolbert_branch_results=1,
         tolbert_global_results=0,
@@ -531,6 +687,177 @@ def test_tolbert_compiler_applies_retained_retrieval_overrides(tmp_path: Path) -
     assert client.last_request["global_results"] == 1
     assert client.last_request["confidence_threshold"] == 0.4
     assert len(packet.control["selected_context_chunks"]) == 1
+
+
+def test_tolbert_compiler_carries_selected_retrieval_into_next_guidance(tmp_path: Path) -> None:
+    compiler = TolbertContextCompiler(
+        config=KernelConfig(provider="mock", use_tolbert_context=True),
+        repo_root=tmp_path,
+        client=SparseTolbertClient(),
+    )
+    state = AgentState(task=TaskBank().get("hello_task"))
+    state.context_packet = ContextPacket(
+        request_id="req-carry",
+        created_at="2026-04-02T00:00:00+00:00",
+        task={"goal": "g", "completion_criteria": "c"},
+        control={
+            "mode": "verify",
+            "retrieval_guidance": {
+                "recommended_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                "recommended_command_spans": [
+                    {
+                        "span_id": "carry:hello:selected",
+                        "command": "printf 'hello agent kernel\\n' > hello.txt",
+                    }
+                ],
+                "avoidance_notes": [],
+                "evidence": ["carry:hello:selected: template command"],
+            },
+        },
+        tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+        retrieval={
+            "branch_scoped": [
+                {
+                    "span_id": "carry:hello:selected",
+                    "text": "printf 'hello agent kernel\\n' > hello.txt",
+                    "source_id": "hello_task",
+                    "span_type": "agent:command_template",
+                    "score": 0.0,
+                    "node_path": [0, 0, 0],
+                    "metadata": {"task_id": "hello_task", "span_type": "agent:command_template"},
+                }
+            ],
+            "fallback_scoped": [],
+            "global": [],
+        },
+        verifier_contract={"success_command": "true"},
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="look around",
+            action="code_execute",
+            content="grep -n hello README.md",
+            selected_skill_id=None,
+            command_result={"command": "grep -n hello README.md", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["missing expected file"]},
+            retrieval_command_match=False,
+            selected_retrieval_span_id="carry:hello:selected",
+            retrieval_influenced=False,
+            trust_retrieval=False,
+        )
+    )
+
+    packet = compiler.compile(state)
+
+    assert "printf 'hello agent kernel\\n' > hello.txt" in packet.control["retrieval_guidance"]["recommended_commands"]
+    assert any("carried retrieval guidance" in item for item in packet.control["retrieval_guidance"]["evidence"])
+    assert any(chunk["span_id"] == "carry:hello:selected" for chunk in packet.control["selected_context_chunks"])
+
+
+def test_tolbert_compiler_adds_retrieval_carry_to_query_text(tmp_path: Path) -> None:
+    client = SparseTolbertClient()
+    compiler = TolbertContextCompiler(
+        config=KernelConfig(provider="mock", use_tolbert_context=True),
+        repo_root=tmp_path,
+        client=client,
+    )
+    state = AgentState(task=TaskBank().get("hello_task"))
+    state.context_packet = ContextPacket(
+        request_id="req-carry",
+        created_at="2026-04-02T00:00:00+00:00",
+        task={"goal": "g", "completion_criteria": "c"},
+        control={
+            "mode": "verify",
+            "retrieval_guidance": {
+                "recommended_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                "recommended_command_spans": [
+                    {
+                        "span_id": "carry:hello:selected",
+                        "command": "printf 'hello agent kernel\\n' > hello.txt",
+                    }
+                ],
+                "avoidance_notes": [],
+                "evidence": [],
+            },
+        },
+        tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+        retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+        verifier_contract={"success_command": "true"},
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read current state",
+            action="code_execute",
+            content="grep -n hello README.md",
+            selected_skill_id=None,
+            command_result={"command": "grep -n hello README.md", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["missing expected file"]},
+            retrieval_command_match=False,
+            selected_retrieval_span_id="carry:hello:selected",
+        )
+    )
+
+    compiler.compile(state)
+
+    assert client.last_request is not None
+    assert "retrieval carry step=1 command=printf 'hello agent kernel\\n' > hello.txt" in client.last_request["query_text"]
+
+
+def test_tolbert_compiler_does_not_carry_failed_matched_retrieval_command(tmp_path: Path) -> None:
+    client = SparseTolbertClient()
+    compiler = TolbertContextCompiler(
+        config=KernelConfig(provider="mock", use_tolbert_context=True),
+        repo_root=tmp_path,
+        client=client,
+    )
+    state = AgentState(task=TaskBank().get("hello_task"))
+    state.context_packet = ContextPacket(
+        request_id="req-carry",
+        created_at="2026-04-02T00:00:00+00:00",
+        task={"goal": "g", "completion_criteria": "c"},
+        control={
+            "mode": "verify",
+            "retrieval_guidance": {
+                "recommended_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                "recommended_command_spans": [
+                    {
+                        "span_id": "carry:hello:selected",
+                        "command": "printf 'hello agent kernel\\n' > hello.txt",
+                    }
+                ],
+                "avoidance_notes": [],
+                "evidence": [],
+            },
+        },
+        tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+        retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+        verifier_contract={"success_command": "true"},
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="try retrieved command",
+            action="code_execute",
+            content="printf 'hello agent kernel\\n' > hello.txt",
+            selected_skill_id=None,
+            command_result={"command": "printf 'hello agent kernel\\n' > hello.txt", "exit_code": 1, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["exit code was 1"]},
+            retrieval_command_match=True,
+            selected_retrieval_span_id="carry:hello:selected",
+            retrieval_influenced=True,
+            trust_retrieval=True,
+        )
+    )
+
+    packet = compiler.compile(state)
+
+    assert "retrieval carry step=1 command=printf 'hello agent kernel\\n' > hello.txt" not in client.last_request["query_text"]
+    assert not any(
+        entry.get("span_id") == "carry:hello:selected"
+        for entry in packet.control["retrieval_guidance"]["recommended_command_spans"]
+    )
 
 
 def test_tolbert_compiler_applies_retained_world_model_controls_to_retrieval_ranking(tmp_path: Path) -> None:
@@ -679,7 +1006,8 @@ def test_tolbert_service_client_prefers_retained_bundle_runtime_paths(monkeypatc
         tolbert_source_spans_paths=("missing/source_spans.jsonl",),
         tolbert_cache_paths=("missing/cache.pt",),
     )
-    TolbertServiceClient(config=config, repo_root=tmp_path)
+    client = TolbertServiceClient(config=config, repo_root=tmp_path)
+    client._ensure_process()
 
     args = captured["args"]
     assert str(config_path) in args
@@ -737,6 +1065,188 @@ def test_tolbert_compiler_globally_ranks_context_chunks_across_buckets(tmp_path:
     packet = compiler.compile(AgentState(task=TaskBank().get("hello_task")))
 
     assert packet.control["selected_context_chunks"][0]["span_id"] == "global:strong"
+
+
+def test_tolbert_compiler_promotes_procedure_spans_into_retrieval_guidance(tmp_path: Path) -> None:
+    class ProcedureGuidanceClient(FakeTolbertClient):
+        def query(self, **kwargs):
+            payload = super().query(**kwargs)
+            payload["retrieval"] = {
+                "branch_scoped": [
+                    {
+                        "span_id": "tool:merge:procedure:1",
+                        "text": "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                        "source_id": "git_parallel_merge_acceptance_task",
+                        "span_type": "agent:procedure_span",
+                        "score": 0.9,
+                        "node_path": [0, 0, 0],
+                        "metadata": {
+                            "task_id": "git_parallel_merge_acceptance_task",
+                            "benchmark_family": "repo_sandbox",
+                            "capability": "repo_environment",
+                            "touched_files": ["docs/status.md"],
+                        },
+                    }
+                ],
+                "fallback_scoped": [],
+                "global": [
+                    {
+                        "span_id": "tool:merge:candidate",
+                        "text": "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                        "source_id": "git_parallel_merge_acceptance_task",
+                        "span_type": "agent:tool_candidate",
+                        "score": 0.8,
+                        "node_path": [0, 0, 1],
+                        "metadata": {"task_id": "git_parallel_merge_acceptance_task"},
+                    }
+                ],
+            }
+            return payload
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_branch_results=1,
+        tolbert_global_results=1,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=ProcedureGuidanceClient(),
+    )
+
+    packet = compiler.compile(AgentState(task=TaskBank().get("git_parallel_merge_acceptance_task")))
+
+    guidance = packet.control["retrieval_guidance"]
+    assert guidance["recommended_commands"][0] == "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'"
+    assert guidance["recommended_command_spans"][0]["span_id"] == "tool:merge:procedure:1"
+    assert any("procedure guidance" in item for item in guidance["evidence"])
+    assert any("reusable tool candidate" in item for item in guidance["evidence"])
+
+
+def test_tolbert_compiler_ranks_artifact_aligned_procedure_spans_for_project_tasks(tmp_path: Path) -> None:
+    class ProjectAlignedProcedureClient(FakeTolbertClient):
+        def query(self, **kwargs):
+            payload = super().query(**kwargs)
+            payload["retrieval"] = {
+                "branch_scoped": [
+                    {
+                        "span_id": "task:merge:overview",
+                        "text": "merge worker branches and verify acceptance",
+                        "source_id": "git_parallel_merge_acceptance_task",
+                        "span_type": "agent:task",
+                        "score": 3.0,
+                        "node_path": [0, 0, 0],
+                        "metadata": {"task_id": "git_parallel_merge_acceptance_task"},
+                    },
+                    {
+                        "span_id": "tool:merge:procedure:accept",
+                        "text": "printf 'api suite passed; docs suite passed\\n' > reports/test_report.txt",
+                        "source_id": "git_parallel_merge_acceptance_task",
+                        "span_type": "agent:procedure_span",
+                        "score": 0.2,
+                        "node_path": [0, 0, 1],
+                        "metadata": {
+                            "task_id": "git_parallel_merge_acceptance_task",
+                            "benchmark_family": "repo_sandbox",
+                            "capability": "repo_environment",
+                            "touched_files": ["reports/test_report.txt"],
+                        },
+                    },
+                ],
+                "fallback_scoped": [],
+                "global": [],
+            }
+            return payload
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_branch_results=2,
+        tolbert_global_results=0,
+        tolbert_context_max_chunks=1,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=ProjectAlignedProcedureClient(),
+    )
+
+    packet = compiler.compile(AgentState(task=TaskBank().get("git_parallel_merge_acceptance_task")))
+
+    assert packet.retrieval["branch_scoped"][0]["span_id"] == "tool:merge:procedure:accept"
+    assert packet.control["selected_context_chunks"][0]["span_id"] == "tool:merge:procedure:accept"
+
+
+def test_tolbert_compiler_trusts_workflow_guarded_learning_guidance_on_low_confidence_paths(
+    tmp_path: Path,
+) -> None:
+    class LowConfidenceDocsClient(FakeTolbertClient):
+        def query(self, **kwargs):
+            payload = super().query(**kwargs)
+            payload["path_prediction"]["confidence_by_level"] = {"1": 0.45, "2": 0.4}
+            payload["retrieval"] = {
+                "branch_scoped": [
+                    {
+                        "span_id": "doc:merge:guard",
+                        "text": "merge workflow notes",
+                        "source_id": "docs/runtime.md",
+                        "span_type": "doc:readme_chunk",
+                        "score": 0.4,
+                        "node_path": [0, 0, 0],
+                        "metadata": {"path": "docs/runtime.md"},
+                    }
+                ],
+                "fallback_scoped": [],
+                "global": [],
+            }
+            return payload
+
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:git_parallel_merge_acceptance_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "git_parallel_merge_acceptance_task",
+                        "benchmark_family": "repo_sandbox",
+                        "procedure": {
+                            "commands": [
+                                "git merge --no-ff worker/api-status -m 'merge worker/api-status' && git merge --no-ff worker/docs-status -m 'merge worker/docs-status' && tests/test_api.sh && tests/test_docs.sh && mkdir -p reports && printf 'accepted worker/api-status for src/api_status.txt and worker/docs-status for docs/status.md into main without collisions\\n' > reports/merge_report.txt && printf 'api suite passed; docs suite passed\\n' > reports/test_report.txt && git add reports/merge_report.txt reports/test_report.txt && git commit -m 'record merge acceptance reports'"
+                            ]
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_branch_results=1,
+        tolbert_global_results=0,
+        learning_artifacts_path=learning_path,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=LowConfidenceDocsClient(),
+    )
+
+    packet = compiler.compile(AgentState(task=TaskBank().get("git_parallel_merge_acceptance_task")))
+
+    assert packet.control["path_confidence"] == pytest.approx(0.4)
+    assert packet.control["trust_retrieval"] is True
+    assert any(
+        span["span_id"].startswith("learning:success_skill:")
+        for span in packet.control["retrieval_guidance"]["recommended_command_spans"]
+    )
 
 
 def test_tolbert_compiler_merges_auxiliary_paper_research_context(tmp_path: Path) -> None:
@@ -818,6 +1328,209 @@ def test_tolbert_compiler_emits_context_compile_subphases(tmp_path: Path) -> Non
         pytest.approx(0.5 * compile_budget_seconds),
     ]
     assert all(payload.get("step_stage") == "context_compile" for payload in observed)
+
+
+def test_tolbert_compiler_uses_task_contract_guidance_for_adjacent_success(tmp_path: Path) -> None:
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_branch_results=1,
+        tolbert_global_results=0,
+        learning_artifacts_path=tmp_path / "learning" / "run_learning_artifacts.json",
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=FakeTolbertClient(),
+    )
+
+    packet = compiler.compile(
+        AgentState(
+            task=TaskSpec(
+                task_id="repo_adjacent",
+                prompt="adjacent",
+                workspace_subdir="repo_adjacent",
+                suggested_commands=[
+                    "mkdir -p repo && printf 'repo ready\\n' > repo/summary.txt",
+                    "cat repo/summary.txt",
+                ],
+                metadata={
+                    "benchmark_family": "repository",
+                    "curriculum_kind": "adjacent_success",
+                    "parent_task": "repo_sync_matrix_task",
+                },
+            )
+        )
+    )
+
+    guidance = packet.control["retrieval_guidance"]
+    assert guidance["recommended_commands"][:2] == [
+        "mkdir -p repo && printf 'repo ready\\n' > repo/summary.txt",
+        "cat repo/summary.txt",
+    ]
+    assert guidance["evidence"][:2] == [
+        "task:repo_adjacent: adjacent success task contract",
+        "task:repo_sync_matrix_task: successful parent episode",
+    ]
+
+
+def test_tolbert_compiler_preserves_adjacent_success_task_contract_while_merging_learning_guidance(
+    tmp_path: Path,
+) -> None:
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:recovery_case:repo_adjacent_parent",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "repo_adjacent_parent",
+                        "benchmark_family": "repository",
+                        "task_metadata": {"curriculum_kind": "failure_recovery"},
+                        "recovery_commands": ["printf 'recovered\\n' > repo/recovery.txt"],
+                        "applicable_tasks": ["repo_adjacent"],
+                        "support_count": 2,
+                    },
+                    {
+                        "candidate_id": "learning:negative_command:repo_adjacent:false",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "repo_adjacent_parent",
+                        "benchmark_family": "repository",
+                        "command": "rm -rf repo",
+                        "verification_reasons": ["it deleted the expected repo state"],
+                        "applicable_tasks": ["repo_adjacent"],
+                        "support_count": 3,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_branch_results=1,
+        tolbert_global_results=0,
+        learning_artifacts_path=learning_path,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=FakeTolbertClient(),
+    )
+
+    packet = compiler.compile(
+        AgentState(
+            task=TaskSpec(
+                task_id="repo_adjacent",
+                prompt="adjacent",
+                workspace_subdir="repo_adjacent",
+                suggested_commands=[
+                    "mkdir -p repo && printf 'repo ready\\n' > repo/summary.txt",
+                    "cat repo/summary.txt",
+                ],
+                metadata={
+                    "benchmark_family": "repository",
+                    "curriculum_kind": "adjacent_success",
+                    "parent_task": "repo_sync_matrix_task",
+                },
+            )
+        )
+    )
+
+    guidance = packet.control["retrieval_guidance"]
+    assert guidance["recommended_commands"][:2] == [
+        "mkdir -p repo && printf 'repo ready\\n' > repo/summary.txt",
+        "cat repo/summary.txt",
+    ]
+    assert "printf 'recovered\\n' > repo/recovery.txt" in guidance["recommended_commands"]
+    assert any("avoid repeating 'rm -rf repo'" in note for note in guidance["avoidance_notes"])
+    assert guidance["evidence"][:2] == [
+        "task:repo_adjacent: adjacent success task contract",
+        "task:repo_sync_matrix_task: successful parent episode",
+    ]
+    assert any("learned recovery_case" in item for item in guidance["evidence"])
+    assert any("learned negative command pattern" in item for item in guidance["evidence"])
+
+
+def test_tolbert_compiler_matches_learning_guidance_via_source_task_alias(tmp_path: Path) -> None:
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:negative_command:config_sync_retrieval_task",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "config_sync_retrieval_task",
+                        "benchmark_family": "workflow",
+                        "command": "cp template.env config/app.env",
+                        "verification_reasons": ["unexpected file content: config/app.env"],
+                        "task_metadata": {
+                            "source_task": "config_sync_task",
+                        },
+                    },
+                    {
+                        "candidate_id": "learning:recovery_case:config_sync_retrieval_task",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "config_sync_retrieval_task",
+                        "benchmark_family": "workflow",
+                        "recovery_commands": ["mkdir -p config && printf 'MODE=prod\\nPORT=8080\\n' > config/app.env"],
+                        "task_metadata": {
+                            "curriculum_kind": "failure_recovery",
+                            "source_task": "config_sync_task",
+                        },
+                        "success": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        storage_backend="json",
+        use_tolbert_context=True,
+        tolbert_branch_results=1,
+        tolbert_global_results=0,
+        learning_artifacts_path=learning_path,
+    )
+    compiler = TolbertContextCompiler(
+        config=config,
+        repo_root=tmp_path,
+        client=FakeTolbertClient(),
+    )
+
+    packet = compiler.compile(
+        AgentState(
+            task=TaskSpec(
+                task_id="fresh_config_repair_task",
+                prompt="repair config",
+                workspace_subdir="fresh_config_repair_task",
+                suggested_commands=[
+                    "mkdir -p config && printf 'MODE=prod\\nPORT=8080\\n' > config/app.env",
+                ],
+                metadata={
+                    "benchmark_family": "workflow",
+                    "curriculum_kind": "failure_recovery",
+                    "source_task": "config_sync_task",
+                },
+            )
+        )
+    )
+
+    guidance = packet.control["retrieval_guidance"]
+    assert "mkdir -p config && printf 'MODE=prod\\nPORT=8080\\n' > config/app.env" in guidance["recommended_commands"]
+    assert any("avoid repeating 'cp template.env config/app.env'" in note for note in guidance["avoidance_notes"])
+    assert any("learned recovery_case" in item for item in guidance["evidence"])
+    assert any("learned negative command pattern" in item for item in guidance["evidence"])
 
 
 def test_tolbert_compiler_guidance_build_encompasses_retrieval_guidance(tmp_path: Path) -> None:
@@ -1021,6 +1734,8 @@ def test_tolbert_service_client_times_out_and_resets(monkeypatch, tmp_path: Path
 
     monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 21.3]))
 
     config = KernelConfig(
         provider="mock",
@@ -1031,6 +1746,7 @@ def test_tolbert_service_client_times_out_and_resets(monkeypatch, tmp_path: Path
         tolbert_source_spans_paths=(str(spans_path),),
         tolbert_cache_paths=(str(checkpoint_path),),
         tolbert_service_timeout_seconds=1,
+        tolbert_service_startup_attempts=1,
     )
     client = TolbertServiceClient(config=config, repo_root=tmp_path)
 
@@ -1070,7 +1786,16 @@ def test_tolbert_service_client_waits_for_startup_ready(monkeypatch, tmp_path: P
         def __init__(self) -> None:
             self._lines = [
                 "transformers warning on stderr\n",
-                json.dumps({"event": "startup_ready", "backend": "tolbert_brain_service"}) + "\n",
+                json.dumps(
+                    {
+                        "event": "startup_ready",
+                        "backend": "tolbert_brain_service",
+                        "pid": 1234,
+                        "cache_shard_count": 2,
+                        "startup_elapsed_seconds": 0.25,
+                    }
+                )
+                + "\n",
             ]
 
         def readline(self):
@@ -1126,12 +1851,62 @@ def test_tolbert_service_client_waits_for_startup_ready(monkeypatch, tmp_path: P
         tolbert_source_spans_paths=(str(spans_path),),
         tolbert_cache_paths=(str(checkpoint_path),),
     )
-    TolbertServiceClient(config=config, repo_root=tmp_path)
+    client = TolbertServiceClient(config=config, repo_root=tmp_path)
+    client._ensure_process()
 
-    assert seen == [
-        "transformers warning on stderr",
-        json.dumps({"event": "startup_ready", "backend": "tolbert_brain_service"}),
-    ]
+    assert seen[0] == "transformers warning on stderr"
+    payload = json.loads(seen[1])
+    assert payload["event"] == "startup_ready"
+    assert payload["backend"] == "tolbert_brain_service"
+    assert "startup_elapsed_seconds" in payload
+
+
+def test_tolbert_service_main_emits_structured_startup_telemetry(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.yaml"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    nodes_path = tmp_path / "nodes.jsonl"
+    label_map_path = tmp_path / "label_map.json"
+    spans_path = tmp_path / "spans.jsonl"
+    cache_path = tmp_path / "cache.pt"
+    config_path.write_text("{}", encoding="utf-8")
+    checkpoint_path.write_bytes(b"stub")
+    nodes_path.write_text("", encoding="utf-8")
+    label_map_path.write_text("{}", encoding="utf-8")
+    spans_path.write_text("", encoding="utf-8")
+    cache_path.write_bytes(b"stub")
+
+    class FakeRuntime:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+            self.shard_names = ["cache-a", "cache-b"]
+
+    monkeypatch.setattr("scripts.tolbert_service.parse_args", lambda: type(
+        "Args",
+        (),
+        {
+            "repo_root": str(tmp_path),
+            "config": str(config_path),
+            "checkpoint": str(checkpoint_path),
+            "nodes": str(nodes_path),
+            "label_map": str(label_map_path),
+            "source_spans": [str(spans_path)],
+            "cache_path": [str(cache_path)],
+            "device": "cpu",
+        },
+    )())
+    monkeypatch.setattr("scripts.tolbert_service.TolbertRuntime", FakeRuntime)
+    monkeypatch.setattr("scripts.tolbert_service.sys.stdin", [])
+
+    from scripts import tolbert_service as service_module
+
+    service_module.main()
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err.strip())
+    assert payload["event"] == "startup_ready"
+    assert payload["device"] == "cpu"
+    assert payload["cache_shard_count"] == 2
+    assert "pid" in payload
+    assert "startup_elapsed_seconds" in payload
 
 
 def test_tolbert_service_client_raises_on_startup_error(monkeypatch, tmp_path: Path) -> None:
@@ -1204,9 +1979,375 @@ def test_tolbert_service_client_raises_on_startup_error(monkeypatch, tmp_path: P
     )
 
     with pytest.raises(RuntimeError, match="CUDA requested but unavailable."):
-        TolbertServiceClient(config=config, repo_root=tmp_path)
+        TolbertServiceClient(config=config, repo_root=tmp_path)._ensure_process()
 
     assert process.terminated is True
+
+
+def test_tolbert_service_client_retries_startup_ready_timeout_once(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    nodes_path = tmp_path / "nodes.jsonl"
+    label_map_path = tmp_path / "label_map.json"
+    spans_path = tmp_path / "spans.jsonl"
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("tolbert_service.py").write_text("print('stub')\n", encoding="utf-8")
+    for path in (config_path, nodes_path, label_map_path, spans_path):
+        path.write_text("{}", encoding="utf-8")
+    checkpoint_path.write_bytes(b"stub")
+
+    created_processes: list[object] = []
+
+    class FakeStderr:
+        def __init__(self, ready: bool) -> None:
+            self._lines = (
+                [json.dumps({"event": "startup_ready", "backend": "tolbert_brain_service"}) + "\n"]
+                if ready
+                else []
+            )
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+        def read(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self, ready: bool):
+            self.stdin = None
+            self.stdout = None
+            self.stderr = FakeStderr(ready)
+            self._poll = None
+            self.terminated = False
+
+        def poll(self):
+            return self._poll
+
+        def terminate(self):
+            self.terminated = True
+            self._poll = 0
+
+        def wait(self, timeout=None):
+            del timeout
+            self._poll = 0
+            return 0
+
+        def kill(self):
+            self._poll = -9
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def select(self, timeout=None):
+            del timeout
+            instance = created_processes[-1]
+            if instance.stderr._lines:
+                return [object()]
+            return []
+
+        def close(self):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        del args, kwargs
+        process = FakeProcess(ready=len(created_processes) > 0)
+        created_processes.append(process)
+        return process
+
+    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(
+        "agent_kernel.tolbert.time.monotonic",
+        _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 11.3]),
+    )
+
+    config = KernelConfig(
+        provider="mock",
+        tolbert_config_path=str(config_path),
+        tolbert_checkpoint_path=str(checkpoint_path),
+        tolbert_nodes_path=str(nodes_path),
+        tolbert_label_map_path=str(label_map_path),
+        tolbert_source_spans_paths=(str(spans_path),),
+        tolbert_cache_paths=(str(checkpoint_path),),
+        tolbert_service_timeout_seconds=1,
+        tolbert_service_startup_attempts=2,
+    )
+
+    client = TolbertServiceClient(config=config, repo_root=tmp_path)
+    client._ensure_process()
+
+    assert client.process is created_processes[-1]
+    assert len(created_processes) == 2
+    assert created_processes[0].terminated is True
+
+
+def test_tolbert_service_client_reports_attempt_count_after_repeated_startup_timeout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    nodes_path = tmp_path / "nodes.jsonl"
+    label_map_path = tmp_path / "label_map.json"
+    spans_path = tmp_path / "spans.jsonl"
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("tolbert_service.py").write_text("print('stub')\n", encoding="utf-8")
+    for path in (config_path, nodes_path, label_map_path, spans_path):
+        path.write_text("{}", encoding="utf-8")
+    checkpoint_path.write_bytes(b"stub")
+
+    created_processes: list[object] = []
+
+    class FakeStderr:
+        def readline(self):
+            return ""
+
+        def read(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = None
+            self.stderr = FakeStderr()
+            self._poll = None
+            self.terminated = False
+
+        def poll(self):
+            return self._poll
+
+        def terminate(self):
+            self.terminated = True
+            self._poll = 0
+
+        def wait(self, timeout=None):
+            del timeout
+            self._poll = 0
+            return 0
+
+        def kill(self):
+            self._poll = -9
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def select(self, timeout=None):
+            del timeout
+            return []
+
+        def close(self):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        del args, kwargs
+        process = FakeProcess()
+        created_processes.append(process)
+        return process
+
+    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(
+        "agent_kernel.tolbert.time.monotonic",
+        _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 11.3, 12.4, 23.5]),
+    )
+
+    config = KernelConfig(
+        provider="mock",
+        tolbert_config_path=str(config_path),
+        tolbert_checkpoint_path=str(checkpoint_path),
+        tolbert_nodes_path=str(nodes_path),
+        tolbert_label_map_path=str(label_map_path),
+        tolbert_source_spans_paths=(str(spans_path),),
+        tolbert_cache_paths=(str(checkpoint_path),),
+        tolbert_service_timeout_seconds=1,
+        tolbert_service_startup_attempts=2,
+    )
+
+    with pytest.raises(RuntimeError, match="attempted startup 2 times"):
+        TolbertServiceClient(config=config, repo_root=tmp_path)._ensure_process()
+
+    assert len(created_processes) == 2
+    assert all(process.terminated is True for process in created_processes)
+
+
+def test_tolbert_service_client_uses_distinct_startup_timeout_budget(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    nodes_path = tmp_path / "nodes.jsonl"
+    label_map_path = tmp_path / "label_map.json"
+    spans_path = tmp_path / "spans.jsonl"
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("tolbert_service.py").write_text("print('stub')\n", encoding="utf-8")
+    for path in (config_path, nodes_path, label_map_path, spans_path):
+        path.write_text("{}", encoding="utf-8")
+    checkpoint_path.write_bytes(b"stub")
+
+    seen_timeouts: list[float | None] = []
+
+    class FakeStderr:
+        def readline(self):
+            return ""
+
+        def read(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = None
+            self.stderr = FakeStderr()
+            self._poll = None
+            self.terminated = False
+
+        def poll(self):
+            return self._poll
+
+        def terminate(self):
+            self.terminated = True
+            self._poll = 0
+
+        def wait(self, timeout=None):
+            del timeout
+            self._poll = 0
+            return 0
+
+        def kill(self):
+            self._poll = -9
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def select(self, timeout=None):
+            seen_timeouts.append(timeout)
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "9")
+    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 9.1, 19.2]))
+
+    config = KernelConfig(
+        provider="mock",
+        tolbert_config_path=str(config_path),
+        tolbert_checkpoint_path=str(checkpoint_path),
+        tolbert_nodes_path=str(nodes_path),
+        tolbert_label_map_path=str(label_map_path),
+        tolbert_source_spans_paths=(str(spans_path),),
+        tolbert_cache_paths=(str(checkpoint_path),),
+        tolbert_service_timeout_seconds=1,
+        tolbert_service_startup_attempts=1,
+    )
+
+    with pytest.raises(RuntimeError, match="failed to become ready after 9.000 seconds"):
+        TolbertServiceClient(config=config, repo_root=tmp_path)._ensure_process()
+
+    assert seen_timeouts[0] == pytest.approx(9.0)
+    assert seen_timeouts[1] == pytest.approx(10.0)
+
+
+def test_tolbert_service_client_keeps_same_process_alive_during_startup_grace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    nodes_path = tmp_path / "nodes.jsonl"
+    label_map_path = tmp_path / "label_map.json"
+    spans_path = tmp_path / "spans.jsonl"
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("tolbert_service.py").write_text("print('stub')\n", encoding="utf-8")
+    for path in (config_path, nodes_path, label_map_path, spans_path):
+        path.write_text("{}", encoding="utf-8")
+    checkpoint_path.write_bytes(b"stub")
+
+    seen_timeouts: list[float | None] = []
+
+    class FakeStderr:
+        def __init__(self) -> None:
+            self._lines = [
+                json.dumps({"event": "startup_ready", "backend": "tolbert_brain_service"}) + "\n"
+            ]
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+        def read(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = None
+            self.stderr = FakeStderr()
+            self._poll = None
+            self.terminated = False
+
+        def poll(self):
+            return self._poll
+
+        def terminate(self):
+            self.terminated = True
+            self._poll = 0
+
+        def wait(self, timeout=None):
+            del timeout
+            self._poll = 0
+            return 0
+
+        def kill(self):
+            self._poll = -9
+
+    class FakeSelector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def select(self, timeout=None):
+            seen_timeouts.append(timeout)
+            self.calls += 1
+            return [] if self.calls == 1 else [object()]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1]))
+
+    config = KernelConfig(
+        provider="mock",
+        tolbert_config_path=str(config_path),
+        tolbert_checkpoint_path=str(checkpoint_path),
+        tolbert_nodes_path=str(nodes_path),
+        tolbert_label_map_path=str(label_map_path),
+        tolbert_source_spans_paths=(str(spans_path),),
+        tolbert_cache_paths=(str(checkpoint_path),),
+        tolbert_service_timeout_seconds=1,
+        tolbert_service_startup_attempts=1,
+    )
+
+    client = TolbertServiceClient(config=config, repo_root=tmp_path)
+    client._ensure_process()
+
+    assert len(seen_timeouts) == 2
+    assert seen_timeouts[0] == pytest.approx(1.0)
+    assert seen_timeouts[1] == pytest.approx(10.0)
+    assert client.process is not None
 
 
 def test_tolbert_service_client_preserves_full_request_controls(monkeypatch, tmp_path: Path) -> None:
@@ -1353,6 +2494,7 @@ def test_tolbert_service_client_close_terminates_live_process(monkeypatch, tmp_p
         tolbert_cache_paths=(str(checkpoint_path),),
     )
     client = TolbertServiceClient(config=config, repo_root=tmp_path)
+    client._ensure_process()
 
     client.close()
 

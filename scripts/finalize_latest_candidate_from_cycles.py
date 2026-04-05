@@ -12,6 +12,59 @@ from agent_kernel.config import KernelConfig
 from agent_kernel.cycle_runner import finalize_cycle
 
 
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _load_trust_breadth_gate(config: KernelConfig) -> dict[str, object]:
+    path = Path(config.unattended_trust_ledger_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "required_families_missing_clean_task_root_breadth": [],
+            "required_family_clean_task_root_counts": {},
+            "family_breadth_min_distinct_task_roots": 0,
+            "bootstrap_finalize_trust_breadth_gate_reason": "",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "required_families_missing_clean_task_root_breadth": [],
+            "required_family_clean_task_root_counts": {},
+            "family_breadth_min_distinct_task_roots": 0,
+            "bootstrap_finalize_trust_breadth_gate_reason": "",
+        }
+    coverage_summary = payload.get("coverage_summary", {})
+    if not isinstance(coverage_summary, dict):
+        coverage_summary = {}
+    missing_families = [
+        str(value).strip()
+        for value in coverage_summary.get("required_families_missing_clean_task_root_breadth", [])
+        if str(value).strip()
+    ]
+    counts = coverage_summary.get("required_family_clean_task_root_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+    threshold = _safe_int(coverage_summary.get("family_breadth_min_distinct_task_roots", 0))
+    details = ", ".join(f"{family}:{_safe_int(counts.get(family, 0))}/{threshold}" for family in missing_families)
+    return {
+        "required_families_missing_clean_task_root_breadth": missing_families,
+        "required_family_clean_task_root_counts": {
+            family: _safe_int(counts.get(family, 0))
+            for family in missing_families
+        },
+        "family_breadth_min_distinct_task_roots": threshold,
+        "bootstrap_finalize_trust_breadth_gate_reason": (
+            f"bootstrap finalize still gated by required clean task-root breadth ({details})"
+            if missing_families and details
+            else ""
+        ),
+    }
+
+
 def _load_last_generate_record(cycles_path: Path, *, subsystem: str | None) -> dict[str, object]:
     last: dict[str, object] | None = None
     requested = str(subsystem or "").strip()
@@ -84,6 +137,9 @@ def _load_frontier_candidate(
         "cycle_id": cycle_id,
         "subsystem": selected_subsystem,
         "candidate_artifact_path": artifact_path,
+        "bootstrap_finalize_trust_breadth_gate_reason": str(
+            candidate.get("bootstrap_finalize_trust_breadth_gate_reason", "")
+        ).strip(),
     }
 
 
@@ -135,11 +191,19 @@ def main() -> None:
             "cycle_id": str(record.get("cycle_id", "")).strip(),
             "subsystem": str(record.get("subsystem", "")).strip(),
             "candidate_artifact_path": str(record.get("candidate_artifact_path", "")).strip(),
+            "bootstrap_finalize_trust_breadth_gate_reason": "",
         }
 
     cycle_id = str(selected.get("cycle_id", "")).strip()
     subsystem = str(selected.get("subsystem", "")).strip()
     candidate_artifact_path = str(selected.get("candidate_artifact_path", "")).strip()
+    trust_breadth_gate_reason = str(selected.get("bootstrap_finalize_trust_breadth_gate_reason", "")).strip()
+
+    if not trust_breadth_gate_reason:
+        config = KernelConfig()
+        trust_breadth_gate_reason = str(
+            _load_trust_breadth_gate(config).get("bootstrap_finalize_trust_breadth_gate_reason", "")
+        ).strip()
 
     implied_cmd = (
         f"python scripts/finalize_improvement_cycle.py"
@@ -173,6 +237,8 @@ def main() -> None:
 
     if args.dry_run:
         print(implied_cmd)
+        if trust_breadth_gate_reason:
+            print(f"finalize_gate_reason={trust_breadth_gate_reason}")
         return
 
     config = KernelConfig()

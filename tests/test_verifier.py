@@ -2,6 +2,7 @@ import json
 from agent_kernel.config import KernelConfig
 from agent_kernel.sandbox import Sandbox
 from agent_kernel.schemas import CommandResult, TaskSpec
+from agent_kernel.shared_repo import bootstrap_shared_repo_seed
 from agent_kernel.task_bank import TaskBank
 from agent_kernel.verifier import Verifier, synthesize_stricter_task
 from urllib import request as url_request
@@ -769,16 +770,7 @@ def test_verifier_accepts_parallel_merge_repo_workflow(tmp_path):
     worker_api = bank.get("git_parallel_worker_api_task")
     worker_docs = bank.get("git_parallel_worker_docs_task")
     task = bank.get("git_parallel_merge_acceptance_task")
-    bootstrap_task = TaskSpec(
-        task_id="parallel_bootstrap",
-        prompt="bootstrap parallel repo",
-        workspace_subdir="parallel_bootstrap",
-        metadata={"workflow_guard": {"managed_paths": ["docs/status.md", "src/api_status.txt", "tests/test_api.sh", "tests/test_docs.sh"]}},
-    )
-
-    for command in worker_api.metadata["shared_repo_bootstrap_commands"]:
-        setup_result = sandbox.run(command, tmp_path, task=bootstrap_task)
-        assert setup_result.exit_code == 0, setup_result.stderr
+    bootstrap_shared_repo_seed(worker_api, workspace=tmp_path, config=config)
     subprocess.run(["git", "checkout", "-b", "worker/api-status"], cwd=tmp_path, check=True, capture_output=True, text=True)
     worker_api_result = sandbox.run(worker_api.suggested_commands[0], tmp_path, task=worker_api)
     assert worker_api_result.exit_code == 0, worker_api_result.stderr
@@ -786,6 +778,139 @@ def test_verifier_accepts_parallel_merge_repo_workflow(tmp_path):
     subprocess.run(["git", "checkout", "-b", "worker/docs-status"], cwd=tmp_path, check=True, capture_output=True, text=True)
     worker_docs_result = sandbox.run(worker_docs.suggested_commands[0], tmp_path, task=worker_docs)
     assert worker_docs_result.exit_code == 0, worker_docs_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    result = sandbox.run(task.suggested_commands[0], tmp_path, task=task)
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_accepts_release_train_repo_workflow(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path,
+        unattended_allow_git_commands=True,
+    )
+    sandbox = Sandbox(timeout_seconds=10, config=config)
+    bank = TaskBank()
+    worker_api = bank.get("git_release_train_worker_api_task")
+    worker_docs = bank.get("git_release_train_worker_docs_task")
+    worker_ops = bank.get("git_release_train_worker_ops_task")
+    task = bank.get("git_release_train_acceptance_task")
+    bootstrap_shared_repo_seed(worker_api, workspace=tmp_path, config=config)
+    subprocess.run(["git", "checkout", "-b", "worker/api-cutover"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_api_result = sandbox.run(worker_api.suggested_commands[0], tmp_path, task=worker_api)
+    assert worker_api_result.exit_code == 0, worker_api_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/docs-cutover"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_docs_result = sandbox.run(worker_docs.suggested_commands[0], tmp_path, task=worker_docs)
+    assert worker_docs_result.exit_code == 0, worker_docs_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/ops-cutover"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_ops_result = sandbox.run(worker_ops.suggested_commands[0], tmp_path, task=worker_ops)
+    assert worker_ops_result.exit_code == 0, worker_ops_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    result = sandbox.run(task.suggested_commands[0], tmp_path, task=task)
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_accepts_release_train_conflict_repo_workflow(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path,
+        unattended_allow_git_commands=True,
+        unattended_allow_generated_path_mutations=True,
+    )
+    sandbox = Sandbox(timeout_seconds=10, config=config)
+    bank = TaskBank()
+    worker_api = bank.get("git_release_train_conflict_worker_api_task")
+    worker_docs = bank.get("git_release_train_conflict_worker_docs_task")
+    worker_ops = bank.get("git_release_train_conflict_worker_ops_task")
+    task = bank.get("git_release_train_conflict_acceptance_task")
+    bootstrap_shared_repo_seed(worker_api, workspace=tmp_path, config=config)
+    subprocess.run(["git", "checkout", "-b", "worker/api-release"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_api_result = sandbox.run(worker_api.suggested_commands[0], tmp_path, task=worker_api)
+    assert worker_api_result.exit_code == 0, worker_api_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/docs-release"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_docs_result = sandbox.run(worker_docs.suggested_commands[0], tmp_path, task=worker_docs)
+    assert worker_docs_result.exit_code == 0, worker_docs_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/ops-release"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_ops_result = sandbox.run(worker_ops.suggested_commands[0], tmp_path, task=worker_ops)
+    assert worker_ops_result.exit_code == 0, worker_ops_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    result = sandbox.run(task.suggested_commands[0], tmp_path, task=task)
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_accepts_parallel_merge_repo_workflow_with_required_branch_artifacts(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path,
+        unattended_allow_git_commands=True,
+    )
+    sandbox = Sandbox(timeout_seconds=10, config=config)
+    bank = TaskBank()
+    worker_api = bank.get("git_parallel_worker_api_task")
+    worker_docs = bank.get("git_parallel_worker_docs_task")
+    task = bank.get("git_parallel_merge_acceptance_task")
+    bootstrap_shared_repo_seed(worker_api, workspace=tmp_path, config=config)
+    subprocess.run(["git", "checkout", "-b", "worker/api-status"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_api_result = sandbox.run(worker_api.suggested_commands[0], tmp_path, task=worker_api)
+    assert worker_api_result.exit_code == 0, worker_api_result.stderr
+    (tmp_path / "reports").mkdir(exist_ok=True)
+    (tmp_path / "reports" / "worker_api-status_report.txt").write_text(
+        "worker/api-status updated src/api_status.txt\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "reports/worker_api-status_report.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "record worker api report"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/docs-status"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_docs_result = sandbox.run(worker_docs.suggested_commands[0], tmp_path, task=worker_docs)
+    assert worker_docs_result.exit_code == 0, worker_docs_result.stderr
+    (tmp_path / "reports").mkdir(exist_ok=True)
+    (tmp_path / "reports" / "worker_docs-status_report.txt").write_text(
+        "worker/docs-status updated docs/status.md\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "reports/worker_docs-status_report.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "record worker docs report"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
     result = sandbox.run(task.suggested_commands[0], tmp_path, task=task)
 
@@ -806,27 +931,7 @@ def test_verifier_rejects_unresolved_generated_conflict_repo_workflow(tmp_path):
     bank = TaskBank()
     worker = bank.get("git_conflict_worker_status_task")
     task = bank.get("git_generated_conflict_resolution_task")
-    bootstrap_task = TaskSpec(
-        task_id="conflict_bootstrap",
-        prompt="bootstrap conflict repo",
-        workspace_subdir="conflict_bootstrap",
-        metadata={
-            "workflow_guard": {
-                "managed_paths": [
-                    "docs/notes.md",
-                    "scripts/generate_bundle.sh",
-                    "src/shared_status.txt",
-                    "tests/test_worker_refresh.sh",
-                    "tests/test_service.sh",
-                    "tests/test_bundle.sh",
-                ]
-            }
-        },
-    )
-
-    for command in worker.metadata["shared_repo_bootstrap_commands"]:
-        setup_result = sandbox.run(command, tmp_path, task=bootstrap_task)
-        assert setup_result.exit_code == 0, setup_result.stderr
+    bootstrap_shared_repo_seed(worker, workspace=tmp_path, config=config)
     subprocess.run(["git", "checkout", "-b", "worker/status-refresh"], cwd=tmp_path, check=True, capture_output=True, text=True)
     worker_result = sandbox.run(worker.suggested_commands[0], tmp_path, task=worker)
     assert worker_result.exit_code == 0, worker_result.stderr
@@ -857,3 +962,28 @@ def test_verifier_rejects_unresolved_generated_conflict_repo_workflow(tmp_path):
 
     assert verification.passed is False
     assert any("git conflict remains unresolved" in reason for reason in verification.reasons)
+
+
+def test_verifier_accepts_generated_conflict_repo_workflow_when_baseline_ref_is_missing(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path,
+        unattended_allow_git_commands=True,
+        unattended_allow_generated_path_mutations=True,
+    )
+    sandbox = Sandbox(timeout_seconds=10, config=config)
+    bank = TaskBank()
+    worker = bank.get("git_conflict_worker_status_task")
+    task = bank.get("git_generated_conflict_resolution_task")
+    bootstrap_shared_repo_seed(worker, workspace=tmp_path, config=config)
+    subprocess.run(["git", "tag", "-d", "baseline"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "worker/status-refresh"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    worker_result = sandbox.run(worker.suggested_commands[0], tmp_path, task=worker)
+    assert worker_result.exit_code == 0, worker_result.stderr
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    result = sandbox.run(task.suggested_commands[0], tmp_path, task=task)
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True

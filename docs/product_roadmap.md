@@ -39,6 +39,23 @@ For product purposes, "does things on your behalf" means all of the following ho
 - reporting clear enough that a user can trust the result after the fact
 - model-comparison discipline strong enough that a learned runtime only gains authority by beating the retained baseline
 
+## Real-World Coding Capability
+
+For this repo, "real-world coding capability" is narrower than open-ended autonomy and stronger than one-step format matching. It means the kernel can reliably handle work such as:
+
+- multi-file edits that preserve existing working artifacts instead of rewriting whole files blindly
+- deterministic test repair and targeted validation on the paths it actually touched
+- repo workflows that require branch hygiene, diff summaries, semantic review packets, or merge-safe worker ownership
+- partial progress under ambiguity where the agent leaves the workspace in a better auditable state even before full completion
+- recovery and rollback after failed or rejected attempts
+- acceptance based on useful semantic outcomes, not only exact-string matches on toy files
+
+Current limitation to keep explicit:
+
+- the runtime can already do bounded localized code repair without a full syntax-aware stack
+- but it still lacks a first-class AST/CST-backed edit layer for symbol-aware transformations and syntax-native validation
+- that missing layer is best understood as a motor/control gap inside the coding product, not as the entire remaining gap to autonomous software engineering
+
 ## Non-Goals
 
 This roadmap does not by itself claim:
@@ -51,6 +68,9 @@ This roadmap does not by itself claim:
 - that a checkpoint becomes trusted merely because it trains successfully
 
 It is a product benchmark that should tighten the runtime while the broader substrate work continues.
+
+The honest current description is narrower than "coding AGI": the repo now has materially real long-horizon software execution, governed retention, canary, rollback, and trust steering, but it still relies heavily on bounded task design, runtime guards, explicit workflow structure, and family-specific recovery improvements. The remaining benchmark gap is not naming. It is repeated unattended proof across broader software families with trust evidence deep enough that the governed machinery deserves wider authority.
+The docs should also say one more thing plainly: the live coding runtime is still not meaningfully syntax-aware. That does not mean the kernel lacks all software understanding, and it does not mean AST tooling is the same thing as general software agency. Human engineers mostly succeed through rich semantic context, repo traversal, and workflow reasoning, not by consciously manipulating ASTs. But for a digital kernel, explicit source structure is still a valuable missing motor aid. It can make localized symbol-aware edits, signature/import propagation, and cheap syntactic preflight materially more reliable than pure text traversal.
 
 ## Runtime Roadmap
 
@@ -151,6 +171,7 @@ What exists in the repo now:
 - a first unattended run outcome taxonomy with `success`, `safe_stop`, and `unsafe_ambiguous`
 - a first unattended task report that records commands, verifier state, before/after workspace snapshots,
   changed-file hashes, contract-accounted side effects, and final workspace files
+- unattended task reports and trust ledgers now also classify `light_supervision` work explicitly, so the kernel can measure objective-only or near-objective-only independent wins separately from heavily guided runs
 - rollback-aware workspace recovery for non-success outcomes
 - bounded `http_request` support alongside bounded workspace execution
 - operator policy and capability policy gates for unattended execution
@@ -317,6 +338,51 @@ The highest-signal remaining product gaps are:
 - the capability system supports bounded core actions and scoped modules, but real external adapters are still sparse
 - there is not yet enough empirical evidence on false passes, hidden side effects, and repeated walk-away success
 - the current learned-runtime product is still mostly retrieval-centered rather than policy/value/transition-centered
+
+## Ten-Agent Acceleration Target
+
+If the repo has ten Codex workers available at once, the fastest honest route is not to label the system AGI. It is to compress the remaining product and liftoff blockers in parallel.
+
+Use this split:
+
+1. `trust_repository`
+   Success target: raise counted unattended executable evidence on `repository` until trust is no longer shallow bootstrap-only coverage.
+2. `trust_project`
+   Success target: do the same for `project`.
+3. `trust_integration`
+   Success target: close the explicit required-family evidence gap on `integration`.
+4. `supervisor_rollout`
+   Success target: widen from newly real non-protected governed retain/canary/rollback into repeated trusted rollout evidence, with candidate-family trust debt steering materially improving the next unattended rounds instead of stopping at isolated gated actions.
+   Current path: let lane-local `light_supervision_clean_success` evidence bridge eligible non-protected families into governed `canary` before unrelated global bootstrap debt has cleared, while still requiring trusted overall posture before broad rollout.
+5. `runtime_stability`
+   Success target: eliminate long-horizon timeout and post-verifier bookkeeping loss so generated followups survive the bounded runtime envelope.
+6. `world_state`
+   Success target: improve long-horizon hotspot detection and learned recovery guidance.
+7. `planner_recovery`
+   Success target: reduce repeated low-yield executor loops by escalating earlier into planner/critic-guided repair.
+8. `task_ecology`
+   Success target: generate harder repo/workflow/integration tasks with verifier-clean contracts and useful failure surfaces.
+9. `memory_retrieval`
+   Success target: widen trusted retrieval influence beyond isolated selected-only steps so prior evidence affects later coding behavior.
+   Current path: keep trusted retrieval carryover visible in live planner/critic payloads, let long-horizon continuation turns reuse aligned trusted retrieval-backed repair commands before recompiling unchanged context, and feed verified long-horizon carryover repairs back into retrieval proposal generation so the subsystem can prefer successful trace procedures over blind activation bootstrap; on missing-artifact recovery turns, allow trusted write patterns to synthesize the current target write while still deferring to workspace-preview structured edits for in-place repairs.
+10. `tolbert_runtime`
+   Success target: produce repeated retained checkpoint wins on approved families so liftoff evidence is model-native rather than wrapper-native.
+
+Cross-cutting unattended-evidence rule:
+
+- bounded compare selection should prefer tasks whose contracts are already strong `light_supervision_candidate` surfaces, so scarce unattended slots are spent on verifier-clean primary work instead of retrieval/replay tails
+- generated curriculum scheduling should preserve that same bias, so adjacent-success and failure-recovery follow-ons continue from `light_supervision_candidate` primaries instead of reintroducing weak retrieval/replay-heavy tails in later waves
+- generated long-horizon scheduling should also preserve structural diversity while doing that: keep complete shared-repo worker/integrator bundles coherent, demote duplicate project-stage integrator variants behind distinct follow-ons, and keep late-wave coverage-expanding tails ahead of saturated same-family phase transitions
+- generated failure-recovery scheduling should preserve recovery-surface diversity under that same contract bias, so later waves do not collapse into one repeated file-recovery or replay-heavy pattern when broader repository, workflow, or integration repair evidence is available
+- generated failure tasks from contract-clean primary failures should also inherit a deeper runtime budget and a distinct trust-evidence label, so the kernel can measure whether deeper verifier-clean recovery follow-ons are becoming real unattended breadth instead of just cleaner seed ranking
+- compare eval output should surface those contract-clean generated recovery runs as their own slice, with explicit long-horizon pass-rate tracking by origin family, so recovery-depth improvements are visible in the harness instead of only in trust-ledger rollups
+- supervisor and liftoff reporting should surface the same bridge evidence directly, so `autonomy_widening_summary` and `LiftoffGateReport` show when lane-local light-supervision depth is sufficient for governed `canary` even before the whole system has reached trusted broad autonomy
+
+Operating rule:
+
+- one worker may handle orchestration, frontier refresh, and queue edits only when needed
+- all other workers should stay in disjoint owned surfaces and close out through machine-readable frontier artifacts
+- the campaign is successful only if it changes `dry_run`, `compare_only`, `bootstrap`, and `shadow_only` status surfaces, not merely local capability anecdotes
 - the modeling package boundary exists, but the planned `tolbert/`, `policy/`, `world/`, `training/`, and `evaluation/` liftoff surfaces are still thin
 - there is not yet a family-routing and liftoff-gate product layer where retained TOLBERT checkpoints can become authoritative in a governed way
 - the current world-state substrate is explicit and symbolic; the open-world latent runtime still needs learned state-space components on top

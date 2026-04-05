@@ -61,8 +61,16 @@ class EvalMetrics:
     tolbert_shadow_episodes_by_benchmark_family: dict[str, int] = field(default_factory=dict)
     tolbert_primary_episodes_by_benchmark_family: dict[str, int] = field(default_factory=dict)
     proposal_metrics_by_benchmark_family: dict[str, dict[str, object]] = field(default_factory=dict)
+    proposal_metrics_by_difficulty: dict[str, dict[str, object]] = field(default_factory=dict)
     world_feedback_summary: dict[str, object] = field(default_factory=dict)
     world_feedback_by_benchmark_family: dict[str, dict[str, object]] = field(default_factory=dict)
+    world_feedback_by_difficulty: dict[str, dict[str, object]] = field(default_factory=dict)
+    long_horizon_persistence_summary: dict[str, object] = field(default_factory=dict)
+    contract_clean_failure_recovery_summary: dict[str, object] = field(default_factory=dict)
+    contract_clean_failure_recovery_by_origin_benchmark_family: dict[str, dict[str, object]] = field(
+        default_factory=dict
+    )
+    transfer_alignment_summary: dict[str, object] = field(default_factory=dict)
     task_outcomes: dict[str, dict[str, object]] = field(default_factory=dict)
     task_trajectories: dict[str, dict[str, object]] = field(default_factory=dict)
 

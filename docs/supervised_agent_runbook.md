@@ -20,6 +20,8 @@ Each worker must:
 4. run only scoped `--generate-only` loops unless explicitly acting as coordinator
 5. write closeout findings back to the work queue
 
+That `--generate-only` rule is a coordination rule for parallel workers, not a statement that the kernel is still compare-only. Eligible non-protected lanes now have a real governed retain/canary/rollback path when the coordinator runs promotion in the appropriate mode.
+
 ## Read Order
 
 1. [`docs/ai_agent_status.md`](/data/agentkernel/docs/ai_agent_status.md)
@@ -54,6 +56,28 @@ Required claim fields:
 - inspect the frontier report before deciding what to run
 - prefer one bounded loop plus one repair over many blind loops
 - do not leave claims open without a terminal status
+
+## Ten-Agent Burst Mode
+
+When ten Codex workers are available, use the dispatch targets in [`docs/supervised_work_queue.md`](/data/agentkernel/docs/supervised_work_queue.md) as the primary split:
+
+1. `trust_repository`
+2. `trust_project`
+3. `trust_integration`
+4. `supervisor_rollout`
+5. `runtime_stability`
+6. `world_state`
+7. `planner_recovery`
+8. `task_ecology`
+9. `memory_retrieval`
+10. `tolbert_runtime`
+
+Burst-mode rules:
+
+- claim one dispatch target and stay inside its preferred surfaces
+- do not duplicate a live dispatch target unless the queue explicitly records a handoff or split
+- use `supervised_runner__codex_main` for coordination only; worker claims should prefer `supervised_runner__open*`
+- if your work changes the repo's measured posture, land that change in machine-readable frontier outputs and then summarize it in the queue
 
 ## Default Commands
 
@@ -105,6 +129,12 @@ python scripts/run_frontier_promotion_pass.py \
   --apply-finalize \
   --allow-bootstrap-finalize
 ```
+
+Coordinator rollout note:
+
+- eligible non-protected lanes can now move past compare-only into governed finalize, one-round canary observation, rollback on trust regression, and post-rollback validation before promotion resumes
+- protected lanes still keep the stricter review-only and rollout-stage gates from [`config/supervisor_meta_policy.json`](/data/agentkernel/config/supervisor_meta_policy.json)
+- use the supervisor and promotion-pass reports as the authority for whether a lane is promotion-eligible; do not infer eligibility from the existence of a candidate artifact alone
 
 Protected first-retain note:
 

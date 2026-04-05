@@ -10,8 +10,10 @@ from evals.metrics import EvalMetrics
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.modeling.training_backends import (
+    artifact_training_env,
     build_training_backend_launch,
     discover_training_backends,
+    qwen_artifact_training_env,
     resolve_training_backend,
     tolbert_artifact_training_env,
 )
@@ -135,6 +137,55 @@ def test_tolbert_artifact_training_env_exports_head_dataset_paths(tmp_path: Path
     assert env["AGENTKERNEL_TOLBERT_ENABLED_HEADS"] == "policy,transition,value,stop"
     assert env["AGENTKERNEL_TOLBERT_PARENT_CHECKPOINT_PATH"].endswith("tolbert_parent.pt")
     assert env["AGENTKERNEL_TOLBERT_CHECKPOINT_DELTA_OUTPUT_PATH"].endswith("tolbert_epoch2__delta.pt")
+
+
+def test_qwen_artifact_training_env_exports_dataset_and_output_paths(tmp_path: Path) -> None:
+    payload = {
+        "artifact_kind": "qwen_adapter_bundle",
+        "base_model_name": "Qwen/Qwen3.5-9B",
+        "training_objective": "qlora_sft",
+        "supported_benchmark_families": ["repository", "workflow"],
+        "training_dataset_manifest": {
+            "manifest_path": str(tmp_path / "dataset" / "manifest.json"),
+            "train_dataset_path": str(tmp_path / "dataset" / "train.jsonl"),
+            "eval_dataset_path": str(tmp_path / "dataset" / "eval.jsonl"),
+        },
+        "runtime_paths": {
+            "adapter_output_dir": str(tmp_path / "adapter"),
+            "merged_output_dir": str(tmp_path / "merged"),
+            "adapter_manifest_path": str(tmp_path / "adapter" / "artifact.json"),
+        },
+    }
+
+    env = qwen_artifact_training_env(payload)
+
+    assert env["AGENTKERNEL_QWEN_BASE_MODEL_NAME"] == "Qwen/Qwen3.5-9B"
+    assert env["AGENTKERNEL_QWEN_TRAINING_OBJECTIVE"] == "qlora_sft"
+    assert env["AGENTKERNEL_QWEN_DATASET_MANIFEST_PATH"].endswith("manifest.json")
+    assert env["AGENTKERNEL_QWEN_TRAIN_DATASET_PATH"].endswith("train.jsonl")
+    assert env["AGENTKERNEL_QWEN_EVAL_DATASET_PATH"].endswith("eval.jsonl")
+    assert env["AGENTKERNEL_QWEN_ADAPTER_OUTPUT_DIR"].endswith("adapter")
+    assert env["AGENTKERNEL_QWEN_MERGED_OUTPUT_DIR"].endswith("merged")
+    assert env["AGENTKERNEL_QWEN_SUPPORTED_BENCHMARK_FAMILIES"] == "repository,workflow"
+
+
+def test_artifact_training_env_routes_by_artifact_kind(tmp_path: Path) -> None:
+    tolbert_payload = {
+        "artifact_kind": "tolbert_model_bundle",
+        "training_inputs": {
+            "training_inputs_manifest_path": str(tmp_path / "tolbert" / "training_inputs_manifest.json"),
+        },
+    }
+    qwen_payload = {
+        "artifact_kind": "qwen_adapter_bundle",
+        "base_model_name": "Qwen/Qwen3.5-9B",
+    }
+
+    tolbert_env = artifact_training_env(tolbert_payload)
+    qwen_env = artifact_training_env(qwen_payload)
+
+    assert tolbert_env["AGENTKERNEL_TOLBERT_TRAINING_INPUTS_MANIFEST_PATH"].endswith("training_inputs_manifest.json")
+    assert qwen_env["AGENTKERNEL_QWEN_BASE_MODEL_NAME"] == "Qwen/Qwen3.5-9B"
 
 
 def test_run_training_backend_script_lists_discovered_backends(tmp_path: Path, monkeypatch) -> None:
@@ -283,6 +334,56 @@ def test_run_training_backend_script_loads_tolbert_artifact_env(tmp_path: Path, 
     payload = json.loads(stream.getvalue())
     assert payload["env"]["AGENTKERNEL_TOLBERT_POLICY_EXAMPLES_PATH"].endswith("policy_examples.jsonl")
     assert payload["env"]["AGENTKERNEL_TOLBERT_ENABLED_HEADS"] == "policy,transition,value,stop"
+
+
+def test_run_training_backend_script_loads_generic_qwen_artifact_env(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script_module("run_training_backend.py")
+    repo_root = tmp_path / "repo"
+    _write_backend_fixture(repo_root)
+    artifact_path = tmp_path / "qwen_adapter" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "qwen_adapter_bundle",
+                "base_model_name": "Qwen/Qwen3.5-9B",
+                "training_objective": "qlora_sft",
+                "training_dataset_manifest": {
+                    "manifest_path": str(tmp_path / "dataset" / "manifest.json"),
+                    "train_dataset_path": str(tmp_path / "dataset" / "train.jsonl"),
+                    "eval_dataset_path": str(tmp_path / "dataset" / "eval.jsonl"),
+                },
+                "runtime_paths": {
+                    "adapter_output_dir": str(tmp_path / "adapter"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_training_backend.py",
+            "--repo-root",
+            str(repo_root),
+            "--backend",
+            "state_space_causal_machine",
+            "--artifact",
+            str(artifact_path),
+            "--dry-run",
+            "1",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["env"]["AGENTKERNEL_QWEN_BASE_MODEL_NAME"] == "Qwen/Qwen3.5-9B"
+    assert payload["env"]["AGENTKERNEL_QWEN_TRAINING_OBJECTIVE"] == "qlora_sft"
+    assert payload["env"]["AGENTKERNEL_QWEN_ADAPTER_OUTPUT_DIR"].endswith("adapter")
 
 
 def test_tolbert_model_candidate_artifact_exposes_external_training_backends(monkeypatch, tmp_path: Path) -> None:

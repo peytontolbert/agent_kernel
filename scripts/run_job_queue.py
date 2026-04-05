@@ -160,6 +160,7 @@ def _job_readiness(
         if getattr(job, "last_error", ""):
             blocker_details.append(str(getattr(job, "last_error", "")).strip())
     return {
+        "benchmark_family": str(metadata.get("benchmark_family", "bounded")).strip() or "bounded",
         "acceptance": acceptance,
         "acceptance_ready": acceptance_ready,
         "promoted": promoted,
@@ -237,6 +238,7 @@ def _job_payload(job: object, readiness: dict[str, object]) -> dict[str, object]
     acceptance = readiness.get("acceptance", {})
     return {
         "job": job.to_dict() if hasattr(job, "to_dict") else {},
+        "benchmark_family": str(readiness.get("benchmark_family", "")).strip(),
         "acceptance": dict(acceptance) if isinstance(acceptance, dict) else {},
         "readiness": _readiness_payload(readiness),
         "latest_scheduler_decision": _latest_scheduler_decision(job),
@@ -263,6 +265,190 @@ def _queue_blocker_counts(jobs_with_readiness: list[tuple[object, dict[str, obje
                 continue
             counts[token] = counts.get(token, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _queue_family_rollups(jobs_with_readiness: list[tuple[object, dict[str, object]]]) -> dict[str, dict[str, object]]:
+    families: dict[str, dict[str, object]] = {}
+    for job, readiness in jobs_with_readiness:
+        family = str(readiness.get("benchmark_family", "")).strip() or "bounded"
+        rollup = families.setdefault(
+            family,
+            {
+                "total_jobs": 0,
+                "runnable_jobs": 0,
+                "blocked_jobs": 0,
+                "promotable_jobs": 0,
+                "worker_jobs": 0,
+                "integrator_jobs": 0,
+                "budget_groups": set(),
+            },
+        )
+        rollup["total_jobs"] = int(rollup["total_jobs"]) + 1
+        if bool(readiness.get("runnable", False)):
+            rollup["runnable_jobs"] = int(rollup["runnable_jobs"]) + 1
+        if bool(readiness.get("blocked", False)):
+            rollup["blocked_jobs"] = int(rollup["blocked_jobs"]) + 1
+        if bool(readiness.get("promotable", False)):
+            rollup["promotable_jobs"] = int(rollup["promotable_jobs"]) + 1
+        if bool(readiness.get("worker_job", False)):
+            rollup["worker_jobs"] = int(rollup["worker_jobs"]) + 1
+        if bool(readiness.get("integrator_job", False)):
+            rollup["integrator_jobs"] = int(rollup["integrator_jobs"]) + 1
+        budget_group = str(getattr(job, "budget_group", "")).strip()
+        if budget_group:
+            budget_groups = rollup.get("budget_groups", set())
+            if isinstance(budget_groups, set):
+                budget_groups.add(budget_group)
+    return {
+        family: {
+            "total_jobs": int(rollup["total_jobs"]),
+            "runnable_jobs": int(rollup["runnable_jobs"]),
+            "blocked_jobs": int(rollup["blocked_jobs"]),
+            "promotable_jobs": int(rollup["promotable_jobs"]),
+            "worker_jobs": int(rollup["worker_jobs"]),
+            "integrator_jobs": int(rollup["integrator_jobs"]),
+            "budget_groups": sorted(
+                str(group).strip()
+                for group in rollup.get("budget_groups", set())
+                if str(group).strip()
+            ),
+        }
+        for family, rollup in sorted(families.items())
+    }
+
+
+def _active_lease_role_rollup(
+    jobs_with_readiness: list[tuple[object, dict[str, object]]],
+    leases: list[dict[str, object]],
+) -> dict[str, object]:
+    job_readiness = {
+        str(getattr(job, "job_id", "")).strip(): readiness
+        for job, readiness in jobs_with_readiness
+        if str(getattr(job, "job_id", "")).strip()
+    }
+    benchmark_families: dict[str, int] = {}
+    budget_groups: dict[str, int] = {}
+    shared_repo_ids: dict[str, int] = {}
+    worker_jobs = 0
+    integrator_jobs = 0
+    other_jobs = 0
+    for lease in leases:
+        if not isinstance(lease, dict):
+            continue
+        job_id = str(lease.get("job_id", "")).strip()
+        readiness = job_readiness.get(job_id, {})
+        if bool(readiness.get("worker_job", False)):
+            worker_jobs += 1
+        elif bool(readiness.get("integrator_job", False)):
+            integrator_jobs += 1
+        else:
+            other_jobs += 1
+        family = str(readiness.get("benchmark_family", "")).strip() or "bounded"
+        benchmark_families[family] = benchmark_families.get(family, 0) + 1
+        budget_group = str(lease.get("budget_group", "")).strip()
+        if budget_group:
+            budget_groups[budget_group] = budget_groups.get(budget_group, 0) + 1
+        shared_repo_id = str(lease.get("shared_repo_id", "")).strip()
+        if shared_repo_id:
+            shared_repo_ids[shared_repo_id] = shared_repo_ids.get(shared_repo_id, 0) + 1
+    return {
+        "total": worker_jobs + integrator_jobs + other_jobs,
+        "worker_jobs": worker_jobs,
+        "integrator_jobs": integrator_jobs,
+        "other_jobs": other_jobs,
+        "benchmark_families": dict(sorted(benchmark_families.items())),
+        "budget_groups": dict(sorted(budget_groups.items())),
+        "shared_repo_ids": dict(sorted(shared_repo_ids.items())),
+    }
+
+
+def _acceptance_review_entry(
+    job: object,
+    readiness: dict[str, object],
+    *,
+    config: KernelConfig,
+    bank: TaskBank,
+) -> dict[str, object]:
+    task = resolve_job_task(bank, job)
+    runtime_task = prepare_runtime_task(
+        task,
+        runtime_overrides=getattr(job, "runtime_overrides", {}),
+        job_id=getattr(job, "job_id", ""),
+    )
+    metadata = dict(getattr(runtime_task, "metadata", {}))
+    workflow_guard = (
+        dict(metadata.get("workflow_guard", {}))
+        if isinstance(metadata.get("workflow_guard", {}), dict)
+        else {}
+    )
+    semantic_verifier = (
+        dict(metadata.get("semantic_verifier", {}))
+        if isinstance(metadata.get("semantic_verifier", {}), dict)
+        else {}
+    )
+    acceptance = dict(readiness.get("acceptance", {})) if isinstance(readiness.get("acceptance", {}), dict) else {}
+    merged_branches = [
+        str(branch).strip()
+        for branch in acceptance.get("merged_branches", [])
+        if str(branch).strip()
+    ] if isinstance(acceptance.get("merged_branches", []), list) else []
+    if not merged_branches:
+        merged_branches = [
+            str(branch).strip()
+            for branch in semantic_verifier.get("required_merged_branches", [])
+            if str(branch).strip()
+        ] if isinstance(semantic_verifier.get("required_merged_branches", []), list) else []
+    benchmark_family = str(readiness.get("benchmark_family", "bounded")).strip() or "bounded"
+    return {
+        "job": _job_payload(job, readiness),
+        "benchmark_family": benchmark_family,
+        "shared_repo_id": str(workflow_guard.get("shared_repo_id", "")).strip(),
+        "target_branch": (
+            str(acceptance.get("target_branch", "")).strip()
+            or str(workflow_guard.get("target_branch", "")).strip()
+        ),
+        "expected_branch": (
+            str(acceptance.get("expected_branch", "")).strip()
+            or str(workflow_guard.get("worker_branch", "")).strip()
+        ),
+        "merged_branches": merged_branches,
+        "report_path": str(getattr(job, "report_path", "")).strip(),
+        "checkpoint_path": str(getattr(job, "checkpoint_path", "")).strip(),
+        "trust_family": _family_trust_summary(config, family=benchmark_family),
+    }
+
+
+def _acceptance_review_rollup(entries: list[dict[str, object]]) -> dict[str, object]:
+    benchmark_families: dict[str, int] = {}
+    shared_repo_ids: dict[str, int] = {}
+    target_branches: dict[str, int] = {}
+    promotable_jobs = 0
+    promoted_jobs = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        job_payload = entry.get("job", {})
+        readiness = job_payload.get("readiness", {}) if isinstance(job_payload, dict) else {}
+        if bool(readiness.get("promotable", False)):
+            promotable_jobs += 1
+        if bool(readiness.get("promoted", False)):
+            promoted_jobs += 1
+        family = str(entry.get("benchmark_family", "")).strip() or "bounded"
+        benchmark_families[family] = benchmark_families.get(family, 0) + 1
+        shared_repo_id = str(entry.get("shared_repo_id", "")).strip()
+        if shared_repo_id:
+            shared_repo_ids[shared_repo_id] = shared_repo_ids.get(shared_repo_id, 0) + 1
+        target_branch = str(entry.get("target_branch", "")).strip()
+        if target_branch:
+            target_branches[target_branch] = target_branches.get(target_branch, 0) + 1
+    return {
+        "total_jobs": len(entries),
+        "promotable_jobs": promotable_jobs,
+        "promoted_jobs": promoted_jobs,
+        "benchmark_families": dict(sorted(benchmark_families.items())),
+        "shared_repo_ids": dict(sorted(shared_repo_ids.items())),
+        "target_branches": dict(sorted(target_branches.items())),
+    }
 
 
 def _capability_scope_entries(capability_policy: dict[str, object]) -> list[dict[str, object]]:
@@ -442,6 +628,12 @@ def _build_parser() -> argparse.ArgumentParser:
     promotable.add_argument("--show-blockers", choices=("0", "1"), default="0")
     promotable.add_argument("--json", action="store_true")
 
+    acceptance_review = subparsers.add_parser("acceptance-review")
+    acceptance_review.add_argument("--state", action="append", default=None)
+    acceptance_review.add_argument("--show-blockers", choices=("0", "1"), default="0")
+    acceptance_review.add_argument("--include-promoted", choices=("0", "1"), default="0")
+    acceptance_review.add_argument("--json", action="store_true")
+
     inspect = subparsers.add_parser("inspect")
     inspect.add_argument("--job-id", required=True)
     inspect.add_argument("--json", action="store_true")
@@ -509,6 +701,7 @@ def main() -> None:
                 notes=str(args.notes).strip(),
                 runtime_overrides=_runtime_overrides_from_args(args),
                 max_queued_jobs_for_budget_group=max(0, int(config.delegated_job_max_queued_per_budget_group)),
+                task_bank=runtime_bank,
             )
         ]
         for job in jobs:
@@ -518,7 +711,7 @@ def main() -> None:
             )
         return
 
-    if args.command in {"list", "promotable", "next-runnable", "inspect", "promote"}:
+    if args.command in {"list", "promotable", "acceptance-review", "next-runnable", "inspect", "promote"}:
         states = set(getattr(args, "state", None) or [])
         repo_root = Path(__file__).resolve().parents[1]
         show_blockers = getattr(args, "show_blockers", "0") == "1" or (
@@ -529,6 +722,12 @@ def main() -> None:
             getattr(args, "ready_to_accept_only", "0") == "1" if args.command == "list" else False
         )
         promotable_only = args.command == "promotable"
+        acceptance_review_only = args.command == "acceptance-review"
+        include_promoted = (
+            getattr(args, "include_promoted", "0") == "1"
+            if acceptance_review_only
+            else False
+        )
         jobs_with_readiness = [
             (job, _job_readiness(queue, job, config=config, repo_root=repo_root, bank=runtime_bank))
             for job in queue.list_jobs(states=states or None)
@@ -698,6 +897,72 @@ def main() -> None:
                 print(json.dumps({"job": None}, indent=2))
                 return
             print("no_runnable_job=1")
+            return
+        if acceptance_review_only:
+            review_entries: list[dict[str, object]] = []
+            for job, readiness in jobs_with_readiness:
+                if not bool(readiness.get("integrator_job", False)):
+                    continue
+                if not bool(readiness.get("acceptance_ready", False)):
+                    continue
+                if not include_promoted and bool(readiness.get("promoted", False)):
+                    continue
+                review_entries.append(
+                    _acceptance_review_entry(
+                        job,
+                        readiness,
+                        config=config,
+                        bank=runtime_bank,
+                    )
+                )
+            review_summary = _acceptance_review_rollup(review_entries)
+            if getattr(args, "json", False):
+                print(json.dumps({"review": review_summary, "jobs": review_entries}, indent=2))
+                return
+            print(
+                "acceptance_review "
+                f"total_jobs={int(review_summary['total_jobs'])} "
+                f"promotable_jobs={int(review_summary['promotable_jobs'])} "
+                f"promoted_jobs={int(review_summary['promoted_jobs'])} "
+                f"families={','.join(f'{name}:{count}' for name, count in review_summary['benchmark_families'].items()) or '-'} "
+                f"shared_repos={','.join(f'{name}:{count}' for name, count in review_summary['shared_repo_ids'].items()) or '-'} "
+                f"target_branches={','.join(f'{name}:{count}' for name, count in review_summary['target_branches'].items()) or '-'}"
+            )
+            for entry in review_entries:
+                if not isinstance(entry, dict):
+                    continue
+                job_payload = entry.get("job", {})
+                if not isinstance(job_payload, dict):
+                    continue
+                job_dict = job_payload.get("job", {})
+                readiness = job_payload.get("readiness", {})
+                trust_family = entry.get("trust_family", {})
+                if not isinstance(job_dict, dict) or not isinstance(readiness, dict):
+                    continue
+                print(
+                    f"job_id={str(job_dict.get('job_id', '')).strip()} "
+                    f"state={str(job_dict.get('state', '')).strip()} "
+                    f"task_id={str(job_dict.get('task_id', '')).strip()} "
+                    f"priority={int(job_dict.get('priority', 0))} "
+                    f"outcome={str(job_dict.get('outcome', '')).strip()} "
+                    f"shared_repo_id={str(entry.get('shared_repo_id', '')).strip() or '-'} "
+                    f"target_branch={str(entry.get('target_branch', '')).strip() or '-'} "
+                    f"merged_branches={','.join(str(value).strip() for value in entry.get('merged_branches', []) if str(value).strip()) or '-'} "
+                    f"promotable={int(bool(readiness.get('promotable', False)))} "
+                    f"promoted={int(bool(readiness.get('promoted', False)))} "
+                    f"trust_status={str(trust_family.get('status', '')).strip() or '-'} "
+                    f"report_path={str(entry.get('report_path', '')).strip() or '-'}"
+                    + (
+                        ""
+                        if not show_blockers
+                        else " "
+                        + (
+                            f"blocked={int(bool(readiness.get('blocked', False)))} "
+                            f"blocked_by={','.join(str(value).strip() for value in readiness.get('blockers', []) if str(value).strip()) or '-'} "
+                            f"blocker_details={';'.join(str(value).strip() for value in readiness.get('blocker_details', []) if str(value).strip()) or '-'}"
+                        )
+                    )
+                )
             return
         filtered_jobs: list[dict[str, object]] = []
         for job, readiness in jobs_with_readiness:
@@ -905,6 +1170,8 @@ def main() -> None:
             ((job, readiness) for job, readiness in jobs_with_readiness if bool(readiness.get("runnable", False))),
             None,
         )
+        family_rollups = _queue_family_rollups(jobs_with_readiness)
+        active_lease_roles = _active_lease_role_rollup(jobs_with_readiness, leases if isinstance(leases, list) else [])
         if json_mode:
             payload = {
                 "policy": dict(policy) if isinstance(policy, dict) else {},
@@ -940,6 +1207,7 @@ def main() -> None:
                     },
                     "state_counts": _queue_state_counts(jobs_with_readiness),
                     "blocker_counts": _queue_blocker_counts(jobs_with_readiness),
+                    "benchmark_families": family_rollups,
                     "decision_counts": dict(sorted(decision_counts.items())),
                     "fairness": {
                         "blocked_open_jobs": blocked_open_jobs,
@@ -955,6 +1223,7 @@ def main() -> None:
                     "budget_groups": dict(snapshot.get("budget_groups", {}))
                     if isinstance(snapshot.get("budget_groups", {}), dict)
                     else {},
+                    "active_lease_roles": active_lease_roles,
                     "active_leases": [
                         dict(lease)
                         for lease in leases
@@ -992,6 +1261,18 @@ def main() -> None:
         blocker_counts = _queue_blocker_counts(jobs_with_readiness)
         if blocker_counts:
             print("queue_blockers " + " ".join(f"{name}={count}" for name, count in blocker_counts.items()))
+        for family, rollup in family_rollups.items():
+            print(
+                "queue_family "
+                f"family={family} "
+                f"total_jobs={rollup['total_jobs']} "
+                f"runnable_jobs={rollup['runnable_jobs']} "
+                f"blocked_jobs={rollup['blocked_jobs']} "
+                f"promotable_jobs={rollup['promotable_jobs']} "
+                f"worker_jobs={rollup['worker_jobs']} "
+                f"integrator_jobs={rollup['integrator_jobs']} "
+                f"budget_groups={','.join(rollup['budget_groups']) or '-'}"
+            )
         print(
             "queue_fairness "
             f"blocked_open_jobs={blocked_open_jobs} "
@@ -1004,6 +1285,16 @@ def main() -> None:
             "scheduler_streak "
             f"budget_group={str(scheduler.get('last_selected_budget_group', '')).strip() or '-'} "
             f"consecutive={int(scheduler.get('consecutive_budget_group_selections', 0))}"
+        )
+        print(
+            "active_roles "
+            f"total={int(active_lease_roles['total'])} "
+            f"worker_leases={int(active_lease_roles['worker_jobs'])} "
+            f"integrator_leases={int(active_lease_roles['integrator_jobs'])} "
+            f"other_leases={int(active_lease_roles['other_jobs'])} "
+            f"families={','.join(f'{name}:{count}' for name, count in active_lease_roles['benchmark_families'].items()) or '-'} "
+            f"budget_groups={','.join(f'{name}:{count}' for name, count in active_lease_roles['budget_groups'].items()) or '-'} "
+            f"shared_repos={','.join(f'{name}:{count}' for name, count in active_lease_roles['shared_repo_ids'].items()) or '-'}"
         )
         if next_runnable is None:
             print("next_runnable no_runnable_job=1")

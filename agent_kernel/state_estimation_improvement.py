@@ -7,6 +7,7 @@ from pathlib import Path
 from evals.metrics import EvalMetrics
 
 from .config import KernelConfig
+from .improvement_catalog import catalog_string_set
 from .improvement_common import (
     build_standard_proposal_artifact,
     ensure_proposals,
@@ -15,45 +16,11 @@ from .improvement_common import (
     retention_gate_preset,
 )
 
-STATE_ESTIMATION_PROPOSAL_AREAS = {
-    "transition_normalization",
-    "risk_sensitivity",
-    "recovery_bias",
-}
-STATE_ESTIMATION_GENERATION_FOCI = {
-    "balanced",
-    "transition_normalization",
-    "risk_sensitivity",
-    "recovery_bias",
-}
-STATE_ESTIMATION_TRANSITION_CONTROL_KEYS = {
-    "no_progress_progress_epsilon",
-    "min_state_change_score_for_progress",
-    "regression_path_budget",
-    "regression_severity_weight",
-    "progress_recovery_credit",
-}
-STATE_ESTIMATION_LATENT_CONTROL_KEYS = {
-    "advancing_completion_ratio",
-    "advancing_progress_delta",
-    "improving_progress_delta",
-    "regressing_progress_delta",
-    "regressive_regression_count",
-    "blocked_forbidden_count",
-    "active_path_budget",
-    "learned_world_progress_threshold",
-    "learned_world_risk_threshold",
-    "learned_world_blend_weight",
-}
-STATE_ESTIMATION_POLICY_CONTROL_KEYS = {
-    "regressive_path_match_bonus",
-    "regressive_cleanup_bonus",
-    "blocked_command_bonus",
-    "advancing_path_match_bonus",
-    "trusted_retrieval_path_bonus",
-    "learned_world_progress_bonus",
-    "learned_world_risk_penalty",
-}
+STATE_ESTIMATION_PROPOSAL_AREAS = catalog_string_set("state_estimation", "proposal_areas")
+STATE_ESTIMATION_GENERATION_FOCI = catalog_string_set("state_estimation", "generation_foci")
+STATE_ESTIMATION_TRANSITION_CONTROL_KEYS = catalog_string_set("state_estimation", "transition_control_keys")
+STATE_ESTIMATION_LATENT_CONTROL_KEYS = catalog_string_set("state_estimation", "latent_control_keys")
+STATE_ESTIMATION_POLICY_CONTROL_KEYS = catalog_string_set("state_estimation", "policy_control_keys")
 
 
 def build_state_estimation_proposal_artifact(

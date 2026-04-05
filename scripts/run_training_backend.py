@@ -12,10 +12,10 @@ import argparse
 
 from agent_kernel.modeling.model_python import preferred_model_python_path
 from agent_kernel.modeling.training_backends import (
+    artifact_training_env,
     build_training_backend_launch,
     discover_training_backends,
     resolve_training_backend,
-    tolbert_artifact_training_env,
 )
 
 
@@ -51,6 +51,7 @@ def main() -> None:
     parser.add_argument("--backend", default="state_space_causal_machine")
     parser.add_argument("--python", default=str(preferred_model_python_path() or Path(sys.executable)))
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--artifact", default="")
     parser.add_argument("--tolbert-artifact", default="")
     parser.add_argument("--env", action="append", default=[])
     parser.add_argument("--arg", action="append", default=[])
@@ -82,13 +83,14 @@ def main() -> None:
     if not bool(manifest.get("trainer_exists", False)):
         raise SystemExit(f"training backend entrypoint is missing: {manifest.get('trainer_path', '')}")
     env_overrides = _parse_env_overrides(args.env)
-    artifact_path = Path(str(args.tolbert_artifact).strip()) if str(args.tolbert_artifact).strip() else None
+    raw_artifact_path = str(args.artifact).strip() or str(args.tolbert_artifact).strip()
+    artifact_path = Path(raw_artifact_path) if raw_artifact_path else None
     if artifact_path is not None:
         try:
             artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             artifact_payload = {}
-        env_overrides.update(tolbert_artifact_training_env(artifact_payload))
+        env_overrides.update(artifact_training_env(artifact_payload))
     launch = build_training_backend_launch(
         manifest,
         python_bin=args.python,

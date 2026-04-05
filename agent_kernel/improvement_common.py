@@ -3,141 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-_RETENTION_GATE_PRESETS: dict[str, dict[str, Any]] = {
-    "benchmark": {
-        "min_pass_rate_delta_abs": 0.02,
-        "require_family_discrimination": True,
-        "max_false_failure_rate": 0.02,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-    },
-    "curriculum": {
-        "min_generated_pass_rate_delta_abs": 0.02,
-        "require_failure_recovery_improvement": True,
-        "max_base_lane_regression": 0.0,
-        "max_regressed_families": 0,
-        "max_generated_regressed_families": 0,
-        "required_confirmation_runs": 2,
-    },
-    "verifier": {
-        "min_discrimination_gain": 0.02,
-        "max_false_failure_rate": 0.01,
-        "require_contract_strictness": True,
-        "required_confirmation_runs": 2,
-        "require_candidate_family_eval": True,
-    },
-    "policy": {
-        "min_pass_rate_delta_abs": 0.01,
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-    },
-    "universe": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_universe_improvement": True,
-        "min_prior_retained_universe_cycles": 2,
-        "min_cross_family_support": 2,
-        "constitution_cooldown_cycles": 2,
-    },
-    "world_model": {
-        "min_pass_rate_delta_abs": 0.0,
-        "max_step_regression": 0.0,
-        "max_low_confidence_episode_regression": 0,
-        "min_first_step_success_delta": 0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-    },
-    "state_estimation": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_state_estimation_improvement": True,
-        "max_no_state_progress_termination_delta": 0,
-        "max_state_regression_trace_delta": 0,
-        "min_paired_trajectory_non_regression_rate": 0.5,
-        "min_regressive_recovery_rate_delta": 0.0,
-    },
-    "trust": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_trust_control_improvement": True,
-    },
-    "recovery": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_recovery_control_improvement": True,
-    },
-    "delegation": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_delegation_control_improvement": True,
-    },
-    "operator_policy": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_operator_policy_improvement": True,
-    },
-    "transition_model": {
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "required_confirmation_runs": 2,
-        "require_transition_model_improvement": True,
-    },
-    "capabilities": {
-        "require_non_regression": True,
-        "max_step_regression": 0.0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "max_regressed_families": 0,
-        "require_capability_surface_growth": True,
-        "required_confirmation_runs": 2,
-    },
-    "retrieval": {
-        "min_pass_rate_delta_abs": 0.02,
-        "require_family_discrimination": True,
-        "max_false_failure_rate": 0.02,
-        "require_failure_recovery_non_regression": True,
-        "required_confirmation_runs": 2,
-        "max_regressed_families": 0,
-        "max_step_regression": 0.0,
-    },
-    "tolbert_model": {
-        "min_pass_rate_delta_abs": 0.0,
-        "max_step_regression": 0.0,
-        "max_regressed_families": 0,
-        "max_low_confidence_episode_regression": 0,
-        "min_first_step_confidence_delta": 0.0,
-        "min_trusted_retrieval_delta": 0,
-        "require_generated_lane_non_regression": True,
-        "require_failure_recovery_non_regression": True,
-        "proposal_gate_by_benchmark_family": {},
-        "required_confirmation_runs": 2,
-    },
-}
+from .improvement_catalog import catalog_object
 
 
 def normalized_generation_focus(focus: str | None, *, default: str = "balanced") -> str:
@@ -200,7 +66,12 @@ def retained_sequence_section(
 
 
 def retention_gate_preset(preset: str, **overrides: Any) -> dict[str, Any]:
-    gate = deepcopy(_RETENTION_GATE_PRESETS.get(preset, {}))
+    presets = catalog_object("improvement", "retention_gate_presets")
+    if not isinstance(presets, dict):
+        presets = {}
+    gate = deepcopy(presets.get(preset, {}))
+    if not isinstance(gate, dict):
+        gate = {}
     for key, value in overrides.items():
         gate[str(key)] = deepcopy(value)
     return gate

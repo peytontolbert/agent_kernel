@@ -146,6 +146,7 @@ class VLLMClient:
         last_data: dict[str, Any] | None = None
         last_error: Exception | None = None
         for prompt in attempts:
+            parsed: dict[str, Any] | None = None
             try:
                 data = self._chat_completion(
                     system_prompt=system_prompt,
@@ -160,8 +161,21 @@ class VLLMClient:
                     prompt=prompt,
                     use_json_schema=False,
                 )
-            last_data = data
-            parsed = self._extract_decision(data)
+                last_data = data
+                parsed = self._extract_decision(data)
+            else:
+                last_data = data
+                parsed = self._extract_decision(data)
+                if parsed is None:
+                    # Some Qwen/vLLM stacks spend the completion budget in reasoning
+                    # and leave content empty even when the transport succeeds.
+                    data = self._chat_completion(
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        use_json_schema=False,
+                    )
+                    last_data = data
+                    parsed = self._extract_decision(data)
             if parsed is not None:
                 return parsed
         if last_error is not None:
@@ -183,6 +197,7 @@ class VLLMClient:
             ],
             "temperature": 0,
             "max_tokens": 1024,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if use_json_schema:
             payload["response_format"] = {
@@ -220,7 +235,10 @@ class VLLMClient:
                 for part in content
                 if isinstance(part, dict)
             )
-        return _extract_json_object(str(content))
+        parsed = _extract_json_object(str(content))
+        if parsed is not None:
+            return parsed
+        return _extract_json_object(str(message.get("reasoning", "")))
 
 
 class MockLLMClient:
@@ -392,6 +410,7 @@ def _compact_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
         "latest_state_transition": state_payload.get("latest_state_transition", {}),
         "plan": state_payload.get("plan", [])[:4],
         "active_subgoal": state_payload.get("active_subgoal", ""),
+        "active_subgoal_diagnosis": state_payload.get("active_subgoal_diagnosis", {}),
         "acting_role": state_payload.get("acting_role", ""),
         "state_context_chunks": state_payload.get("state_context_chunks", [])[:8],
         "allowed_actions": state_payload.get("allowed_actions", []),

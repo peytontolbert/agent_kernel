@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
 import json
+import re
 import subprocess
 
 from agent_kernel.config import KernelConfig
@@ -26,9 +27,293 @@ from agent_kernel.runtime_supervision import (
 )
 from agent_kernel.trust import build_unattended_trust_ledger
 
+REPEATED_UNSAMPLED_PRIORITY_WEIGHT_STEP = 1.0
+REPEATED_UNSAMPLED_PRIORITY_TASK_LIMIT_STEP = 1
+_REPEATED_CHILD_GENERATED_SUCCESS_COMPLETION_GRACE_SECONDS = 120.0
+_REPEATED_CHILD_GENERATED_FAILURE_SEED_ACTIVE_GRACE_SECONDS = 240.0
+_REPEATED_CHILD_GENERATED_FAILURE_SEED_COMPLETION_GRACE_SECONDS = 180.0
+_REPEATED_CHILD_GENERATED_FAILURE_ACTIVE_GRACE_SECONDS = 180.0
+_REPEATED_CHILD_GENERATED_FAILURE_COMPLETION_GRACE_SECONDS = 180.0
+_REPEATED_CHILD_METRICS_FINALIZE_GRACE_SECONDS = 120.0
+_REPEATED_CHILD_FINALIZE_GRACE_SECONDS = 120.0
+
+
+def _status_path(config: KernelConfig) -> Path:
+    return config.improvement_reports_dir / "repeated_improvement_status.json"
+
+
+def _ordered_unique_strings(*groups: object) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for values in groups:
+        if isinstance(values, str):
+            candidates = [values]
+        elif isinstance(values, (list, tuple, set)):
+            candidates = [str(value) for value in values]
+        else:
+            candidates = []
+        for value in candidates:
+            normalized = str(value).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
+
 
 def _runtime_env(config: KernelConfig) -> dict[str, str]:
     return config.to_env()
+
+
+def _parse_progress_fields(line: str) -> dict[str, object]:
+    normalized = str(line).strip()
+    if not normalized:
+        return {}
+    parsed: dict[str, object] = {}
+    phase_match = re.search(r"phase=(?P<phase>[A-Za-z0-9_:-]+)", normalized)
+    if phase_match:
+        parsed["last_progress_phase"] = str(phase_match.group("phase")).strip()
+    observe_match = re.search(
+        r"observe complete passed=(?P<passed>\d+)/(?P<total>\d+) pass_rate=(?P<pass_rate>[0-9.]+) "
+        r"generated_pass_rate=(?P<generated_pass_rate>[0-9.]+)",
+        normalized,
+    )
+    if observe_match:
+        parsed["observe_summary"] = {
+            "passed": int(observe_match.group("passed")),
+            "total": int(observe_match.group("total")),
+            "pass_rate": float(observe_match.group("pass_rate")),
+            "generated_pass_rate": float(observe_match.group("generated_pass_rate")),
+        }
+        parsed["observe_completed"] = True
+    selected_match = re.search(r"campaign \d+/\d+ select subsystem=(?P<subsystem>[a-z_]+)", normalized)
+    if selected_match:
+        parsed["selected_subsystem"] = str(selected_match.group("subsystem")).strip()
+    phase_total_match = re.search(r"phase=(?P<phase>[A-Za-z0-9_:-]+) total=(?P<total>\d+)", normalized)
+    if phase_total_match:
+        phase_name = str(phase_total_match.group("phase")).strip()
+        parsed[f"{phase_name}_total"] = int(phase_total_match.group("total"))
+    variant_search_match = re.search(
+        r"variant_search start subsystem=(?P<subsystem>[a-z_]+) selected_variants=(?P<count>\d+) "
+        r"variant_ids=(?P<variant_ids>[A-Za-z0-9_,.-]+)",
+        normalized,
+    )
+    if variant_search_match:
+        parsed["selected_subsystem"] = str(variant_search_match.group("subsystem")).strip()
+        parsed["selected_variants"] = int(variant_search_match.group("count"))
+        parsed["selected_variant_ids"] = [
+            token
+            for token in str(variant_search_match.group("variant_ids")).split(",")
+            if str(token).strip()
+        ]
+    generate_match = re.search(
+        r"variant generate complete subsystem=(?P<subsystem>[a-z_]+) "
+        r"variant=(?P<variant>[A-Za-z0-9_:-]+) artifact=(?P<artifact>\S+)",
+        normalized,
+    )
+    if generate_match:
+        parsed["selected_subsystem"] = str(generate_match.group("subsystem")).strip()
+        parsed["last_candidate_variant"] = str(generate_match.group("variant")).strip()
+        parsed["last_candidate_artifact_path"] = str(generate_match.group("artifact")).strip()
+    finalize_match = re.search(
+        r"finalize phase=(?P<phase>[A-Za-z0-9_:-]+) subsystem=(?P<subsystem>[a-z_]+)",
+        normalized,
+    )
+    if finalize_match:
+        parsed["selected_subsystem"] = str(finalize_match.group("subsystem")).strip()
+        parsed["finalize_phase"] = str(finalize_match.group("phase")).strip()
+    phase_task_match = re.search(
+        r"phase=(?P<phase>[A-Za-z0-9_:-]+) task (?P<index>\d+)/(?P<total>\d+) "
+        r"(?P<task_id>\S+) family=(?P<family>[a-z_]+)",
+        normalized,
+    )
+    if phase_task_match:
+        phase_name = str(phase_task_match.group("phase")).strip()
+        parsed["current_task"] = {
+            "index": int(phase_task_match.group("index")),
+            "total": int(phase_task_match.group("total")),
+            "task_id": str(phase_task_match.group("task_id")).strip(),
+            "family": str(phase_task_match.group("family")).strip(),
+            "phase": phase_name,
+        }
+        if phase_name:
+            parsed["last_progress_phase"] = phase_name
+        if int(phase_task_match.group("index")) >= int(phase_task_match.group("total")):
+            parsed[f"{phase_name}_completed"] = True
+    else:
+        task_match = re.search(
+            r"task (?P<index>\d+)/(?P<total>\d+) (?P<task_id>\S+) family=(?P<family>[a-z_]+)",
+            normalized,
+        )
+        if task_match:
+            parsed["current_task"] = {
+                "index": int(task_match.group("index")),
+                "total": int(task_match.group("total")),
+                "task_id": str(task_match.group("task_id")).strip(),
+                "family": str(task_match.group("family")).strip(),
+            }
+    return parsed
+
+
+def _child_runtime_extension_plan(
+    *,
+    last_progress_phase: str,
+    current_task: dict[str, object] | None,
+) -> tuple[str, float]:
+    normalized_phase = str(last_progress_phase).strip()
+    task_payload = current_task if isinstance(current_task, dict) else {}
+    task_phase = str(task_payload.get("phase", "")).strip() or normalized_phase
+    task_index = int(task_payload.get("index", 0) or 0)
+    task_total = int(task_payload.get("total", 0) or 0)
+    task_completed = task_total > 0 and task_index >= task_total
+    if task_phase == "generated_success" and task_completed:
+        return (
+            "generated_success_completion",
+            _REPEATED_CHILD_GENERATED_SUCCESS_COMPLETION_GRACE_SECONDS,
+        )
+    if task_phase == "generated_failure_seed":
+        if task_completed:
+            return (
+                "generated_failure_seed_completion",
+                _REPEATED_CHILD_GENERATED_FAILURE_SEED_COMPLETION_GRACE_SECONDS,
+            )
+        return (
+            "generated_failure_seed_active",
+            _REPEATED_CHILD_GENERATED_FAILURE_SEED_ACTIVE_GRACE_SECONDS,
+        )
+    if task_phase == "generated_failure":
+        if task_completed:
+            return (
+                "generated_failure_completion",
+                _REPEATED_CHILD_GENERATED_FAILURE_COMPLETION_GRACE_SECONDS,
+            )
+        return (
+            "generated_failure_active",
+            _REPEATED_CHILD_GENERATED_FAILURE_ACTIVE_GRACE_SECONDS,
+        )
+    if normalized_phase == "metrics_finalize":
+        return ("metrics_finalize", _REPEATED_CHILD_METRICS_FINALIZE_GRACE_SECONDS)
+    if normalized_phase == "finalize":
+        return ("finalize", _REPEATED_CHILD_FINALIZE_GRACE_SECONDS)
+    return ("", 0.0)
+
+
+def _progress_sampled_families(
+    active_cycle_run: dict[str, object] | None,
+    priority_benchmark_families: list[str],
+) -> list[str]:
+    if not isinstance(active_cycle_run, dict):
+        return []
+    current_task = active_cycle_run.get("current_task", {})
+    if not isinstance(current_task, dict):
+        return []
+    family = str(current_task.get("family", "")).strip()
+    if not family:
+        return []
+    if priority_benchmark_families:
+        return [family] if family in set(priority_benchmark_families) else []
+    return [family]
+
+
+def _partial_progress_summary(
+    active_cycle_run: dict[str, object] | None,
+    *,
+    priority_benchmark_families: list[str],
+) -> dict[str, object]:
+    if not isinstance(active_cycle_run, dict):
+        return {}
+    observe_summary = active_cycle_run.get("observe_summary", {})
+    if not isinstance(observe_summary, dict):
+        observe_summary = {}
+    sampled_families = _ordered_unique_strings(
+        active_cycle_run.get("sampled_families_from_progress", []),
+        _progress_sampled_families(active_cycle_run, priority_benchmark_families),
+    )
+    last_progress_phase = str(active_cycle_run.get("last_progress_phase", "")).strip()
+    generated_success_total = int(active_cycle_run.get("generated_success_total", 0) or 0)
+    generated_success_completed = bool(active_cycle_run.get("generated_success_completed", False))
+    current_task = active_cycle_run.get("current_task", {})
+    if not isinstance(current_task, dict):
+        current_task = {}
+    if (
+        not generated_success_completed
+        and str(current_task.get("phase", "")).strip() == "generated_success"
+        and int(current_task.get("index", 0) or 0) > 0
+        and int(current_task.get("index", 0) or 0) >= int(current_task.get("total", 0) or 0)
+    ):
+        generated_success_completed = True
+    generated_success_started = (
+        generated_success_total > 0
+        or str(last_progress_phase).startswith("generated_success")
+        or str(current_task.get("phase", "")).strip() == "generated_success"
+    )
+    observe_completed = (
+        bool(active_cycle_run.get("observe_completed", False))
+        or int(observe_summary.get("total", 0) or 0) > 0
+        or generated_success_started
+    )
+    partial_productive = observe_completed or generated_success_started or bool(sampled_families)
+    priority_unsampled = [
+        family for family in priority_benchmark_families if family not in set(sampled_families)
+    ]
+    return {
+        "observe_completed": observe_completed,
+        "observe_summary": observe_summary,
+        "generated_success_started": generated_success_started,
+        "generated_success_total": generated_success_total,
+        "generated_success_completed": generated_success_completed,
+        "last_progress_phase": last_progress_phase,
+        "sampled_families_from_progress": sampled_families,
+        "priority_families_without_progress_sampling": priority_unsampled,
+        "candidate_generated": bool(str(active_cycle_run.get("last_candidate_artifact_path", "")).strip()),
+        "productive_partial": partial_productive,
+    }
+
+
+def _append_partial_run_from_active_progress(
+    *,
+    runs: list[dict[str, object]],
+    active_cycle_run: dict[str, object] | None,
+    priority_benchmark_families: list[str],
+    returncode: int,
+    stderr: str,
+    timed_out: bool = False,
+    timeout_reason: str = "",
+    interrupted: bool = False,
+) -> dict[str, object] | None:
+    progress = _partial_progress_summary(
+        active_cycle_run,
+        priority_benchmark_families=priority_benchmark_families,
+    )
+    if not bool(progress.get("productive_partial", False)):
+        return None
+    current_run = active_cycle_run if isinstance(active_cycle_run, dict) else {}
+    synthetic_run = {
+        "index": int(current_run.get("index", len(runs) + 1) or (len(runs) + 1)),
+        "returncode": int(returncode),
+        "stdout": "",
+        "stderr": str(stderr).strip(),
+        "timed_out": bool(timed_out),
+        "timeout_reason": str(timeout_reason).strip(),
+        "priority_benchmark_families": list(priority_benchmark_families),
+        "priority_benchmark_family_weights": dict(current_run.get("priority_benchmark_family_weights", {}))
+        if isinstance(current_run.get("priority_benchmark_family_weights", {}), dict)
+        else {},
+        "partial_progress": progress,
+        "partial_productive": bool(progress.get("productive_partial", False)),
+        "partial_candidate_generated": bool(progress.get("candidate_generated", False)),
+        "productive": bool(progress.get("productive_partial", False)),
+        "retained_gain": False,
+        "campaign_cycle_ids": [],
+        "runtime_managed_decisions": 0,
+        "runtime_managed_retained_cycles": 0,
+        "runtime_managed_rejected_cycles": 0,
+        "decision_conversion_state": "partial_productive_without_decision",
+    }
+    if interrupted:
+        synthetic_run["interrupted"] = True
+    runs.append(synthetic_run)
+    return synthetic_run
 
 
 def _priority_benchmark_family_weights(values: list[str] | None) -> dict[str, float]:
@@ -48,6 +333,100 @@ def _priority_benchmark_family_weights(values: list[str] | None) -> dict[str, fl
         if family and weight > 0.0:
             weights[family] = weight
     return weights
+
+
+def _reroute_priority_families_for_unsampled_pressure(
+    priority_families: list[str],
+    priority_family_weights: dict[str, float],
+    unsampled_priority_families: list[str],
+) -> dict[str, object]:
+    normalized_families = [str(value).strip() for value in priority_families if str(value).strip()]
+    normalized_unsampled = [
+        family for family in [str(value).strip() for value in unsampled_priority_families if str(value).strip()]
+        if family in set(normalized_families)
+    ]
+    if not normalized_families or not normalized_unsampled:
+        return {
+            "applied": False,
+            "reason": "no_unsampled_priority_families",
+            "priority_benchmark_families": normalized_families,
+            "priority_benchmark_family_weights": dict(priority_family_weights),
+            "weight_bonus_by_family": {},
+            "unsampled_priority_families": [],
+        }
+    reordered_families = _ordered_unique_strings(normalized_unsampled, normalized_families)
+    effective_weights = {
+        family: float(priority_family_weights.get(family, 0.0) or 0.0)
+        for family in reordered_families
+    }
+    max_existing_weight = max([weight for weight in effective_weights.values() if weight > 0.0], default=1.0)
+    rerouted_weights = dict(effective_weights)
+    weight_bonus_by_family: dict[str, float] = {}
+    for index, family in enumerate(normalized_unsampled):
+        target_weight = max_existing_weight + (
+            REPEATED_UNSAMPLED_PRIORITY_WEIGHT_STEP * float(len(normalized_unsampled) - index)
+        )
+        original_weight = rerouted_weights.get(family, 0.0)
+        rerouted_weights[family] = max(original_weight, round(target_weight, 6))
+        weight_bonus = round(rerouted_weights[family] - original_weight, 6)
+        if weight_bonus > 0.0:
+            weight_bonus_by_family[family] = weight_bonus
+    return {
+        "applied": True,
+        "reason": "unsampled_priority_families",
+        "priority_benchmark_families": reordered_families,
+        "priority_benchmark_family_weights": rerouted_weights,
+        "weight_bonus_by_family": weight_bonus_by_family,
+        "unsampled_priority_families": normalized_unsampled,
+    }
+
+
+def _reroute_task_budget_for_unsampled_pressure(
+    *,
+    current_task_limit: int,
+    max_task_limit: int,
+    priority_families: list[str],
+    unsampled_priority_families: list[str],
+) -> dict[str, object]:
+    normalized_families = [str(value).strip() for value in priority_families if str(value).strip()]
+    normalized_unsampled = [
+        family for family in [str(value).strip() for value in unsampled_priority_families if str(value).strip()]
+        if family in set(normalized_families)
+    ]
+    bounded_current_task_limit = max(0, int(current_task_limit))
+    bounded_max_task_limit = max(0, int(max_task_limit))
+    minimum_family_task_limit = min(bounded_max_task_limit, len(normalized_families)) if bounded_max_task_limit > 0 else 0
+    if (
+        bounded_current_task_limit <= 0
+        or bounded_max_task_limit <= bounded_current_task_limit
+        or not normalized_families
+        or not normalized_unsampled
+    ):
+        return {
+            "applied": False,
+            "reason": "no_unsampled_priority_budget_reroute",
+            "current_task_limit": bounded_current_task_limit,
+            "next_task_limit": bounded_current_task_limit,
+            "task_limit_delta": 0,
+            "minimum_family_task_limit": minimum_family_task_limit,
+            "unsampled_priority_families": normalized_unsampled,
+        }
+    target_task_limit = min(
+        bounded_max_task_limit,
+        max(
+            bounded_current_task_limit + (REPEATED_UNSAMPLED_PRIORITY_TASK_LIMIT_STEP * len(normalized_unsampled)),
+            minimum_family_task_limit,
+        ),
+    )
+    return {
+        "applied": target_task_limit > bounded_current_task_limit,
+        "reason": "unsampled_priority_task_budget" if target_task_limit > bounded_current_task_limit else "task_limit_already_sufficient",
+        "current_task_limit": bounded_current_task_limit,
+        "next_task_limit": target_task_limit,
+        "task_limit_delta": max(0, target_task_limit - bounded_current_task_limit),
+        "minimum_family_task_limit": minimum_family_task_limit,
+        "unsampled_priority_families": normalized_unsampled,
+    }
 
 
 def _run_and_stream(
@@ -153,6 +532,10 @@ def _run_and_stream(
     max_silence = max(0.0, float(max_silence_seconds))
     max_runtime = max(0.0, float(max_runtime_seconds))
     max_progress_stall = max(0.0, float(max_progress_stall_seconds))
+    last_progress_phase = ""
+    current_task: dict[str, object] = {}
+    runtime_grace_keys: set[str] = set()
+    runtime_deadline = started_at + max_runtime if max_runtime > 0.0 else 0.0
     try:
         while True:
             events = selector.select(timeout=1.0)
@@ -167,6 +550,13 @@ def _run_and_stream(
                     last_output_at = now
                     if "[cycle:" in line or "[eval:" in line or "[repeated]" in line or "finalize phase=" in line:
                         last_progress_at = now
+                        parsed_progress = _parse_progress_fields(line)
+                        phase_name = str(parsed_progress.get("last_progress_phase", "")).strip()
+                        if phase_name:
+                            last_progress_phase = phase_name
+                        parsed_task = parsed_progress.get("current_task", {})
+                        if isinstance(parsed_task, dict) and parsed_task:
+                            current_task = dict(parsed_task)
                     print(line, end="", file=sys.stderr, flush=True)
                     _emit_event(
                         {
@@ -199,11 +589,35 @@ def _run_and_stream(
                     }
                 )
                 last_heartbeat_at = now
-            if max_runtime > 0.0 and runtime_elapsed >= max_runtime:
+            if runtime_deadline > 0.0 and now >= runtime_deadline:
+                grace_key, extension_seconds = _child_runtime_extension_plan(
+                    last_progress_phase=last_progress_phase,
+                    current_task=current_task,
+                )
+                if grace_key and extension_seconds > 0.0 and grace_key not in runtime_grace_keys:
+                    runtime_grace_keys.add(grace_key)
+                    runtime_deadline = now + extension_seconds
+                    _emit_event(
+                        {
+                            "event": "runtime_grace",
+                            "pid": process_pid,
+                            "progress_label": progress_label or "run_improvement_cycle",
+                            "timestamp": time.time(),
+                            "runtime_seconds": int(runtime_elapsed),
+                            "grace_seconds": int(extension_seconds),
+                            "grace_key": grace_key,
+                            "last_progress_phase": last_progress_phase,
+                            "current_task": dict(current_task),
+                        }
+                    )
+                    continue
                 terminate_process_tree(process)
                 return _timeout_result(
                     reason=f"child exceeded max runtime of {int(max_runtime)} seconds",
-                    details={"runtime_seconds": int(runtime_elapsed)},
+                    details={
+                        "runtime_seconds": int(runtime_elapsed),
+                        "last_progress_phase": last_progress_phase,
+                    },
                 )
             if max_silence > 0.0 and silence >= max_silence:
                 terminate_process_tree(process)
@@ -248,6 +662,80 @@ def _is_runtime_managed_artifact_path(path: str) -> bool:
     return not (lowered.startswith("/tmp/") or "pytest-" in lowered or "/tests/" in lowered)
 
 
+def _reconcile_incomplete_cycles(
+    *,
+    config: KernelConfig,
+    planner: ImprovementPlanner,
+    progress_label: str | None,
+) -> list[dict[str, object]]:
+    reconciled: list[dict[str, object]] = []
+    for summary in planner.incomplete_cycle_summaries(config.improvement_cycles_path, protocol="autonomous"):
+        cycle_id = str(summary.get("cycle_id", "")).strip()
+        subsystem = str(summary.get("subsystem", "")).strip()
+        if not cycle_id or not subsystem:
+            continue
+        active_artifact_path = (
+            str(summary.get("active_artifact_path", "")).strip()
+            or str(summary.get("artifact_path", "")).strip()
+        )
+        candidate_artifact_path = str(summary.get("candidate_artifact_path", "")).strip()
+        artifact_kind = str(summary.get("artifact_kind", "")).strip() or "retention_decision"
+        reason = (
+            "cycle ended before retention finalization; recorded fail-closed rejection "
+            "for stale incomplete autonomous cycle"
+        )
+        metrics_summary = {
+            "protocol": "autonomous",
+            "protocol_match_id": str(summary.get("protocol_match_id", "")).strip(),
+            "incomplete_cycle": True,
+            "reconciled_at": datetime.now(timezone.utc).isoformat(),
+            "last_state": str(summary.get("last_state", "")).strip(),
+            "last_action": str(summary.get("last_action", "")).strip(),
+            "selected_variant_id": str(summary.get("selected_variant_id", "")).strip(),
+            "record_count": int(summary.get("record_count", 0) or 0),
+            "selected_cycles": int(summary.get("selected_cycles", 0) or 0),
+        }
+        planner.append_cycle_record(
+            config.improvement_cycles_path,
+            ImprovementCycleRecord(
+                cycle_id=cycle_id,
+                state="reject",
+                subsystem=subsystem,
+                action="finalize_cycle",
+                artifact_path=active_artifact_path,
+                artifact_kind=artifact_kind,
+                reason=reason,
+                metrics_summary=metrics_summary,
+                candidate_artifact_path=candidate_artifact_path,
+                active_artifact_path=active_artifact_path,
+            ),
+            govern_exports=False,
+        )
+        planner.append_cycle_record(
+            config.improvement_cycles_path,
+            ImprovementCycleRecord(
+                cycle_id=cycle_id,
+                state="record",
+                subsystem=subsystem,
+                action="persist_retention_outcome",
+                artifact_path=active_artifact_path,
+                artifact_kind=artifact_kind,
+                reason="persisted fail-closed outcome for incomplete autonomous cycle",
+                metrics_summary=metrics_summary,
+                candidate_artifact_path=candidate_artifact_path,
+                active_artifact_path=active_artifact_path,
+            ),
+            govern_exports=False,
+        )
+        reconciled.append(summary)
+        print(
+            f"[repeated] reconciled incomplete cycle cycle_id={cycle_id} subsystem={subsystem} state=reject",
+            file=sys.stderr,
+            flush=True,
+        )
+    return reconciled
+
+
 def _record_metrics_summary(record: dict[str, object]) -> dict[str, object]:
     metrics_summary = record.get("metrics_summary", {})
     return metrics_summary if isinstance(metrics_summary, dict) else {}
@@ -269,11 +757,25 @@ def _campaign_records(
 ) -> list[dict[str, object]]:
     scoped = records[max(0, start_index) :]
     if campaign_match_id:
-        scoped = [
-            record
+        matching_cycle_ids = {
+            str(record.get("cycle_id", "")).strip()
             for record in scoped
             if _record_protocol(record) == "autonomous"
             and _record_protocol_match_id(record) == campaign_match_id
+            and str(record.get("cycle_id", "")).strip()
+        }
+        scoped = [
+            record
+            for record in scoped
+            if (
+                _record_protocol(record) == "autonomous"
+                and _record_protocol_match_id(record) == campaign_match_id
+            )
+            or (
+                str(record.get("cycle_id", "")).strip() in matching_cycle_ids
+                and str(record.get("state", "")).strip()
+                in {"evaluate", "select", "retain", "reject", "record"}
+            )
         ]
     return scoped
 
@@ -310,6 +812,158 @@ def _non_runtime_managed_decisions(records: list[dict[str, object]]) -> list[dic
         if str(record.get("state", "")) in {"retain", "reject"}
         and not _is_runtime_managed_artifact_path(str(record.get("artifact_path", "")))
     ]
+
+
+def _cycle_report_safe_id(cycle_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(cycle_id).strip()).strip("._") or "cycle"
+
+
+def _load_cycle_report(config: KernelConfig, cycle_id: str) -> dict[str, object] | None:
+    report_path = config.improvement_reports_dir / f"cycle_report_{_cycle_report_safe_id(cycle_id)}.json"
+    if not report_path.exists():
+        return None
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _report_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _decision_record_from_cycle_report(report: dict[str, object]) -> dict[str, object] | None:
+    current_cycle_records = report.get("current_cycle_records", [])
+    if isinstance(current_cycle_records, list):
+        for record in reversed(current_cycle_records):
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("state", "")).strip() not in {"retain", "reject"}:
+                continue
+            if not _is_runtime_managed_artifact_path(str(record.get("artifact_path", ""))):
+                continue
+            return dict(record)
+    final_state = str(report.get("final_state", "")).strip()
+    if final_state not in {"retain", "reject"}:
+        return None
+    artifact_path = str(report.get("active_artifact_path", report.get("artifact_path", ""))).strip()
+    if not _is_runtime_managed_artifact_path(artifact_path):
+        return None
+    evidence = report.get("evidence", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    return {
+        "cycle_id": str(report.get("cycle_id", "")).strip(),
+        "state": final_state,
+        "subsystem": str(report.get("subsystem", "")).strip(),
+        "artifact_path": artifact_path,
+        "artifact_kind": str(report.get("artifact_kind", "")).strip() or "retention_decision",
+        "reason": str(report.get("final_reason", "")).strip(),
+        "candidate_artifact_path": str(report.get("candidate_artifact_path", "")).strip(),
+        "active_artifact_path": artifact_path,
+        "metrics_summary": {
+            "baseline_pass_rate": _report_float(report.get("baseline_metrics", {}).get("pass_rate", 0.0))
+            if isinstance(report.get("baseline_metrics", {}), dict)
+            else 0.0,
+            "candidate_pass_rate": _report_float(report.get("candidate_metrics", {}).get("pass_rate", 0.0))
+            if isinstance(report.get("candidate_metrics", {}), dict)
+            else 0.0,
+            "baseline_average_steps": _report_float(report.get("baseline_metrics", {}).get("average_steps", 0.0))
+            if isinstance(report.get("baseline_metrics", {}), dict)
+            else 0.0,
+            "candidate_average_steps": _report_float(report.get("candidate_metrics", {}).get("average_steps", 0.0))
+            if isinstance(report.get("candidate_metrics", {}), dict)
+            else 0.0,
+            "preview_reason_code": str(report.get("preview_reason_code", "")).strip(),
+            "decision_reason_code": str(report.get("decision_reason_code", "")).strip(),
+            **evidence,
+        },
+    }
+
+
+def _cycle_audit_summary_from_report(report: dict[str, object]) -> dict[str, object] | None:
+    decision_record = _decision_record_from_cycle_report(report)
+    if not isinstance(decision_record, dict):
+        return None
+    metrics_summary = decision_record.get("metrics_summary", {})
+    if not isinstance(metrics_summary, dict):
+        metrics_summary = {}
+    return {
+        "cycle_id": str(report.get("cycle_id", "")).strip(),
+        "subsystem": str(report.get("subsystem", "")).strip(),
+        "selected_variant_id": "",
+        "prior_retained_cycle_id": "",
+        "candidate_artifact_path": str(report.get("candidate_artifact_path", "")).strip(),
+        "active_artifact_path": str(report.get("active_artifact_path", report.get("artifact_path", ""))).strip(),
+        "final_state": str(decision_record.get("state", "")).strip(),
+        "final_reason": str(decision_record.get("reason", "")).strip(),
+        "preview_reason_code": str(metrics_summary.get("preview_reason_code", "")).strip(),
+        "decision_reason_code": str(metrics_summary.get("decision_reason_code", "")).strip(),
+        "baseline_pass_rate": _report_float(metrics_summary.get("baseline_pass_rate", 0.0)),
+        "candidate_pass_rate": _report_float(metrics_summary.get("candidate_pass_rate", 0.0)),
+        "baseline_average_steps": _report_float(metrics_summary.get("baseline_average_steps", 0.0)),
+        "candidate_average_steps": _report_float(metrics_summary.get("candidate_average_steps", 0.0)),
+        "phase_gate_passed": metrics_summary.get("phase_gate_passed"),
+        "artifact_kind": str(decision_record.get("artifact_kind", "")).strip(),
+        "artifact_path": str(decision_record.get("artifact_path", "")).strip(),
+        "artifact_lifecycle_state": str(report.get("artifact_lifecycle_state", "")).strip(),
+        "artifact_sha256": str(report.get("artifact_sha256", "")).strip(),
+        "previous_artifact_sha256": str(report.get("previous_artifact_sha256", "")).strip(),
+        "rollback_artifact_path": str(report.get("rollback_artifact_path", "")).strip(),
+        "artifact_snapshot_path": str(report.get("artifact_snapshot_path", "")).strip(),
+    }
+
+
+def _recovered_runtime_managed_decisions_from_reports(
+    config: KernelConfig,
+    cycle_ids: list[str],
+) -> list[dict[str, object]]:
+    recovered: list[dict[str, object]] = []
+    for cycle_id in cycle_ids:
+        report = _load_cycle_report(config, cycle_id)
+        if not isinstance(report, dict):
+            continue
+        decision_record = _decision_record_from_cycle_report(report)
+        if isinstance(decision_record, dict):
+            recovered.append(decision_record)
+    return recovered
+
+
+def _merge_decision_records(
+    primary: list[dict[str, object]],
+    fallback: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[tuple[str, str, str], dict[str, object]] = {}
+
+    def _decision_record_richness(record: dict[str, object]) -> tuple[int, int]:
+        metrics_summary = record.get("metrics_summary", {})
+        if not isinstance(metrics_summary, dict):
+            metrics_summary = {}
+        family_pass_rate_delta = metrics_summary.get("family_pass_rate_delta", {})
+        generated_family_pass_rate_delta = metrics_summary.get("generated_family_pass_rate_delta", {})
+        family_signal_count = len(family_pass_rate_delta) if isinstance(family_pass_rate_delta, dict) else 0
+        generated_signal_count = len(generated_family_pass_rate_delta) if isinstance(generated_family_pass_rate_delta, dict) else 0
+        return (
+            family_signal_count + generated_signal_count,
+            len(metrics_summary),
+        )
+
+    for record in [*primary, *fallback]:
+        if not isinstance(record, dict):
+            continue
+        key = (
+            str(record.get("cycle_id", "")).strip(),
+            str(record.get("state", "")).strip(),
+            str(record.get("artifact_path", "")).strip(),
+        )
+        current = merged.get(key)
+        if current is None or _decision_record_richness(record) > _decision_record_richness(current):
+            merged[key] = record
+    return list(merged.values())
 
 
 def _candidate_isolation_summary(
@@ -441,6 +1095,40 @@ def _yield_summary_for(
         "worst_family_delta": _worst_metric(records, "worst_family_delta"),
         "worst_generated_family_delta": _worst_metric(records, "generated_worst_family_delta"),
         "worst_failure_recovery_delta": _worst_metric(records, "failure_recovery_pass_rate_delta"),
+    }
+
+
+def _partial_progress_rollup(runs: list[dict[str, object]]) -> dict[str, object]:
+    observed_primary_runs = 0
+    generated_success_started_runs = 0
+    generated_success_completed_runs = 0
+    candidate_generated_runs = 0
+    sampled_families: list[str] = []
+    for run in runs:
+        progress = run.get("partial_progress", {})
+        if not isinstance(progress, dict):
+            continue
+        if bool(progress.get("observe_completed", False)):
+            observed_primary_runs += 1
+        if bool(progress.get("generated_success_started", False)):
+            generated_success_started_runs += 1
+        if bool(progress.get("generated_success_completed", False)):
+            generated_success_completed_runs += 1
+        if bool(progress.get("candidate_generated", False)):
+            candidate_generated_runs += 1
+        sampled_families = _ordered_unique_strings(sampled_families, progress.get("sampled_families_from_progress", []))
+    return {
+        "partial_productive_runs": sum(1 for run in runs if bool(run.get("partial_productive", False))),
+        "partial_candidate_runs": sum(1 for run in runs if bool(run.get("partial_candidate_generated", False))),
+        "observed_primary_runs": observed_primary_runs,
+        "generated_success_started_runs": generated_success_started_runs,
+        "generated_success_completed_runs": generated_success_completed_runs,
+        "sampled_families_from_progress": sampled_families,
+        "recent_partial_progress": [
+            run.get("partial_progress", {})
+            for run in runs[-3:]
+            if isinstance(run.get("partial_progress", {}), dict) and run.get("partial_progress", {})
+        ],
     }
 
 
@@ -750,12 +1438,15 @@ def _trust_breadth_summary(config: KernelConfig) -> dict[str, object]:
     overall = ledger.get("overall_summary", {})
     external = ledger.get("external_summary", {})
     coverage = ledger.get("coverage_summary", {})
+    policy = ledger.get("policy", {})
     if not isinstance(overall, dict):
         overall = {}
     if not isinstance(external, dict):
         external = {}
     if not isinstance(coverage, dict):
         coverage = {}
+    if not isinstance(policy, dict):
+        policy = {}
     return {
         "reports_considered": int(ledger.get("reports_considered", 0) or 0),
         "distinct_benchmark_families": int(overall.get("distinct_benchmark_families", 0) or 0),
@@ -782,8 +1473,281 @@ def _trust_breadth_summary(config: KernelConfig) -> dict[str, object]:
         "missing_required_families": list(coverage.get("missing_required_families", []))
         if isinstance(coverage.get("missing_required_families", []), list)
         else [],
+        "family_breadth_min_distinct_task_roots": int(policy.get("family_breadth_min_distinct_task_roots", 0) or 0),
+        "required_family_clean_task_root_counts": dict(coverage.get("required_family_clean_task_root_counts", {}))
+        if isinstance(coverage.get("required_family_clean_task_root_counts", {}), dict)
+        else {},
+        "missing_required_family_clean_task_root_breadth": [
+            family
+            for family in (
+                list(coverage.get("required_families", []))
+                if isinstance(coverage.get("required_families", []), list)
+                else []
+            )
+            if int(
+                (
+                    dict(coverage.get("required_family_clean_task_root_counts", {}))
+                    if isinstance(coverage.get("required_family_clean_task_root_counts", {}), dict)
+                    else {}
+                ).get(str(family).strip(), 0)
+                or 0
+            )
+            < int(policy.get("family_breadth_min_distinct_task_roots", 0) or 0)
+        ],
         "distinct_family_gap": int(coverage.get("distinct_family_gap", 0) or 0),
     }
+
+
+def _load_json_payload(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _campaign_status_snapshot(
+    *,
+    planner: ImprovementPlanner,
+    cycles_path: Path,
+    campaign_match_id: str,
+    cycle_log_start_index: int,
+    priority_benchmark_families: list[str],
+    priority_family_weights: dict[str, float],
+) -> dict[str, object]:
+    records = planner.load_cycle_records(cycles_path)
+    campaign_records = _campaign_records(
+        records,
+        campaign_match_id=campaign_match_id,
+        start_index=cycle_log_start_index,
+    )
+    decision_records = [
+        record for record in campaign_records if str(record.get("state", "")) in {"retain", "reject"}
+    ]
+    priority_family_allocation_summary = _priority_family_allocation_summary(
+        campaign_records,
+        priority_benchmark_families,
+        priority_family_weights,
+    )
+    aggregated_task_counts = priority_family_allocation_summary.get("aggregated_task_counts", {})
+    if not isinstance(aggregated_task_counts, dict):
+        aggregated_task_counts = {}
+    families_sampled = [
+        family
+        for family in priority_benchmark_families
+        if int(aggregated_task_counts.get(family, 0) or 0) > 0
+    ]
+    priority_families_without_sampling = [
+        family for family in priority_benchmark_families if family not in set(families_sampled)
+    ]
+    current_cycle_ids = [
+        str(record.get("cycle_id", "")).strip()
+        for record in campaign_records
+        if str(record.get("cycle_id", "")).strip()
+    ]
+    return {
+        "campaign_records_considered": len(campaign_records),
+        "decision_records_considered": len(decision_records),
+        "campaign_cycle_ids": current_cycle_ids,
+        "priority_family_allocation_summary": priority_family_allocation_summary,
+        "families_sampled": families_sampled,
+        "priority_families_without_sampling": priority_families_without_sampling,
+    }
+
+
+def _ordered_new_cycle_ids(
+    current_cycle_ids: list[str],
+    *,
+    seen_cycle_ids: set[str],
+) -> list[str]:
+    ordered: list[str] = []
+    seen_local: set[str] = set()
+    for cycle_id in current_cycle_ids:
+        token = str(cycle_id).strip()
+        if not token or token in seen_cycle_ids or token in seen_local:
+            continue
+        ordered.append(token)
+        seen_local.add(token)
+    return ordered
+
+
+def _run_decision_conversion_state(
+    *,
+    final_state: str,
+    runtime_managed_decisions: int,
+    partial_productive: bool,
+) -> str:
+    normalized_state = str(final_state).strip()
+    if runtime_managed_decisions > 0:
+        return "runtime_managed"
+    if normalized_state in {"retain", "reject"}:
+        return "non_runtime_managed"
+    if partial_productive:
+        return "partial_productive_without_decision"
+    return "no_decision"
+
+
+def _summarize_run_decision_conversion(runs: list[dict[str, object]]) -> dict[str, int]:
+    summary = {
+        "runtime_managed_runs": 0,
+        "non_runtime_managed_runs": 0,
+        "partial_productive_without_decision_runs": 0,
+        "no_decision_runs": 0,
+    }
+    for run in runs:
+        state = str(run.get("decision_conversion_state", "")).strip()
+        if state == "runtime_managed":
+            summary["runtime_managed_runs"] += 1
+        elif state == "non_runtime_managed":
+            summary["non_runtime_managed_runs"] += 1
+        elif state == "partial_productive_without_decision":
+            summary["partial_productive_without_decision_runs"] += 1
+        else:
+            summary["no_decision_runs"] += 1
+    summary["decision_runs"] = summary["runtime_managed_runs"] + summary["non_runtime_managed_runs"]
+    return summary
+
+
+def _mirror_autonomous_parent_status(
+    *,
+    config: KernelConfig,
+    child_status_path: Path,
+    child_status_payload: dict[str, object],
+) -> None:
+    raw_parent_status_path = str(os.environ.get("AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH", "")).strip()
+    if not raw_parent_status_path:
+        return
+    parent_status_path = Path(raw_parent_status_path)
+    parent_payload = _load_json_payload(parent_status_path)
+    if not parent_payload:
+        return
+    active_run = parent_payload.get("active_run", {})
+    if not isinstance(active_run, dict):
+        active_run = {}
+    expected_run_match_id = str(os.environ.get("AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID", "")).strip()
+    if expected_run_match_id:
+        active_run_match_id = str(active_run.get("run_match_id", "")).strip()
+        if active_run_match_id and active_run_match_id != expected_run_match_id:
+            return
+    expected_run_index = str(os.environ.get("AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX", "")).strip()
+    if expected_run_index:
+        try:
+            expected_index_value = int(expected_run_index)
+        except ValueError:
+            expected_index_value = 0
+        active_run_index = int(active_run.get("run_index", 0) or 0)
+        if active_run_index and expected_index_value and active_run_index != expected_index_value:
+            return
+    requested_priority_families = [
+        str(value).strip()
+        for value in parent_payload.get("requested_priority_benchmark_families", [])
+        if str(value).strip()
+    ] if isinstance(parent_payload.get("requested_priority_benchmark_families", []), list) else []
+    completed_frontier = parent_payload.get("partial_frontier_expansion_summary", {})
+    if not isinstance(completed_frontier, dict):
+        completed_frontier = {}
+    completed_families_sampled = [
+        str(value).strip()
+        for value in completed_frontier.get("families_sampled", [])
+        if str(value).strip()
+    ] if isinstance(completed_frontier.get("families_sampled", []), list) else []
+    child_families_sampled = [
+        str(value).strip()
+        for value in child_status_payload.get("families_sampled", [])
+        if str(value).strip()
+    ] if isinstance(child_status_payload.get("families_sampled", []), list) else []
+    merged_families_sampled = _ordered_unique_strings(completed_families_sampled, child_families_sampled)
+    if requested_priority_families:
+        sampled_set = set(merged_families_sampled)
+        merged_unsampled = [
+            family for family in requested_priority_families if family not in sampled_set
+        ]
+    else:
+        merged_unsampled = [
+            str(value).strip()
+            for value in child_status_payload.get("priority_families_without_sampling", [])
+            if str(value).strip()
+        ] if isinstance(child_status_payload.get("priority_families_without_sampling", []), list) else []
+    active_run["child_status_path"] = str(child_status_path)
+    active_run["child_status"] = child_status_payload
+    parent_payload["active_run"] = active_run
+    parent_payload["families_sampled"] = merged_families_sampled
+    parent_payload["families_never_sampled"] = merged_unsampled
+    parent_payload["pressure_families_without_sampling"] = merged_unsampled
+    parent_payload["created_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(parent_status_path, parent_payload, config=config, govern_storage=False)
+
+
+def _write_campaign_status(
+    *,
+    config: KernelConfig,
+    report_path: Path,
+    planner: ImprovementPlanner,
+    cycles_path: Path,
+    campaign_match_id: str,
+    campaign_label: str,
+    cycle_log_start_index: int,
+    priority_benchmark_families: list[str],
+    priority_family_weights: dict[str, float],
+    cycles_requested: int,
+    runs: list[dict[str, object]],
+    state: str,
+    active_cycle_run: dict[str, object] | None = None,
+    snapshot: dict[str, object] | None = None,
+) -> Path:
+    if snapshot is None:
+        snapshot = _campaign_status_snapshot(
+            planner=planner,
+            cycles_path=cycles_path,
+            campaign_match_id=campaign_match_id,
+            cycle_log_start_index=cycle_log_start_index,
+            priority_benchmark_families=priority_benchmark_families,
+            priority_family_weights=priority_family_weights,
+        )
+    progress_summary = _partial_progress_summary(
+        active_cycle_run,
+        priority_benchmark_families=priority_benchmark_families,
+    )
+    families_sampled = _ordered_unique_strings(
+        snapshot.get("families_sampled", []),
+        progress_summary.get("sampled_families_from_progress", []),
+    )
+    priority_families_without_sampling = [
+        family for family in priority_benchmark_families if family not in set(families_sampled)
+    ]
+    payload = {
+        "spec_version": "asi_v1",
+        "report_kind": "repeated_improvement_status",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "report_path": str(report_path),
+        "state": state,
+        "campaign_label": campaign_label,
+        "campaign_match_id": campaign_match_id,
+        "cycles_requested": cycles_requested,
+        "completed_runs": len(runs),
+        "successful_runs": sum(1 for run in runs if int(run.get("returncode", 1)) == 0),
+        "productive_runs": sum(1 for run in runs if bool(run.get("productive", False))),
+        "retained_gain_runs": sum(1 for run in runs if bool(run.get("retained_gain", False))),
+        "partial_productive_runs": sum(1 for run in runs if bool(run.get("partial_productive", False))),
+        "partial_candidate_runs": sum(1 for run in runs if bool(run.get("partial_candidate_generated", False))),
+        "priority_benchmark_families": priority_benchmark_families,
+        "priority_benchmark_family_weights": dict(priority_family_weights),
+        "active_cycle_run": active_cycle_run or {},
+        **snapshot,
+        "families_sampled": families_sampled,
+        "priority_families_without_sampling": priority_families_without_sampling,
+        "active_cycle_progress": progress_summary,
+    }
+    status_path = _status_path(config)
+    atomic_write_json(status_path, payload, config=config, govern_storage=False)
+    _mirror_autonomous_parent_status(
+        config=config,
+        child_status_path=status_path,
+        child_status_payload=payload,
+    )
+    return status_path
 
 
 def main() -> None:
@@ -833,7 +1797,12 @@ def main() -> None:
     config.ensure_directories()
     campaign_label = str(args.campaign_label).strip()
     campaign_match_id = str(args.campaign_match_id).strip() or f"campaign-{uuid4().hex}"
-    priority_family_weights = _priority_benchmark_family_weights(args.priority_benchmark_family_weight)
+    requested_priority_benchmark_families = [
+        str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
+    ]
+    requested_priority_family_weights = _priority_benchmark_family_weights(args.priority_benchmark_family_weight)
+    current_priority_benchmark_families = list(requested_priority_benchmark_families)
+    current_priority_family_weights = dict(requested_priority_family_weights)
 
     repo_root = Path(__file__).resolve().parents[1]
     script_path = repo_root / "scripts" / "run_improvement_cycle.py"
@@ -847,6 +1816,11 @@ def main() -> None:
         trust_ledger_path=config.unattended_trust_ledger_path,
         runtime_config=config,
     )
+    _reconcile_incomplete_cycles(
+        config=config,
+        planner=planner,
+        progress_label=campaign_label or campaign_match_id,
+    )
     cycle_log_start_index = len(planner.load_cycle_records(config.improvement_cycles_path))
     current_campaign_width = max(1, int(args.campaign_width))
     current_variant_width = max(1, int(args.variant_width))
@@ -856,11 +1830,30 @@ def main() -> None:
     max_variant_width = max(current_variant_width, 4)
     max_task_limit = max(current_task_limit, int(getattr(config, "compare_feature_max_tasks", 0) or 0))
     seen_campaign_cycle_ids: set[str] = set()
+    active_cycle_run: dict[str, object] = {}
+    last_status_refresh_at = 0.0
+    last_snapshot_refresh_at = 0.0
+    status_snapshot_cache: dict[str, object] = {}
 
     report_path = config.improvement_reports_dir / (
         f"campaign_report_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
     )
     try:
+        _write_campaign_status(
+            config=config,
+            report_path=report_path,
+            planner=planner,
+            cycles_path=config.improvement_cycles_path,
+            campaign_match_id=campaign_match_id,
+            campaign_label=campaign_label,
+            cycle_log_start_index=cycle_log_start_index,
+            priority_benchmark_families=[str(value).strip() for value in args.priority_benchmark_family if str(value).strip()],
+            priority_family_weights=current_priority_family_weights,
+            cycles_requested=max(1, args.cycles),
+            runs=runs,
+            state="starting",
+            snapshot=status_snapshot_cache,
+        )
         for index in range(1, max(1, args.cycles) + 1):
             cmd = [
                 sys.executable,
@@ -879,14 +1872,14 @@ def main() -> None:
                 cmd.append("--adaptive-search")
             if current_task_limit > 0:
                 cmd.extend(["--task-limit", str(current_task_limit)])
-            for family in args.priority_benchmark_family:
+            for family in current_priority_benchmark_families:
                 token = str(family).strip()
                 if token:
                     cmd.extend(["--priority-benchmark-family", token])
-            for weighted_family in args.priority_benchmark_family_weight:
-                token = str(weighted_family).strip()
-                if token:
-                    cmd.extend(["--priority-benchmark-family-weight", token])
+            for family in current_priority_benchmark_families:
+                weight = float(current_priority_family_weights.get(family, 0.0) or 0.0)
+                if weight > 0.0:
+                    cmd.extend(["--priority-benchmark-family-weight", f"{family}={weight}"])
             if args.provider:
                 cmd.extend(["--provider", args.provider])
             if args.model:
@@ -912,6 +1905,105 @@ def main() -> None:
             env = dict(os.environ)
             env["PYTHONUNBUFFERED"] = "1"
             env.update(_runtime_env(config))
+            child_reports_dir = Path(
+                str(env.get("AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR", config.improvement_reports_dir)).strip()
+                or str(config.improvement_reports_dir)
+            )
+            env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"] = str(child_reports_dir / "agentkernel.sqlite3")
+            active_cycle_run = {
+                "index": index,
+                "progress_label": campaign_label or f"cycle-{index}",
+                "campaign_width": current_campaign_width,
+                "variant_width": current_variant_width,
+                "task_limit": current_task_limit,
+                "adaptive_search": bool(current_adaptive_search),
+                "priority_benchmark_families": list(current_priority_benchmark_families),
+                "priority_benchmark_family_weights": dict(current_priority_family_weights),
+            }
+            _write_campaign_status(
+                config=config,
+                report_path=report_path,
+                planner=planner,
+                cycles_path=config.improvement_cycles_path,
+                campaign_match_id=campaign_match_id,
+                campaign_label=campaign_label,
+                cycle_log_start_index=cycle_log_start_index,
+                priority_benchmark_families=current_priority_benchmark_families,
+                priority_family_weights=current_priority_family_weights,
+                cycles_requested=max(1, args.cycles),
+                runs=runs,
+                state="running",
+                active_cycle_run=active_cycle_run,
+                snapshot=status_snapshot_cache,
+            )
+
+            def _refresh_child_status(event: dict[str, object]) -> None:
+                nonlocal last_status_refresh_at, last_snapshot_refresh_at, active_cycle_run, status_snapshot_cache
+                event_kind = str(event.get("event", "")).strip()
+                line = str(event.get("line", "")).strip()
+                active_cycle_run = {
+                    **active_cycle_run,
+                    "pid": int(event.get("pid", 0) or active_cycle_run.get("pid", 0) or 0),
+                    "last_event": event_kind,
+                    "last_event_at": float(event.get("timestamp", 0.0) or time.time()),
+                }
+                if event_kind == "start":
+                    active_cycle_run["started_at"] = float(event.get("started_at", 0.0) or time.time())
+                if event_kind == "heartbeat":
+                    active_cycle_run["silence_seconds"] = int(event.get("silence_seconds", 0) or 0)
+                if line:
+                    active_cycle_run["last_output_line"] = line
+                    if "[cycle:" in line or "[eval:" in line or "finalize phase=" in line or "[repeated]" in line:
+                        active_cycle_run["last_progress_line"] = line
+                    parsed_progress = _parse_progress_fields(line)
+                    active_cycle_run.update(parsed_progress)
+                    current_task = active_cycle_run.get("current_task", {})
+                    if isinstance(current_task, dict):
+                        family = str(current_task.get("family", "")).strip()
+                        if family:
+                            active_cycle_run["sampled_families_from_progress"] = _ordered_unique_strings(
+                                active_cycle_run.get("sampled_families_from_progress", []),
+                                [family],
+                            )
+                refresh_now = event_kind in {"start", "heartbeat", "timeout", "exit"}
+                if not refresh_now and line and (
+                    "[cycle:" in line or "[eval:" in line or "finalize phase=" in line or "[repeated]" in line
+                ):
+                    refresh_now = True
+                now = time.monotonic()
+                if not refresh_now and (now - last_status_refresh_at) < 2.0:
+                    return
+                last_status_refresh_at = now
+                force_snapshot_refresh = event_kind in {"start", "timeout", "exit"}
+                if not force_snapshot_refresh and (now - last_snapshot_refresh_at) >= 30.0:
+                    force_snapshot_refresh = True
+                if force_snapshot_refresh:
+                    status_snapshot_cache = _campaign_status_snapshot(
+                        planner=planner,
+                        cycles_path=config.improvement_cycles_path,
+                        campaign_match_id=campaign_match_id,
+                        cycle_log_start_index=cycle_log_start_index,
+                        priority_benchmark_families=current_priority_benchmark_families,
+                        priority_family_weights=current_priority_family_weights,
+                    )
+                    last_snapshot_refresh_at = now
+                _write_campaign_status(
+                    config=config,
+                    report_path=report_path,
+                    planner=planner,
+                    cycles_path=config.improvement_cycles_path,
+                    campaign_match_id=campaign_match_id,
+                    campaign_label=campaign_label,
+                    cycle_log_start_index=cycle_log_start_index,
+                    priority_benchmark_families=current_priority_benchmark_families,
+                    priority_family_weights=current_priority_family_weights,
+                    cycles_requested=max(1, args.cycles),
+                    runs=runs,
+                    state="running",
+                    active_cycle_run=active_cycle_run,
+                    snapshot=status_snapshot_cache,
+                )
+
             completed = _run_and_stream(
                 cmd,
                 cwd=repo_root,
@@ -921,6 +2013,7 @@ def main() -> None:
                 max_silence_seconds=float(args.max_child_silence_seconds),
                 max_runtime_seconds=float(args.max_child_runtime_seconds),
                 max_progress_stall_seconds=float(args.max_child_progress_stall_seconds),
+                on_event=_refresh_child_status,
             )
             runs.append(
                 {
@@ -930,7 +2023,22 @@ def main() -> None:
                     "stderr": str(completed["stderr"]).strip(),
                     "timed_out": bool(completed.get("timed_out", False)),
                     "timeout_reason": str(completed.get("timeout_reason", "")).strip(),
+                    "priority_benchmark_families": list(current_priority_benchmark_families),
+                    "priority_benchmark_family_weights": dict(current_priority_family_weights),
                 }
+            )
+            partial_progress = _partial_progress_summary(
+                active_cycle_run,
+                priority_benchmark_families=current_priority_benchmark_families,
+            )
+            runs[-1]["partial_progress"] = partial_progress
+            runs[-1]["partial_productive"] = bool(partial_progress.get("productive_partial", False))
+            runs[-1]["partial_candidate_generated"] = bool(partial_progress.get("candidate_generated", False))
+            active_cycle_run = {}
+            _reconcile_incomplete_cycles(
+                config=config,
+                planner=planner,
+                progress_label=campaign_label or campaign_match_id,
             )
             records = planner.load_cycle_records(config.improvement_cycles_path)
             campaign_records = _campaign_records(
@@ -943,26 +2051,146 @@ def main() -> None:
                 for record in campaign_records
                 if str(record.get("cycle_id", "")).strip()
             }
-            new_cycle_ids = {
-                cycle_id for cycle_id in current_cycle_ids
-                if cycle_id and cycle_id not in seen_campaign_cycle_ids
-            }
+            ordered_current_cycle_ids = [
+                str(record.get("cycle_id", "")).strip()
+                for record in campaign_records
+                if str(record.get("cycle_id", "")).strip()
+            ]
+            new_cycle_ids = _ordered_new_cycle_ids(
+                ordered_current_cycle_ids,
+                seen_cycle_ids=seen_campaign_cycle_ids,
+            )
             new_records = [
                 record
                 for record in campaign_records
-                if str(record.get("cycle_id", "")).strip() in new_cycle_ids
+                if str(record.get("cycle_id", "")).strip() in set(new_cycle_ids)
             ]
+            cycle_ids_for_run = list(new_cycle_ids)
+            if not cycle_ids_for_run:
+                fallback_cycle_id = str(runs[-1].get("cycle_id", "")).strip()
+                if fallback_cycle_id:
+                    cycle_ids_for_run = [fallback_cycle_id]
             new_runtime_managed_decisions = _production_decisions(new_records)
+            recovered_runtime_managed_decisions = (
+                _recovered_runtime_managed_decisions_from_reports(config, cycle_ids_for_run)
+                if not new_runtime_managed_decisions and cycle_ids_for_run
+                else []
+            )
+            if recovered_runtime_managed_decisions:
+                new_runtime_managed_decisions = _merge_decision_records(
+                    new_runtime_managed_decisions,
+                    recovered_runtime_managed_decisions,
+                )
             new_decision_summary = _count_decisions(new_runtime_managed_decisions)
             runs[-1]["runtime_managed_decisions"] = new_decision_summary["total_decisions"]
             runs[-1]["runtime_managed_retained_cycles"] = new_decision_summary["retained_cycles"]
             runs[-1]["runtime_managed_rejected_cycles"] = new_decision_summary["rejected_cycles"]
-            runs[-1]["campaign_cycle_ids"] = sorted(new_cycle_ids)
-            runs[-1]["productive"] = new_decision_summary["total_decisions"] > 0
+            runs[-1]["campaign_cycle_ids"] = list(new_cycle_ids)
+            runs[-1]["productive"] = (
+                new_decision_summary["total_decisions"] > 0
+                or bool(runs[-1].get("partial_productive", False))
+            )
             runs[-1]["retained_gain"] = new_decision_summary["retained_cycles"] > 0
+            best_cycle_audit: dict[str, object] | None = None
+            for cycle_id in cycle_ids_for_run:
+                cycle_audit = planner.cycle_audit_summary(config.improvement_cycles_path, cycle_id=cycle_id)
+                report_payload = _load_cycle_report(config, cycle_id)
+                report_audit = _cycle_audit_summary_from_report(report_payload) if isinstance(report_payload, dict) else None
+                if isinstance(report_audit, dict) and str(report_audit.get("final_state", "")).strip() in {"retain", "reject"}:
+                    cycle_audit = report_audit
+                elif not isinstance(cycle_audit, dict):
+                    cycle_audit = report_audit
+                if not isinstance(cycle_audit, dict):
+                    continue
+                best_cycle_audit = cycle_audit
+                if str(cycle_audit.get("final_state", "")).strip() in {"retain", "reject"}:
+                    break
+            if isinstance(best_cycle_audit, dict):
+                for field in (
+                    "cycle_id",
+                    "subsystem",
+                    "selected_variant_id",
+                    "prior_retained_cycle_id",
+                    "candidate_artifact_path",
+                    "active_artifact_path",
+                    "final_state",
+                    "final_reason",
+                    "preview_reason_code",
+                    "decision_reason_code",
+                    "phase_gate_passed",
+                    "artifact_kind",
+                    "artifact_path",
+                    "artifact_lifecycle_state",
+                    "artifact_sha256",
+                    "previous_artifact_sha256",
+                    "rollback_artifact_path",
+                    "artifact_snapshot_path",
+                    "baseline_pass_rate",
+                    "candidate_pass_rate",
+                    "baseline_average_steps",
+                    "candidate_average_steps",
+                ):
+                    if field in best_cycle_audit:
+                        runs[-1][field] = best_cycle_audit[field]
+            runs[-1]["decision_conversion_state"] = _run_decision_conversion_state(
+                final_state=str(runs[-1].get("final_state", "")).strip(),
+                runtime_managed_decisions=int(runs[-1].get("runtime_managed_decisions", 0) or 0),
+                partial_productive=bool(runs[-1].get("partial_productive", False)),
+            )
             seen_campaign_cycle_ids.update(new_cycle_ids)
+            status_snapshot_cache = _campaign_status_snapshot(
+                planner=planner,
+                cycles_path=config.improvement_cycles_path,
+                campaign_match_id=campaign_match_id,
+                cycle_log_start_index=cycle_log_start_index,
+                priority_benchmark_families=current_priority_benchmark_families,
+                priority_family_weights=current_priority_family_weights,
+            )
+            last_snapshot_refresh_at = time.monotonic()
+            _write_campaign_status(
+                config=config,
+                report_path=report_path,
+                planner=planner,
+                cycles_path=config.improvement_cycles_path,
+                campaign_match_id=campaign_match_id,
+                campaign_label=campaign_label,
+                cycle_log_start_index=cycle_log_start_index,
+                priority_benchmark_families=current_priority_benchmark_families,
+                priority_family_weights=current_priority_family_weights,
+                cycles_requested=max(1, args.cycles),
+                runs=runs,
+                state="running" if index < max(1, args.cycles) else "finalizing",
+                snapshot=status_snapshot_cache,
+            )
+            rerouting_summary = _reroute_priority_families_for_unsampled_pressure(
+                current_priority_benchmark_families,
+                current_priority_family_weights,
+                list(status_snapshot_cache.get("priority_families_without_sampling", []))
+                if isinstance(status_snapshot_cache.get("priority_families_without_sampling", []), list)
+                else [],
+            )
+            runs[-1]["priority_family_rerouting"] = rerouting_summary
+            budget_rerouting_summary = _reroute_task_budget_for_unsampled_pressure(
+                current_task_limit=current_task_limit,
+                max_task_limit=max_task_limit,
+                priority_families=current_priority_benchmark_families,
+                unsampled_priority_families=list(rerouting_summary.get("unsampled_priority_families", [])),
+            )
+            runs[-1]["priority_family_budget_rerouting"] = budget_rerouting_summary
             if int(completed["returncode"]) != 0:
                 break
+            if bool(rerouting_summary.get("applied", False)) and index < max(1, args.cycles):
+                current_priority_benchmark_families = list(rerouting_summary["priority_benchmark_families"])
+                current_priority_family_weights = dict(rerouting_summary["priority_benchmark_family_weights"])
+            if bool(budget_rerouting_summary.get("applied", False)) and index < max(1, args.cycles):
+                current_task_limit = int(budget_rerouting_summary["next_task_limit"])
+                print(
+                    "[repeated] budget_reroute reason=unsampled_priority_task_budget "
+                    f"next_task_limit={current_task_limit} "
+                    f"unsampled_priority_families={','.join(budget_rerouting_summary['unsampled_priority_families'])}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if new_decision_summary["retained_cycles"] <= 0 and index < max(1, args.cycles):
                 current_adaptive_search = True
                 if current_task_limit > 0 and max_task_limit > 0:
@@ -985,25 +2213,37 @@ def main() -> None:
             campaign_match_id=campaign_match_id,
             start_index=cycle_log_start_index,
         )
-        recent_decisions = [
-            record
-            for record in campaign_records
-            if str(record.get("state", "")) in {"retain", "reject"}
-        ][-10:]
         generate_index = {
             str(record.get("cycle_id", "")): record
             for record in campaign_records
             if str(record.get("state", "")) == "generate"
         }
-        decision_records = [
-            record for record in campaign_records if str(record.get("state", "")) in {"retain", "reject"}
-        ]
-        summary = _yield_summary_for(decision_records, generate_index)
         campaign_cycle_ids = {
             str(record.get("cycle_id", "")).strip()
             for record in campaign_records
             if str(record.get("cycle_id", "")).strip()
         }
+        report_cycle_ids = set(campaign_cycle_ids)
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            run_cycle_id = str(run.get("cycle_id", "")).strip()
+            if run_cycle_id:
+                report_cycle_ids.add(run_cycle_id)
+            for cycle_id in run.get("campaign_cycle_ids", []) if isinstance(run.get("campaign_cycle_ids", []), list) else []:
+                token = str(cycle_id).strip()
+                if token:
+                    report_cycle_ids.add(token)
+        decision_records = [
+            record for record in campaign_records if str(record.get("state", "")) in {"retain", "reject"}
+        ]
+        recovered_runtime_managed_decisions = _recovered_runtime_managed_decisions_from_reports(
+            config,
+            sorted(report_cycle_ids),
+        )
+        decision_records = _merge_decision_records(decision_records, recovered_runtime_managed_decisions)
+        recent_decisions = decision_records[-10:]
+        summary = _yield_summary_for(decision_records, generate_index)
         incomplete_cycles = (
             [
                 item
@@ -1014,19 +2254,22 @@ def main() -> None:
             else []
         )
         planner_pressure_summary = _planner_pressure_summary(campaign_records)
-        production_decisions = _production_decisions(campaign_records)
+        production_decisions = _merge_decision_records(
+            _production_decisions(campaign_records),
+            recovered_runtime_managed_decisions,
+        )
         non_runtime_managed_decisions = _non_runtime_managed_decisions(campaign_records)
         phase_gate_summary = _phase_gate_summary_for(production_decisions)
         trust_breadth_summary = _trust_breadth_summary(config)
         priority_family_yield_summary = _priority_family_yield_summary(
             production_decisions,
-            [str(value).strip() for value in args.priority_benchmark_family if str(value).strip()],
+            requested_priority_benchmark_families,
             generate_index,
         )
         priority_family_allocation_summary = _priority_family_allocation_summary(
             campaign_records,
-            [str(value).strip() for value in args.priority_benchmark_family if str(value).strip()],
-            priority_family_weights,
+            requested_priority_benchmark_families,
+            requested_priority_family_weights,
         )
         inherited_decisions = 0
         runtime_managed_decisions = 0
@@ -1039,6 +2282,8 @@ def main() -> None:
             if _is_runtime_managed_artifact_path(str(record.get("artifact_path", ""))):
                 runtime_managed_decisions += 1
         candidate_isolation_summary = _candidate_isolation_summary(decision_records, generate_index)
+        partial_progress_summary = _partial_progress_rollup(runs)
+        decision_conversion_summary = _summarize_run_decision_conversion(runs)
 
         report = {
             "spec_version": "asi_v1",
@@ -1048,10 +2293,11 @@ def main() -> None:
             "campaign_match_id": campaign_match_id,
             "adaptive_search": bool(args.adaptive_search),
             "task_limit": max(0, args.task_limit),
-            "priority_benchmark_families": [
-                str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
-            ],
-            "priority_benchmark_family_weights": dict(priority_family_weights),
+            "effective_task_limit": max(0, current_task_limit),
+            "priority_benchmark_families": requested_priority_benchmark_families,
+            "priority_benchmark_family_weights": dict(requested_priority_family_weights),
+            "effective_priority_benchmark_families": list(current_priority_benchmark_families),
+            "effective_priority_benchmark_family_weights": dict(current_priority_family_weights),
             "excluded_subsystems": [str(value).strip() for value in args.exclude_subsystem if str(value).strip()],
             "record_scope": {
                 "protocol": "autonomous",
@@ -1059,13 +2305,16 @@ def main() -> None:
                 "cycle_log_start_index": cycle_log_start_index,
                 "records_considered": len(campaign_records),
                 "decision_records_considered": len(decision_records),
-                "cycle_ids": sorted(campaign_cycle_ids),
+                "cycle_ids": sorted(report_cycle_ids),
             },
             "cycles_requested": max(1, args.cycles),
             "completed_runs": len(runs),
             "successful_runs": sum(1 for run in runs if int(run.get("returncode", 1)) == 0),
             "productive_runs": sum(1 for run in runs if bool(run.get("productive", False))),
             "retained_gain_runs": sum(1 for run in runs if bool(run.get("retained_gain", False))),
+            "runtime_managed_decisions": runtime_managed_decisions,
+            "partial_productive_runs": partial_progress_summary["partial_productive_runs"],
+            "partial_candidate_runs": partial_progress_summary["partial_candidate_runs"],
             "yield_summary": {
                 "retained_cycles": summary["retained_cycles"],
                 "rejected_cycles": summary["rejected_cycles"],
@@ -1099,13 +2348,38 @@ def main() -> None:
                 "non_runtime_managed_decisions": max(0, len(decision_records) - runtime_managed_decisions),
             },
             "candidate_isolation_summary": candidate_isolation_summary,
+            "decision_conversion_summary": decision_conversion_summary,
+            "partial_progress_summary": partial_progress_summary,
             "recent_decisions": recent_decisions,
             "recent_runtime_managed_decisions": production_decisions[-10:],
             "recent_production_decisions": production_decisions[-10:],
             "recent_non_runtime_decisions": non_runtime_managed_decisions[-10:],
             "runs": runs,
         }
-        atomic_write_json(report_path, report)
+        atomic_write_json(report_path, report, config=config)
+        status_snapshot_cache = _campaign_status_snapshot(
+            planner=planner,
+            cycles_path=config.improvement_cycles_path,
+            campaign_match_id=campaign_match_id,
+            cycle_log_start_index=cycle_log_start_index,
+            priority_benchmark_families=current_priority_benchmark_families,
+            priority_family_weights=current_priority_family_weights,
+        )
+        _write_campaign_status(
+                config=config,
+                report_path=report_path,
+                planner=planner,
+                cycles_path=config.improvement_cycles_path,
+                campaign_match_id=campaign_match_id,
+                campaign_label=campaign_label,
+                cycle_log_start_index=cycle_log_start_index,
+                priority_benchmark_families=current_priority_benchmark_families,
+                priority_family_weights=current_priority_family_weights,
+                cycles_requested=max(1, args.cycles),
+                runs=runs,
+                state="finished",
+                snapshot=status_snapshot_cache,
+        )
         planner.append_cycle_record(
             config.improvement_cycles_path,
             ImprovementCycleRecord(
@@ -1121,15 +2395,21 @@ def main() -> None:
                     "campaign_match_id": campaign_match_id,
                     "adaptive_search": bool(args.adaptive_search),
                     "task_limit": max(0, args.task_limit),
-                    "priority_benchmark_families": [
-                        str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
-                    ],
-                    "priority_benchmark_family_weights": dict(priority_family_weights),
+                    "effective_task_limit": max(0, current_task_limit),
+                    "priority_benchmark_families": requested_priority_benchmark_families,
+                    "priority_benchmark_family_weights": dict(requested_priority_family_weights),
+                    "effective_priority_benchmark_families": list(current_priority_benchmark_families),
+                    "effective_priority_benchmark_family_weights": dict(current_priority_family_weights),
                     "cycles_requested": max(1, args.cycles),
                     "completed_runs": len(runs),
                     "successful_runs": sum(1 for run in runs if int(run.get("returncode", 1)) == 0),
                     "productive_runs": sum(1 for run in runs if bool(run.get("productive", False))),
                     "retained_gain_runs": sum(1 for run in runs if bool(run.get("retained_gain", False))),
+                    "partial_productive_runs": partial_progress_summary["partial_productive_runs"],
+                    "partial_candidate_runs": partial_progress_summary["partial_candidate_runs"],
+                    "observed_primary_runs": partial_progress_summary["observed_primary_runs"],
+                    "generated_success_started_runs": partial_progress_summary["generated_success_started_runs"],
+                    "generated_success_completed_runs": partial_progress_summary["generated_success_completed_runs"],
                     "production_total_decisions": report["production_yield_summary"]["total_decisions"],
                     "production_retained_cycles": report["production_yield_summary"]["retained_cycles"],
                     "production_rejected_cycles": report["production_yield_summary"]["rejected_cycles"],
@@ -1149,9 +2429,23 @@ def main() -> None:
                     "priority_family_allocation_total_priority_tasks": priority_family_allocation_summary["total_priority_tasks"],
                 },
             ),
+            govern_exports=False,
         )
         print(report_path)
     except KeyboardInterrupt:
+        synthetic_run = _append_partial_run_from_active_progress(
+            runs=runs,
+            active_cycle_run=active_cycle_run,
+            priority_benchmark_families=current_priority_benchmark_families,
+            returncode=-9,
+            stderr=(
+                f"received signal {signal.Signals(received_signal['value']).name}"
+                if int(received_signal["value"]) > 0
+                else "operator interrupted repeated improvement campaign"
+            ),
+            interrupted=True,
+        )
+        partial_progress_summary = _partial_progress_rollup(runs)
         interrupted_report = {
             "spec_version": "asi_v1",
             "report_kind": "improvement_campaign_report",
@@ -1160,25 +2454,47 @@ def main() -> None:
             "campaign_match_id": campaign_match_id,
             "adaptive_search": bool(args.adaptive_search),
             "task_limit": max(0, args.task_limit),
-            "priority_benchmark_families": [
-                str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
-            ],
-            "priority_benchmark_family_weights": dict(priority_family_weights),
+            "effective_task_limit": max(0, current_task_limit),
+            "priority_benchmark_families": requested_priority_benchmark_families,
+            "priority_benchmark_family_weights": dict(requested_priority_family_weights),
+            "effective_priority_benchmark_families": list(current_priority_benchmark_families),
+            "effective_priority_benchmark_family_weights": dict(current_priority_family_weights),
             "excluded_subsystems": [str(value).strip() for value in args.exclude_subsystem if str(value).strip()],
             "cycles_requested": max(1, args.cycles),
             "completed_runs": len(runs),
             "successful_runs": sum(1 for run in runs if int(run.get("returncode", 1)) == 0),
             "productive_runs": sum(1 for run in runs if bool(run.get("productive", False))),
             "retained_gain_runs": sum(1 for run in runs if bool(run.get("retained_gain", False))),
+            "partial_productive_runs": partial_progress_summary["partial_productive_runs"],
+            "partial_candidate_runs": partial_progress_summary["partial_candidate_runs"],
             "status": "interrupted",
             "reason": (
                 f"received signal {signal.Signals(received_signal['value']).name}"
                 if int(received_signal["value"]) > 0
                 else "operator interrupted repeated improvement campaign"
             ),
+            "partial_progress_summary": partial_progress_summary,
+            "interrupted_active_cycle_run": active_cycle_run,
+            "synthetic_interrupted_run_index": synthetic_run.get("index") if isinstance(synthetic_run, dict) else 0,
             "runs": runs,
         }
-        atomic_write_json(report_path, interrupted_report)
+        atomic_write_json(report_path, interrupted_report, config=config)
+        _write_campaign_status(
+            config=config,
+            report_path=report_path,
+            planner=planner,
+            cycles_path=config.improvement_cycles_path,
+            campaign_match_id=campaign_match_id,
+            campaign_label=campaign_label,
+            cycle_log_start_index=cycle_log_start_index,
+            priority_benchmark_families=current_priority_benchmark_families,
+            priority_family_weights=current_priority_family_weights,
+            cycles_requested=max(1, args.cycles),
+            runs=runs,
+            state="interrupted",
+            active_cycle_run=active_cycle_run,
+            snapshot=status_snapshot_cache,
+        )
         print(report_path)
         raise SystemExit(130)
     finally:

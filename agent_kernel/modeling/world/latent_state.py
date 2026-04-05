@@ -107,6 +107,8 @@ def build_latent_state_summary(
             "world_prior_backend": str(learned.get("world_prior_backend", "")).strip(),
             "world_prior_top_state": int(learned.get("world_prior_top_state", -1) or -1),
             "world_prior_top_probability": _float_value(learned.get("world_prior_top_probability"), 0.0),
+            "world_prior_horizon_hint": str(learned.get("world_prior_horizon_hint", "")).strip(),
+            "world_prior_bias_strength": _float_value(learned.get("world_prior_bias_strength"), 1.0),
             "world_profile_horizons": [
                 int(value)
                 for value in learned.get("world_profile_horizons", [])
@@ -136,6 +138,18 @@ def latent_command_bias(latent_state_summary: dict[str, object], command: str) -
         if str(path).strip()
     }
     progress_band = str(latent_state_summary.get("progress_band", "flat"))
+    learned = latent_state_summary.get("learned_world_state", {})
+    learned = learned if isinstance(learned, dict) else {}
+    learned_progress_signal = _learned_progress_signal(learned)
+    learned_risk_signal = _learned_risk_signal(learned)
+    targets_active_path = any(path in normalized for path in active_paths)
+    write_like_command = any(token in normalized for token in ("mkdir -p ", "printf ", "> ", "touch "))
+    cleanup_like_command = "rm " in normalized or "unlink " in normalized
+    risky_broad_cleanup = (
+        "rm -rf" in normalized
+        or "git reset --hard" in normalized
+        or "git checkout --" in normalized
+    )
     score = 0
     if risk_band == "regressive" and any(path in normalized for path in active_paths):
         score += 2
@@ -146,6 +160,17 @@ def latent_command_bias(latent_state_summary: dict[str, object], command: str) -
             score += 1
     if progress_band == "advancing" and any(path in normalized for path in active_paths):
         score += 1
+    if learned_progress_signal >= 0.55 and targets_active_path:
+        score += 1
+        if write_like_command:
+            score += 1
+    if learned_risk_signal >= 0.55:
+        if targets_active_path:
+            score += 1
+            if cleanup_like_command:
+                score += 2
+        if risky_broad_cleanup:
+            score -= 4
     return score
 
 
@@ -227,6 +252,36 @@ def _float_value(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _learned_progress_signal(learned_world_state: dict[str, object]) -> float:
+    return max(
+        0.0,
+        min(
+            1.0,
+            max(
+                _float_value(learned_world_state.get("progress_signal"), 0.0),
+                _float_value(learned_world_state.get("world_progress_score"), 0.0),
+                _float_value(learned_world_state.get("decoder_world_progress_score"), 0.0),
+                _float_value(learned_world_state.get("transition_progress_score"), 0.0),
+            ),
+        ),
+    )
+
+
+def _learned_risk_signal(learned_world_state: dict[str, object]) -> float:
+    return max(
+        0.0,
+        min(
+            1.0,
+            max(
+                _float_value(learned_world_state.get("risk_signal"), 0.0),
+                _float_value(learned_world_state.get("world_risk_score"), 0.0),
+                _float_value(learned_world_state.get("decoder_world_risk_score"), 0.0),
+                _float_value(learned_world_state.get("transition_regression_score"), 0.0),
+            ),
+        ),
+    )
 
 
 def _is_int_like(value: object) -> bool:

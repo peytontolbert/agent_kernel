@@ -18,6 +18,85 @@ def _load_script(name: str):
     return module
 
 
+def test_write_report_skips_storage_governance(tmp_path, monkeypatch):
+    module = _load_script("run_tolbert_liftoff_loop.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        candidate_artifacts_root=tmp_path / "candidates",
+    )
+    config.ensure_directories()
+    captured: dict[str, object] = {}
+
+    def fake_atomic_write_json(path, payload, *, config=None, govern_storage=True):
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["config"] = config
+        captured["govern_storage"] = govern_storage
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(module, "atomic_write_json", fake_atomic_write_json)
+
+    report_path = config.improvement_reports_dir / "liftoff_report.json"
+    payload = {"report_kind": "tolbert_liftoff_loop_report", "status": "running"}
+    module._write_report(report_path, payload, config=config)
+
+    assert captured["path"] == report_path
+    assert captured["payload"] == payload
+    assert captured["config"] == config
+    assert captured["govern_storage"] is False
+    assert json.loads(report_path.read_text(encoding="utf-8")) == payload
+
+
+def test_apply_routing_to_artifact_skips_storage_governance(tmp_path, monkeypatch):
+    module = _load_script("run_tolbert_liftoff_loop.py")
+    config = KernelConfig(
+        candidate_artifacts_root=tmp_path / "candidates",
+        improvement_reports_dir=tmp_path / "reports",
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+    )
+    config.ensure_directories()
+    captured: dict[str, object] = {}
+
+    def fake_atomic_write_json(path, payload, *, config=None, govern_storage=True):
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["config"] = config
+        captured["govern_storage"] = govern_storage
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = type(
+        "Report",
+        (),
+        {
+            "state": "retain",
+            "primary_takeover_families": ["workflow"],
+            "shadow_only_families": ["project"],
+        },
+    )()
+    artifact_path = config.candidate_artifacts_root / "candidate.json"
+    artifact = {
+        "runtime_policy": {
+            "shadow_benchmark_families": [],
+            "primary_benchmark_families": [],
+        },
+        "hybrid_runtime": {},
+    }
+
+    monkeypatch.setattr(module, "atomic_write_json", fake_atomic_write_json)
+
+    module._apply_routing_to_artifact(artifact_path, artifact, report, config=config)
+
+    assert captured["path"] == artifact_path
+    assert captured["config"] == config
+    assert captured["govern_storage"] is False
+    assert json.loads(artifact_path.read_text(encoding="utf-8"))["runtime_policy"]["primary_benchmark_families"] == [
+        "workflow"
+    ]
+
+
 def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch):
     module = _load_script("run_tolbert_liftoff_loop.py")
     candidate_root = tmp_path / "improvement" / "candidates"
@@ -54,7 +133,9 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
     seen_task_limits: list[int | None] = []
 
     def fake_run_eval(*, config, progress_label, task_limit=None, **kwargs):
-        del config, kwargs
+        del config
+        assert kwargs["write_unattended_reports"] is True
+        assert kwargs["prefer_low_cost_tasks"] is True
         seen_task_limits.append(task_limit)
         metrics_calls["count"] += 1
         if progress_label == "tolbert_liftoff_baseline":
@@ -69,6 +150,8 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
                 generated_passed=1,
                 generated_by_kind={"failure_recovery": 1},
                 generated_passed_by_kind={"failure_recovery": 1},
+                total_by_difficulty={"long_horizon": 4},
+                passed_by_difficulty={"long_horizon": 3},
                 total_by_benchmark_family={"workflow": 6, "project": 4},
                 passed_by_benchmark_family={"workflow": 5, "project": 3},
                 proposal_metrics_by_benchmark_family={
@@ -85,6 +168,14 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
                         "novel_valid_command_rate": 0.0,
                     },
                 },
+                proposal_metrics_by_difficulty={
+                    "long_horizon": {
+                        "task_count": 4,
+                        "proposal_selected_steps": 1,
+                        "novel_valid_command_steps": 1,
+                        "novel_valid_command_rate": 0.5,
+                    }
+                },
                 world_feedback_summary={
                     "step_count": 8,
                     "progress_calibration_mae": 0.30,
@@ -95,6 +186,24 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
                 world_feedback_by_benchmark_family={
                     "workflow": {"step_count": 5, "progress_calibration_mae": 0.25, "risk_calibration_mae": 0.22},
                     "project": {"step_count": 3, "progress_calibration_mae": 0.38, "risk_calibration_mae": 0.36},
+                },
+                world_feedback_by_difficulty={
+                    "long_horizon": {"step_count": 4, "progress_calibration_mae": 0.30, "risk_calibration_mae": 0.24},
+                },
+                long_horizon_persistence_summary={
+                    "long_horizon_steps": 6,
+                    "productive_long_horizon_step_rate": 0.5,
+                    "recovery_response_rate": 0.25,
+                    "horizon_drop_rate": 0.1667,
+                    "long_horizon_success_rate": 0.75,
+                },
+                transfer_alignment_summary={
+                    "transfer_step_count": 4,
+                    "verified_transfer_step_rate": 0.5,
+                    "trusted_retrieval_alignment_mean": 0.3,
+                    "graph_environment_alignment_mean": 0.1,
+                    "safe_transfer_step_rate": 0.5,
+                    "unsafe_transfer_step_rate": 0.5,
                 },
             )
         return EvalMetrics(
@@ -108,6 +217,8 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
             generated_passed=2,
             generated_by_kind={"failure_recovery": 1},
             generated_passed_by_kind={"failure_recovery": 1},
+            total_by_difficulty={"long_horizon": 4},
+            passed_by_difficulty={"long_horizon": 4},
             total_by_benchmark_family={"workflow": 6, "project": 4},
             passed_by_benchmark_family={"workflow": 6, "project": 3},
             tolbert_shadow_episodes=4,
@@ -126,6 +237,14 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
                     "novel_valid_command_rate": 0.0,
                 },
             },
+            proposal_metrics_by_difficulty={
+                "long_horizon": {
+                    "task_count": 4,
+                    "proposal_selected_steps": 3,
+                    "novel_valid_command_steps": 2,
+                    "novel_valid_command_rate": 1.0,
+                }
+            },
             world_feedback_summary={
                 "step_count": 10,
                 "progress_calibration_mae": 0.18,
@@ -136,6 +255,24 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
             world_feedback_by_benchmark_family={
                 "workflow": {"step_count": 6, "progress_calibration_mae": 0.14, "risk_calibration_mae": 0.12},
                 "project": {"step_count": 4, "progress_calibration_mae": 0.24, "risk_calibration_mae": 0.22},
+            },
+            world_feedback_by_difficulty={
+                "long_horizon": {"step_count": 4, "progress_calibration_mae": 0.18, "risk_calibration_mae": 0.14},
+            },
+            long_horizon_persistence_summary={
+                "long_horizon_steps": 8,
+                "productive_long_horizon_step_rate": 0.75,
+                "recovery_response_rate": 0.5,
+                "horizon_drop_rate": 0.0,
+                "long_horizon_success_rate": 1.0,
+            },
+            transfer_alignment_summary={
+                "transfer_step_count": 4,
+                "verified_transfer_step_rate": 0.75,
+                "trusted_retrieval_alignment_mean": 0.6,
+                "graph_environment_alignment_mean": 0.4,
+                "safe_transfer_step_rate": 1.0,
+                "unsafe_transfer_step_rate": 0.0,
             },
         )
 
@@ -292,8 +429,14 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
     assert payload["comparison"]["proposal_selected_steps_delta"] == 3
     assert payload["comparison"]["novel_valid_command_rate_delta"] > 0.0
     assert payload["comparison"]["proposal_metrics_by_benchmark_family"]["workflow"]["proposal_selected_steps_delta"] == 3
+    assert payload["comparison"]["proposal_metrics_by_difficulty"]["long_horizon"]["proposal_selected_steps_delta"] == 2
     assert payload["comparison"]["world_feedback_calibration"]["progress_calibration_mae_gain"] == 0.12
     assert payload["comparison"]["world_feedback_by_benchmark_family"]["workflow"]["progress_calibration_mae_gain"] == 0.11
+    assert payload["comparison"]["long_horizon"]["pass_rate_delta"] == 0.25
+    assert payload["comparison"]["long_horizon"]["world_feedback"]["progress_calibration_mae_gain"] == 0.12
+    assert payload["comparison"]["long_horizon"]["persistence"]["productive_long_horizon_step_rate_delta"] == 0.25
+    assert payload["comparison"]["transfer_alignment"]["graph_environment_alignment_mean_delta"] == 0.3
+    assert payload["comparison"]["transfer_alignment"]["safe_transfer_step_rate_delta"] == 0.5
     assert payload["comparison"]["family_takeover_summary"]["project"]["failure_reason"] == "missing proposal-selected commands"
     assert (
         payload["comparison"]["proposal_gate_failure_reasons_by_benchmark_family"]["project"]
@@ -306,3 +449,170 @@ def test_run_tolbert_liftoff_loop_writes_readiness_report(tmp_path, monkeypatch)
     assert payload["universal_decoder_eval"]["slices"]["docs_markdown"]["hybrid_exact_match_rate"] == 1.0
     assert payload["liftoff_report"]["state"] in {"retain", "shadow_only"}
     assert "demotion family=project reason=missing proposal-selected commands" in err_stream.getvalue()
+
+
+def test_run_tolbert_liftoff_loop_resume_preserves_metrics_and_trust_payloads(tmp_path, monkeypatch):
+    module = _load_script("run_tolbert_liftoff_loop.py")
+    candidate_root = tmp_path / "improvement" / "candidates"
+    reports_dir = tmp_path / "improvement" / "reports"
+    retained_artifact_path = tmp_path / "tolbert_model" / "retained_artifact.json"
+    config = KernelConfig(
+        candidate_artifacts_root=candidate_root,
+        improvement_reports_dir=reports_dir,
+        tolbert_model_artifact_path=retained_artifact_path,
+        trajectories_root=tmp_path / "episodes",
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+    )
+    config.ensure_directories()
+    report_path = reports_dir / "liftoff_resume.json"
+    candidate_artifact_path = candidate_root / "resume_candidate.json"
+    candidate_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "liftoff_gate": {
+                    "require_takeover_drift_eval": False,
+                    "takeover_drift_step_budget": 0,
+                },
+                "dataset_manifest": {"benchmark_families": ["repository"]},
+                "build_policy": {"allow_kernel_autobuild": True},
+                "runtime_paths": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    baseline_metrics = EvalMetrics(
+        total=4,
+        passed=2,
+        average_steps=2.0,
+        total_by_difficulty={"long_horizon": 2},
+        passed_by_difficulty={"long_horizon": 1},
+        total_by_benchmark_family={"repository": 4},
+        passed_by_benchmark_family={"repository": 2},
+        long_horizon_persistence_summary={
+            "long_horizon_steps": 4,
+            "productive_long_horizon_step_rate": 0.25,
+        },
+        contract_clean_failure_recovery_summary={
+            "task_count": 1,
+            "long_horizon_pass_rate": 0.0,
+        },
+        transfer_alignment_summary={
+            "verified_transfer_step_rate": 0.25,
+            "graph_environment_alignment_mean": 0.1,
+        },
+    )
+    candidate_metrics = EvalMetrics(
+        total=4,
+        passed=3,
+        average_steps=1.5,
+        total_by_difficulty={"long_horizon": 2},
+        passed_by_difficulty={"long_horizon": 2},
+        total_by_benchmark_family={"repository": 4},
+        passed_by_benchmark_family={"repository": 3},
+        long_horizon_persistence_summary={
+            "long_horizon_steps": 5,
+            "productive_long_horizon_step_rate": 0.8,
+        },
+        contract_clean_failure_recovery_summary={
+            "task_count": 2,
+            "long_horizon_pass_rate": 1.0,
+        },
+        transfer_alignment_summary={
+            "verified_transfer_step_rate": 0.75,
+            "graph_environment_alignment_mean": 0.6,
+        },
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "tolbert_liftoff_loop_report",
+                "campaign": {"completed": True},
+                "candidate_artifact_path": str(candidate_artifact_path),
+                "baseline_metrics": module._metric_summary(baseline_metrics),
+                "candidate_metrics": module._metric_summary(candidate_metrics),
+                "baseline_trust": {
+                    "overall_summary": {"light_supervision_clean_success_count": 1},
+                },
+                "candidate_trust": {
+                    "overall_summary": {"light_supervision_clean_success_count": 3},
+                },
+                "takeover_drift": {"budget_reached": True},
+                "universal_decoder_eval": {"available": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_run_eval(**kwargs):
+        raise AssertionError(f"run_eval should not run on resume: {kwargs}")
+
+    def fail_run_and_stream(*args, **kwargs):
+        raise AssertionError(f"campaign should not run on resume: {args} {kwargs}")
+
+    captured: dict[str, object] = {}
+
+    def fake_build_liftoff_gate_report(
+        *,
+        candidate_metrics,
+        baseline_metrics,
+        artifact_payload,
+        candidate_trust_ledger,
+        baseline_trust_ledger,
+        takeover_drift_report,
+    ):
+        assert artifact_payload["artifact_kind"] == "tolbert_model_bundle"
+        assert baseline_metrics.long_horizon_persistence_summary["productive_long_horizon_step_rate"] == 0.25
+        assert candidate_metrics.long_horizon_persistence_summary["productive_long_horizon_step_rate"] == 0.8
+        assert baseline_metrics.contract_clean_failure_recovery_summary["task_count"] == 1
+        assert candidate_metrics.transfer_alignment_summary["graph_environment_alignment_mean"] == 0.6
+        assert baseline_trust_ledger["overall_summary"]["light_supervision_clean_success_count"] == 1
+        assert candidate_trust_ledger["overall_summary"]["light_supervision_clean_success_count"] == 3
+        assert takeover_drift_report == {"budget_reached": True}
+        captured["called"] = True
+        return type(
+            "Report",
+            (),
+            {
+                "state": "shadow_only",
+                "reason": "resume_check",
+                "primary_takeover_families": [],
+                "shadow_only_families": ["repository"],
+                "insufficient_proposal_families": [],
+                "proposal_gate_failure_reasons_by_benchmark_family": {},
+                "family_takeover_evidence": {},
+                "to_dict": lambda self: {
+                    "state": "shadow_only",
+                    "reason": "resume_check",
+                    "shadow_only_families": ["repository"],
+                },
+            },
+        )()
+
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(module, "run_eval", fail_run_eval)
+    monkeypatch.setattr(module, "_run_and_stream", fail_run_and_stream)
+    monkeypatch.setattr(module, "build_liftoff_gate_report", fake_build_liftoff_gate_report)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tolbert_liftoff_loop.py",
+            "--report-path",
+            str(report_path),
+            "--resume",
+            "--skip-improvement",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert captured["called"] is True
+    assert payload["candidate_trust"]["overall_summary"]["light_supervision_clean_success_count"] == 3
+    assert payload["takeover_drift"]["budget_reached"] is True
+    assert payload["universal_decoder_eval"]["available"] is False

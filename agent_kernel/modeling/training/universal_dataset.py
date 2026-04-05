@@ -4,13 +4,29 @@ from collections import Counter
 from pathlib import Path
 import hashlib
 import json
+import shutil
 from typing import Any
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.state import _software_work_objective_phase
 
 from ..tolbert.config import HybridTolbertSSMConfig
 from ..tolbert.tokenization import build_decoder_vocabulary, decoder_tokenizer_stats
 from .corpus_acquisition import external_corpus_examples, materialize_external_corpus
+
+
+def _sync_jsonl_shards(
+    output_dir: Path,
+    stem: str,
+    rows: list[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> list[Path]:
+    if enabled:
+        return _write_jsonl_shards(output_dir, stem, rows)
+    if output_dir.exists():
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return []
 
 
 def materialize_universal_decoder_dataset(
@@ -55,8 +71,19 @@ def materialize_universal_decoder_dataset(
     manifest_path = output_dir / "universal_decoder_dataset_manifest.json"
     _write_jsonl(train_path, train_examples)
     _write_jsonl(eval_path, eval_examples)
-    train_shard_paths = _write_jsonl_shards(output_dir / "shards", "universal_decoder_train", train_examples)
-    eval_shard_paths = _write_jsonl_shards(output_dir / "shards", "universal_decoder_eval", eval_examples)
+    shard_output_dir = output_dir / "shards"
+    train_shard_paths = _sync_jsonl_shards(
+        shard_output_dir,
+        "universal_decoder_train",
+        train_examples,
+        enabled=bool(config.storage_write_dataset_shards),
+    )
+    eval_shard_paths = _sync_jsonl_shards(
+        shard_output_dir,
+        "universal_decoder_eval",
+        eval_examples,
+        enabled=bool(config.storage_write_dataset_shards),
+    )
     decoder_vocab_path.write_text(json.dumps(decoder_vocab, indent=2, sort_keys=True), encoding="utf-8")
     decoder_tokenizer_manifest_path.write_text(
         json.dumps(
@@ -71,6 +98,8 @@ def materialize_universal_decoder_dataset(
         encoding="utf-8",
     )
     source_counts = Counter(str(example.get("source_type", "unknown")) for example in examples)
+    difficulty_counts = Counter(str(example.get("difficulty", "seed")).strip() or "seed" for example in examples)
+    long_horizon_example_count = int(difficulty_counts.get("long_horizon", 0) or 0)
     manifest = {
         "artifact_kind": "tolbert_universal_decoder_dataset",
         "train_dataset_path": str(train_path),
@@ -96,6 +125,8 @@ def materialize_universal_decoder_dataset(
         "train_shard_paths": [str(path) for path in train_shard_paths],
         "eval_shard_paths": [str(path) for path in eval_shard_paths],
         "source_counts": dict(sorted(source_counts.items())),
+        "difficulty_counts": dict(sorted(difficulty_counts.items())),
+        "long_horizon_example_count": long_horizon_example_count,
         "sources": sorted(source_counts),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -150,11 +181,14 @@ def _trajectory_examples(config: KernelConfig) -> list[dict[str, Any]]:
         if not isinstance(task_metadata, dict):
             task_metadata = {}
         benchmark_family = str(task_metadata.get("benchmark_family", "bounded")).strip() or "bounded"
+        difficulty = str(task_metadata.get("difficulty", task_metadata.get("task_difficulty", "seed"))).strip() or "seed"
+        example_weight = 1.5 if difficulty == "long_horizon" else 1.0
         episode_success = bool(payload.get("success", False))
         steps = payload.get("steps", [])
         if not isinstance(steps, list):
             continue
         history: list[str] = []
+        software_work_outcomes: list[str] = []
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
                 continue
@@ -172,11 +206,14 @@ def _trajectory_examples(config: KernelConfig) -> list[dict[str, Any]]:
                         for value in [
                             f"task: {prompt}" if prompt else "",
                             f"action: {action}",
+                            f"difficulty: {difficulty}",
                             f"context:\n{history_slice}" if history_slice else "",
                         ]
                         if value
                     ),
                     "target": content,
+                    "difficulty": difficulty,
+                    "example_weight": example_weight,
                 }
             )
             verification = step.get("verification", {})
@@ -185,6 +222,8 @@ def _trajectory_examples(config: KernelConfig) -> list[dict[str, Any]]:
                 and content
                 and (episode_success or (isinstance(verification, dict) and bool(verification.get("passed", False))))
             ):
+                software_work_agenda = _trajectory_software_work_agenda(payload, task_metadata=task_metadata)
+                recent_software_work_outcomes = "\n".join(software_work_outcomes[-3:])
                 examples.append(
                     {
                         "source_type": "trajectory_success_command",
@@ -194,16 +233,193 @@ def _trajectory_examples(config: KernelConfig) -> list[dict[str, Any]]:
                             for value in [
                                 f"task: {prompt}" if prompt else "",
                                 f"benchmark_family: {benchmark_family}",
-                                "goal: emit a verifier-aligned bounded shell command",
+                                (
+                                    "goal: emit a verifier-aligned long-horizon shell command that preserves completed progress"
+                                    if difficulty == "long_horizon"
+                                    else "goal: emit a verifier-aligned bounded shell command"
+                                ),
+                                f"difficulty: {difficulty}",
                                 f"context:\n{history_slice}" if history_slice else "",
                             ]
                             if value
                         ),
                         "target": content,
+                        "difficulty": difficulty,
+                        "example_weight": example_weight,
                     }
                 )
+                if difficulty == "long_horizon" and software_work_agenda:
+                    software_work_phase_state = _trajectory_software_work_phase_state(
+                        payload,
+                        task_metadata=task_metadata,
+                        recent_outcomes=software_work_outcomes[-3:],
+                    )
+                    examples.append(
+                        {
+                            "source_type": "trajectory_software_work_command",
+                            "source_id": f"{task_id}:{index}:software_work_command",
+                            "prompt": "\n".join(
+                                value
+                                for value in [
+                                    f"task: {prompt}" if prompt else "",
+                                    f"benchmark_family: {benchmark_family}",
+                                    "goal: emit the next verifier-aligned long-horizon software-work command",
+                                    f"software_work_agenda:\n{software_work_agenda}",
+                                    (
+                                        f"software_work_phase_state:\n{software_work_phase_state}"
+                                        if software_work_phase_state
+                                        else ""
+                                    ),
+                                    (
+                                        f"software_work_recent_outcomes:\n{recent_software_work_outcomes}"
+                                        if recent_software_work_outcomes
+                                        else ""
+                                    ),
+                                    f"context:\n{history_slice}" if history_slice else "",
+                                ]
+                                if value
+                            ),
+                            "target": content,
+                            "difficulty": difficulty,
+                            "example_weight": example_weight + 0.25,
+                        }
+                    )
+            outcome = _trajectory_software_work_outcome(step)
+            if difficulty == "long_horizon" and outcome:
+                software_work_outcomes.append(outcome)
             history.append(content)
     return examples
+
+
+def _trajectory_software_work_agenda(
+    payload: dict[str, Any],
+    *,
+    task_metadata: dict[str, Any],
+) -> str:
+    objectives: list[str] = []
+    synthetic_edit_plan = task_metadata.get("synthetic_edit_plan", [])
+    if isinstance(synthetic_edit_plan, list):
+        for step in synthetic_edit_plan[:3]:
+            if not isinstance(step, dict):
+                continue
+            path = str(step.get("path", "")).strip()
+            if path:
+                objectives.append(f"apply planned edit {path}")
+    world_model_summary = payload.get("world_model_summary", {})
+    if isinstance(world_model_summary, dict):
+        for path in world_model_summary.get("missing_expected_artifacts", []):
+            normalized = str(path).strip()
+            if normalized:
+                objectives.append(f"complete implementation for {normalized}")
+        for path in world_model_summary.get("unsatisfied_expected_contents", []):
+            normalized = str(path).strip()
+            if normalized:
+                objectives.append(f"revise implementation for {normalized}")
+        for path in world_model_summary.get("workflow_report_paths", []):
+            normalized = str(path).strip()
+            if normalized:
+                objectives.append(f"write workflow report {normalized}")
+        for branch in world_model_summary.get("workflow_required_merges", []):
+            normalized = str(branch).strip()
+            if normalized:
+                objectives.append(f"accept required branch {normalized}")
+        for label in world_model_summary.get("workflow_required_tests", []):
+            normalized = str(label).strip()
+            if normalized:
+                objectives.append(f"run workflow test {normalized}")
+    ordered: list[str] = []
+    for objective in objectives:
+        if objective and objective not in ordered:
+            ordered.append(objective)
+    return "\n".join(ordered[:4])
+
+
+def _trajectory_software_work_outcome(step: dict[str, Any]) -> str:
+    objective = str(step.get("active_subgoal", "")).strip()
+    if not objective:
+        return ""
+    transition = step.get("state_transition", {})
+    transition = transition if isinstance(transition, dict) else {}
+    verification = step.get("verification", {})
+    verification = verification if isinstance(verification, dict) else {}
+    status = "stalled"
+    if bool(verification.get("passed", False)):
+        status = "completed"
+    elif bool(transition.get("regressed", False)) or list(transition.get("regressions", [])):
+        status = "regressed"
+    else:
+        try:
+            progress_delta = float(step.get("state_progress_delta", transition.get("progress_delta", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            progress_delta = 0.0
+        if progress_delta > 0.0:
+            status = "advanced"
+    return f"{objective}: {status}"
+
+
+def _trajectory_software_work_phase_state(
+    payload: dict[str, Any],
+    *,
+    task_metadata: dict[str, Any],
+    recent_outcomes: list[str],
+) -> str:
+    agenda_lines = [
+        line.strip()
+        for line in _trajectory_software_work_agenda(payload, task_metadata=task_metadata).splitlines()
+        if line.strip()
+    ]
+    if not agenda_lines:
+        return ""
+    phase_buckets: dict[str, list[str]] = {
+        "implementation": [],
+        "migration": [],
+        "test": [],
+        "follow_up_fix": [],
+    }
+    test_attempted = any(_software_work_objective_phase(line.partition(":")[0], test_attempted=False) == "test" for line in recent_outcomes)
+    regression_signaled = any(": regressed" in line for line in recent_outcomes)
+    for objective in agenda_lines:
+        phase = _software_work_objective_phase(
+            objective,
+            test_attempted=test_attempted,
+            regression_signaled=regression_signaled,
+        )
+        phase_buckets.setdefault(phase, []).append(objective)
+    current_phase = ""
+    for phase in ("implementation", "migration", "test", "follow_up_fix"):
+        if phase_buckets.get(phase):
+            current_phase = phase
+            break
+    if not current_phase:
+        return ""
+    next_phase = ""
+    ordered_phases = ("implementation", "migration", "test", "follow_up_fix")
+    current_index = ordered_phases.index(current_phase)
+    for phase in ordered_phases[current_index + 1 :]:
+        if phase_buckets.get(phase):
+            next_phase = phase
+            break
+    current_phase_status = ""
+    for line in reversed(recent_outcomes):
+        objective, _, status = line.partition(":")
+        if _software_work_objective_phase(
+            objective,
+            test_attempted=test_attempted,
+            regression_signaled=regression_signaled,
+        ) == current_phase:
+            current_phase_status = status.strip()
+            break
+    suggested_phase = next_phase if current_phase_status in {"advanced", "completed"} and next_phase else current_phase
+    lines = [
+        f"current_phase: {current_phase}",
+        f"current_phase_status: {current_phase_status or 'pending'}",
+        f"suggested_phase: {suggested_phase}",
+    ]
+    for phase in ordered_phases:
+        objectives = phase_buckets.get(phase, [])
+        if objectives:
+            lines.append(f"{phase}: {objectives[0]}")
+    return "\n".join(lines)
 
 
 def _markdown_examples(root: Path) -> list[dict[str, Any]]:

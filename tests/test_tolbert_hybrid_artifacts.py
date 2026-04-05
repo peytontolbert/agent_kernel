@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -310,6 +311,48 @@ def test_tolbert_model_candidate_artifact_runs_independent_generation_pipelines_
     assert [record["job_id"] for record in artifact["job_records"]] == ["train", "hybrid", "universal"]
 
 
+def test_tolbert_build_policy_requires_long_horizon_head_coverage_when_present() -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    insufficient = module._tolbert_build_policy(
+        {
+            "total_examples": 1024,
+            "synthetic_trajectory_examples": 128,
+            "policy_examples": 512,
+            "transition_examples": 512,
+            "value_examples": 512,
+            "stop_examples": 256,
+            "long_horizon_trajectory_examples": 6,
+            "long_horizon_policy_examples": 2,
+            "long_horizon_transition_examples": 2,
+            "long_horizon_value_examples": 2,
+            "long_horizon_stop_examples": 0,
+        },
+        current_payload=None,
+    )
+    sufficient = module._tolbert_build_policy(
+        {
+            "total_examples": 1024,
+            "synthetic_trajectory_examples": 128,
+            "policy_examples": 512,
+            "transition_examples": 512,
+            "value_examples": 512,
+            "stop_examples": 256,
+            "long_horizon_trajectory_examples": 6,
+            "long_horizon_policy_examples": 6,
+            "long_horizon_transition_examples": 6,
+            "long_horizon_value_examples": 6,
+            "long_horizon_stop_examples": 2,
+        },
+        current_payload=None,
+    )
+
+    assert insufficient["allow_kernel_autobuild"] is False
+    assert insufficient["ready_long_horizon_policy_examples"] == 2
+    assert insufficient["min_long_horizon_policy_examples"] == 4
+    assert sufficient["allow_kernel_autobuild"] is True
+
+
 def test_compact_tolbert_model_candidate_output_keeps_final_checkpoint(tmp_path: Path) -> None:
     from agent_kernel import tolbert_model_improvement as module
 
@@ -405,6 +448,66 @@ def test_materialize_tolbert_model_shared_store_dedupes_normalized_candidate_pat
     assert stored_manifest["supervised_examples_path"] == str(Path(dataset_store_path_a) / "supervised_examples.jsonl")
     assert not (output_a / "dataset").exists()
     assert not (output_b / "dataset").exists()
+
+
+def test_cleanup_tolbert_model_candidate_storage_prunes_old_dirs_and_unreferenced_store(tmp_path: Path) -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    config = KernelConfig(
+        candidate_artifacts_root=tmp_path / "candidates",
+        tolbert_model_artifact_path=tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json",
+        storage_keep_tolbert_candidate_dirs=0,
+        storage_tolbert_candidate_budget_bytes=4096,
+        storage_tolbert_shared_store_budget_bytes=1024,
+    )
+    candidates_root = config.candidate_artifacts_root / "tolbert_model"
+    live_store = config.tolbert_model_artifact_path.parent / "store" / "training" / "live_keep"
+    old_store = config.tolbert_model_artifact_path.parent / "store" / "training" / "old_drop"
+    middle_store = config.tolbert_model_artifact_path.parent / "store" / "training" / "middle_drop"
+    current_store = config.tolbert_model_artifact_path.parent / "store" / "training" / "current_keep"
+    for path in (live_store, old_store, middle_store, current_store):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "checkpoint.pt").write_bytes(b"x" * 64)
+
+    config.tolbert_model_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.tolbert_model_artifact_path.write_text(
+        json.dumps({"shared_store": {"entries": {"training": {"path": str(live_store)}}}}),
+        encoding="utf-8",
+    )
+
+    cycle_old = candidates_root / "cycle_old"
+    cycle_middle = candidates_root / "cycle_middle"
+    cycle_current = candidates_root / "cycle_current"
+    for index, (cycle_root, store_path) in enumerate(
+        ((cycle_old, old_store), (cycle_middle, middle_store), (cycle_current, current_store)),
+        start=1,
+    ):
+        cycle_root.mkdir(parents=True, exist_ok=True)
+        (cycle_root / "tolbert_model_artifact.json").write_text(
+            json.dumps({"shared_store": {"entries": {"training": {"path": str(store_path)}}}}),
+            encoding="utf-8",
+        )
+        (cycle_root / "padding.bin").write_bytes(b"p" * 96)
+        os.utime(cycle_root, (100 + index, 100 + index))
+
+    cleanup = module.cleanup_tolbert_model_candidate_storage(
+        config=config,
+        preserve_paths=(cycle_current,),
+    )
+
+    assert not cycle_old.exists()
+    assert not cycle_middle.exists()
+    assert cycle_current.exists()
+    assert live_store.exists()
+    assert current_store.exists()
+    assert not old_store.exists()
+    assert not middle_store.exists()
+    assert cleanup["candidate_budget_satisfied"] is True
+    assert cleanup["shared_store_budget_satisfied"] is True
+    assert str(cycle_old) in cleanup["removed_candidate_dirs"]
+    assert str(cycle_middle) in cleanup["removed_candidate_dirs"]
+    assert str(old_store) in cleanup["removed_shared_store"]
+    assert str(middle_store) in cleanup["removed_shared_store"]
 
 
 def test_tolbert_model_candidate_artifact_stores_parameter_delta_when_parent_checkpoint_exists(

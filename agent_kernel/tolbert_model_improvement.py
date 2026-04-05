@@ -16,6 +16,7 @@ from evals.metrics import EvalMetrics
 from .config import KernelConfig
 from .improvement_common import retention_gate_preset
 from .job_queue import DelegatedJobQueue, drain_delegated_jobs
+from .kernel_catalog import kernel_catalog_mapping, kernel_catalog_string_list, kernel_catalog_string_set
 from .modeling.training_backends import discover_training_backends
 from .modeling.training.universal_dataset import materialize_universal_decoder_dataset
 from .modeling.tolbert.delta import (
@@ -27,40 +28,10 @@ from .schemas import TaskSpec
 from .task_bank import load_discovered_tasks
 from .tolbert_assets import build_agentkernel_tolbert_assets
 
-_DEFAULT_TOLBERT_BUILD_POLICY: dict[str, object] = {
-    "allow_kernel_autobuild": False,
-    "allow_kernel_rebuild": False,
-    "require_synthetic_dataset": True,
-    "require_head_targets": True,
-    "min_total_examples": 512,
-    "min_synthetic_examples": 64,
-    "min_policy_examples": 256,
-    "min_transition_examples": 256,
-    "min_value_examples": 256,
-    "min_stop_examples": 128,
-}
-_TOLBERT_SHARED_STORE_GROUPS = (
-    "assets",
-    "dataset",
-    "universal_dataset",
-    "training",
-    "retrieval_cache",
-    "hybrid_runtime",
-    "universal_runtime",
-)
-_TOLBERT_HARD_PROPOSAL_FAMILIES = {
-    "integration",
-    "project",
-    "repository",
-}
-_TOLBERT_MEDIUM_PROPOSAL_FAMILIES = {
-    "benchmark_candidate",
-    "repo_chore",
-    "repo_sandbox",
-    "tooling",
-    "verifier_candidate",
-    "workflow",
-}
+_DEFAULT_TOLBERT_BUILD_POLICY: dict[str, object] = kernel_catalog_mapping("tolbert_model", "default_build_policy")
+_TOLBERT_SHARED_STORE_GROUPS = tuple(kernel_catalog_string_list("tolbert_model", "shared_store_groups"))
+_TOLBERT_HARD_PROPOSAL_FAMILIES = kernel_catalog_string_set("tolbert_model", "hard_proposal_families")
+_TOLBERT_MEDIUM_PROPOSAL_FAMILIES = kernel_catalog_string_set("tolbert_model", "medium_proposal_families")
 
 
 def build_tolbert_model_candidate_artifact(
@@ -660,6 +631,187 @@ def _normalized_file_bytes(path: Path, *, output_dir: Path) -> bytes:
     return normalized.encode("utf-8")
 
 
+def _resolved_existing_path(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _path_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        if path.is_file():
+            return path.stat().st_size
+    except OSError:
+        return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            file_path = Path(root) / name
+            try:
+                total += file_path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _load_json_dict(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _collect_existing_paths(value: object) -> set[Path]:
+    paths: set[Path] = set()
+    if isinstance(value, dict):
+        for item in value.values():
+            paths.update(_collect_existing_paths(item))
+        return paths
+    if isinstance(value, list):
+        for item in value:
+            paths.update(_collect_existing_paths(item))
+        return paths
+    if not isinstance(value, str):
+        return paths
+    raw = value.strip()
+    if not raw or "/" not in raw:
+        return paths
+    resolved = _resolved_existing_path(Path(raw))
+    if resolved is not None:
+        paths.add(resolved)
+    return paths
+
+
+def _cleanup_unreferenced_tolbert_shared_store(
+    config: KernelConfig,
+    *,
+    referenced_paths: set[Path],
+) -> list[str]:
+    store_root = config.tolbert_model_artifact_path.parent / "store"
+    if not store_root.exists():
+        return []
+    removed: list[str] = []
+    for group_dir in sorted(path for path in store_root.iterdir() if path.is_dir()):
+        for digest_dir in sorted(path for path in group_dir.iterdir() if path.is_dir()):
+            resolved = _resolved_existing_path(digest_dir)
+            if resolved is not None and resolved in referenced_paths:
+                continue
+            shutil.rmtree(digest_dir, ignore_errors=True)
+            if not digest_dir.exists():
+                removed.append(str(digest_dir))
+        try:
+            next(group_dir.iterdir())
+        except StopIteration:
+            try:
+                group_dir.rmdir()
+            except OSError:
+                pass
+    try:
+        next(store_root.iterdir())
+    except StopIteration:
+        try:
+            store_root.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def cleanup_tolbert_model_candidate_storage(
+    *,
+    config: KernelConfig,
+    preserve_paths: tuple[Path, ...] = (),
+) -> dict[str, object]:
+    candidates_root = config.candidate_artifacts_root / "tolbert_model"
+    store_root = config.tolbert_model_artifact_path.parent / "store"
+    before_candidate_bytes = _path_bytes(candidates_root)
+    before_store_bytes = _path_bytes(store_root)
+    keep_candidate_dirs = max(0, int(config.storage_keep_tolbert_candidate_dirs))
+    candidate_budget_bytes = max(0, int(config.storage_tolbert_candidate_budget_bytes))
+    shared_store_budget_bytes = max(0, int(config.storage_tolbert_shared_store_budget_bytes))
+    preserved = {
+        resolved
+        for path in preserve_paths
+        if (resolved := _resolved_existing_path(path)) is not None
+    }
+
+    removed_candidate_dirs: list[str] = []
+    candidate_dirs = []
+    if candidates_root.exists():
+        candidate_dirs = sorted(
+            (path for path in candidates_root.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+            reverse=True,
+        )
+    retained_candidates: list[Path] = []
+    kept_unpreserved = 0
+    for path in candidate_dirs:
+        resolved = _resolved_existing_path(path)
+        if resolved is not None and resolved in preserved:
+            retained_candidates.append(path)
+            continue
+        if kept_unpreserved < keep_candidate_dirs:
+            retained_candidates.append(path)
+            kept_unpreserved += 1
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            removed_candidate_dirs.append(str(path))
+
+    retained_candidates = [path for path in retained_candidates if path.exists()]
+    while candidate_budget_bytes > 0 and _path_bytes(candidates_root) > candidate_budget_bytes:
+        removable = []
+        for path in retained_candidates:
+            resolved = _resolved_existing_path(path)
+            if resolved is not None and resolved in preserved:
+                continue
+            removable.append(path)
+        if not removable:
+            break
+        oldest = min(removable, key=lambda path: path.stat().st_mtime if path.exists() else float("inf"))
+        shutil.rmtree(oldest, ignore_errors=True)
+        if not oldest.exists():
+            removed_candidate_dirs.append(str(oldest))
+        retained_candidates = [path for path in retained_candidates if path.exists()]
+
+    referenced_paths: set[Path] = set()
+    artifact_paths = sorted(candidates_root.glob("*/*.json")) if candidates_root.exists() else []
+    for artifact_path in artifact_paths:
+        payload = _load_json_dict(artifact_path)
+        if isinstance(payload, dict):
+            referenced_paths.update(_collect_existing_paths(payload))
+    live_payload = _load_json_dict(config.tolbert_model_artifact_path)
+    if isinstance(live_payload, dict):
+        referenced_paths.update(_collect_existing_paths(live_payload))
+
+    removed_shared_store = _cleanup_unreferenced_tolbert_shared_store(
+        config,
+        referenced_paths=referenced_paths,
+    )
+    after_candidate_bytes = _path_bytes(candidates_root)
+    after_store_bytes = _path_bytes(store_root)
+    return {
+        "kept_candidate_dirs": keep_candidate_dirs,
+        "candidate_budget_bytes": candidate_budget_bytes,
+        "shared_store_budget_bytes": shared_store_budget_bytes,
+        "before_candidate_bytes": before_candidate_bytes,
+        "after_candidate_bytes": after_candidate_bytes,
+        "before_shared_store_bytes": before_store_bytes,
+        "after_shared_store_bytes": after_store_bytes,
+        "removed_candidate_dirs": removed_candidate_dirs,
+        "removed_shared_store": removed_shared_store,
+        "candidate_budget_satisfied": candidate_budget_bytes <= 0 or after_candidate_bytes <= candidate_budget_bytes,
+        "shared_store_budget_satisfied": shared_store_budget_bytes <= 0 or after_store_bytes <= shared_store_budget_bytes,
+    }
+
+
 def _path_aliases(path: Path) -> tuple[str, ...]:
     raw = str(path)
     aliases = [raw]
@@ -737,6 +889,12 @@ def build_tolbert_supervised_dataset_manifest(
     value_examples = 0
     stop_examples = 0
     stop_positive_examples = 0
+    difficulty_counts: dict[str, int] = {}
+    long_horizon_trajectory_examples = 0
+    long_horizon_policy_examples = 0
+    long_horizon_transition_examples = 0
+    long_horizon_value_examples = 0
+    long_horizon_stop_examples = 0
     benchmark_families: list[str] = []
     trajectory_payloads = (
         config.sqlite_store().iter_trajectory_payloads()
@@ -772,6 +930,13 @@ def build_tolbert_supervised_dataset_manifest(
         if not task_id:
             continue
         benchmark_family = str(task_metadata.get("benchmark_family", "bounded")).strip() or "bounded"
+        task_difficulty = str(
+            task_metadata.get(
+                "difficulty",
+                task_metadata.get("task_difficulty", world_model_summary.get("horizon", "seed")),
+            )
+        ).strip() or "seed"
+        difficulty_counts[task_difficulty] = difficulty_counts.get(task_difficulty, 0) + 1
         final_completion_ratio = _safe_float(
             summary.get("final_completion_ratio", world_model_summary.get("completion_ratio", 0.0)),
         )
@@ -783,6 +948,7 @@ def build_tolbert_supervised_dataset_manifest(
                 "failure_types": [str(value) for value in summary.get("failure_types", [])],
                 "transition_failures": [str(value) for value in summary.get("transition_failures", [])],
                 "benchmark_family": benchmark_family,
+                "difficulty": task_difficulty,
                 "synthetic_worker": bool(task_metadata.get("synthetic_worker", False)),
                 "prompt": str(task_contract.get("prompt", payload.get("prompt", ""))).strip(),
                 "suggested_commands": _string_list(task_contract.get("suggested_commands", [])),
@@ -820,6 +986,7 @@ def build_tolbert_supervised_dataset_manifest(
                         "action": action,
                         "content": content,
                         "benchmark_family": benchmark_family,
+                        "difficulty": task_difficulty,
                         "decision_source": str(raw_step.get("decision_source", "")).strip() or "unknown",
                         "tolbert_route_mode": str(raw_step.get("tolbert_route_mode", "")).strip(),
                         "selected_skill_id": str(raw_step.get("selected_skill_id", "")).strip(),
@@ -844,6 +1011,8 @@ def build_tolbert_supervised_dataset_manifest(
                     }
                     policy_records.append(policy_record)
                     policy_examples += 1
+                    if task_difficulty == "long_horizon":
+                        long_horizon_policy_examples += 1
                     if step_passed or progress_delta > 0.0 or bool(payload.get("success", False)):
                         policy_positive_examples += 1
                 if state_transition:
@@ -854,6 +1023,7 @@ def build_tolbert_supervised_dataset_manifest(
                         "action": action,
                         "content": content,
                         "benchmark_family": benchmark_family,
+                        "difficulty": task_difficulty,
                         "progress_delta": progress_delta,
                         "completion_ratio_before": max(0.0, min(1.0, round(cumulative_progress - progress_delta, 3))),
                         "completion_ratio_after": cumulative_progress,
@@ -871,6 +1041,8 @@ def build_tolbert_supervised_dataset_manifest(
                     }
                     transition_records.append(transition_record)
                     transition_examples += 1
+                    if task_difficulty == "long_horizon":
+                        long_horizon_transition_examples += 1
                     if transition_record["regressions"] or transition_record["no_progress"] or state_regression_count > 0:
                         transition_regression_examples += 1
                 value_record = {
@@ -878,6 +1050,7 @@ def build_tolbert_supervised_dataset_manifest(
                     "task_id": task_id,
                     "step_index": step_index,
                     "benchmark_family": benchmark_family,
+                    "difficulty": task_difficulty,
                     "completion_ratio_estimate": cumulative_progress,
                     "progress_delta": progress_delta,
                     "remaining_steps": remaining_steps,
@@ -895,6 +1068,8 @@ def build_tolbert_supervised_dataset_manifest(
                 }
                 value_records.append(value_record)
                 value_examples += 1
+                if task_difficulty == "long_horizon":
+                    long_horizon_value_examples += 1
                 stop_label = bool(
                     step_index == total_steps
                     and bool(payload.get("success", False))
@@ -905,6 +1080,7 @@ def build_tolbert_supervised_dataset_manifest(
                     "task_id": task_id,
                     "step_index": step_index,
                     "benchmark_family": benchmark_family,
+                    "difficulty": task_difficulty,
                     "completion_ratio_estimate": cumulative_progress,
                     "final_completion_ratio": final_completion_ratio,
                     "progress_delta": progress_delta,
@@ -917,9 +1093,13 @@ def build_tolbert_supervised_dataset_manifest(
                 }
                 stop_records.append(stop_record)
                 stop_examples += 1
+                if task_difficulty == "long_horizon":
+                    long_horizon_stop_examples += 1
                 if stop_label:
                     stop_positive_examples += 1
         trajectory_examples += 1
+        if task_difficulty == "long_horizon":
+            long_horizon_trajectory_examples += 1
         if bool(task_metadata.get("synthetic_worker", False)):
             synthetic_trajectory_examples += 1
         if benchmark_family and benchmark_family not in benchmark_families:
@@ -997,6 +1177,13 @@ def build_tolbert_supervised_dataset_manifest(
         "value_examples": value_examples,
         "stop_examples": stop_examples,
         "stop_positive_examples": stop_positive_examples,
+        "difficulty_counts": dict(sorted(difficulty_counts.items())),
+        "long_horizon_trajectory_examples": long_horizon_trajectory_examples,
+        "long_horizon_policy_examples": long_horizon_policy_examples,
+        "long_horizon_transition_examples": long_horizon_transition_examples,
+        "long_horizon_value_examples": long_horizon_value_examples,
+        "long_horizon_stop_examples": long_horizon_stop_examples,
+        "long_horizon_coverage_ratio": round(long_horizon_trajectory_examples / max(1, trajectory_examples), 4),
         "action_generation_examples": int(action_generation_summary.get("example_count", 0) or 0),
         "action_generation_positive_examples": int(action_generation_summary.get("positive_example_count", 0) or 0),
         "action_generation_summary": action_generation_summary,
@@ -1132,12 +1319,18 @@ def _tolbert_build_policy(
                 "allow_kernel_rebuild",
                 "require_synthetic_dataset",
                 "require_head_targets",
+                "require_long_horizon_head_targets",
                 "min_total_examples",
                 "min_synthetic_examples",
                 "min_policy_examples",
                 "min_transition_examples",
                 "min_value_examples",
                 "min_stop_examples",
+                "min_long_horizon_trajectory_examples",
+                "min_long_horizon_policy_examples",
+                "min_long_horizon_transition_examples",
+                "min_long_horizon_value_examples",
+                "min_long_horizon_stop_examples",
             ):
                 if key in current:
                     controls[key] = current[key]
@@ -1147,6 +1340,11 @@ def _tolbert_build_policy(
     transition_examples = int(dataset_manifest.get("transition_examples", 0) or 0)
     value_examples = int(dataset_manifest.get("value_examples", 0) or 0)
     stop_examples = int(dataset_manifest.get("stop_examples", 0) or 0)
+    long_horizon_trajectory_examples = int(dataset_manifest.get("long_horizon_trajectory_examples", 0) or 0)
+    long_horizon_policy_examples = int(dataset_manifest.get("long_horizon_policy_examples", 0) or 0)
+    long_horizon_transition_examples = int(dataset_manifest.get("long_horizon_transition_examples", 0) or 0)
+    long_horizon_value_examples = int(dataset_manifest.get("long_horizon_value_examples", 0) or 0)
+    long_horizon_stop_examples = int(dataset_manifest.get("long_horizon_stop_examples", 0) or 0)
     controls["allow_kernel_autobuild"] = bool(total_examples >= int(controls["min_total_examples"]))
     if bool(controls.get("require_synthetic_dataset", True)):
         controls["allow_kernel_autobuild"] = bool(
@@ -1160,12 +1358,26 @@ def _tolbert_build_policy(
             and value_examples >= int(controls["min_value_examples"])
             and stop_examples >= int(controls["min_stop_examples"])
         )
+    if bool(controls.get("require_long_horizon_head_targets", True)) and long_horizon_trajectory_examples > 0:
+        controls["allow_kernel_autobuild"] = bool(
+            controls["allow_kernel_autobuild"]
+            and long_horizon_trajectory_examples >= int(controls["min_long_horizon_trajectory_examples"])
+            and long_horizon_policy_examples >= int(controls["min_long_horizon_policy_examples"])
+            and long_horizon_transition_examples >= int(controls["min_long_horizon_transition_examples"])
+            and long_horizon_value_examples >= int(controls["min_long_horizon_value_examples"])
+            and long_horizon_stop_examples >= int(controls["min_long_horizon_stop_examples"])
+        )
     controls["ready_total_examples"] = total_examples
     controls["ready_synthetic_examples"] = synthetic_examples
     controls["ready_policy_examples"] = policy_examples
     controls["ready_transition_examples"] = transition_examples
     controls["ready_value_examples"] = value_examples
     controls["ready_stop_examples"] = stop_examples
+    controls["ready_long_horizon_trajectory_examples"] = long_horizon_trajectory_examples
+    controls["ready_long_horizon_policy_examples"] = long_horizon_policy_examples
+    controls["ready_long_horizon_transition_examples"] = long_horizon_transition_examples
+    controls["ready_long_horizon_value_examples"] = long_horizon_value_examples
+    controls["ready_long_horizon_stop_examples"] = long_horizon_stop_examples
     return controls
 
 
@@ -1249,6 +1461,9 @@ def _tolbert_retention_gate(
     gate.setdefault("min_proposal_selected_steps_delta", 0)
     gate.setdefault("min_novel_valid_command_steps", 1)
     gate.setdefault("min_novel_valid_command_rate_delta", 0.0)
+    gate.setdefault("require_long_horizon_non_regression", True)
+    gate.setdefault("require_long_horizon_novel_command_non_regression", True)
+    gate.setdefault("require_long_horizon_world_feedback_non_regression", True)
     gate.setdefault("required_confirmation_runs", 2)
     gate["proposal_gate_by_benchmark_family"] = _tolbert_proposal_gate_by_benchmark_family(
         dataset_manifest,
@@ -1768,6 +1983,9 @@ def _tolbert_liftoff_gate(dataset_manifest: dict[str, object]) -> dict[str, obje
         "max_regressed_families": 0,
         "require_generated_lane_non_regression": True,
         "require_failure_recovery_non_regression": True,
+        "require_long_horizon_non_regression": True,
+        "require_long_horizon_novel_command_non_regression": True,
+        "require_long_horizon_world_feedback_non_regression": True,
         "require_shadow_signal": True,
         "min_shadow_episodes_per_promoted_family": 1,
         "require_family_novel_command_evidence": True,
@@ -2063,6 +2281,11 @@ def _write_training_inputs_manifest(
         "transition_examples": int(dataset_manifest.get("transition_examples", 0) or 0),
         "value_examples": int(dataset_manifest.get("value_examples", 0) or 0),
         "stop_examples": int(dataset_manifest.get("stop_examples", 0) or 0),
+        "long_horizon_trajectory_examples": int(dataset_manifest.get("long_horizon_trajectory_examples", 0) or 0),
+        "long_horizon_policy_examples": int(dataset_manifest.get("long_horizon_policy_examples", 0) or 0),
+        "long_horizon_transition_examples": int(dataset_manifest.get("long_horizon_transition_examples", 0) or 0),
+        "long_horizon_value_examples": int(dataset_manifest.get("long_horizon_value_examples", 0) or 0),
+        "long_horizon_stop_examples": int(dataset_manifest.get("long_horizon_stop_examples", 0) or 0),
         "enabled_heads": enabled_heads,
     }
     manifest_path = output_dir / "training_inputs_manifest.json"

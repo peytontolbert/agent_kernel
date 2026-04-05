@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 
 from evals.metrics import EvalMetrics
 from .improvement_common import (
@@ -158,6 +159,8 @@ def policy_behavior_controls(
     if focus == "retrieval_caution":
         controls["direct_command_confidence_boost"] = max(float(controls["direct_command_confidence_boost"]), 0.2)
         controls["skill_ranking_confidence_boost"] = max(float(controls["skill_ranking_confidence_boost"]), 0.1)
+        controls["verifier_alignment_bias"] = max(int(controls["verifier_alignment_bias"]), 1)
+        controls["planner_subgoal_command_bias"] = max(int(controls["planner_subgoal_command_bias"]), 1)
         controls["critic_repeat_failure_bias"] = max(int(controls["critic_repeat_failure_bias"]), 2)
     if failure_counts.get("missing_expected_file", 0) > 0 or focus == "verifier_alignment":
         controls["verifier_alignment_bias"] = 2
@@ -165,6 +168,13 @@ def policy_behavior_controls(
         controls["planner_subgoal_command_bias"] = 2
     if focus == "verifier_alignment":
         controls["critic_repeat_failure_bias"] = max(int(controls["critic_repeat_failure_bias"]), 1)
+    if focus == "long_horizon_success":
+        controls["direct_command_confidence_boost"] = max(float(controls["direct_command_confidence_boost"]), 0.05)
+        controls["skill_ranking_confidence_boost"] = max(float(controls["skill_ranking_confidence_boost"]), 0.05)
+        controls["verifier_alignment_bias"] = max(int(controls["verifier_alignment_bias"]), 1)
+        controls["planner_subgoal_command_bias"] = max(int(controls["planner_subgoal_command_bias"]), 2)
+        controls["critic_repeat_failure_bias"] = max(int(controls["critic_repeat_failure_bias"]), 2)
+        controls["required_artifact_first_step_bias"] = max(int(controls["required_artifact_first_step_bias"]), 2)
     return controls
 
 
@@ -185,10 +195,24 @@ def planner_mutation_controls(
         controls.update(deepcopy(baseline))
     if metrics.low_confidence_episodes > 0 or focus == "retrieval_caution":
         controls["max_initial_subgoals"] = 4
+    if focus == "retrieval_caution":
+        controls["prepend_verifier_contract_check"] = True
     if failure_counts.get("missing_expected_file", 0) > 0 or focus == "verifier_alignment":
         controls["prepend_verifier_contract_check"] = True
     if focus == "verifier_alignment":
         controls["max_initial_subgoals"] = 6
+    if focus == "long_horizon_success":
+        try:
+            max_initial_subgoals = int(controls.get("max_initial_subgoals", 5))
+        except (TypeError, ValueError):
+            max_initial_subgoals = 5
+        controls["max_initial_subgoals"] = max(max_initial_subgoals, 6)
+        controls["prepend_verifier_contract_check"] = True
+        controls["append_validation_subgoal"] = True
+        controls["append_preservation_subgoal"] = True
+        controls["prefer_expected_artifacts_first"] = True
+        controls["include_preserved_artifact_steps"] = True
+        controls["prefer_preserved_artifacts_first"] = True
     return controls
 
 
@@ -329,6 +353,36 @@ def improvement_planner_controls(
         variant_gain_multiplier["policy"] = {"verifier_alignment": 1.15}
         search_guardrails["campaign"]["relative_score_floor"] = 0.7
         controls["portfolio_exploration_bonus"] = 0.012
+    if focus == "long_horizon_success":
+        gain_multiplier["policy"] = max(float(gain_multiplier.get("policy", 1.0)), 1.25)
+        gain_multiplier["verifier"] = max(float(gain_multiplier.get("verifier", 1.0)), 1.1)
+        score_bias["policy"] = max(float(score_bias.get("policy", 0.0)), 0.009)
+        bootstrap_multiplier["verifier"] = min(float(bootstrap_multiplier.get("verifier", 1.0)), 0.75)
+        variant_gain_multiplier["policy"] = {
+            **dict(variant_gain_multiplier.get("policy", {})),
+            "long_horizon_orientation": 1.12,
+        }
+        allocation_confidence["history_window_runs"] = max(
+            int(allocation_confidence.get("history_window_runs", 0) or 0),
+            5,
+        )
+        allocation_confidence["history_weight"] = max(float(allocation_confidence.get("history_weight", 0.0) or 0.0), 0.65)
+        allocation_confidence["bonus_history_weight"] = max(
+            float(allocation_confidence.get("bonus_history_weight", 0.0) or 0.0),
+            0.85,
+        )
+        search_guardrails["campaign"]["history_relative_threshold"] = min(
+            float(search_guardrails["campaign"].get("history_relative_threshold", 0.8)),
+            0.78,
+        )
+        controls["portfolio_recent_retention_bonus_multiplier"] = max(
+            float(controls.get("portfolio_recent_retention_bonus_multiplier", 1.0) or 0.0),
+            1.1,
+        )
+        controls["portfolio_recent_rejection_penalty_multiplier"] = max(
+            float(controls.get("portfolio_recent_rejection_penalty_multiplier", 1.0) or 0.0),
+            1.05,
+        )
     if metrics.generated_total and metrics.generated_pass_rate < metrics.pass_rate:
         allocation_confidence["target_priority_tasks"] = max(
             int(allocation_confidence.get("target_priority_tasks", 0) or 0),
@@ -370,15 +424,80 @@ def role_directive_overrides(
         directives["planner"] = (
             "Bias the next subgoal toward expected artifacts and explicit verifier-visible validation before termination."
         )
+    if focus == "retrieval_caution":
+        directives["planner"] = (
+            "Bias the next subgoal toward verifier-visible probes, expected artifacts, and short repo-grounding checks before larger edits when retrieval remains weak."
+        )
     if failure_counts.get("command_failure", 0) > 0 or focus == "retrieval_caution":
         directives["critic"] = (
             "Escalate repeated command-shape failures quickly and require a verifier-facing reason before approving execution."
         )
     if metrics.low_confidence_episodes > 0 or focus == "retrieval_caution":
         directives["executor"] = (
-            "Prefer shorter verifier-relevant commands and avoid committing to a brittle path when retrieval remains weak."
+            "Prefer shorter verifier-relevant commands, starting with a read, search, or verifier-visible probe when retrieval remains weak, and avoid committing to a brittle path too early."
+        )
+    if focus == "long_horizon_success":
+        directives["planner"] = (
+            "Sequence multi-file repo work toward verifier-visible milestones that preserve working artifacts, maintain rollback room, ground on existing repo state, and avoid spending the whole step budget on a brittle rewrite."
+        )
+        directives["critic"] = (
+            "Reject commands that create avoidable regressions, skip targeted validation, ignore concrete failure evidence, or trade immediate completion for a weaker future repo state."
+        )
+        directives["executor"] = (
+            "Prefer the smallest reversible edit or verifier-relevant local check that advances expected artifacts, keeps preserved files stable, reads the relevant file or failure before a rewrite, and earns the right to stop through validation on the touched paths."
         )
     return directives
+
+
+def _normalized_prompt_proposal_text(value: object) -> str:
+    tokens = re.findall(r"[a-z0-9]+", str(value).lower())
+    return " ".join(tokens)
+
+
+def _prompt_proposal_topic(proposal: dict[str, object]) -> str:
+    reason = str(proposal.get("reason", "")).strip()
+    suggestion = str(proposal.get("suggestion", "")).strip()
+    text = f"{reason} {suggestion}".lower()
+    if "retrieval confidence" in text or "low-confidence retrieval" in text or (
+        "retrieval" in text and "confidence" in text
+    ):
+        return "retrieval_confidence_caution"
+    if (
+        ("missing expected file" in text or "expected artifact" in text or "expected artifacts" in text)
+        or ("expected" in text and ("file" in text or "artifact" in text))
+    ) and any(token in text for token in ("confirm", "created", "terminate", "terminating")):
+        return "expected_artifact_confirmation"
+    if "command failure" in text or "failing command" in text:
+        return "command_failure_avoidance"
+    if "generated-task performance trails" in text or "one-shot synthesis" in text:
+        return "generated_lane_adaptation"
+    if "long-horizon" in text or ("repository" in text and "validation-backed" in text):
+        return "long_horizon_success"
+    return _normalized_prompt_proposal_text(suggestion or reason)
+
+
+def dedupe_prompt_adjustments(proposals: list[dict[str, object]]) -> list[dict[str, object]]:
+    winners: dict[tuple[str, str], dict[str, object]] = {}
+    winner_order: dict[tuple[str, str], int] = {}
+    for index, raw_proposal in enumerate(proposals):
+        if not isinstance(raw_proposal, dict):
+            continue
+        proposal = deepcopy(raw_proposal)
+        area = str(proposal.get("area", "")).strip()
+        key = (area, _prompt_proposal_topic(proposal))
+        current = winners.get(key)
+        if current is None:
+            winners[key] = proposal
+            winner_order[key] = index
+            continue
+        current_priority = int(current.get("priority", 0) or 0)
+        proposal_priority = int(proposal.get("priority", 0) or 0)
+        current_signal = len(str(current.get("suggestion", "")).strip()) + len(str(current.get("reason", "")).strip())
+        proposal_signal = len(str(proposal.get("suggestion", "")).strip()) + len(str(proposal.get("reason", "")).strip())
+        if (proposal_priority, proposal_signal) > (current_priority, current_signal):
+            winners[key] = proposal
+            winner_order[key] = index
+    return [deepcopy(winners[key]) for key in sorted(winners, key=lambda item: winner_order[item])]
 
 
 def propose_prompt_adjustments(
@@ -394,7 +513,7 @@ def propose_prompt_adjustments(
                 "area": "decision",
                 "priority": 6,
                 "reason": "selected variant targets low-confidence retrieval caution",
-                "suggestion": "When retrieval confidence is weak, prefer additional search or verifier checks before committing to a command path.",
+                "suggestion": "When retrieval confidence is weak, prefer additional search, verifier checks, or a verifier-visible repo-grounding command before committing to a command path.",
             }
         )
     if focus == "verifier_alignment":
@@ -405,6 +524,29 @@ def propose_prompt_adjustments(
                 "reason": "selected variant targets verifier alignment",
                 "suggestion": "Bias action selection toward commands that directly satisfy expected files and verifier-visible artifacts.",
             }
+        )
+    if focus == "long_horizon_success":
+        proposals.extend(
+            [
+                {
+                    "area": "system",
+                    "priority": 6,
+                    "reason": "selected variant targets durable long-horizon coding progress",
+                    "suggestion": "Favor small reversible edits, preservation of working artifacts, repo-state grounding, and validation-backed stopping on repository, project, tooling, and integration tasks over optimistic large rewrites.",
+                },
+                {
+                    "area": "decision",
+                    "priority": 6,
+                    "reason": "selected variant targets durable long-horizon coding progress",
+                    "suggestion": "Before executing or terminating, check expected artifacts, preserved paths, concrete failure evidence, and whether the next step should be a targeted edit or local verification step on the touched files.",
+                },
+                {
+                    "area": "reflection",
+                    "priority": 5,
+                    "reason": "selected variant targets durable long-horizon coding progress",
+                    "suggestion": "Treat single easy-task wins as weak evidence and use repo-scale regressions, preserved-artifact damage, and repeated repository failure modes as stronger signals for the next change.",
+                },
+            ]
         )
     if metrics.low_confidence_episodes > 0:
         proposals.append(
@@ -443,17 +585,27 @@ def propose_prompt_adjustments(
             }
         )
     if focus == "retrieval_caution":
-        return filter_proposals_by_area(proposals, allowed_areas={"decision", "reflection"})
+        return dedupe_prompt_adjustments(
+            filter_proposals_by_area(proposals, allowed_areas={"decision", "reflection"})
+        )
     if focus == "verifier_alignment":
-        return filter_proposals_by_area(proposals, allowed_areas={"system", "decision"})
-    return ensure_proposals(
-        proposals,
-        fallback={
-            "area": "system",
-            "priority": 3,
-            "reason": "policy behavior should remain explicit as a retained runtime surface",
-            "suggestion": "Preserve bounded prompt and planner controls even when recent failures are sparse.",
-        },
+        return dedupe_prompt_adjustments(
+            filter_proposals_by_area(proposals, allowed_areas={"system", "decision"})
+        )
+    if focus == "long_horizon_success":
+        return dedupe_prompt_adjustments(
+            filter_proposals_by_area(proposals, allowed_areas={"system", "decision", "reflection"})
+        )
+    return dedupe_prompt_adjustments(
+        ensure_proposals(
+            proposals,
+            fallback={
+                "area": "system",
+                "priority": 3,
+                "reason": "policy behavior should remain explicit as a retained runtime surface",
+                "suggestion": "Preserve bounded prompt and planner controls even when recent failures are sparse.",
+            },
+        )
     )
 
 

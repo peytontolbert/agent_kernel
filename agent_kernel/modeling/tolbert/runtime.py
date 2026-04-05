@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
+import re
 from typing import Any
 
 import torch
 
 from ..world.causal_machine import condition_causal_world_prior, load_causal_world_profile
 from ..world.latent_state import latent_command_bias
-from agent_kernel.state import AgentState
+from agent_kernel.state import AgentState, _software_work_objective_phase, _software_work_phase_rank
 
 from .checkpoint import load_hybrid_runtime_bundle
 from .config import HybridTolbertSSMConfig
@@ -87,6 +89,20 @@ def score_hybrid_candidates(
         world_diagnostics = {}
     weights = _normalized_scoring_policy(scoring_policy)
     scored: list[dict[str, object]] = []
+    task_horizon = str(state.world_model_summary.get("horizon", "")).strip() or str(
+        state.task.metadata.get("difficulty", "")
+    ).strip()
+    is_long_horizon = task_horizon == "long_horizon"
+    horizon_values: list[float] = []
+    for value in world_prior["diagnostics"].get("horizons", []):
+        try:
+            horizon_values.append(max(0.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+    horizon_extent = max(horizon_values, default=0.0)
+    horizon_scale = 1.0 + (
+        weights["long_horizon_horizon_scale_weight"] * min(3.0, math.log1p(horizon_extent))
+    )
     for index, candidate in enumerate(candidates):
         learned_score = float(torch.sigmoid(output.score[index]).item())
         policy_score = float(torch.sigmoid(output.policy_logits[index]).item())
@@ -128,6 +144,42 @@ def score_hybrid_candidates(
             if world_probs.numel() > 3:
                 world_risk_score += float(world_probs[3].item())
         latent_bias = float(latent_command_bias(state.latent_state_summary, str(candidate.get("command", candidate.get("content", "")))))
+        recovery_stage_alignment, recovery_stage_rank, recovery_stage_objective = _planner_recovery_stage_alignment(
+            state,
+            candidate,
+        )
+        software_work_alignment, software_work_rank, software_work_objective = _software_work_stage_alignment(
+            state,
+            candidate,
+        )
+        software_work_transition_alignment, software_work_stage_status = _software_work_transition_alignment(
+            state,
+            candidate,
+            objective=software_work_objective,
+        )
+        software_work_phase_alignment, software_work_candidate_phase, software_work_suggested_phase = (
+            _software_work_phase_boundary_alignment(
+                state,
+                candidate,
+                objective=software_work_objective,
+            )
+        )
+        software_work_phase_gate_alignment, software_work_gate_objective = _software_work_phase_gate_alignment(
+            state,
+            candidate,
+            objective=software_work_objective,
+        )
+        campaign_contract_alignment, campaign_contract_rank, campaign_contract_objective = _campaign_contract_alignment(
+            state,
+            candidate,
+        )
+        campaign_drift_penalty, campaign_drift_reason = _campaign_contract_drift_penalty(
+            state,
+            candidate,
+        )
+        trusted_retrieval_alignment = _trusted_retrieval_alignment(state, candidate)
+        trusted_retrieval_procedure_alignment = _trusted_retrieval_procedure_alignment(state, candidate)
+        graph_environment_alignment = _graph_environment_alignment(state, candidate)
         total_score = (
             (weights["learned_score_weight"] * learned_score)
             + (weights["policy_weight"] * policy_score)
@@ -140,7 +192,33 @@ def score_hybrid_candidates(
             - (weights["decoder_world_risk_penalty_weight"] * decoder_world_risk_score)
             + (weights["latent_bias_weight"] * latent_bias)
             + (weights["decoder_logprob_weight"] * decoder_logprob)
+            + (weights["recovery_stage_alignment_weight"] * recovery_stage_alignment)
+            + (weights["software_work_alignment_weight"] * software_work_alignment)
+            + (weights["software_work_transition_weight"] * software_work_transition_alignment)
+            + (weights["software_work_phase_handoff_weight"] * software_work_phase_alignment)
+            + (weights["software_work_phase_gate_weight"] * software_work_phase_gate_alignment)
+            + (weights["campaign_contract_alignment_weight"] * campaign_contract_alignment)
+            - (weights["campaign_drift_penalty_weight"] * max(0.0, campaign_drift_penalty))
+            + (weights["trusted_retrieval_alignment_weight"] * trusted_retrieval_alignment)
+            + (weights["trusted_retrieval_procedure_alignment_weight"] * trusted_retrieval_procedure_alignment)
+            + (weights["graph_environment_alignment_weight"] * graph_environment_alignment)
         )
+        long_horizon_progress_signal = max(
+            transition_progress,
+            world_progress_score,
+            decoder_world_progress_score,
+        )
+        long_horizon_risk_signal = max(
+            max(0.0, transition_regression),
+            world_risk_score,
+            decoder_world_risk_score,
+            risk_score,
+        )
+        if is_long_horizon and str(candidate.get("action", "code_execute")) != "respond":
+            total_score += horizon_scale * (
+                (weights["long_horizon_progress_bonus_weight"] * long_horizon_progress_signal)
+                - (weights["long_horizon_risk_penalty_weight"] * long_horizon_risk_signal)
+            )
         if str(candidate.get("action", "code_execute")) == "respond":
             total_score = (
                 (weights["respond_learned_score_weight"] * learned_score)
@@ -174,6 +252,10 @@ def score_hybrid_candidates(
                 "hybrid_decoder_world_progress_score": decoder_world_progress_score,
                 "hybrid_decoder_world_risk_score": decoder_world_risk_score,
                 "hybrid_decoder_world_entropy_mean": decoder_world_entropy_mean,
+                "hybrid_task_horizon": task_horizon,
+                "hybrid_long_horizon_scale": horizon_scale if is_long_horizon else 1.0,
+                "hybrid_long_horizon_progress_signal": long_horizon_progress_signal,
+                "hybrid_long_horizon_risk_signal": long_horizon_risk_signal,
                 "hybrid_total_score": total_score,
                 "hybrid_model_family": str(manifest.get("model_family", "")),
                 "hybrid_ssm_backend": str(output.ssm_backend),
@@ -198,9 +280,35 @@ def score_hybrid_candidates(
                 "hybrid_world_prior_top_probability": float(
                     world_prior["diagnostics"].get("matched_state_probability", 0.0) or 0.0
                 ),
+                "hybrid_world_prior_horizon_hint": str(world_prior["diagnostics"].get("horizon_hint", "")),
+                "hybrid_world_prior_bias_strength": float(
+                    world_prior["diagnostics"].get("applied_bias_strength", 1.0) or 1.0
+                ),
                 "hybrid_world_profile_horizons": list(world_prior["diagnostics"].get("horizons", [])),
                 "hybrid_world_signature_token_count": int(world_prior["diagnostics"].get("token_count", 0) or 0),
                 "hybrid_latent_bias": latent_bias,
+                "hybrid_recovery_stage_alignment": recovery_stage_alignment,
+                "hybrid_recovery_stage_rank": recovery_stage_rank,
+                "hybrid_recovery_stage_objective": recovery_stage_objective,
+                "hybrid_software_work_alignment": software_work_alignment,
+                "hybrid_software_work_rank": software_work_rank,
+                "hybrid_software_work_objective": software_work_objective,
+                "hybrid_software_work_transition_alignment": software_work_transition_alignment,
+                "hybrid_software_work_stage_status": software_work_stage_status,
+                "hybrid_software_work_phase_alignment": software_work_phase_alignment,
+                "hybrid_software_work_candidate_phase": software_work_candidate_phase,
+                "hybrid_software_work_suggested_phase": software_work_suggested_phase,
+                "hybrid_software_work_phase_gate_alignment": software_work_phase_gate_alignment,
+                "hybrid_software_work_gate_objective": software_work_gate_objective,
+                "hybrid_campaign_contract_alignment": campaign_contract_alignment,
+                "hybrid_campaign_contract_rank": campaign_contract_rank,
+                "hybrid_campaign_contract_objective": campaign_contract_objective,
+                "hybrid_campaign_drift_penalty": campaign_drift_penalty,
+                "hybrid_campaign_drift_reason": campaign_drift_reason,
+                "hybrid_trusted_retrieval_alignment": trusted_retrieval_alignment,
+                "hybrid_trusted_retrieval_procedure_alignment": trusted_retrieval_procedure_alignment,
+                "hybrid_graph_environment_alignment": graph_environment_alignment,
+                "hybrid_transfer_novelty": _historical_environment_novelty(state),
                 "hybrid_scoring_policy": dict(weights),
             }
         )
@@ -267,6 +375,8 @@ def infer_hybrid_world_signal(
             float(top.get("hybrid_world_prior_top_probability", 0.0) or 0.0),
             4,
         ),
+        "world_prior_horizon_hint": str(top.get("hybrid_world_prior_horizon_hint", "")).strip(),
+        "world_prior_bias_strength": round(float(top.get("hybrid_world_prior_bias_strength", 1.0) or 1.0), 4),
         "world_profile_horizons": list(top.get("hybrid_world_profile_horizons", [])),
         "world_signature_token_count": int(top.get("hybrid_world_signature_token_count", 0) or 0),
         "world_transition_family": str(top.get("hybrid_world_transition_family", "")).strip(),
@@ -375,10 +485,10 @@ def build_prompt_condition_batch(
 
 
 def _candidate_step_frame(state: AgentState, candidate: dict[str, object]) -> dict[str, object]:
-    heuristic_score = float(candidate.get("score", candidate.get("hybrid_total_score", 0.0)) or 0.0)
     trust_retrieval = bool(state.context_packet.control.get("trust_retrieval", False)) if state.context_packet else False
     command = str(candidate.get("command", candidate.get("content", ""))).strip()
     learned = _runtime_world_feedback(state.latent_state_summary)
+    no_progress = bool(state.latest_state_transition.get("no_progress", False))
     return {
         "command": command,
         "features": [
@@ -388,13 +498,14 @@ def _candidate_step_frame(state: AgentState, candidate: dict[str, object]) -> di
             float(len(state.latest_state_transition.get("regressions", []))),
             1.0 if bool(candidate.get("retrieval_influenced", False)) else 0.0,
             1.0 if bool(candidate.get("retrieval_ranked_skill", False)) else 0.0,
-            min(1.0, len(state.available_skills) / 5.0),
-            min(1.0, len(state.retrieval_direct_candidates) / 5.0),
-            1.0 if str(candidate.get("reason", "")).strip().startswith("retrieval") else 0.0,
+            learned["trusted_retrieval_alignment"],
+            learned["graph_environment_alignment"],
+            learned["transfer_novelty"],
             1.0 if str(candidate.get("action", "code_execute")) == "code_execute" else 0.0,
             1.0 if str(candidate.get("action", "")) == "respond" else 0.0,
+            0.0,
             float(latent_command_bias(state.latent_state_summary, command)),
-            heuristic_score / 10.0 if heuristic_score > 0.0 else 0.0,
+            1.0 if no_progress else 0.0,
             learned["progress_signal"],
             learned["risk_signal"],
         ],
@@ -423,9 +534,9 @@ def _history_step_frame(step: Any) -> dict[str, object]:
             float(getattr(step, "state_regression_count", 0.0) or 0.0),
             1.0 if bool(getattr(step, "retrieval_influenced", False)) else 0.0,
             1.0 if bool(getattr(step, "retrieval_ranked_skill", False)) else 0.0,
-            min(1.0, float(getattr(step, "available_skill_count", 0) or 0) / 5.0),
-            min(1.0, float(getattr(step, "retrieval_candidate_count", 0) or 0) / 5.0),
-            min(1.0, float(getattr(step, "retrieval_evidence_count", 0) or 0) / 5.0),
+            learned["trusted_retrieval_alignment"],
+            learned["graph_environment_alignment"],
+            learned["transfer_novelty"],
             1.0 if str(getattr(step, "action", "")).strip() == "code_execute" else 0.0,
             1.0 if str(getattr(step, "action", "")).strip() == "respond" else 0.0,
             1.0 if bool(verification.get("passed", False)) else 0.0,
@@ -459,9 +570,27 @@ def _runtime_world_feedback(
         float(proposal.get("hybrid_world_risk_score", 0.0) or 0.0),
         float(proposal.get("hybrid_decoder_world_risk_score", 0.0) or 0.0),
     )
+    trusted_retrieval_alignment = max(
+        float(learned.get("trusted_retrieval_alignment", 0.0) or 0.0),
+        float(proposal.get("hybrid_trusted_retrieval_alignment", 0.0) or 0.0),
+    )
+    graph_environment_alignment = float(
+        proposal.get(
+            "hybrid_graph_environment_alignment",
+            learned.get("graph_environment_alignment", 0.0),
+        )
+        or 0.0
+    )
+    transfer_novelty = max(
+        float(learned.get("transfer_novelty", 0.0) or 0.0),
+        float(proposal.get("hybrid_transfer_novelty", 0.0) or 0.0),
+    )
     return {
         "progress_signal": max(0.0, min(1.0, progress_signal)),
         "risk_signal": max(0.0, min(1.0, risk_signal)),
+        "trusted_retrieval_alignment": max(0.0, min(1.0, trusted_retrieval_alignment)),
+        "graph_environment_alignment": max(-1.0, min(1.0, graph_environment_alignment)),
+        "transfer_novelty": max(0.0, min(1.0, transfer_novelty)),
     }
 
 
@@ -512,6 +641,16 @@ def _normalized_scoring_policy(policy: dict[str, object] | None) -> dict[str, fl
         "decoder_world_risk_penalty_weight": 0.20,
         "latent_bias_weight": 0.10,
         "decoder_logprob_weight": 0.10,
+        "recovery_stage_alignment_weight": 0.35,
+        "software_work_alignment_weight": 0.30,
+        "software_work_transition_weight": 0.35,
+        "software_work_phase_handoff_weight": 0.32,
+        "software_work_phase_gate_weight": 0.42,
+        "campaign_contract_alignment_weight": 0.38,
+        "campaign_drift_penalty_weight": 0.30,
+        "trusted_retrieval_alignment_weight": 0.45,
+        "trusted_retrieval_procedure_alignment_weight": 0.40,
+        "graph_environment_alignment_weight": 0.35,
         "respond_learned_score_weight": 1.25,
         "respond_policy_weight": 0.0,
         "respond_value_weight": 1.0,
@@ -525,6 +664,9 @@ def _normalized_scoring_policy(policy: dict[str, object] | None) -> dict[str, fl
         "respond_decoder_world_risk_penalty_weight": 0.30,
         "respond_latent_bias_weight": 0.0,
         "respond_decoder_logprob_weight": 0.05,
+        "long_horizon_progress_bonus_weight": 0.0,
+        "long_horizon_risk_penalty_weight": 0.0,
+        "long_horizon_horizon_scale_weight": 0.0,
     }
     if not isinstance(policy, dict):
         return defaults
@@ -535,6 +677,651 @@ def _normalized_scoring_policy(policy: dict[str, object] | None) -> dict[str, fl
         except (TypeError, ValueError):
             normalized[key] = default
     return normalized
+
+
+def _planner_recovery_stage_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> tuple[float, int, str]:
+    artifact = dict(state.planner_recovery_artifact) if isinstance(state.planner_recovery_artifact, dict) else {}
+    if str(artifact.get("kind", "")).strip() != "planner_recovery_rewrite":
+        return 0.0, -1, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, -1, ""
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return 0.0, -1, ""
+    ranked = artifact.get("ranked_objectives", [])
+    if not isinstance(ranked, list):
+        ranked = []
+    for index, item in enumerate(ranked[:4], start=1):
+        if not isinstance(item, dict):
+            continue
+        objective = str(item.get("objective", "")).strip()
+        if not objective or not _candidate_matches_planner_recovery_objective(command, objective):
+            continue
+        raw_score = float(item.get("score", 0.0) or 0.0)
+        scaled = max(0.0, min(1.5, raw_score / 100.0))
+        scaled *= max(0.4, 1.0 - ((index - 1) * 0.15))
+        return scaled, index, objective
+    next_stage = str(artifact.get("next_stage_objective", "")).strip()
+    if next_stage and _candidate_matches_planner_recovery_objective(command, next_stage):
+        return 0.5, 1, next_stage
+    return 0.0, -1, ""
+
+
+def _software_work_stage_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> tuple[float, int, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, -1, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, -1, ""
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return 0.0, -1, ""
+    objectives = state.software_work_plan_update()
+    for index, objective in enumerate(objectives[:5], start=1):
+        if not _candidate_matches_software_work_objective(command, objective):
+            continue
+        scale = max(0.35, 1.0 - ((index - 1) * 0.12))
+        return scale, index, objective
+    return 0.0, -1, ""
+
+
+def _software_work_transition_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+    *,
+    objective: str,
+) -> tuple[float, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, ""
+    normalized_objective = str(objective).strip()
+    if not normalized_objective:
+        return 0.0, ""
+    overview = state.software_work_stage_overview()
+    objective_states = overview.get("objective_states", {})
+    objective_states = objective_states if isinstance(objective_states, dict) else {}
+    attempt_counts = overview.get("attempt_counts", {})
+    attempt_counts = attempt_counts if isinstance(attempt_counts, dict) else {}
+    status = str(objective_states.get(normalized_objective, "pending")).strip() or "pending"
+    attempts = max(0, int(attempt_counts.get(normalized_objective, 0) or 0))
+    command = _canonicalize_command(str(candidate.get("command", candidate.get("content", ""))))
+    failed_commands = state.all_failed_command_signatures()
+    if status == "completed":
+        return 0.0, status
+    if status == "advanced":
+        return 0.35, status
+    if status == "pending":
+        return 0.18, status
+    if status == "stalled":
+        if command in failed_commands:
+            return -0.22 - (min(3, attempts) * 0.03), status
+        return 0.05, status
+    if status == "regressed":
+        if command in failed_commands:
+            return -0.30 - (min(3, attempts) * 0.04), status
+        return 0.08, status
+    return 0.0, status
+
+
+def _software_work_phase_boundary_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+    *,
+    objective: str,
+) -> tuple[float, str, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, "", ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, "", ""
+    phase_state = state.software_work_phase_state()
+    if not isinstance(phase_state, dict) or not phase_state:
+        return 0.0, "", ""
+    current_phase = str(phase_state.get("current_phase", "")).strip()
+    suggested_phase = str(phase_state.get("suggested_phase", "")).strip()
+    if not suggested_phase:
+        return 0.0, "", ""
+    candidate_phase = _software_work_candidate_phase(state, candidate, objective=objective)
+    if not candidate_phase:
+        return 0.0, "", suggested_phase
+    if candidate_phase == suggested_phase:
+        if bool(phase_state.get("handoff_ready", False)) and current_phase and suggested_phase != current_phase:
+            return 0.34, candidate_phase, suggested_phase
+        return 0.18, candidate_phase, suggested_phase
+    if bool(phase_state.get("handoff_ready", False)) and current_phase and candidate_phase == current_phase:
+        return -0.20, candidate_phase, suggested_phase
+    if current_phase and _software_work_phase_rank(candidate_phase) > _software_work_phase_rank(suggested_phase):
+        return -0.10, candidate_phase, suggested_phase
+    if current_phase and not bool(phase_state.get("handoff_ready", False)):
+        if _software_work_phase_rank(candidate_phase) > _software_work_phase_rank(current_phase):
+            return -0.24, candidate_phase, suggested_phase
+    return 0.0, candidate_phase, suggested_phase
+
+
+def _software_work_phase_gate_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+    *,
+    objective: str,
+) -> tuple[float, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, ""
+    gate_state = state.software_work_phase_gate_state()
+    if not isinstance(gate_state, dict) or not gate_state:
+        return 0.0, ""
+    gate_phase = str(gate_state.get("gate_phase", "")).strip()
+    gate_objectives = [
+        str(item).strip()
+        for item in gate_state.get("gate_objectives", [])
+        if str(item).strip()
+    ]
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    for gate_objective in gate_objectives:
+        if _candidate_matches_software_work_objective(command, gate_objective):
+            return 0.42, gate_objective
+    candidate_phase = _software_work_candidate_phase(state, candidate, objective=objective)
+    if gate_phase and candidate_phase and _software_work_phase_rank(candidate_phase) > _software_work_phase_rank(gate_phase):
+        return -0.28, candidate_phase
+    return (-0.08, "") if gate_objectives else (0.0, "")
+
+
+def _campaign_contract_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> tuple[float, int, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, -1, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, -1, ""
+    contract = state.campaign_contract_state()
+    if not isinstance(contract, dict) or not contract:
+        return 0.0, -1, ""
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return 0.0, -1, ""
+    regressed = {
+        str(item).strip()
+        for item in contract.get("regressed_objectives", [])
+        if str(item).strip()
+    }
+    stalled = {
+        str(item).strip()
+        for item in contract.get("stalled_objectives", [])
+        if str(item).strip()
+    }
+    for index, objective in enumerate(contract.get("anchor_objectives", [])[:5], start=1):
+        normalized = str(objective).strip()
+        if not normalized or not _candidate_matches_software_work_objective(command, normalized):
+            continue
+        scale = max(0.3, 1.0 - ((index - 1) * 0.14))
+        if normalized in regressed:
+            scale += 0.18
+        elif normalized in stalled:
+            scale += 0.08
+        return min(1.4, scale), index, normalized
+    required_paths = {
+        str(item).strip().lower()
+        for item in contract.get("required_paths", [])
+        if str(item).strip()
+    }
+    if required_paths and any(path in command for path in required_paths):
+        return 0.18, 6, next(iter(sorted(required_paths)))
+    return 0.0, -1, ""
+
+
+def _campaign_contract_drift_penalty(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> tuple[float, str]:
+    if state.world_horizon() != "long_horizon":
+        return 0.0, ""
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0, ""
+    contract = state.campaign_contract_state()
+    if not isinstance(contract, dict) or not contract:
+        return 0.0, ""
+    drift_pressure = max(0, int(contract.get("drift_pressure", 0) or 0))
+    if drift_pressure <= 0:
+        return 0.0, ""
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return 0.0, ""
+    for objective in contract.get("anchor_objectives", [])[:5]:
+        normalized = str(objective).strip()
+        if normalized and _candidate_matches_software_work_objective(command, normalized):
+            return 0.0, ""
+    required_paths = {
+        str(item).strip().lower()
+        for item in contract.get("required_paths", [])
+        if str(item).strip()
+    }
+    if required_paths and any(path in command for path in required_paths):
+        return 0.0, ""
+    if _is_read_only_discovery(command) or _is_verification_command(command):
+        return 0.0, ""
+    return min(1.0, 0.18 + (0.08 * drift_pressure)), "off_contract_mutation"
+
+
+def _software_work_candidate_phase(
+    state: AgentState,
+    candidate: dict[str, object],
+    *,
+    objective: str,
+) -> str:
+    normalized_objective = str(objective).strip()
+    if normalized_objective:
+        return _software_work_objective_phase(
+            normalized_objective,
+            test_attempted=_software_work_test_attempted(state),
+            regression_signaled=bool(state.latest_state_transition.get("regressed", False)),
+        )
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return ""
+    objectives = state.software_work_plan_update()
+    for objective in objectives[:6]:
+        if _candidate_matches_software_work_objective(command, objective):
+            return _software_work_objective_phase(
+                objective,
+                test_attempted=_software_work_test_attempted(state),
+                regression_signaled=bool(state.latest_state_transition.get("regressed", False)),
+            )
+    if any(token in command for token in ("pytest", "unittest", "nose", "tox", "smoke", "test")):
+        return "test"
+    if any(token in command for token in ("git merge", "git cherry-pick", "git rebase", "codegen", "generate")):
+        return "migration"
+    if any(token in command for token in ("report", "summary", "postmortem", "fix", "repair")):
+        return "follow_up_fix"
+    return "implementation"
+
+
+def _software_work_test_attempted(state: AgentState) -> bool:
+    overview = state.software_work_stage_overview()
+    recent_outcomes = overview.get("recent_outcomes", [])
+    if not isinstance(recent_outcomes, list):
+        return False
+    return any(
+        _software_work_objective_phase(str(item.get("objective", "")).strip()) == "test"
+        for item in recent_outcomes
+        if isinstance(item, dict)
+    )
+
+
+def _trusted_retrieval_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> float:
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0
+    graph_summary = state.graph_summary if isinstance(state.graph_summary, dict) else {}
+    trusted_commands = graph_summary.get("trusted_retrieval_command_counts", {})
+    if not isinstance(trusted_commands, dict) or not trusted_commands:
+        return 0.0
+    command = _canonicalize_command(str(candidate.get("command", candidate.get("content", ""))))
+    if not command:
+        return 0.0
+    command_tokens = _command_target_tokens(command)
+    repair_tokens = _repair_surface_tokens(state)
+    best = 0.0
+    for prior_command, raw_count in trusted_commands.items():
+        prior = _canonicalize_command(str(prior_command))
+        count = _safe_int(raw_count)
+        if not prior or count <= 0:
+            continue
+        if prior == command:
+            best = max(best, min(1.6, 0.45 + (0.35 * count)))
+            continue
+        overlap = repair_tokens.intersection(command_tokens).intersection(_command_target_tokens(prior))
+        if overlap:
+            best = max(best, min(1.0, 0.2 + (0.15 * count) + (0.1 * len(overlap))))
+    return best
+
+
+def _trusted_retrieval_procedure_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> float:
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0
+    graph_summary = state.graph_summary if isinstance(state.graph_summary, dict) else {}
+    procedures = graph_summary.get("trusted_retrieval_procedures", {})
+    if not isinstance(procedures, list) or not procedures:
+        return 0.0
+    command = _canonicalize_command(str(candidate.get("command", candidate.get("content", ""))))
+    if not command:
+        return 0.0
+    recent_commands = _recent_successful_command_suffix(state)
+    if not recent_commands:
+        return 0.0
+    best = 0.0
+    for item in procedures[:4]:
+        if not isinstance(item, dict):
+            continue
+        commands = [_canonicalize_command(str(value)) for value in item.get("commands", []) if str(value).strip()]
+        commands = [value for value in commands if value]
+        if len(commands) < 2:
+            continue
+        prefix_len = _trusted_retrieval_procedure_prefix_match(recent_commands, commands)
+        if prefix_len <= 0 or prefix_len >= len(commands):
+            continue
+        if commands[prefix_len] != command:
+            continue
+        count = _safe_int(item.get("count", 0))
+        bonus = 0.24 + (0.14 * prefix_len) + (0.08 * min(3, count))
+        if _is_verification_command(command):
+            bonus += 0.08
+        best = max(best, min(1.2, bonus))
+    return best
+
+
+def _graph_environment_alignment(
+    state: AgentState,
+    candidate: dict[str, object],
+) -> float:
+    if str(candidate.get("action", "code_execute")).strip() == "respond":
+        return 0.0
+    graph_summary = state.graph_summary if isinstance(state.graph_summary, dict) else {}
+    universe_summary = state.universe_summary if isinstance(state.universe_summary, dict) else {}
+    if not graph_summary or not universe_summary:
+        return 0.0
+    snapshot = universe_summary.get("environment_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    command = str(candidate.get("command", candidate.get("content", ""))).strip().lower()
+    if not command:
+        return 0.0
+    novelty = _historical_environment_novelty(state)
+    failures = _graph_environment_alignment_failures(graph_summary)
+    read_only_discovery = _is_read_only_discovery(command)
+    verification_aligned = _is_verification_command(command)
+    git_mutation = _is_git_mutation_command(command)
+    network_fetch = _is_network_fetch_command(command)
+    workspace_scope_escape = _is_workspace_scope_escape_command(command)
+    destructive_mutation = _is_destructive_command(command)
+
+    score = 0.0
+    if novelty > 0:
+        if read_only_discovery:
+            score += 0.55 * novelty
+        if verification_aligned:
+            score += 0.35 * novelty
+        if git_mutation and _environment_conflicts(snapshot, graph_summary, "git_write_mode"):
+            score -= 0.75 * novelty
+        if network_fetch and _environment_conflicts(snapshot, graph_summary, "network_access_mode"):
+            score -= 0.75 * novelty
+        if (workspace_scope_escape or destructive_mutation) and _environment_conflicts(
+            snapshot,
+            graph_summary,
+            "workspace_write_scope",
+        ):
+            score -= 0.85 * novelty
+
+    if git_mutation:
+        score -= min(0.9, 0.2 * failures.get("git_write_aligned", 0))
+    if network_fetch:
+        score -= min(0.9, 0.2 * failures.get("network_access_aligned", 0))
+    if workspace_scope_escape or destructive_mutation:
+        score -= min(1.0, 0.25 * failures.get("workspace_scope_aligned", 0))
+    if failures and verification_aligned:
+        score += 0.2
+    return score
+
+
+def _candidate_matches_software_work_objective(command: str, objective: str) -> bool:
+    normalized = str(objective).strip().lower()
+    if not normalized:
+        return False
+    if _candidate_matches_planner_recovery_objective(command, normalized):
+        return True
+    for prefix in (
+        "apply planned edit ",
+        "complete implementation for ",
+        "revise implementation for ",
+        "materialize expected artifact ",
+        "remove forbidden artifact ",
+        "preserve required artifact ",
+    ):
+        if normalized.startswith(prefix):
+            target = normalized.removeprefix(prefix).strip()
+            return bool(target) and target in command
+    return False
+
+
+def _canonicalize_command(command: str) -> str:
+    normalized = str(command).strip()
+    if not normalized:
+        return ""
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\n", "\\n").replace("\t", "\\t")
+    return " ".join(normalized.split())
+
+
+def _repair_surface_tokens(state: AgentState) -> set[str]:
+    tokens: set[str] = set()
+    world = state.world_model_summary if isinstance(state.world_model_summary, dict) else {}
+    diagnosis = state.active_subgoal_diagnosis()
+    for value in (
+        diagnosis.get("path", ""),
+        *world.get("missing_expected_artifacts", []),
+        *world.get("present_forbidden_artifacts", []),
+        *world.get("unsatisfied_expected_contents", []),
+        *state.task.expected_files,
+        *state.task.forbidden_files,
+        *state.task.expected_file_contents.keys(),
+    ):
+        tokens.update(_path_tokens(str(value)))
+    return tokens
+
+
+def _command_target_tokens(command: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z0-9_.\\-/]+", str(command).lower())
+        if "/" in token or "." in token
+    }
+
+
+def _path_tokens(path: str) -> set[str]:
+    normalized = str(path).strip().lower()
+    if not normalized:
+        return set()
+    parts = [part for part in re.split(r"[\\/]", normalized) if part and part not in {".", ".."}]
+    tokens = set(parts)
+    tokens.add(normalized)
+    if parts:
+        tokens.add(parts[-1])
+    return tokens
+
+
+def _historical_environment_novelty(state: AgentState) -> int:
+    graph_summary = state.graph_summary if isinstance(state.graph_summary, dict) else {}
+    universe_summary = state.universe_summary if isinstance(state.universe_summary, dict) else {}
+    snapshot = universe_summary.get("environment_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    novelty = 0
+    for field in ("network_access_mode", "git_write_mode", "workspace_write_scope"):
+        current = str(snapshot.get(field, "")).strip().lower()
+        dominant = _dominant_graph_environment_mode(graph_summary, field)
+        if current and dominant and current != dominant:
+            novelty += 1
+    return novelty
+
+
+def _recent_successful_command_suffix(state: AgentState) -> list[str]:
+    commands: list[str] = []
+    for step in state.history[-6:]:
+        if str(getattr(step, "action", "")).strip() != "code_execute":
+            continue
+        command = _canonicalize_command(str(getattr(step, "content", "")).strip())
+        if not command:
+            continue
+        command_result = getattr(step, "command_result", {})
+        if isinstance(command_result, dict) and not bool(command_result.get("timed_out", False)):
+            try:
+                if int(command_result.get("exit_code", 1)) == 0:
+                    commands.append(command)
+                    continue
+            except (TypeError, ValueError):
+                pass
+        verification = getattr(step, "verification", {})
+        if isinstance(verification, dict) and bool(verification.get("passed", False)):
+            commands.append(command)
+    return commands
+
+
+def _trusted_retrieval_procedure_prefix_match(
+    recent_commands: list[str],
+    procedure_commands: list[str],
+) -> int:
+    if len(procedure_commands) < 2:
+        return 0
+    max_prefix = min(len(recent_commands), len(procedure_commands) - 1)
+    for prefix_len in range(max_prefix, 0, -1):
+        if recent_commands[-prefix_len:] == procedure_commands[:prefix_len]:
+            return prefix_len
+    return 0
+
+
+def _graph_environment_alignment_failures(graph_summary: dict[str, object]) -> dict[str, int]:
+    failures = graph_summary.get("environment_alignment_failures", {})
+    if not isinstance(failures, dict):
+        return {}
+    return {
+        str(key).strip(): value
+        for key, value in (
+            (str(key).strip(), _safe_int(raw_value))
+            for key, raw_value in failures.items()
+        )
+        if key and value > 0
+    }
+
+
+def _dominant_graph_environment_mode(graph_summary: dict[str, object], field: str) -> str:
+    observed_modes = graph_summary.get("observed_environment_modes", {})
+    if not isinstance(observed_modes, dict):
+        return ""
+    values = observed_modes.get(field, {})
+    if not isinstance(values, dict):
+        return ""
+    ranked = sorted(
+        (
+            (str(mode).strip().lower(), _safe_int(count))
+            for mode, count in values.items()
+            if str(mode).strip()
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return ranked[0][0] if ranked and ranked[0][1] > 0 else ""
+
+
+def _environment_conflicts(
+    snapshot: dict[str, object],
+    graph_summary: dict[str, object],
+    field: str,
+) -> bool:
+    current = str(snapshot.get(field, "")).strip().lower()
+    dominant = _dominant_graph_environment_mode(graph_summary, field)
+    return bool(current and dominant and current != dominant)
+
+
+def _is_read_only_discovery(command: str) -> bool:
+    return any(
+        command.startswith(prefix)
+        for prefix in (
+            "ls",
+            "find ",
+            "rg ",
+            "grep ",
+            "cat ",
+            "sed -n",
+            "git status",
+            "git diff",
+            "git log",
+            "git rev-parse",
+            "pwd",
+            "test ",
+        )
+    )
+
+
+def _is_verification_command(command: str) -> bool:
+    return any(token in command for token in ("pytest", " test ", "grep -q", "diff ", "git diff", "python -m pytest"))
+
+
+def _is_git_mutation_command(command: str) -> bool:
+    return any(
+        command.startswith(prefix)
+        for prefix in (
+            "git commit",
+            "git merge",
+            "git rebase",
+            "git cherry-pick",
+            "git push",
+            "git pull",
+            "git reset",
+            "git checkout ",
+            "git switch ",
+            "git branch ",
+        )
+    )
+
+
+def _is_network_fetch_command(command: str) -> bool:
+    return any(token in command for token in ("curl ", "wget ", "pip install", "npm install", "uv pip install"))
+
+
+def _is_workspace_scope_escape_command(command: str) -> bool:
+    return "../" in command or " /tmp/" in command or " cd .." in command
+
+
+def _is_destructive_command(command: str) -> bool:
+    return "rm -rf" in command or "git reset --hard" in command
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_matches_planner_recovery_objective(command: str, objective: str) -> bool:
+    normalized_command = str(command).strip().lower()
+    normalized_objective = str(objective).strip().lower()
+    if not normalized_command or not normalized_objective:
+        return False
+    for prefix in (
+        "update workflow path ",
+        "regenerate generated artifact ",
+        "write workflow report ",
+        "accept required branch ",
+        "prepare workflow branch ",
+        "run workflow test ",
+    ):
+        if normalized_objective.startswith(prefix):
+            target = normalized_objective.removeprefix(prefix).strip()
+            if not target:
+                return False
+            if prefix == "accept required branch ":
+                return "git merge" in normalized_command and target in normalized_command
+            if prefix == "prepare workflow branch ":
+                return target in normalized_command and any(
+                    token in normalized_command for token in ("git checkout", "git switch", "git branch")
+                )
+            if prefix == "run workflow test ":
+                objective_tokens = {token for token in target.split() if len(token) > 2}
+                return (
+                    ("test" in normalized_command or "pytest" in normalized_command)
+                    and bool(objective_tokens.intersection(set(normalized_command.split())))
+                )
+            return target in normalized_command
+    return any(token in normalized_command for token in normalized_objective.split() if len(token) > 3)
 
 
 def _world_initial_belief_payload(
@@ -568,6 +1355,7 @@ def _world_initial_belief_payload(
     prior = condition_causal_world_prior(
         profile,
         text_fragments=_state_profile_fragments(state),
+        horizon_hint=_state_horizon_hint(state),
     )
     log_prior = torch.tensor(prior.log_prior, dtype=torch.float32, device=device).unsqueeze(0).expand(batch_size, -1)
     payload["log_belief"] = log_prior
@@ -577,6 +1365,8 @@ def _world_initial_belief_payload(
         "matched_state_probability": prior.matched_state_probability,
         "signature_norm": prior.signature_norm,
         "token_count": prior.token_count,
+        "horizon_hint": prior.horizon_hint,
+        "applied_bias_strength": prior.applied_bias_strength,
         "horizons": list(profile.horizons),
         "profile_path": str(profile.profile_path),
     }
@@ -910,14 +1700,32 @@ def _state_profile_fragments(state: AgentState | None) -> list[str]:
     if state is None:
         return []
     fragments: list[str] = [str(state.task.prompt)]
+    benchmark_family = str(state.task.metadata.get("benchmark_family", "")).strip()
+    if benchmark_family:
+        fragments.append(f"benchmark_family:{benchmark_family}")
+    horizon_hint = _state_horizon_hint(state)
+    if horizon_hint:
+        fragments.append(f"horizon:{horizon_hint}")
     fragments.extend(str(command) for command in state.task.suggested_commands[:4])
     fragments.extend(str(goal) for goal in state.plan[:4])
     fragments.extend(str(goal) for goal in state.initial_plan[:4])
     fragments.extend(str(item) for item in state.world_model_summary.get("missing_expected_artifacts", [])[:6])
     fragments.extend(str(item) for item in state.world_model_summary.get("present_forbidden_artifacts", [])[:6])
+    fragments.extend(str(item) for item in state.world_model_summary.get("preserved_artifacts", [])[:6])
     fragments.extend(str(item) for item in state.latest_state_transition.get("regressions", [])[:4])
+    if str(state.active_subgoal).strip():
+        fragments.append(str(state.active_subgoal))
     fragments.extend(str(step.content) for step in state.history[-4:] if str(step.content).strip())
     return [fragment.strip() for fragment in fragments if str(fragment).strip()]
+
+
+def _state_horizon_hint(state: AgentState | None) -> str:
+    if state is None:
+        return ""
+    horizon = str(state.world_model_summary.get("horizon", "")).strip()
+    if horizon:
+        return horizon
+    return str(state.task.metadata.get("difficulty", state.task.metadata.get("task_difficulty", ""))).strip()
 
 
 def _load_decoder_vocabulary(manifest: dict[str, object]) -> dict[str, int]:

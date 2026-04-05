@@ -4,10 +4,11 @@ import json
 from pathlib import Path
 import re
 
-from .config import KernelConfig
+from .config import KernelConfig, current_external_task_manifests_paths
 from .episode_store import iter_episode_documents
 from .learning_compiler import load_learning_candidates
 from .schemas import EpisodeRecord
+from .task_bank import TaskBank
 
 
 def render_episode_document(episode: EpisodeRecord) -> dict[str, object]:
@@ -213,18 +214,36 @@ def _iter_episode_documents_for_root(episodes_root: Path) -> list[dict[str, obje
     return iter_episode_documents(episodes_root)
 
 
+def _task_bank_for_extractors() -> TaskBank:
+    manifest_paths = current_external_task_manifests_paths()
+    try:
+        return TaskBank(
+            config=KernelConfig(),
+            external_task_manifests=manifest_paths if manifest_paths else None,
+        )
+    except TypeError:
+        return TaskBank()
+
+
 def _success_skill_candidates_from_learning_artifacts(episodes_root: Path) -> list[dict[str, object]]:
     path = _learning_artifacts_path_for_episodes_root(episodes_root)
+    bank = _task_bank_for_extractors()
     skills: list[dict[str, object]] = []
     for candidate in load_learning_candidates(path):
-        if str(candidate.get("artifact_kind", "")).strip() != "success_skill_candidate":
+        artifact_kind = str(candidate.get("artifact_kind", "")).strip()
+        if artifact_kind not in {"success_skill_candidate", "recovery_case"}:
             continue
-        procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
-        commands = [str(command) for command in procedure.get("commands", []) if str(command).strip()]
-        if not commands:
-            continue
-        source_task_id = str(candidate.get("source_task_id", "")).strip()
+        source_task_id, task_contract = _learning_candidate_source(candidate, bank=bank)
         if not source_task_id:
+            continue
+        if artifact_kind == "recovery_case":
+            if not bool(candidate.get("success", False)):
+                continue
+            commands = [str(command).strip() for command in candidate.get("recovery_commands", []) if str(command).strip()]
+        else:
+            procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
+            commands = [str(command).strip() for command in procedure.get("commands", []) if str(command).strip()]
+        if not commands:
             continue
         skills.append(
             {
@@ -242,16 +261,18 @@ def _success_skill_candidates_from_learning_artifacts(episodes_root: Path) -> li
                 },
                 "known_failure_types": [
                     str(value)
-                    for value in candidate.get("known_failure_types", [])
+                    for value in candidate.get("known_failure_types", candidate.get("failure_types", []))
                     if str(value).strip()
                 ],
-                "task_contract": dict(candidate.get("task_contract", {}))
-                if isinstance(candidate.get("task_contract", {}), dict)
-                else {},
+                "task_contract": task_contract,
                 "reuse_scope": "task_specific",
                 "skill_signature": build_skill_signature(commands),
-                "quality": float(candidate.get("quality", 0.8) or 0.8),
+                "quality": _quality_with_retrieval_bonus(
+                    float(candidate.get("quality", 0.78 if artifact_kind == "recovery_case" else 0.8) or 0.8),
+                    candidate,
+                ),
                 "benchmark_family": str(candidate.get("benchmark_family", "bounded")).strip() or "bounded",
+                **_retrieval_provenance_fields(candidate, commands),
             }
         )
     return skills
@@ -302,6 +323,7 @@ def extract_successful_command_skills(
                     "benchmark_family": str(
                         data.get("task_metadata", {}).get("benchmark_family", "bounded")
                     ),
+                    **_retrieval_provenance_fields(data, commands),
                 }
             )
 
@@ -336,7 +358,11 @@ def extract_tool_candidates(
     min_quality: float = 0.0,
     replay_hardening: bool = False,
 ) -> Path:
-    candidates: list[dict[str, object]] = []
+    bank = _task_bank_for_extractors()
+    candidates: list[dict[str, object]] = _tool_candidates_from_learning_artifacts(
+        episodes_root,
+        replay_hardening=replay_hardening,
+    )
     for data in _iter_episode_documents_for_root(episodes_root):
         if not data.get("success"):
             continue
@@ -346,34 +372,38 @@ def extract_tool_candidates(
             for fragment in data.get("fragments", [])
             if fragment.get("kind") == "command" and fragment.get("passed")
         ]
-        if len(commands) < 2:
+        if not commands:
+            commands = [
+                _normalize_command_for_workspace(step["content"], workspace_name)
+                for step in data.get("steps", [])
+                if step.get("action") == "code_execute" and str(step.get("content", "")).strip()
+            ]
+        if not commands:
             continue
         task_id = str(data.get("task_id", "")).strip()
         if not task_id:
             continue
-        command_count = len(commands)
+        try:
+            task = bank.get(task_id)
+        except KeyError:
+            continue
         benchmark_family = str(data.get("task_metadata", {}).get("benchmark_family", "bounded"))
-        candidate_id = f"tool:{task_id}:primary"
-        script_lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
-        if replay_hardening:
-            script_lines.extend(["IFS=$'\\n\\t'", "trap 'exit 1' ERR"])
-        candidates.append(
-            {
-                "spec_version": "asi_v1",
-                "tool_id": candidate_id,
-                "kind": "local_shell_procedure",
-                "lifecycle_state": "candidate",
-                "promotion_stage": "candidate_procedure",
-                "source_task_id": task_id,
-                "benchmark_family": benchmark_family,
-                "quality": score_tool_candidate(data, commands),
-                "script_name": f"{task_id}_tool.sh",
-                "script_body": "\n".join([*script_lines, *commands, ""]),
-                "procedure": {"commands": commands},
-                "task_contract": dict(data.get("task_contract", {})),
-                "verifier": {"termination_reason": data.get("termination_reason", "")},
-            }
+        task_contract = _enriched_task_contract(
+            dict(data.get("task_contract", {})) if isinstance(data.get("task_contract", {}), dict) else {},
+            fallback_task=task,
         )
+        candidate = _tool_candidate_payload(
+            source_task_id=task_id,
+            benchmark_family=benchmark_family,
+            commands=commands,
+            task_contract=task_contract,
+            termination_reason=str(data.get("termination_reason", "")).strip(),
+            quality=score_tool_candidate(data, commands, task_contract=task_contract),
+            replay_hardening=replay_hardening,
+            provenance=_retrieval_provenance_fields(data, commands),
+        )
+        if _procedure_has_transfer_potential(candidate):
+            candidates.append(candidate)
     deduped = dedupe_tool_candidates(candidates)
     if min_quality > 0.0:
         deduped = [candidate for candidate in deduped if float(candidate.get("quality", 0.0)) >= min_quality]
@@ -495,6 +525,36 @@ def _normalize_command_for_workspace(command: str, workspace_name: str) -> str:
     return normalized.replace(f"{workspace_name}/", "")
 
 
+def _enriched_task_contract(task_contract: dict[str, object], *, fallback_task: object | None) -> dict[str, object]:
+    enriched = dict(task_contract)
+    if fallback_task is None:
+        return enriched
+    fallback_metadata = dict(getattr(fallback_task, "metadata", {}))
+    metadata = dict(enriched.get("metadata", {})) if isinstance(enriched.get("metadata", {}), dict) else {}
+    merged_metadata = dict(fallback_metadata)
+    merged_metadata.update(metadata)
+    if merged_metadata:
+        enriched["metadata"] = merged_metadata
+    defaults = {
+        "prompt": str(getattr(fallback_task, "prompt", "")),
+        "workspace_subdir": str(getattr(fallback_task, "workspace_subdir", "")),
+        "success_command": str(getattr(fallback_task, "success_command", "")),
+        "setup_commands": list(getattr(fallback_task, "setup_commands", [])),
+        "suggested_commands": list(getattr(fallback_task, "suggested_commands", [])),
+        "expected_files": list(getattr(fallback_task, "expected_files", [])),
+        "expected_output_substrings": list(getattr(fallback_task, "expected_output_substrings", [])),
+        "forbidden_files": list(getattr(fallback_task, "forbidden_files", [])),
+        "forbidden_output_substrings": list(getattr(fallback_task, "forbidden_output_substrings", [])),
+        "expected_file_contents": dict(getattr(fallback_task, "expected_file_contents", {})),
+        "max_steps": int(getattr(fallback_task, "max_steps", 5) or 5),
+    }
+    for key, value in defaults.items():
+        current = enriched.get(key)
+        if current in (None, "", [], {}):
+            enriched[key] = value
+    return enriched
+
+
 def _successful_commands(data: dict[str, object]) -> list[str]:
     workspace_name = Path(str(data.get("workspace", ""))).name
     commands = [
@@ -597,6 +657,11 @@ def _prefer_skill(candidate: dict[str, object], incumbent: dict[str, object]) ->
     if candidate_quality != incumbent_quality:
         return candidate_quality > incumbent_quality
 
+    candidate_retrieval_score = _retrieval_preference_score(candidate)
+    incumbent_retrieval_score = _retrieval_preference_score(incumbent)
+    if candidate_retrieval_score != incumbent_retrieval_score:
+        return candidate_retrieval_score > incumbent_retrieval_score
+
     candidate_commands = list(candidate.get("procedure", {}).get("commands", []))
     incumbent_commands = list(incumbent.get("procedure", {}).get("commands", []))
     if len(candidate_commands) != len(incumbent_commands):
@@ -629,32 +694,64 @@ def score_skill_quality(data: dict[str, object], commands: list[str]) -> float:
         score += 0.05
     if normalized_commands and all("echo '" not in command or "printf" in command for command in normalized_commands):
         score += 0.05
+    score += _retrieval_quality_bonus(data)
     return round(min(score, 1.0), 2)
 
 
-def score_tool_candidate(data: dict[str, object], commands: list[str]) -> float:
+def score_tool_candidate(
+    data: dict[str, object],
+    commands: list[str],
+    *,
+    task_contract: dict[str, object] | None = None,
+) -> float:
     score = score_skill_quality(data, commands)
+    bundle = _shared_repo_bundle_metadata(
+        task_contract
+        if isinstance(task_contract, dict)
+        else dict(data.get("task_contract", {})) if isinstance(data.get("task_contract", {}), dict) else {},
+        commands,
+    )
+    if bundle:
+        role = str(bundle.get("role", "")).strip()
+        if role == "worker":
+            score += 0.05
+        elif not bool(bundle.get("bundle_complete", False)):
+            score -= 0.45
+        else:
+            score += 0.05
     if len(commands) >= 2:
         score += 0.05
     if len(commands) <= 4:
         score += 0.05
-    return round(min(score, 1.0), 2)
+    return round(max(0.0, min(score, 1.0)), 2)
 
 
 def dedupe_tool_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
     best_by_signature: dict[str, dict[str, object]] = {}
     for candidate in candidates:
-        commands = list(candidate.get("procedure", {}).get("commands", []))
-        signature = build_skill_signature(commands)
+        normalized = _normalized_tool_candidate(candidate)
+        commands = list(normalized.get("procedure", {}).get("commands", []))
+        signature = build_skill_signature([_stable_command_signature(command) for command in commands])
         incumbent = best_by_signature.get(signature)
-        if incumbent is None or _prefer_skill(candidate, incumbent):
-            best_by_signature[signature] = dict(candidate)
-    return sorted(best_by_signature.values(), key=lambda item: (-float(item.get("quality", 0.0)), str(item.get("tool_id", ""))))
+        if incumbent is None or _prefer_skill(normalized, incumbent):
+            best_by_signature[signature] = normalized
+    return sorted(
+        best_by_signature.values(),
+        key=lambda item: (-float(item.get("quality", 0.0)), str(item.get("tool_id", ""))),
+    )
 
 
 def _skill_has_transfer_potential(skill: dict[str, object]) -> bool:
-    commands = list(skill.get("procedure", {}).get("commands", []))
-    benchmark_family = str(skill.get("benchmark_family", "bounded"))
+    return _procedure_has_transfer_potential(skill)
+
+
+def _procedure_has_transfer_potential(record: dict[str, object]) -> bool:
+    bundle = record.get("shared_repo_bundle", {})
+    if isinstance(bundle, dict) and str(bundle.get("role", "")).strip() == "integrator":
+        if not bool(bundle.get("bundle_complete", False)):
+            return False
+    commands = list(record.get("procedure", {}).get("commands", []))
+    benchmark_family = str(record.get("benchmark_family", "bounded"))
     return len(commands) >= 2 or benchmark_family in {
         "workflow",
         "tooling",
@@ -662,3 +759,314 @@ def _skill_has_transfer_potential(skill: dict[str, object]) -> bool:
         "project",
         "repository",
     }
+
+
+def _tool_candidate_payload(
+    *,
+    source_task_id: str,
+    benchmark_family: str,
+    commands: list[str],
+    task_contract: dict[str, object],
+    termination_reason: str,
+    quality: float,
+    replay_hardening: bool,
+    provenance: dict[str, object] | None = None,
+) -> dict[str, object]:
+    compact_commands = _dedupe_procedure_commands(commands)
+    script_lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    if replay_hardening:
+        script_lines.extend(["IFS=$'\n\t'", "trap 'exit 1' ERR"])
+    prompt = str(task_contract.get("prompt", "")).strip()
+    shared_repo_bundle = _shared_repo_bundle_metadata(task_contract, compact_commands)
+    payload = {
+        "spec_version": "asi_v1",
+        "tool_id": f"tool:{source_task_id}:primary",
+        "kind": "local_shell_procedure",
+        "lifecycle_state": "candidate",
+        "promotion_stage": "candidate_procedure",
+        "source_task_id": source_task_id,
+        "benchmark_family": benchmark_family,
+        "quality": quality,
+        "name": f"{source_task_id}_procedure",
+        "title": source_task_id.replace("_", " "),
+        "summary": prompt or f"Reusable shell procedure derived from {source_task_id}.",
+        "command": compact_commands[0] if len(compact_commands) == 1 else "",
+        "script_name": f"{source_task_id}_tool.sh",
+        "script_body": "\n".join([*script_lines, *compact_commands, ""]),
+        "procedure": {"commands": compact_commands},
+        "task_contract": dict(task_contract),
+        "verifier": {"termination_reason": termination_reason},
+        "shared_repo_bundle": shared_repo_bundle,
+    }
+    if provenance:
+        payload.update(provenance)
+    return payload
+
+
+def _shared_repo_bundle_metadata(task_contract: dict[str, object], commands: list[str]) -> dict[str, object]:
+    metadata = dict(task_contract.get("metadata", {})) if isinstance(task_contract.get("metadata", {}), dict) else {}
+    workflow_guard = dict(metadata.get("workflow_guard", {})) if isinstance(metadata.get("workflow_guard", {}), dict) else {}
+    verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
+    repo_id = str(workflow_guard.get("shared_repo_id", "")).strip()
+    worker_branch = str(workflow_guard.get("worker_branch", "")).strip()
+    try:
+        shared_repo_order = int(metadata.get("shared_repo_order", 0) or 0)
+    except (TypeError, ValueError):
+        shared_repo_order = 0
+    required_merged_branches = [
+        str(value).strip()
+        for value in verifier.get("required_merged_branches", [])
+        if str(value).strip()
+    ]
+    if not repo_id and not worker_branch and shared_repo_order <= 0 and not required_merged_branches:
+        return {}
+    observed_merged_branches = [
+        branch for branch in required_merged_branches if any(branch in str(command) for command in commands)
+    ]
+    role = "integrator" if shared_repo_order > 0 or required_merged_branches else "worker"
+    bundle_complete = True if role != "integrator" else len(observed_merged_branches) >= len(required_merged_branches)
+    return {
+        "shared_repo_id": repo_id,
+        "role": role,
+        "shared_repo_order": shared_repo_order,
+        "worker_branch": worker_branch,
+        "required_merged_branches": required_merged_branches,
+        "observed_merged_branches": observed_merged_branches,
+        "bundle_complete": bundle_complete,
+    }
+
+
+def _dedupe_procedure_commands(commands: list[str]) -> list[str]:
+    best_by_signature: dict[str, str] = {}
+    order: list[str] = []
+    for raw_command in commands:
+        command = str(raw_command).strip()
+        if not command:
+            continue
+        signature = _stable_command_signature(command)
+        incumbent = best_by_signature.get(signature)
+        if incumbent is None:
+            order.append(signature)
+            best_by_signature[signature] = command
+            continue
+        if _prefer_command_variant(command, incumbent):
+            best_by_signature[signature] = command
+    return [best_by_signature[signature] for signature in order]
+
+
+def _stable_command_signature(command: str) -> str:
+    normalized = str(command).replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = normalized.replace("\n", "\\n")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _prefer_command_variant(candidate: str, incumbent: str) -> bool:
+    candidate_score = (candidate.count("\n"), len(candidate))
+    incumbent_score = (incumbent.count("\n"), len(incumbent))
+    if candidate_score != incumbent_score:
+        return candidate_score < incumbent_score
+    return candidate < incumbent
+
+
+def _normalized_tool_candidate(candidate: dict[str, object]) -> dict[str, object]:
+    normalized = dict(candidate)
+    procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
+    commands = _dedupe_procedure_commands(
+        [str(value) for value in procedure.get("commands", []) if str(value).strip()]
+    )
+    normalized["procedure"] = {"commands": commands}
+    script_lines = [line for line in str(candidate.get("script_body", "")).splitlines() if line.strip()]
+    header_lines: list[str] = []
+    body_started = False
+    for line in script_lines:
+        if not body_started and line.startswith("#!"):
+            header_lines.append(line)
+            continue
+        if not body_started and (line.startswith("set -") or line.startswith("IFS=") or line.startswith("trap ")):
+            header_lines.append(line)
+            continue
+        body_started = True
+    if header_lines:
+        normalized["script_body"] = "\n".join([*header_lines, *commands, ""])
+    if len(commands) == 1:
+        normalized["command"] = commands[0]
+    elif "command" not in normalized:
+        normalized["command"] = ""
+    return normalized
+
+
+def _retrieval_provenance_fields(record: dict[str, object], commands: list[str]) -> dict[str, object]:
+    selected_span_ids = [
+        str(value).strip()
+        for value in record.get("selected_retrieval_span_ids", [])
+        if str(value).strip()
+    ]
+    retrieval_backed_commands = [
+        str(value).strip()
+        for value in record.get("retrieval_backed_commands", [])
+        if str(value).strip()
+    ]
+    retrieval_selected_steps = _safe_int(record.get("retrieval_selected_steps", 0))
+    retrieval_influenced_steps = _safe_int(record.get("retrieval_influenced_steps", 0))
+    trusted_retrieval_steps = _safe_int(record.get("trusted_retrieval_steps", 0))
+    for step in record.get("steps", []) if isinstance(record.get("steps", []), list) else []:
+        if not isinstance(step, dict):
+            continue
+        command = str(step.get("content", "")).strip()
+        selected_span_id = str(step.get("selected_retrieval_span_id", "")).strip()
+        retrieval_influenced = bool(step.get("retrieval_influenced", False))
+        trusted_retrieval = bool(step.get("trust_retrieval", False))
+        passed = bool(dict(step.get("verification", {})).get("passed", False))
+        if selected_span_id and selected_span_id not in selected_span_ids:
+            selected_span_ids.append(selected_span_id)
+            retrieval_selected_steps += 1
+        if retrieval_influenced:
+            retrieval_influenced_steps += 1
+        if trusted_retrieval:
+            trusted_retrieval_steps += 1
+        if passed and (selected_span_id or retrieval_influenced or trusted_retrieval) and command and command in commands:
+            if command not in retrieval_backed_commands:
+                retrieval_backed_commands.append(command)
+    retrieval_backed = bool(record.get("retrieval_backed", False)) or bool(
+        retrieval_backed_commands or retrieval_influenced_steps or trusted_retrieval_steps
+    )
+    return {
+        "retrieval_backed": retrieval_backed,
+        "retrieval_selected_steps": retrieval_selected_steps,
+        "retrieval_influenced_steps": retrieval_influenced_steps,
+        "trusted_retrieval_steps": trusted_retrieval_steps,
+        "selected_retrieval_span_ids": selected_span_ids,
+        "retrieval_backed_commands": retrieval_backed_commands,
+    }
+
+
+def _retrieval_quality_bonus(record: dict[str, object]) -> float:
+    if not bool(record.get("retrieval_backed", False)):
+        if (
+            _safe_int(record.get("retrieval_selected_steps", 0)) <= 0
+            and _safe_int(record.get("retrieval_influenced_steps", 0)) <= 0
+            and _safe_int(record.get("trusted_retrieval_steps", 0)) <= 0
+        ):
+            return 0.0
+    bonus = 0.05
+    if _safe_int(record.get("trusted_retrieval_steps", 0)) > 0:
+        bonus += 0.03
+    return bonus
+
+
+def _quality_with_retrieval_bonus(base_quality: float, record: dict[str, object]) -> float:
+    return round(min(1.0, max(0.0, float(base_quality) + _retrieval_quality_bonus(record))), 2)
+
+
+def _retrieval_preference_score(record: dict[str, object]) -> int:
+    if not bool(record.get("retrieval_backed", False)):
+        return 0
+    score = 1
+    if _safe_int(record.get("retrieval_influenced_steps", 0)) > 0:
+        score += 1
+    if _safe_int(record.get("trusted_retrieval_steps", 0)) > 0:
+        score += 2
+    if any(str(value).strip() for value in record.get("retrieval_backed_commands", [])):
+        score += 1
+    return score
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tool_candidates_from_learning_artifacts(
+    episodes_root: Path,
+    *,
+    replay_hardening: bool = False,
+) -> list[dict[str, object]]:
+    path = _learning_artifacts_path_for_episodes_root(episodes_root)
+    bank = _task_bank_for_extractors()
+    tools: list[dict[str, object]] = []
+    for candidate in load_learning_candidates(path):
+        artifact_kind = str(candidate.get("artifact_kind", "")).strip()
+        if artifact_kind not in {"success_skill_candidate", "recovery_case"}:
+            continue
+        source_task_id, task_contract = _tool_candidate_learning_source(candidate, bank=bank)
+        if not source_task_id:
+            continue
+        procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
+        if artifact_kind == "recovery_case":
+            if not bool(candidate.get("success", False)):
+                continue
+            commands = [str(command).strip() for command in candidate.get("recovery_commands", []) if str(command).strip()]
+        else:
+            commands = [str(command).strip() for command in procedure.get("commands", []) if str(command).strip()]
+        if not commands:
+            continue
+        try:
+            fallback_task = bank.get(source_task_id)
+        except KeyError:
+            fallback_task = None
+        task_contract = _enriched_task_contract(task_contract, fallback_task=fallback_task)
+        tool = _tool_candidate_payload(
+            source_task_id=source_task_id,
+            benchmark_family=str(candidate.get("benchmark_family", "bounded")).strip() or "bounded",
+            commands=commands,
+            task_contract=task_contract,
+            termination_reason=str(candidate.get("termination_reason", "")).strip(),
+            quality=_quality_with_retrieval_bonus(
+                float(candidate.get("quality", 0.78 if artifact_kind == "recovery_case" else 0.8) or 0.8),
+                candidate,
+            ),
+            replay_hardening=replay_hardening,
+            provenance=_retrieval_provenance_fields(candidate, commands),
+        )
+        if _procedure_has_transfer_potential(tool):
+            tools.append(tool)
+    return tools
+
+
+def _tool_candidate_learning_source(
+    candidate: dict[str, object],
+    *,
+    bank: TaskBank,
+) -> tuple[str, dict[str, object]]:
+    return _learning_candidate_source(candidate, bank=bank)
+
+
+def _learning_candidate_source(
+    candidate: dict[str, object],
+    *,
+    bank: TaskBank,
+) -> tuple[str, dict[str, object]]:
+    candidate_contract = (
+        dict(candidate.get("task_contract", {}))
+        if isinstance(candidate.get("task_contract", {}), dict)
+        else {}
+    )
+    task_metadata = dict(candidate.get("task_metadata", {})) if isinstance(candidate.get("task_metadata", {}), dict) else {}
+    contract_metadata = (
+        dict(candidate_contract.get("metadata", {}))
+        if isinstance(candidate_contract.get("metadata", {}), dict)
+        else {}
+    )
+    aliases: list[str] = []
+    for value in (
+        candidate.get("source_task_id", ""),
+        candidate.get("parent_task", ""),
+        task_metadata.get("source_task", ""),
+        task_metadata.get("parent_task", ""),
+        contract_metadata.get("source_task", ""),
+    ):
+        token = str(value).strip()
+        if token and token not in aliases:
+            aliases.append(token)
+    for alias in aliases:
+        try:
+            task = bank.get(alias)
+        except KeyError:
+            continue
+        if candidate_contract:
+            return alias, candidate_contract
+        return alias, task.to_dict()
+    return "", candidate_contract

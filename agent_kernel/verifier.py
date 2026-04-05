@@ -103,27 +103,40 @@ class Verifier:
                 reasons.append(f"git branch mismatch: expected {expected_branch!r} got {branch.strip()!r}")
 
         diff_base_ref = str(contract.get("diff_base_ref", "")).strip()
+        resolved_diff_base_ref = self._resolved_git_diff_base_ref(workspace, diff_base_ref or None)
         expected_changed_paths = [
             str(path).strip()
             for path in contract.get("expected_changed_paths", [])
             if str(path).strip()
         ]
+        required_merged_branches = [
+            str(path).strip()
+            for path in contract.get("required_merged_branches", [])
+            if str(path).strip()
+        ]
         if expected_changed_paths:
-            changed_paths = self._git_changed_paths(workspace, base_ref=diff_base_ref or None)
+            changed_paths = self._git_changed_paths(workspace, base_ref=resolved_diff_base_ref)
             expected_set = set(expected_changed_paths)
+            allowed_required_branch_paths: set[str] = set()
+            if resolved_diff_base_ref and required_merged_branches:
+                for branch_name in required_merged_branches:
+                    allowed_required_branch_paths.update(
+                        self._git_changed_paths_between(
+                            workspace,
+                            start_ref=resolved_diff_base_ref,
+                            end_ref=branch_name,
+                        )
+                    )
             actual_set = set(changed_paths)
             missing = sorted(expected_set - actual_set)
-            unexpected = sorted(actual_set - expected_set)
+            unexpected = sorted(actual_set - expected_set - allowed_required_branch_paths)
             for path in missing:
                 reasons.append(f"git diff missing expected path: {path}")
             for path in unexpected:
                 reasons.append(f"git diff includes unexpected path: {path}")
 
         current_branch = expected_branch or str(contract.get("target_branch", "")).strip()
-        for branch_name in contract.get("required_merged_branches", []):
-            normalized = str(branch_name).strip()
-            if not normalized:
-                continue
+        for normalized in required_merged_branches:
             if not current_branch:
                 reasons.append(
                     f"semantic verifier contract malformed: required_merged_branches needs expected_branch or target_branch"
@@ -141,7 +154,7 @@ class Verifier:
 
         for preserved_path in contract.get("preserved_paths", []):
             normalized = str(preserved_path).strip()
-            if normalized and normalized in self._git_changed_paths(workspace, base_ref=diff_base_ref or None):
+            if normalized and normalized in self._git_changed_paths(workspace, base_ref=resolved_diff_base_ref):
                 reasons.append(f"git diff unexpectedly changed preserved path: {normalized}")
 
         generated_paths = {
@@ -149,7 +162,7 @@ class Verifier:
             for path in contract.get("generated_paths", [])
             if str(path).strip()
         }
-        changed_paths_for_generated = set(self._git_changed_paths(workspace, base_ref=diff_base_ref or None))
+        changed_paths_for_generated = set(self._git_changed_paths(workspace, base_ref=resolved_diff_base_ref))
         for generated_path in sorted(generated_paths):
             if not (workspace / generated_path).exists():
                 reasons.append(f"generated artifact missing: {generated_path}")
@@ -246,6 +259,25 @@ class Verifier:
             if line.strip()
         }
         return sorted(changed)
+
+    def _git_changed_paths_between(self, workspace: Path, *, start_ref: str, end_ref: str) -> list[str]:
+        diff_output = self._git_output(workspace, "diff", "--name-only", "--relative", f"{start_ref}..{end_ref}")
+        return sorted(line.strip() for line in (diff_output or "").splitlines() if line.strip())
+
+    def _resolved_git_diff_base_ref(self, workspace: Path, base_ref: str | None) -> str | None:
+        normalized = str(base_ref or "").strip()
+        if not normalized:
+            return None
+        if self._git_returncode(workspace, "rev-parse", "--verify", "--quiet", normalized) == 0:
+            return normalized
+        # Shared-repo fixtures historically use a logical "baseline" ref; if it is absent in the
+        # live clone, the repository root commit is the intended semantic baseline.
+        if normalized == "baseline":
+            root_commit = self._git_output(workspace, "rev-list", "--max-parents=0", "HEAD")
+            resolved_root = root_commit.splitlines()[-1].strip() if root_commit else ""
+            if resolved_root:
+                return resolved_root
+        return normalized
 
     def _git_unmerged_paths(self, workspace: Path) -> list[str]:
         output = self._git_output(workspace, "diff", "--name-only", "--diff-filter=U")

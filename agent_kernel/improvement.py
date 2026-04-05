@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from copy import deepcopy
+from datetime import UTC, datetime
 import hashlib
 import json
 import re
@@ -15,11 +16,14 @@ from .capabilities import load_capability_modules
 from .capability_improvement import capability_surface_summary
 from .config import KernelConfig, current_external_task_manifests_paths
 from .delegation_policy import delegation_policy_snapshot
+from .improvement_catalog import catalog_mapping, catalog_object, catalog_string_set
 from .improvement_common import normalized_control_mapping, retained_artifact_payload, retention_gate_preset
+from .learning_compiler import load_learning_candidates
 from .memory import EpisodeMemory
 from .modeling.tolbert.delta import materialize_tolbert_checkpoint_from_delta, resolve_tolbert_runtime_checkpoint_path
 from .operator_policy import operator_policy_snapshot
 from .prompt_improvement import retained_improvement_planner_controls
+from .runtime_supervision import atomic_copy_file, atomic_write_json
 from .state_estimation_improvement import (
     STATE_ESTIMATION_GENERATION_FOCI,
     STATE_ESTIMATION_LATENT_CONTROL_KEYS,
@@ -61,86 +65,21 @@ from .universe_improvement import (
     write_universe_bundle_files,
 )
 
-_WORLD_MODEL_CONTROL_KEYS = {
-    "expected_artifact_score_weight",
-    "preserved_artifact_score_weight",
-    "forbidden_artifact_penalty",
-    "forbidden_cleanup_score_weight",
-    "workflow_branch_target_score_weight",
-    "workflow_changed_path_score_weight",
-    "workflow_generated_path_score_weight",
-    "workflow_report_path_score_weight",
-    "workflow_preserved_path_score_weight",
-    "required_tests_score_weight",
-    "required_merges_score_weight",
-    "long_horizon_scaffold_bonus",
-    "retrieved_expected_artifact_score_weight",
-    "retrieved_forbidden_artifact_penalty",
-    "retrieved_preserved_artifact_score_weight",
-    "retrieved_workflow_changed_path_score_weight",
-    "retrieved_workflow_report_path_score_weight",
-}
-_WORLD_MODEL_PLANNING_CONTROL_KEYS = {
-    "include_preserved_artifact_steps",
-    "prefer_preserved_artifacts_first",
-    "append_preservation_subgoal",
-    "max_preserved_artifacts",
-}
-_WORLD_MODEL_PROPOSAL_AREAS = {
-    "workflow_alignment",
-    "conflict_avoidance",
-    "preservation_bias",
-    "branch_targeting",
-}
-_WORLD_MODEL_GENERATION_FOCI = {
-    "balanced",
-    "workflow_alignment",
-    "preservation_bias",
-    "conflict_avoidance",
-}
+_WORLD_MODEL_CONTROL_KEYS = catalog_string_set("improvement", "world_model_control_keys")
+_WORLD_MODEL_PLANNING_CONTROL_KEYS = catalog_string_set("improvement", "world_model_planning_control_keys")
+_WORLD_MODEL_PROPOSAL_AREAS = catalog_string_set("improvement", "world_model_proposal_areas")
+_WORLD_MODEL_GENERATION_FOCI = catalog_string_set("improvement", "world_model_generation_foci")
 _STATE_ESTIMATION_CONTROL_KEYS = set(STATE_ESTIMATION_TRANSITION_CONTROL_KEYS)
 _STATE_ESTIMATION_LATENT_KEYS = set(STATE_ESTIMATION_LATENT_CONTROL_KEYS)
 _STATE_ESTIMATION_POLICY_KEYS = set(STATE_ESTIMATION_POLICY_CONTROL_KEYS)
 _STATE_ESTIMATION_PROPOSAL_AREAS = set(STATE_ESTIMATION_PROPOSAL_AREAS)
 _STATE_ESTIMATION_GENERATION_FOCI = set(STATE_ESTIMATION_GENERATION_FOCI)
-_RECOVERY_CONTROL_KEYS = {
-    "snapshot_before_execution",
-    "rollback_on_runner_exception",
-    "rollback_on_failed_outcome",
-    "rollback_on_safe_stop",
-    "verify_post_rollback_file_count",
-    "max_post_rollback_file_count",
-}
-_RECOVERY_PROPOSAL_AREAS = {
-    "rollback_safety",
-    "snapshot_coverage",
-}
-_RECOVERY_GENERATION_FOCI = {
-    "balanced",
-    "rollback_safety",
-    "snapshot_coverage",
-}
-_DELEGATION_CONTROL_KEYS = {
-    "delegated_job_max_concurrency",
-    "delegated_job_max_active_per_budget_group",
-    "delegated_job_max_queued_per_budget_group",
-    "delegated_job_max_artifact_bytes",
-    "delegated_job_max_subprocesses_per_job",
-    "command_timeout_seconds",
-    "llm_timeout_seconds",
-    "max_steps",
-}
-_DELEGATION_PROPOSAL_AREAS = {
-    "throughput_balance",
-    "queue_elasticity",
-    "worker_depth",
-}
-_DELEGATION_GENERATION_FOCI = {
-    "balanced",
-    "throughput_balance",
-    "queue_elasticity",
-    "worker_depth",
-}
+_RECOVERY_CONTROL_KEYS = catalog_string_set("improvement", "recovery_control_keys")
+_RECOVERY_PROPOSAL_AREAS = catalog_string_set("improvement", "recovery_proposal_areas")
+_RECOVERY_GENERATION_FOCI = catalog_string_set("improvement", "recovery_generation_foci")
+_DELEGATION_CONTROL_KEYS = catalog_string_set("improvement", "delegation_control_keys")
+_DELEGATION_PROPOSAL_AREAS = catalog_string_set("improvement", "delegation_proposal_areas")
+_DELEGATION_GENERATION_FOCI = catalog_string_set("improvement", "delegation_generation_foci")
 _UNIVERSE_ACTION_RISK_KEYS = set(UNIVERSE_ACTION_RISK_CONTROL_KEYS)
 _UNIVERSE_ENVIRONMENT_ENUM_FIELDS = {
     str(key): set(values) for key, values in UNIVERSE_ENVIRONMENT_ASSUMPTION_ENUM_FIELDS.items()
@@ -149,162 +88,23 @@ _UNIVERSE_ENVIRONMENT_BOOL_FIELDS = set(UNIVERSE_ENVIRONMENT_ASSUMPTION_BOOL_FIE
 _UNIVERSE_GOVERNANCE_KEYS = set(UNIVERSE_GOVERNANCE_KEYS)
 _UNIVERSE_PROPOSAL_AREAS = set(UNIVERSE_PROPOSAL_AREAS)
 _UNIVERSE_GENERATION_FOCI = set(UNIVERSE_GENERATION_FOCI)
-_OPERATOR_POLICY_CONTROL_KEYS = {
-    "unattended_allowed_benchmark_families",
-    "unattended_allow_git_commands",
-    "unattended_allow_http_requests",
-    "unattended_http_allowed_hosts",
-    "unattended_http_timeout_seconds",
-    "unattended_http_max_body_bytes",
-    "unattended_allow_generated_path_mutations",
-    "unattended_generated_path_prefixes",
-}
-_OPERATOR_POLICY_PROPOSAL_AREAS = {
-    "family_breadth",
-    "git_http_scope",
-    "generated_path_scope",
-}
-_OPERATOR_POLICY_GENERATION_FOCI = {
-    "balanced",
-    "family_breadth",
-    "git_http_scope",
-    "generated_path_scope",
-}
-_TRANSITION_MODEL_CONTROL_KEYS = {
-    "repeat_command_penalty",
-    "regressed_path_command_penalty",
-    "recovery_command_bonus",
-    "progress_command_bonus",
-    "max_signatures",
-}
-_TRANSITION_MODEL_PROPOSAL_AREAS = {
-    "repeat_avoidance",
-    "regression_guard",
-    "recovery_bias",
-}
-_TRANSITION_MODEL_GENERATION_FOCI = {
-    "balanced",
-    "repeat_avoidance",
-    "regression_guard",
-    "recovery_bias",
-}
-_TOLBERT_MODEL_GENERATION_FOCI = {
-    "balanced",
-    "recovery_alignment",
-    "discovered_task_adaptation",
-}
-_TOLBERT_MODEL_SURFACE_KEYS = {
-    "encoder_surface",
-    "latent_dynamics_surface",
-    "decoder_surface",
-    "world_model_surface",
-    "retrieval_surface",
-    "policy_head",
-    "value_head",
-    "transition_head",
-    "risk_head",
-    "stop_head",
-    "latent_state",
-    "universal_runtime",
-}
-_TOLBERT_RUNTIME_POLICY_KEYS = {
-    "shadow_benchmark_families",
-    "primary_benchmark_families",
-    "min_path_confidence",
-    "require_trusted_retrieval",
-    "fallback_to_vllm_on_low_confidence",
-    "allow_direct_command_primary",
-    "allow_skill_primary",
-    "primary_min_command_score",
-    "use_encoder_context",
-    "use_decoder_head",
-    "use_value_head",
-    "use_transition_head",
-    "use_world_model_head",
-    "use_risk_head",
-    "use_stop_head",
-    "use_policy_head",
-    "use_latent_state",
-}
-_TOLBERT_DECODER_POLICY_KEYS = {
-    "allow_retrieval_guidance",
-    "allow_skill_commands",
-    "allow_task_suggestions",
-    "allow_stop_decision",
-    "min_stop_completion_ratio",
-    "max_task_suggestions",
-}
-_TOLBERT_ACTION_GENERATION_POLICY_KEYS = {
-    "enabled",
-    "max_candidates",
-    "proposal_score_bias",
-    "novel_command_bonus",
-    "verifier_alignment_bonus",
-    "expected_file_template_bonus",
-    "cleanup_template_bonus",
-    "min_family_support",
-    "template_preferences",
-}
-_TOLBERT_ROLLOUT_POLICY_KEYS = {
-    "predicted_progress_gain_weight",
-    "predicted_conflict_penalty_weight",
-    "predicted_preserved_bonus_weight",
-    "predicted_workflow_bonus_weight",
-    "latent_progress_bonus_weight",
-    "latent_risk_penalty_weight",
-    "recover_from_stall_bonus_weight",
-    "stop_completion_weight",
-    "stop_missing_expected_penalty_weight",
-    "stop_forbidden_penalty_weight",
-    "stop_preserved_penalty_weight",
-    "stable_stop_bonus_weight",
-}
-_TOLBERT_LIFTOFF_GATE_KEYS = {
-    "min_pass_rate_delta",
-    "max_step_regression",
-    "max_regressed_families",
-    "require_generated_lane_non_regression",
-    "require_failure_recovery_non_regression",
-    "require_shadow_signal",
-    "min_shadow_episodes_per_promoted_family",
-    "require_family_novel_command_evidence",
-    "proposal_gate_by_benchmark_family",
-    "require_unsafe_ambiguous_non_regression",
-    "require_hidden_side_effect_non_regression",
-    "require_success_hidden_side_effect_non_regression",
-    "require_trust_gate_pass",
-    "require_trust_success_non_regression",
-    "require_trust_unsafe_non_regression",
-    "require_trust_hidden_side_effect_non_regression",
-    "require_trust_success_hidden_side_effect_non_regression",
-    "require_takeover_drift_eval",
-    "takeover_drift_step_budget",
-    "takeover_drift_wave_task_limit",
-    "takeover_drift_max_waves",
-    "max_takeover_drift_pass_rate_regression",
-    "max_takeover_drift_unsafe_ambiguous_rate_regression",
-    "max_takeover_drift_hidden_side_effect_rate_regression",
-    "max_takeover_drift_trust_success_rate_regression",
-    "max_takeover_drift_trust_unsafe_ambiguous_rate_regression",
-}
-_TOLBERT_BUILD_POLICY_KEYS = {
-    "allow_kernel_autobuild",
-    "allow_kernel_rebuild",
-    "require_synthetic_dataset",
-    "require_head_targets",
-    "min_total_examples",
-    "min_synthetic_examples",
-    "min_policy_examples",
-    "min_transition_examples",
-    "min_value_examples",
-    "min_stop_examples",
-    "ready_total_examples",
-    "ready_synthetic_examples",
-    "ready_policy_examples",
-    "ready_transition_examples",
-    "ready_value_examples",
-    "ready_stop_examples",
-}
+_OPERATOR_POLICY_CONTROL_KEYS = catalog_string_set("operator_policy", "control_keys")
+_OPERATOR_POLICY_PROPOSAL_AREAS = catalog_string_set("operator_policy", "proposal_areas")
+_OPERATOR_POLICY_GENERATION_FOCI = catalog_string_set("operator_policy", "generation_foci")
+_TRANSITION_MODEL_CONTROL_KEYS = catalog_string_set("transition_model", "control_keys")
+_TRANSITION_MODEL_PROPOSAL_AREAS = catalog_string_set("transition_model", "proposal_areas")
+_TRANSITION_MODEL_GENERATION_FOCI = catalog_string_set("transition_model", "generation_foci")
+_TOLBERT_MODEL_GENERATION_FOCI = catalog_string_set("improvement", "tolbert_model_generation_foci")
+_TOLBERT_MODEL_SURFACE_KEYS = catalog_string_set("improvement", "tolbert_model_surface_keys")
+_TOLBERT_RUNTIME_POLICY_KEYS = catalog_string_set("improvement", "tolbert_runtime_policy_keys")
+_TOLBERT_DECODER_POLICY_KEYS = catalog_string_set("improvement", "tolbert_decoder_policy_keys")
+_TOLBERT_ACTION_GENERATION_POLICY_KEYS = catalog_string_set("improvement", "tolbert_action_generation_policy_keys")
+_TOLBERT_ROLLOUT_POLICY_KEYS = catalog_string_set("improvement", "tolbert_rollout_policy_keys")
+_TOLBERT_LIFTOFF_GATE_KEYS = catalog_string_set("improvement", "tolbert_liftoff_gate_keys")
+_TOLBERT_BUILD_POLICY_KEYS = catalog_string_set("improvement", "tolbert_build_policy_keys")
+_ARTIFACT_VALIDATION_PROFILES = catalog_object("improvement", "artifact_validation_profiles")
+_ARTIFACT_CONTRACTS = catalog_mapping("improvement", "artifact_contracts")
+_CAPABILITY_SURFACE_ARTIFACT_KINDS = catalog_mapping("improvement", "capability_surface_artifact_kinds")
 
 
 @dataclass(slots=True)
@@ -458,6 +258,11 @@ class ImprovementPlanner:
         self.trust_ledger_path = (
             trust_ledger_path if trust_ledger_path is not None else self._default_trust_ledger_path(memory_root)
         )
+        self.learning_artifacts_path = (
+            runtime_config.learning_artifacts_path
+            if runtime_config is not None
+            else self._default_learning_artifacts_path(memory_root)
+        )
         self.runtime_config = runtime_config
 
     def _base_subsystem(self, subsystem: str) -> str:
@@ -481,6 +286,43 @@ class ImprovementPlanner:
             return normalized_left == "universe" or normalized_right == "universe"
         return self._base_subsystem(normalized_left) == self._base_subsystem(normalized_right)
 
+    @staticmethod
+    def _coding_strength_summary(metrics: EvalMetrics) -> dict[str, object]:
+        coding_families = ("repository", "project", "integration")
+        observed_totals: dict[str, int] = {}
+        observed_passed: dict[str, int] = {}
+        for family in coding_families:
+            total = int(metrics.total_by_benchmark_family.get(family, 0) or 0)
+            if total <= 0:
+                continue
+            observed_totals[family] = total
+            observed_passed[family] = int(metrics.passed_by_benchmark_family.get(family, 0) or 0)
+        coding_total = sum(observed_totals.values())
+        coding_passed = sum(observed_passed.values())
+        coding_pass_rate = 0.0 if coding_total <= 0 else float(coding_passed) / float(coding_total)
+        return {
+            "families": list(coding_families),
+            "observed_families": sorted(observed_totals),
+            "observed_family_count": len(observed_totals),
+            "total": coding_total,
+            "passed": coding_passed,
+            "pass_rate": round(coding_pass_rate, 4),
+            "overall_pass_rate": round(float(metrics.pass_rate), 4),
+            "generated_pass_rate": round(float(metrics.generated_pass_rate), 4),
+        }
+
+    @classmethod
+    def _allow_qwen_adapter_support_runtime(cls, metrics: EvalMetrics) -> tuple[bool, dict[str, object]]:
+        summary = cls._coding_strength_summary(metrics)
+        strong_coding_round = (
+            int(summary.get("observed_family_count", 0) or 0) >= 2
+            and int(summary.get("total", 0) or 0) >= 4
+            and float(summary.get("pass_rate", 0.0) or 0.0) >= 0.8
+            and float(summary.get("overall_pass_rate", 0.0) or 0.0) >= 0.8
+        )
+        summary["strong_coding_round"] = strong_coding_round
+        return (not strong_coding_round), summary
+
     def rank_targets(self, metrics: EvalMetrics) -> list[ImprovementTarget]:
         return [
             ImprovementTarget(
@@ -495,6 +337,7 @@ class ImprovementPlanner:
         failure_counts = self.failure_counts()
         transition_failure_counts = self.transition_failure_counts()
         transition_summary = self.transition_summary()
+        trust_summary = self.trust_ledger_summary()
         candidates: list[ImprovementExperiment] = []
         if (failure_counts or transition_failure_counts) and (
             metrics.total_by_benchmark_family.get("benchmark_candidate", 0) == 0
@@ -515,7 +358,7 @@ class ImprovementPlanner:
             candidates.append(
                 ImprovementExperiment(
                     subsystem="benchmark",
-                    reason="failure clusters, stalled transitions, and environment patterns can be turned into benchmark proposals that are not yet fully populated or discriminative",
+                    reason="failure clusters, stalled transitions, and environment patterns can be turned into benchmark proposals, but those proposals must expand operator-relevant coverage instead of only matching the current validator shape",
                     priority=5,
                     expected_gain=benchmark_gain,
                     estimated_cost=3,
@@ -528,6 +371,10 @@ class ImprovementPlanner:
                         "pass_rate": metrics.pass_rate,
                         "benchmark_expected_gain_raw": round(float(benchmark_gain_raw), 4),
                         "benchmark_expected_gain_capped": benchmark_gain,
+                        "benchmark_candidate_share": round(
+                            metrics.total_by_benchmark_family.get("benchmark_candidate", 0) / max(1, metrics.total),
+                            4,
+                        ),
                     },
                 )
             )
@@ -536,6 +383,7 @@ class ImprovementPlanner:
                 metrics.low_confidence_episodes / max(1, metrics.total),
                 0.0 if metrics.total == 0 else 0.5 - (metrics.trusted_retrieval_steps / max(1, metrics.total)),
             )
+            allow_qwen_support_runtime, coding_strength = self._allow_qwen_adapter_support_runtime(metrics)
             candidates.append(
                 ImprovementExperiment(
                     subsystem="retrieval",
@@ -564,9 +412,29 @@ class ImprovementPlanner:
                         "trusted_retrieval_steps": metrics.trusted_retrieval_steps,
                         "average_first_step_path_confidence": metrics.average_first_step_path_confidence,
                         "total": metrics.total,
+                        "coding_strength": coding_strength,
                     },
                 )
             )
+            if allow_qwen_support_runtime:
+                candidates.append(
+                    ImprovementExperiment(
+                        subsystem="qwen_adapter",
+                        reason="current coding weakness may need a stronger adapted Qwen support runtime while Tolbert remains the liftoff path",
+                        priority=4,
+                        expected_gain=round(max(0.015, confidence_gap * 0.6), 4),
+                        estimated_cost=3,
+                        score=0.0,
+                        evidence={
+                            "low_confidence_episodes": metrics.low_confidence_episodes,
+                            "trusted_retrieval_steps": metrics.trusted_retrieval_steps,
+                            "average_first_step_path_confidence": metrics.average_first_step_path_confidence,
+                            "total": metrics.total,
+                            "support_runtime_only": True,
+                            "coding_strength": coding_strength,
+                        },
+                    )
+                )
         if metrics.total_by_memory_source.get("verifier", 0) == 0 or transition_failure_counts:
             candidates.append(
                 ImprovementExperiment(
@@ -830,22 +698,54 @@ class ImprovementPlanner:
                     },
                 )
             )
-        trust_summary = self.trust_ledger_summary()
         if trust_summary and (
             str(trust_summary.get("overall_status", "")).strip() in {"bootstrap", "restricted"}
             or float(trust_summary.get("unsafe_ambiguous_rate", 0.0)) > 0.0
             or float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)) > 0.0
+            or float(trust_summary.get("false_pass_risk_rate", 0.0)) > 0.0
+            or float(trust_summary.get("unexpected_change_report_rate", 0.0)) > 0.0
             or int(trust_summary.get("distinct_benchmark_families", 0)) < 2
+            or int(trust_summary.get("distinct_family_gap", 0)) > 0
+            or list(trust_summary.get("missing_required_families", []))
+            or list(trust_summary.get("missing_required_family_clean_task_root_breadth", []))
         ):
+            clean_success_rate = float(trust_summary.get("clean_success_rate", 0.0))
+            false_pass_risk_rate = float(trust_summary.get("false_pass_risk_rate", 0.0))
+            hidden_side_effect_risk_rate = float(trust_summary.get("hidden_side_effect_risk_rate", 0.0))
+            unexpected_change_report_rate = float(trust_summary.get("unexpected_change_report_rate", 0.0))
+            missing_required_task_root_breadth = list(
+                trust_summary.get("missing_required_family_clean_task_root_breadth", [])
+            )
+            breadth_threshold = int(trust_summary.get("family_breadth_min_distinct_task_roots", 0) or 0)
+            breadth_gap = 0.0
+            if breadth_threshold > 0 and missing_required_task_root_breadth:
+                counts = trust_summary.get("required_family_clean_task_root_counts", {})
+                if not isinstance(counts, dict):
+                    counts = {}
+                deficits = [
+                    max(0, breadth_threshold - int(counts.get(family, 0) or 0))
+                    for family in missing_required_task_root_breadth
+                ]
+                breadth_gap = min(0.08, sum(deficits) * 0.02)
+            false_pass_contamination = max(0.0, false_pass_risk_rate - max(0.0, clean_success_rate))
             trust_risk_signal = max(
                 float(trust_summary.get("unsafe_ambiguous_rate", 0.0)),
-                float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)),
+                hidden_side_effect_risk_rate,
                 float(trust_summary.get("success_hidden_side_effect_risk_rate", 0.0)),
+                false_pass_risk_rate,
+                unexpected_change_report_rate,
+                false_pass_contamination,
+                breadth_gap,
+                min(
+                    0.08,
+                    (int(trust_summary.get("distinct_family_gap", 0) or 0) * 0.01)
+                    + (len(list(trust_summary.get("missing_required_families", []))) * 0.005),
+                ),
             )
             candidates.append(
                 ImprovementExperiment(
                     subsystem="trust",
-                    reason="unattended trust gating remains restricted, under-sampled, or exposed to hidden-risk outcomes",
+                    reason="unattended trust gating remains restricted, coverage-misaligned, or exposed to hidden-risk and false-pass outcomes",
                     priority=4,
                     expected_gain=round(max(0.01, trust_risk_signal or 0.02), 4),
                     estimated_cost=2,
@@ -856,15 +756,28 @@ class ImprovementPlanner:
         if trust_summary and (
             float(trust_summary.get("rollback_performed_rate", 0.0)) > 0.0
             or float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)) > 0.0
+            or float(trust_summary.get("success_hidden_side_effect_risk_rate", 0.0)) > 0.0
+            or float(trust_summary.get("false_pass_risk_rate", 0.0)) > 0.0
+            or float(trust_summary.get("unexpected_change_report_rate", 0.0)) > 0.0
         ):
+            rollback_performed_rate = float(trust_summary.get("rollback_performed_rate", 0.0))
+            hidden_side_effect_risk_rate = float(trust_summary.get("hidden_side_effect_risk_rate", 0.0))
+            success_hidden_side_effect_risk_rate = float(
+                trust_summary.get("success_hidden_side_effect_risk_rate", 0.0)
+            )
+            false_pass_risk_rate = float(trust_summary.get("false_pass_risk_rate", 0.0))
+            unexpected_change_report_rate = float(trust_summary.get("unexpected_change_report_rate", 0.0))
             recovery_signal = max(
-                float(trust_summary.get("rollback_performed_rate", 0.0)),
-                float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)),
+                rollback_performed_rate,
+                hidden_side_effect_risk_rate,
+                success_hidden_side_effect_risk_rate,
+                false_pass_risk_rate,
+                unexpected_change_report_rate,
             )
             candidates.append(
                 ImprovementExperiment(
                     subsystem="recovery",
-                    reason="unattended runs still depend on rollback or leave hidden side-effect risk after restore paths",
+                    reason="unattended runs still depend on rollback or leave residual side-effect uncertainty after restore paths",
                     priority=4,
                     expected_gain=round(max(0.01, recovery_signal), 4),
                     estimated_cost=2,
@@ -874,9 +787,11 @@ class ImprovementPlanner:
             )
         delegation_summary = self.delegation_policy_summary()
         if delegation_summary and (
-            int(delegation_summary.get("delegated_job_max_concurrency", 1)) <= 1
-            or int(delegation_summary.get("delegated_job_max_subprocesses_per_job", 1)) <= 1
-            or int(delegation_summary.get("max_steps", 5)) <= 5
+            int(delegation_summary.get("delegated_job_max_concurrency", 1)) < 3
+            or int(delegation_summary.get("delegated_job_max_active_per_budget_group", 0)) < 2
+            or int(delegation_summary.get("delegated_job_max_queued_per_budget_group", 0)) < 8
+            or int(delegation_summary.get("delegated_job_max_subprocesses_per_job", 1)) < 2
+            or int(delegation_summary.get("max_steps", 5)) < 12
         ):
             candidates.append(
                 ImprovementExperiment(
@@ -954,8 +869,15 @@ class ImprovementPlanner:
             )
         )
         planner_controls = self._improvement_planner_controls()
+        learning_candidate_summary = self._learning_candidate_summary()
         scored_candidates = [
-            self._score_experiment(candidate, metrics=metrics, planner_controls=planner_controls)
+            self._score_experiment(
+                candidate,
+                metrics=metrics,
+                planner_controls=planner_controls,
+                learning_candidate_summary=learning_candidate_summary,
+                trust_summary=trust_summary,
+            )
             for candidate in candidates
         ]
         scored_candidates.sort(key=lambda candidate: (-candidate.score, -candidate.priority, candidate.subsystem))
@@ -1426,8 +1348,11 @@ class ImprovementPlanner:
                 "average_retained_pass_rate_delta": 0.0,
                 "average_retained_step_delta": 0.0,
                 "broad_support_cycle_count": 0,
+                "narrow_support_cycle_count": 0,
+                "phase_gate_warning_count": 0,
                 "constitution_retained_cycle_count": 0,
                 "operating_envelope_retained_cycle_count": 0,
+                "dominant_variant_share": 0.0,
             }
         decision_records = [
             record
@@ -1447,8 +1372,11 @@ class ImprovementPlanner:
                 "average_retained_pass_rate_delta": 0.0,
                 "average_retained_step_delta": 0.0,
                 "broad_support_cycle_count": 0,
+                "narrow_support_cycle_count": 0,
+                "phase_gate_warning_count": 0,
                 "constitution_retained_cycle_count": 0,
                 "operating_envelope_retained_cycle_count": 0,
+                "dominant_variant_share": 0.0,
             }
         recent_records = decision_records[-max(1, recent_cycle_window) :]
         selected_variant_counts: dict[str, int] = {}
@@ -1469,6 +1397,8 @@ class ImprovementPlanner:
         pass_rate_deltas: list[float] = []
         step_deltas: list[float] = []
         broad_support_cycle_count = 0
+        narrow_support_cycle_count = 0
+        phase_gate_warning_count = 0
         constitution_retained_cycle_count = 0
         operating_envelope_retained_cycle_count = 0
         for record in recent_records:
@@ -1482,15 +1412,39 @@ class ImprovementPlanner:
             if baseline_average_steps is not None and candidate_average_steps is not None:
                 step_deltas.append(candidate_average_steps - baseline_average_steps)
             non_regressed_family_support = _record_non_regressed_family_support(record)
-            support_discount = 0.5 if non_regressed_family_support <= 1 else 1.0
+            if non_regressed_family_support <= 1:
+                narrow_support_cycle_count += 1
+            support_confidence = 0.35 if non_regressed_family_support <= 1 else (0.75 if non_regressed_family_support == 2 else 1.0)
             pass_rate_delta = 0.0
             if baseline_pass_rate is not None and candidate_pass_rate is not None:
                 pass_rate_delta = candidate_pass_rate - baseline_pass_rate
             step_gain = 0.0
             if baseline_average_steps is not None and candidate_average_steps is not None:
                 step_gain = baseline_average_steps - candidate_average_steps
-            outcome_weight = max(0.25, 1.0 + max(0.0, pass_rate_delta) * 20.0 + max(0.0, step_gain) * 5.0)
-            weighted_support = round(outcome_weight * max(1, non_regressed_family_support) * support_discount, 4)
+            phase_gate_passed = _record_phase_gate_passed(record)
+            phase_gate_failures = _record_phase_gate_failures(record)
+            phase_gate_confidence = 1.0
+            if phase_gate_passed is False or phase_gate_failures:
+                phase_gate_warning_count += 1
+                phase_gate_confidence = 0.5
+            regressed_family_count = 0
+            metrics_summary = _record_metrics_summary(record)
+            if "regressed_family_count" in metrics_summary:
+                try:
+                    regressed_family_count = max(0, int(metrics_summary.get("regressed_family_count", 0) or 0))
+                except (TypeError, ValueError):
+                    regressed_family_count = 0
+            regression_confidence = max(0.55, 1.0 - min(0.45, regressed_family_count * 0.15))
+            outcome_weight = max(
+                0.4,
+                1.0
+                + max(0.0, min(0.05, pass_rate_delta)) * 8.0
+                + max(0.0, min(1.0, step_gain)) * 2.0,
+            )
+            weighted_support = round(
+                outcome_weight * support_confidence * phase_gate_confidence * regression_confidence,
+                4,
+            )
             if non_regressed_family_support >= 2:
                 broad_support_cycle_count += 1
             if variant_id:
@@ -1527,6 +1481,9 @@ class ImprovementPlanner:
                 successful_action_risk_control_weighted_weight[key] = (
                     successful_action_risk_control_weighted_weight.get(key, 0.0) + weighted_support
                 )
+        dominant_variant_share = 0.0
+        if recent_records and selected_variant_counts:
+            dominant_variant_share = round(max(selected_variant_counts.values()) / len(recent_records), 4)
         return {
             "retained_cycle_count": len(recent_records),
             "selected_variant_counts": selected_variant_counts,
@@ -1550,8 +1507,11 @@ class ImprovementPlanner:
             if step_deltas
             else 0.0,
             "broad_support_cycle_count": broad_support_cycle_count,
+            "narrow_support_cycle_count": narrow_support_cycle_count,
+            "phase_gate_warning_count": phase_gate_warning_count,
             "constitution_retained_cycle_count": constitution_retained_cycle_count,
             "operating_envelope_retained_cycle_count": operating_envelope_retained_cycle_count,
+            "dominant_variant_share": dominant_variant_share,
         }
 
     def capability_surface_summary(self) -> dict[str, int]:
@@ -1577,10 +1537,24 @@ class ImprovementPlanner:
         overall = payload.get("overall_summary", {}) if isinstance(payload.get("overall_summary", {}), dict) else {}
         gated = payload.get("gated_summary", {}) if isinstance(payload.get("gated_summary", {}), dict) else {}
         assessment = payload.get("overall_assessment", {}) if isinstance(payload.get("overall_assessment", {}), dict) else {}
+        coverage = payload.get("coverage_summary", {}) if isinstance(payload.get("coverage_summary", {}), dict) else {}
+        required_family_clean_task_root_counts = (
+            coverage.get("required_family_clean_task_root_counts", {})
+            if isinstance(coverage.get("required_family_clean_task_root_counts", {}), dict)
+            else {}
+        )
+        clean_success_task_roots = gated.get("clean_success_task_roots", overall.get("clean_success_task_roots", []))
         return {
             "reports_considered": int(payload.get("reports_considered", 0) or 0),
             "overall_status": str(assessment.get("status", "")).strip(),
             "overall_passed": bool(assessment.get("passed", False)),
+            "failing_thresholds": [
+                str(value).strip()
+                for value in assessment.get("failing_thresholds", [])
+                if str(value).strip()
+            ]
+            if isinstance(assessment.get("failing_thresholds", []), list)
+            else [],
             "success_rate": float(gated.get("success_rate", overall.get("success_rate", 0.0)) or 0.0),
             "unsafe_ambiguous_rate": float(
                 gated.get("unsafe_ambiguous_rate", overall.get("unsafe_ambiguous_rate", 0.0)) or 0.0
@@ -1598,7 +1572,62 @@ class ImprovementPlanner:
                 )
                 or 0.0
             ),
+            "false_pass_risk_rate": float(
+                gated.get("false_pass_risk_rate", overall.get("false_pass_risk_rate", 0.0)) or 0.0
+            ),
+            "unexpected_change_report_rate": float(
+                gated.get("unexpected_change_report_rate", overall.get("unexpected_change_report_rate", 0.0)) or 0.0
+            ),
+            "clean_success_rate": float(gated.get("clean_success_rate", overall.get("clean_success_rate", 0.0)) or 0.0),
             "distinct_benchmark_families": int(overall.get("distinct_benchmark_families", 0) or 0),
+            "distinct_clean_success_task_roots": int(
+                gated.get(
+                    "distinct_clean_success_task_roots",
+                    overall.get("distinct_clean_success_task_roots", 0),
+                )
+                or 0
+            ),
+            "clean_success_task_roots": [
+                str(value).strip()
+                for value in clean_success_task_roots
+                if str(value).strip()
+            ]
+            if isinstance(clean_success_task_roots, list)
+            else [],
+            "distinct_family_gap": int(coverage.get("distinct_family_gap", 0) or 0),
+            "missing_required_families": [
+                str(value).strip()
+                for value in coverage.get("missing_required_families", [])
+                if str(value).strip()
+            ]
+            if isinstance(coverage.get("missing_required_families", []), list)
+            else [],
+            "restricted_required_families": [
+                str(value).strip()
+                for value in coverage.get("restricted_required_families", [])
+                if str(value).strip()
+            ]
+            if isinstance(coverage.get("restricted_required_families", []), list)
+            else [],
+            "family_breadth_min_distinct_task_roots": int(
+                coverage.get("family_breadth_min_distinct_task_roots", 0) or 0
+            ),
+            "required_family_clean_task_root_counts": {
+                str(key).strip(): int(value or 0)
+                for key, value in required_family_clean_task_root_counts.items()
+                if str(key).strip()
+            },
+            "missing_required_family_clean_task_root_breadth": [
+                str(value).strip()
+                for value in coverage.get("required_families_missing_clean_task_root_breadth", [])
+                if str(value).strip()
+            ]
+            if isinstance(coverage.get("required_families_missing_clean_task_root_breadth", []), list)
+            else [],
+            "external_report_count": int(coverage.get("external_report_count", 0) or 0),
+            "distinct_external_benchmark_families": int(
+                coverage.get("distinct_external_benchmark_families", 0) or 0
+            ),
         }
 
     def delegation_policy_summary(self) -> dict[str, object]:
@@ -1657,12 +1686,20 @@ class ImprovementPlanner:
             return None
         return memory_root.parent / "reports" / "unattended_trust_ledger.json"
 
+    @staticmethod
+    def _default_learning_artifacts_path(memory_root: Path | None) -> Path | None:
+        if memory_root is None:
+            return None
+        return memory_root.parent / "learning" / "run_learning_artifacts.json"
+
     def _score_experiment(
         self,
         candidate: ImprovementExperiment,
         metrics: EvalMetrics,
         *,
         planner_controls: dict[str, object] | None = None,
+        learning_candidate_summary: dict[str, dict[str, object]] | None = None,
+        trust_summary: dict[str, object] | None = None,
     ) -> ImprovementExperiment:
         resolved_planner_controls = planner_controls if planner_controls is not None else self._improvement_planner_controls()
         effective_subsystem = self._base_subsystem(candidate.subsystem)
@@ -1737,6 +1774,17 @@ class ImprovementPlanner:
             min_value=-0.1,
             max_value=0.1,
         )
+        learning_candidate_bonus, learning_candidate_evidence = self._learning_candidate_experiment_bonus(
+            candidate.subsystem,
+            summary_by_subsystem=learning_candidate_summary,
+        )
+        measurement_guardrail_penalty, measurement_guardrail_reasons, measurement_guardrail_evidence = (
+            self._measurement_guardrail_penalty(
+                candidate,
+                metrics,
+                trust_summary=trust_summary,
+            )
+        )
         score = round(
             max(
                 0.0,
@@ -1744,12 +1792,14 @@ class ImprovementPlanner:
                 + self._history_bonus(history)
                 + self._recent_history_bonus(recent_history)
                 + memory_source_bonus
+                + learning_candidate_bonus
                 - bootstrap_penalty
                 - cold_start_penalty
                 - stalled_selection_penalty
                 - observation_timeout_penalty
                 - promotion_failure_penalty
                 - benchmark_no_yield_penalty
+                - measurement_guardrail_penalty
                 + score_bias,
             ),
             4,
@@ -1760,6 +1810,10 @@ class ImprovementPlanner:
         evidence["recent_history"] = recent_history
         if memory_source_evidence:
             evidence["memory_source_pressure"] = memory_source_evidence
+        if learning_candidate_evidence:
+            evidence["learning_candidate_pressure"] = learning_candidate_evidence
+        if measurement_guardrail_evidence:
+            evidence["measurement_guardrails"] = measurement_guardrail_evidence
         if mutation_evidence:
             evidence["improvement_planner_mutation"] = mutation_evidence
         selection_penalties = [
@@ -1769,6 +1823,7 @@ class ImprovementPlanner:
             *observation_timeout_reasons,
             *promotion_failure_reasons,
             *benchmark_no_yield_reasons,
+            *measurement_guardrail_reasons,
         ]
         if selection_penalties:
             evidence["selection_penalties"] = selection_penalties
@@ -1781,6 +1836,82 @@ class ImprovementPlanner:
             score=score,
             evidence=evidence,
         )
+
+    def _measurement_guardrail_penalty(
+        self,
+        candidate: ImprovementExperiment,
+        metrics: EvalMetrics,
+        *,
+        trust_summary: dict[str, object] | None = None,
+    ) -> tuple[float, list[str], dict[str, object]]:
+        effective_subsystem = self._base_subsystem(candidate.subsystem)
+        resolved_trust_summary = trust_summary if trust_summary is not None else self.trust_ledger_summary()
+        if not resolved_trust_summary:
+            return 0.0, [], {}
+        false_pass_risk_rate = float(resolved_trust_summary.get("false_pass_risk_rate", 0.0) or 0.0)
+        unexpected_change_report_rate = float(resolved_trust_summary.get("unexpected_change_report_rate", 0.0) or 0.0)
+        distinct_family_gap = int(resolved_trust_summary.get("distinct_family_gap", 0) or 0)
+        missing_required_families = (
+            [
+                str(value).strip()
+                for value in resolved_trust_summary.get("missing_required_families", [])
+                if str(value).strip()
+            ]
+            if isinstance(resolved_trust_summary.get("missing_required_families", []), list)
+            else []
+        )
+        evaluator_alignment_penalty = 0.0
+        benchmark_shape_penalty = 0.0
+        if effective_subsystem not in {"trust", "recovery", "operating_envelope", "universe_constitution"}:
+            evaluator_alignment_penalty = min(
+                0.04,
+                max(
+                    false_pass_risk_rate,
+                    unexpected_change_report_rate,
+                    0.02 if str(resolved_trust_summary.get("overall_status", "")).strip() in {"bootstrap", "restricted"} else 0.0,
+                )
+                + min(0.02, (distinct_family_gap * 0.005) + (len(missing_required_families) * 0.005)),
+            )
+        if effective_subsystem == "benchmark":
+            observed_family_totals = {
+                family: int(total or 0)
+                for family, total in metrics.total_by_benchmark_family.items()
+                if str(family).strip() and str(family).strip() != "benchmark_candidate" and int(total or 0) > 0
+            }
+            observed_family_total = sum(observed_family_totals.values())
+            largest_family_share = (
+                max(observed_family_totals.values()) / max(1, observed_family_total)
+                if observed_family_totals
+                else 0.0
+            )
+            if len(observed_family_totals) < 2:
+                benchmark_shape_penalty += 0.015
+            if metrics.total < 16:
+                benchmark_shape_penalty += min(0.015, (16 - max(0, metrics.total)) * 0.0015)
+            if largest_family_share > 0.7:
+                benchmark_shape_penalty += min(0.015, (largest_family_share - 0.7) * 0.05)
+            if metrics.generated_total < max(4, min(8, metrics.total)):
+                benchmark_shape_penalty += 0.01
+            if false_pass_risk_rate > 0.0 or unexpected_change_report_rate > 0.0:
+                benchmark_shape_penalty += min(0.02, false_pass_risk_rate + unexpected_change_report_rate)
+            benchmark_shape_penalty = min(0.06, benchmark_shape_penalty)
+        total_penalty = round(evaluator_alignment_penalty + benchmark_shape_penalty, 4)
+        if total_penalty <= 0.0:
+            return 0.0, [], {}
+        reasons: list[str] = []
+        if evaluator_alignment_penalty > 0.0:
+            reasons.append(f"evaluator_alignment_penalty={evaluator_alignment_penalty:.4f}")
+        if benchmark_shape_penalty > 0.0:
+            reasons.append(f"benchmark_shape_penalty={benchmark_shape_penalty:.4f}")
+        return total_penalty, reasons, {
+            "total_penalty": total_penalty,
+            "evaluator_alignment_penalty": round(evaluator_alignment_penalty, 4),
+            "benchmark_shape_penalty": round(benchmark_shape_penalty, 4),
+            "false_pass_risk_rate": round(false_pass_risk_rate, 4),
+            "unexpected_change_report_rate": round(unexpected_change_report_rate, 4),
+            "distinct_family_gap": distinct_family_gap,
+            "missing_required_families": missing_required_families,
+        }
 
     @staticmethod
     def _memory_source_focus_summary(metrics: EvalMetrics) -> dict[str, dict[str, object]]:
@@ -1939,6 +2070,155 @@ class ImprovementPlanner:
             "relevant_sources": relevant_payloads,
         }
 
+    def _learning_candidate_summary(self) -> dict[str, dict[str, object]]:
+        path = self.learning_artifacts_path
+        if path is None:
+            return {}
+        summary: dict[str, dict[str, object]] = {}
+
+        def ensure_row(subsystem: str) -> dict[str, object]:
+            row = summary.get(subsystem)
+            if row is None:
+                row = {
+                    "candidate_count": 0,
+                    "support_total": 0,
+                    "artifact_kind_counts": {},
+                    "artifact_kind_support": {},
+                    "transition_failure_total": 0,
+                    "applicable_task_total": 0,
+                    "memory_sources": {},
+                }
+                summary[subsystem] = row
+            return row
+
+        for candidate in load_learning_candidates(path, config=self.runtime_config):
+            artifact_kind = str(candidate.get("artifact_kind", "")).strip()
+            if not artifact_kind:
+                continue
+            try:
+                support = max(1, int(candidate.get("support_count", 1) or 1))
+            except (TypeError, ValueError):
+                support = 1
+            transition_failures = [
+                str(value).strip()
+                for value in candidate.get("transition_failures", [])
+                if str(value).strip()
+            ]
+            applicable_tasks = [
+                str(value).strip()
+                for value in candidate.get("applicable_tasks", [])
+                if str(value).strip()
+            ]
+            memory_source = str(candidate.get("memory_source", "")).strip()
+            gap_kind = str(candidate.get("gap_kind", "")).strip()
+            subsystem_targets: set[str] = set()
+            if artifact_kind == "negative_command_pattern":
+                subsystem_targets.add("transition_model")
+            elif artifact_kind == "success_skill_candidate":
+                subsystem_targets.add("skills")
+            elif artifact_kind == "recovery_case":
+                subsystem_targets.update({"transition_model", "curriculum"})
+            elif artifact_kind == "failure_case":
+                subsystem_targets.update({"verifier", "curriculum"})
+            elif artifact_kind == "benchmark_gap":
+                subsystem_targets.update({"benchmark", "curriculum"})
+                if gap_kind in {"failure_cluster", "recovery_path", "transition_pressure"}:
+                    subsystem_targets.add("verifier")
+                if transition_failures or gap_kind == "transition_pressure":
+                    subsystem_targets.add("transition_model")
+            for subsystem in subsystem_targets:
+                row = ensure_row(subsystem)
+                row["candidate_count"] = int(row.get("candidate_count", 0) or 0) + 1
+                row["support_total"] = int(row.get("support_total", 0) or 0) + support
+                row["transition_failure_total"] = int(row.get("transition_failure_total", 0) or 0) + len(
+                    transition_failures
+                )
+                row["applicable_task_total"] = int(row.get("applicable_task_total", 0) or 0) + len(applicable_tasks)
+                artifact_kind_counts = row.setdefault("artifact_kind_counts", {})
+                if isinstance(artifact_kind_counts, dict):
+                    artifact_kind_counts[artifact_kind] = int(artifact_kind_counts.get(artifact_kind, 0) or 0) + 1
+                artifact_kind_support = row.setdefault("artifact_kind_support", {})
+                if isinstance(artifact_kind_support, dict):
+                    artifact_kind_support[artifact_kind] = int(artifact_kind_support.get(artifact_kind, 0) or 0) + support
+                if memory_source:
+                    memory_sources = row.setdefault("memory_sources", {})
+                    if isinstance(memory_sources, dict):
+                        memory_sources[memory_source] = int(memory_sources.get(memory_source, 0) or 0) + 1
+        return summary
+
+    def _learning_candidate_experiment_bonus(
+        self,
+        subsystem: str,
+        *,
+        summary_by_subsystem: dict[str, dict[str, object]] | None = None,
+    ) -> tuple[float, dict[str, object]]:
+        effective_subsystem = self._base_subsystem(subsystem)
+        resolved_summary = summary_by_subsystem if summary_by_subsystem is not None else self._learning_candidate_summary()
+        summary = resolved_summary.get(effective_subsystem)
+        if not isinstance(summary, dict) or int(summary.get("candidate_count", 0) or 0) <= 0:
+            return 0.0, {}
+        artifact_kind_counts = (
+            dict(summary.get("artifact_kind_counts", {}))
+            if isinstance(summary.get("artifact_kind_counts", {}), dict)
+            else {}
+        )
+        artifact_kind_support = (
+            dict(summary.get("artifact_kind_support", {}))
+            if isinstance(summary.get("artifact_kind_support", {}), dict)
+            else {}
+        )
+        support_total = int(summary.get("support_total", 0) or 0)
+        transition_failure_total = int(summary.get("transition_failure_total", 0) or 0)
+        applicable_task_total = int(summary.get("applicable_task_total", 0) or 0)
+        bonus = 0.0
+        cap = 0.0
+        if effective_subsystem == "transition_model":
+            bonus = (
+                int(artifact_kind_support.get("negative_command_pattern", 0) or 0) * 0.012
+                + int(artifact_kind_support.get("recovery_case", 0) or 0) * 0.006
+                + min(4, transition_failure_total) * 0.004
+            )
+            cap = 0.04
+        elif effective_subsystem == "curriculum":
+            bonus = (
+                int(artifact_kind_support.get("recovery_case", 0) or 0) * 0.008
+                + int(artifact_kind_support.get("failure_case", 0) or 0) * 0.005
+                + int(artifact_kind_support.get("benchmark_gap", 0) or 0) * 0.006
+            )
+            cap = 0.03
+        elif effective_subsystem == "verifier":
+            bonus = (
+                int(artifact_kind_support.get("failure_case", 0) or 0) * 0.01
+                + int(artifact_kind_support.get("benchmark_gap", 0) or 0) * 0.005
+            )
+            cap = 0.03
+        elif effective_subsystem == "benchmark":
+            bonus = (
+                int(artifact_kind_support.get("benchmark_gap", 0) or 0) * 0.01
+                + min(6, applicable_task_total) * 0.001
+            )
+            cap = 0.03
+        elif effective_subsystem == "skills":
+            bonus = (
+                int(artifact_kind_support.get("success_skill_candidate", 0) or 0) * 0.012
+                + min(4, applicable_task_total) * 0.001
+            )
+            cap = 0.025
+        if cap <= 0.0 or bonus <= 0.0:
+            return 0.0, {}
+        capped_bonus = round(min(cap, bonus), 4)
+        return capped_bonus, {
+            "bonus": capped_bonus,
+            "candidate_count": int(summary.get("candidate_count", 0) or 0),
+            "support_total": support_total,
+            "artifact_kind_counts": artifact_kind_counts,
+            "artifact_kind_support": artifact_kind_support,
+            "transition_failure_total": transition_failure_total,
+            "memory_sources": dict(summary.get("memory_sources", {}))
+            if isinstance(summary.get("memory_sources", {}), dict)
+            else {},
+        }
+
     @staticmethod
     def _bootstrap_penalty(
         candidate: ImprovementExperiment,
@@ -1984,19 +2264,21 @@ class ImprovementPlanner:
         effective_subsystem: str | None = None,
     ) -> tuple[float, list[str]]:
         subsystem = effective_subsystem or candidate.subsystem
-        if subsystem not in {"retrieval", "tolbert_model"}:
+        if subsystem not in {"retrieval", "tolbert_model", "qwen_adapter"}:
+            return 0.0, []
+        evidence = candidate.evidence if isinstance(candidate.evidence, dict) else {}
+        if subsystem == "qwen_adapter" and not bool(evidence.get("support_runtime_only", False)):
             return 0.0, []
         if int(history.get("total_decisions", 0) or 0) > 0:
             return 0.0, []
         if int(recent_history.get("selected_cycles", 0) or 0) > 0:
             return 0.0, []
-        evidence = candidate.evidence if isinstance(candidate.evidence, dict) else {}
         total = int(evidence.get("total", 0) or 0)
         low_confidence = int(evidence.get("low_confidence_episodes", 0) or 0)
         if total <= 0 or low_confidence <= 0:
             return 0.0, []
         raw_score = ImprovementPlanner._experiment_score(candidate, effective_subsystem=subsystem)
-        default_cap = 0.12 if subsystem == "retrieval" else 0.1
+        default_cap = 0.12 if subsystem == "retrieval" else 0.09 if subsystem == "qwen_adapter" else 0.1
         cap = ImprovementPlanner._planner_control_subsystem_float(
             planner_controls or {},
             "cold_start_low_confidence_score_cap",
@@ -2276,7 +2558,13 @@ class ImprovementPlanner:
     def _variant_score_fields(expected_gain: float, estimated_cost: int) -> float:
         return round(expected_gain / max(1, estimated_cost), 4)
 
-    def append_cycle_record(self, output_path: Path, record: ImprovementCycleRecord) -> Path:
+    def append_cycle_record(
+        self,
+        output_path: Path,
+        record: ImprovementCycleRecord,
+        *,
+        govern_exports: bool = True,
+    ) -> Path:
         record = _normalized_cycle_record(record)
         _validate_cycle_record_consistency(record)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2288,9 +2576,17 @@ class ImprovementPlanner:
             if self.runtime_config.storage_write_cycle_exports:
                 with output_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
+                if govern_exports:
+                    from .export_governance import govern_improvement_export_storage
+
+                    govern_improvement_export_storage(self.runtime_config, preserve_paths=(output_path,))
             return output_path
         with output_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
+        if self.runtime_config is not None and govern_exports:
+            from .export_governance import govern_improvement_export_storage
+
+            govern_improvement_export_storage(self.runtime_config, preserve_paths=(output_path,))
         return output_path
 
     def load_cycle_records(self, output_path: Path) -> list[dict[str, object]]:
@@ -2358,6 +2654,12 @@ class ImprovementPlanner:
             "active_artifact_path": active_artifact_path,
             "final_state": str(decision_record.get("state", "")).strip(),
             "final_reason": str(decision_record.get("reason", "")).strip(),
+            "preview_reason_code": str(
+                _record_metrics_summary(decision_record).get("preview_reason_code", "")
+            ).strip(),
+            "decision_reason_code": str(
+                _record_metrics_summary(decision_record).get("decision_reason_code", "")
+            ).strip(),
             "baseline_pass_rate": _record_float_value(decision_record, "baseline_pass_rate"),
             "candidate_pass_rate": _record_float_value(decision_record, "candidate_pass_rate"),
             "baseline_average_steps": _record_float_value(decision_record, "baseline_average_steps"),
@@ -2428,12 +2730,17 @@ class ImprovementPlanner:
                 if isinstance(record, dict)
             ]
             protocol_value = ""
+            protocol_match_id = ""
             for metrics_summary in metrics_sources:
                 if not isinstance(metrics_summary, dict):
                     continue
                 token = str(metrics_summary.get("protocol", "")).strip()
                 if token:
                     protocol_value = token
+                match_token = str(metrics_summary.get("protocol_match_id", "")).strip()
+                if match_token and not protocol_match_id:
+                    protocol_match_id = match_token
+                if protocol_value and protocol_match_id:
                     break
             if protocol is not None and protocol_value != protocol:
                 continue
@@ -2462,6 +2769,7 @@ class ImprovementPlanner:
                     "cycle_id": cycle_id,
                     "subsystem": str(latest_record.get("subsystem", "")).strip(),
                     "protocol": protocol_value,
+                    "protocol_match_id": protocol_match_id,
                     "last_state": str(latest_record.get("state", "")).strip(),
                     "last_action": str(latest_record.get("action", "")).strip(),
                     "reason": str(latest_record.get("reason", "")).strip(),
@@ -2566,8 +2874,7 @@ class ImprovementPlanner:
         if not snapshot_path.exists():
             raise FileNotFoundError(f"rollback snapshot does not exist: {snapshot_path}")
         destination = Path(str(artifact_path))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snapshot_path, destination)
+        atomic_copy_file(snapshot_path, destination, config=self.runtime_config)
         subsystem = str(latest.get("subsystem", "")).strip()
         if subsystem in {"universe", "universe_constitution", "operating_envelope"}:
             restored_payload = _load_json_payload(destination)
@@ -2577,7 +2884,54 @@ class ImprovementPlanner:
                 live_artifact_path=destination,
                 runtime_config=_runtime_config_for_universe_sync(self.runtime_config, destination),
             )
+        self._write_rollback_revalidation_receipt(
+            destination=destination,
+            snapshot_path=snapshot_path,
+            latest_record=latest,
+        )
         return destination
+
+    def _write_rollback_revalidation_receipt(
+        self,
+        *,
+        destination: Path,
+        snapshot_path: Path,
+        latest_record: dict[str, object],
+    ) -> Path:
+        trust_summary = self.trust_ledger_summary()
+        phase_gate_failures = _record_phase_gate_failures(latest_record)
+        reasons = ["artifact_rollback_restores_files_not_world_state"]
+        if phase_gate_failures:
+            reasons.append("prior_phase_gate_failures_present")
+        if float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)) > 0.0:
+            reasons.append("trust_hidden_side_effect_risk_present")
+        if float(trust_summary.get("rollback_performed_rate", 0.0)) > 0.0:
+            reasons.append("trust_history_requires_rollback")
+        if float(trust_summary.get("false_pass_risk_rate", 0.0)) > 0.0:
+            reasons.append("trust_false_pass_risk_present")
+        if float(trust_summary.get("unexpected_change_report_rate", 0.0)) > 0.0:
+            reasons.append("unexpected_change_reports_present")
+        receipt_path = destination.with_name(f"{destination.name}.rollback_receipt.json")
+        receipt_payload = {
+            "receipt_kind": "artifact_rollback_revalidation_receipt",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "artifact_path": str(destination),
+            "rollback_snapshot_path": str(snapshot_path),
+            "cycle_id": str(latest_record.get("cycle_id", "")).strip(),
+            "subsystem": str(latest_record.get("subsystem", "")).strip(),
+            "world_state_revalidation_required": True,
+            "revalidation_scope": [
+                "workspace_side_effects",
+                "runtime_environment",
+                "external_services_and_caches",
+                "trust_ledger_alignment",
+            ],
+            "reasons": reasons,
+            "phase_gate_failures": phase_gate_failures,
+            "trust_summary": trust_summary,
+        }
+        atomic_write_json(receipt_path, receipt_payload, config=self.runtime_config)
+        return receipt_path
 
     def retained_gain_summary(
         self,
@@ -4104,6 +4458,52 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
         and discrimination_satisfied
     ):
         return ("retain", "retrieval candidate improved pass rate and family discrimination without increasing steps")
+    min_trusted_carryover_repair_rate = float(context.gate.get("min_trusted_carryover_repair_rate", 0.0))
+    min_trusted_carryover_verified_step_delta = int(
+        context.gate.get("min_trusted_carryover_verified_step_delta", 1)
+    )
+    trusted_carryover_repair_rate = float(context.evidence.get("trusted_carryover_repair_rate", 0.0))
+    baseline_trusted_carryover_repair_rate = float(
+        context.evidence.get("baseline_trusted_carryover_repair_rate", 0.0)
+    )
+    trusted_carryover_verified_steps = int(context.evidence.get("trusted_carryover_verified_steps", 0) or 0)
+    baseline_trusted_carryover_verified_steps = int(
+        context.evidence.get("baseline_trusted_carryover_verified_steps", 0) or 0
+    )
+    trusted_carryover_verified_step_delta = int(
+        context.evidence.get("trusted_carryover_verified_step_delta", 0) or 0
+    )
+    if bool(context.gate.get("require_trusted_carryover_repair_improvement", False)) and (
+        context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
+        and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
+        and int(context.evidence.get("low_confidence_episode_delta", 0)) <= int(
+            context.gate.get("max_low_confidence_episode_regression", 0)
+        )
+        and float(context.evidence.get("false_failure_rate", 0.0))
+        <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and trusted_carryover_repair_rate >= min_trusted_carryover_repair_rate
+        and trusted_carryover_verified_step_delta >= min_trusted_carryover_verified_step_delta
+    ):
+        return (
+            "retain",
+            "retrieval candidate increased verified long-horizon trusted-retrieval carryover without regressing the base lane",
+        )
+    if bool(context.gate.get("require_trusted_carryover_repair_improvement", False)) and (
+        context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
+        and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
+        and int(context.evidence.get("low_confidence_episode_delta", 0)) <= int(
+            context.gate.get("max_low_confidence_episode_regression", 0)
+        )
+        and float(context.evidence.get("false_failure_rate", 0.0))
+        <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and baseline_trusted_carryover_repair_rate >= min_trusted_carryover_repair_rate
+        and trusted_carryover_repair_rate >= baseline_trusted_carryover_repair_rate
+        and trusted_carryover_verified_steps >= baseline_trusted_carryover_verified_steps
+    ):
+        return (
+            "retain",
+            "retrieval candidate preserved verified long-horizon trusted-retrieval carryover without regressing the base lane",
+        )
     if (
         context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
         and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
@@ -4117,6 +4517,9 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
 
 
 def _evaluate_tolbert_model_retention(context: RetentionDecisionContext) -> tuple[str, str]:
+    long_horizon = context.evidence.get("long_horizon_summary", {})
+    if not isinstance(long_horizon, dict):
+        long_horizon = {}
     if not bool(context.evidence.get("checkpoint_exists", False)):
         return ("reject", "Tolbert model candidate did not produce a checkpoint")
     if int(context.evidence.get("cache_count", 0)) <= 0:
@@ -4155,6 +4558,24 @@ def _evaluate_tolbert_model_retention(context: RetentionDecisionContext) -> tupl
         context.gate.get("min_novel_valid_command_rate_delta", 0.0)
     ):
         return ("reject", "Tolbert model candidate regressed verifier-valid novel-command rate")
+    if bool(context.gate.get("require_long_horizon_non_regression", True)) and int(
+        long_horizon.get("baseline_task_count", 0) or 0
+    ) + int(long_horizon.get("candidate_task_count", 0) or 0) > 0:
+        if float(long_horizon.get("pass_rate_delta", 0.0) or 0.0) < 0.0:
+            return ("reject", "Tolbert model candidate regressed long-horizon pass rate")
+    if bool(context.gate.get("require_long_horizon_novel_command_non_regression", True)) and int(
+        long_horizon.get("baseline_task_count", 0) or 0
+    ) + int(long_horizon.get("candidate_task_count", 0) or 0) > 0:
+        if float(long_horizon.get("novel_valid_command_rate_delta", 0.0) or 0.0) < 0.0:
+            return ("reject", "Tolbert model candidate regressed long-horizon verifier-valid novel-command rate")
+    long_horizon_world_feedback = long_horizon.get("world_feedback", {})
+    if not isinstance(long_horizon_world_feedback, dict):
+        long_horizon_world_feedback = {}
+    if bool(context.gate.get("require_long_horizon_world_feedback_non_regression", True)) and int(
+        long_horizon.get("baseline_world_feedback_step_count", 0) or 0
+    ) + int(long_horizon.get("candidate_world_feedback_step_count", 0) or 0) > 0:
+        if float(long_horizon_world_feedback.get("progress_calibration_mae_gain", 0.0) or 0.0) < 0.0:
+            return ("reject", "Tolbert model candidate regressed long-horizon world-feedback calibration")
     family_gate_failure = proposal_gate_failure_reason(
         context.gate,
         context.evidence,
@@ -4165,6 +4586,44 @@ def _evaluate_tolbert_model_retention(context: RetentionDecisionContext) -> tupl
     if context.candidate_metrics.pass_rate < context.baseline_metrics.pass_rate:
         return ("reject", "Tolbert model candidate regressed base success")
     return ("retain", "Tolbert model candidate improved learned retrieval and novel-command behavior without broader regression")
+
+
+def _evaluate_qwen_adapter_retention(context: RetentionDecisionContext) -> tuple[str, str]:
+    common = _common_family_and_lane_checks(
+        context,
+        subject="Qwen adapter candidate",
+        require_generated_lane_non_regression_default=True,
+        require_failure_recovery_non_regression_default=True,
+    )
+    if common is not None:
+        return common
+    if bool(context.gate.get("require_support_runtime_only", True)) and not bool(
+        context.evidence.get("support_runtime_only", False)
+    ):
+        return ("reject", "Qwen adapter candidate attempted to claim primary runtime authority")
+    if bool(context.gate.get("require_teacher_generation", True)) and not bool(
+        context.evidence.get("teacher_generation_enabled", False)
+    ):
+        return ("reject", "Qwen adapter candidate disabled teacher-generation support")
+    if bool(context.gate.get("require_runtime_target_declared", True)) and not bool(
+        context.evidence.get("runtime_target_declared", False)
+    ):
+        return ("reject", "Qwen adapter candidate did not declare a runtime target")
+    if int(context.evidence.get("dataset_total_examples", 0) or 0) <= 0:
+        return ("reject", "Qwen adapter candidate did not produce a training dataset")
+    if not str(context.evidence.get("base_model_name", "")).strip():
+        return ("reject", "Qwen adapter candidate did not declare a base model")
+    if context.candidate_metrics.pass_rate < context.baseline_metrics.pass_rate:
+        return ("reject", "Qwen adapter candidate regressed base success")
+    if (
+        context.pass_rate_delta > float(context.gate.get("min_pass_rate_delta_abs", 0.0))
+        or (
+            context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
+            and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
+        )
+    ):
+        return ("retain", "Qwen adapter candidate improved or preserved the coding baseline without claiming liftoff authority")
+    return ("reject", "Qwen adapter candidate did not produce a retained baseline gain")
 
 
 def _evaluate_capabilities_retention(context: RetentionDecisionContext) -> tuple[str, str]:
@@ -4196,6 +4655,18 @@ def _evaluate_skill_or_tooling_retention(context: RetentionDecisionContext) -> t
     )
     if common is not None:
         return common
+    if context.subsystem == "tooling" and bool(context.gate.get("require_shared_repo_bundle_coherence", True)):
+        shared_repo_candidate_count = int(context.evidence.get("shared_repo_candidate_count", 0) or 0)
+        shared_repo_complete_candidate_count = int(context.evidence.get("shared_repo_complete_candidate_count", 0) or 0)
+        shared_repo_incomplete_integrator_count = int(
+            context.evidence.get("shared_repo_incomplete_integrator_candidate_count", 0) or 0
+        )
+        if (
+            shared_repo_candidate_count > 0
+            and shared_repo_complete_candidate_count <= 0
+            and shared_repo_incomplete_integrator_count > 0
+        ):
+            return ("reject", "tool candidate artifact surfaced only incomplete shared-repo integrator histories")
     if (
         context.candidate_metrics.pass_rate > context.baseline_metrics.pass_rate
         or (
@@ -4237,6 +4708,7 @@ _RETENTION_EVALUATORS: dict[str, callable] = {
     "transition_model": _evaluate_transition_model_retention,
     "retrieval": _evaluate_retrieval_retention,
     "tolbert_model": _evaluate_tolbert_model_retention,
+    "qwen_adapter": _evaluate_qwen_adapter_retention,
     "capabilities": _evaluate_capabilities_retention,
     "skills": _evaluate_skill_or_tooling_retention,
     "tooling": _evaluate_skill_or_tooling_retention,
@@ -4278,6 +4750,9 @@ def retention_evidence(
         evidence["family_pass_rate_delta"] = family_pass_rate_delta
         evidence["regressed_family_count"] = _family_regression_count(baseline_metrics, candidate_metrics)
         evidence["worst_family_delta"] = _family_worst_delta(baseline_metrics, candidate_metrics)
+    difficulty_pass_rate_delta = _difficulty_pass_rate_delta_map(baseline_metrics, candidate_metrics)
+    if difficulty_pass_rate_delta:
+        evidence["difficulty_pass_rate_delta"] = difficulty_pass_rate_delta
     generated_family_pass_rate_delta = _generated_family_pass_rate_delta_map(baseline_metrics, candidate_metrics)
     if generated_family_pass_rate_delta:
         evidence["generated_family_pass_rate_delta"] = generated_family_pass_rate_delta
@@ -4294,7 +4769,19 @@ def retention_evidence(
             candidate_metrics,
             "failure_recovery",
         ) - _generated_kind_pass_rate(baseline_metrics, "failure_recovery")
+    validation_family_summary = _benchmark_family_summary(
+        baseline_metrics,
+        candidate_metrics,
+        family="validation",
+    )
+    if validation_family_summary:
+        evidence["validation_family_summary"] = validation_family_summary
+    if subsystem in {"skills", "tooling"}:
+        retrieval_reuse_summary = _artifact_retrieval_reuse_comparison(payload, subsystem=subsystem)
+        if retrieval_reuse_summary:
+            evidence["retrieval_reuse_summary"] = retrieval_reuse_summary
     if subsystem == "retrieval":
+        evidence["baseline_trusted_carryover_repair_rate"] = _trusted_carryover_repair_rate(baseline_metrics)
         benchmark_candidate_total = candidate_metrics.total_by_benchmark_family.get("benchmark_candidate", 0)
         evidence["family_discrimination_gain"] = _family_discrimination_gain(
             baseline_metrics,
@@ -4310,6 +4797,17 @@ def retention_evidence(
         )
         evidence["low_confidence_episode_delta"] = (
             candidate_metrics.low_confidence_episodes - baseline_metrics.low_confidence_episodes
+        )
+        evidence["trusted_carryover_repair_rate"] = _trusted_carryover_repair_rate(candidate_metrics)
+        evidence["trusted_carryover_repair_rate_delta"] = (
+            _trusted_carryover_repair_rate(candidate_metrics)
+            - _trusted_carryover_repair_rate(baseline_metrics)
+        )
+        evidence["baseline_trusted_carryover_verified_steps"] = _trusted_carryover_verified_steps(baseline_metrics)
+        evidence["trusted_carryover_verified_steps"] = _trusted_carryover_verified_steps(candidate_metrics)
+        evidence["trusted_carryover_verified_step_delta"] = (
+            _trusted_carryover_verified_steps(candidate_metrics)
+            - _trusted_carryover_verified_steps(baseline_metrics)
         )
     if subsystem == "tolbert_model":
         runtime_paths = payload.get("runtime_paths", {}) if isinstance(payload, dict) else {}
@@ -4335,6 +4833,22 @@ def retention_evidence(
         )
         if proposal_metrics_by_family:
             evidence["proposal_metrics_by_benchmark_family"] = proposal_metrics_by_family
+        proposal_metrics_by_difficulty = _proposal_metrics_delta_by_difficulty(
+            baseline_metrics,
+            candidate_metrics,
+        )
+        if proposal_metrics_by_difficulty:
+            evidence["proposal_metrics_by_difficulty"] = proposal_metrics_by_difficulty
+        world_feedback_by_difficulty = _world_feedback_delta_by_difficulty(
+            baseline_metrics,
+            candidate_metrics,
+        )
+        if world_feedback_by_difficulty:
+            evidence["world_feedback_by_difficulty"] = world_feedback_by_difficulty
+        evidence["long_horizon_summary"] = _long_horizon_summary(
+            baseline_metrics,
+            candidate_metrics,
+        )
         evidence["first_step_confidence_delta"] = (
             candidate_metrics.average_first_step_path_confidence
             - baseline_metrics.average_first_step_path_confidence
@@ -4357,6 +4871,33 @@ def retention_evidence(
             if isinstance(cache_paths, list)
             else 0
         )
+    if subsystem == "qwen_adapter":
+        runtime_paths = payload.get("runtime_paths", {}) if isinstance(payload, dict) else {}
+        dataset_manifest = payload.get("training_dataset_manifest", {}) if isinstance(payload, dict) else {}
+        runtime_policy = payload.get("runtime_policy", {}) if isinstance(payload, dict) else {}
+        evidence["family_discrimination_gain"] = _family_discrimination_gain(
+            baseline_metrics,
+            candidate_metrics,
+        )
+        if isinstance(dataset_manifest, dict):
+            evidence["dataset_total_examples"] = int(dataset_manifest.get("total_examples", 0) or 0)
+            evidence["long_horizon_example_count"] = int(dataset_manifest.get("long_horizon_example_count", 0) or 0)
+        runtime_target = ""
+        if isinstance(runtime_paths, dict):
+            runtime_target = str(
+                runtime_paths.get("served_model_name")
+                or runtime_paths.get("merged_output_dir")
+                or runtime_paths.get("adapter_output_dir")
+            ).strip()
+        evidence["runtime_target_declared"] = bool(runtime_target)
+        evidence["runtime_target"] = runtime_target
+        evidence["base_model_name"] = str(payload.get("base_model_name", "")).strip() if isinstance(payload, dict) else ""
+        evidence["support_runtime_only"] = not bool(
+            runtime_policy.get("allow_primary_routing", False)
+        ) if isinstance(runtime_policy, dict) else True
+        evidence["teacher_generation_enabled"] = bool(
+            runtime_policy.get("allow_teacher_generation", False)
+        ) if isinstance(runtime_policy, dict) else False
     if subsystem == "verifier":
         verifier_candidate_total = candidate_metrics.total_by_benchmark_family.get("verifier_candidate", 0)
         verifier_candidate_pass_rate = candidate_metrics.benchmark_family_pass_rate("verifier_candidate")
@@ -4389,6 +4930,10 @@ def retention_evidence(
         evidence["support_count"] = _operator_support_count(payload)
     if subsystem == "tooling":
         evidence["replay_verified"] = _tool_candidates_have_stage(payload, "replay_verified")
+        evidence.update(_tool_shared_repo_bundle_evidence(payload))
+        shared_repo_bundle_summary = _tool_shared_repo_bundle_comparison(payload)
+        if shared_repo_bundle_summary:
+            evidence["shared_repo_bundle_summary"] = shared_repo_bundle_summary
     if subsystem == "trust":
         baseline_controls = _trust_controls_from_payload(_active_artifact_payload_from_generation_context(payload))
         candidate_controls = _trust_controls_from_payload(payload)
@@ -5496,8 +6041,7 @@ def apply_artifact_retention_decision(
                 tolbert_rejected_output_dir = str(payload.get("output_dir", "")).strip()
                 payload = _compact_rejected_tolbert_payload(payload)
 
-    candidate_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    candidate_artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(candidate_artifact_path, payload, config=runtime_config)
     if subsystem == "tolbert_model" and decision_state != "retain" and isinstance(payload, dict):
         tolbert_rejected_gc = _cleanup_rejected_tolbert_payload_artifacts(
             candidate_artifact_path=candidate_artifact_path,
@@ -5505,7 +6049,7 @@ def apply_artifact_retention_decision(
             output_dir=tolbert_rejected_output_dir,
         )
         payload["rejected_storage_gc"] = tolbert_rejected_gc
-        candidate_artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_json(candidate_artifact_path, payload, config=runtime_config)
     candidate_artifact_snapshot_path = _snapshot_artifact(
         candidate_artifact_path,
         cycle_id=cycle_id,
@@ -5515,9 +6059,12 @@ def apply_artifact_retention_decision(
     active_rollback_source = _prior_active_artifact_path(payload)
     active_artifact_snapshot_path = candidate_artifact_snapshot_path
     if decision_state == "retain":
-        live_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         if staged_candidate:
-            shutil.copy2(candidate_artifact_path, live_artifact_path)
+            atomic_copy_file(
+                candidate_artifact_path,
+                live_artifact_path,
+                config=runtime_config,
+            )
         synchronized_artifact_paths = _synchronize_retained_universe_artifacts(
             subsystem=subsystem,
             payload=payload,
@@ -5530,7 +6077,11 @@ def apply_artifact_retention_decision(
             stage="post_retain_active",
         )
     elif not staged_candidate and active_rollback_source is not None and active_rollback_source.exists():
-        shutil.copy2(active_rollback_source, live_artifact_path)
+        atomic_copy_file(
+            active_rollback_source,
+            live_artifact_path,
+            config=runtime_config,
+        )
         restored_live_artifact = True
         active_artifact_snapshot_path = candidate_artifact_snapshot_path
     current_sha256 = artifact_sha256(live_artifact_path)
@@ -5924,15 +6475,19 @@ def _tolbert_shared_store_paths_from_payload(payload: object) -> set[str]:
     return referenced
 
 
-def persist_replay_verified_tool_artifact(artifact_path: Path, *, cycle_id: str = "manual") -> dict[str, object]:
+def persist_replay_verified_tool_artifact(
+    artifact_path: Path,
+    *,
+    cycle_id: str = "manual",
+    runtime_config: KernelConfig | None = None,
+) -> dict[str, object]:
     payload = _load_json_payload(artifact_path)
     previous_sha256 = artifact_sha256(artifact_path)
     rollback_snapshot_path = _snapshot_artifact(artifact_path, cycle_id=cycle_id, stage="pre_replay_verified")
     replay_verified_payload = materialize_replay_verified_tool_payload(payload)
     replay_verified_payload["lifecycle_state"] = "replay_verified"
     replay_verified_payload["rollback_artifact_path"] = str(rollback_snapshot_path)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_text(json.dumps(replay_verified_payload, indent=2), encoding="utf-8")
+    atomic_write_json(artifact_path, replay_verified_payload, config=runtime_config)
     artifact_snapshot_path = _snapshot_artifact(artifact_path, cycle_id=cycle_id, stage="post_replay_verified")
     return {
         "artifact_kind": str(replay_verified_payload.get("artifact_kind", "")),
@@ -6017,31 +6572,215 @@ def _tool_candidate_lifecycle_state(candidate: dict[str, object]) -> str:
     return str(candidate.get("lifecycle_state", "")).strip()
 
 
+def _artifact_contract(subsystem: str) -> dict[str, object]:
+    value = _ARTIFACT_CONTRACTS.get(subsystem, {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _allowed_artifact_lifecycle_states(subsystem: str) -> set[str]:
-    if subsystem in {
-        "benchmark",
-        "retrieval",
-        "verifier",
-        "policy",
-        "universe",
-        "world_model",
-        "state_estimation",
-        "trust",
-        "recovery",
-        "delegation",
-        "operator_policy",
-        "transition_model",
-        "curriculum",
-        "capabilities",
-    }:
-        return {"proposed", "retained", "rejected"}
-    if subsystem == "tolbert_model":
-        return {"candidate", "retained", "rejected"}
-    if subsystem == "tooling":
-        return {"candidate", "replay_verified", "retained", "rejected"}
-    if subsystem in {"skills", "operators"}:
-        return {"promoted", "retained", "rejected"}
-    return set()
+    contract = _artifact_contract(subsystem)
+    raw_states = contract.get("lifecycle_states", [])
+    if not isinstance(raw_states, list):
+        return set()
+    return {state for state in (str(value).strip() for value in raw_states) if state}
+
+
+def _artifact_validation_profile(subsystem: str) -> dict[str, object]:
+    if not isinstance(_ARTIFACT_VALIDATION_PROFILES, dict):
+        return {}
+    value = _ARTIFACT_VALIDATION_PROFILES.get(subsystem, {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _rule_error(rule: dict[str, object], key: str, *, range_error: bool = False) -> str:
+    template_key = "range_error" if range_error and isinstance(rule.get("range_error"), str) else "type_error"
+    if not isinstance(rule.get(template_key), str):
+        template_key = "error"
+    template = str(rule.get(template_key, "")).strip()
+    return template.replace("{key}", key) if template else ""
+
+
+def _string_list_has_content(value: object) -> bool:
+    return isinstance(value, list) and bool([str(item).strip() for item in value if str(item).strip()])
+
+
+def _validate_profile_rule(value: object, rule: dict[str, object], *, key: str) -> str:
+    rule_kind = str(rule.get("kind", "")).strip()
+    skip_values = rule.get("skip_values", [])
+    if isinstance(skip_values, list) and any(value == item for item in skip_values):
+        return ""
+    if rule_kind == "boolean":
+        return "" if isinstance(value, bool) else _rule_error(rule, key)
+    if rule_kind == "int":
+        minimum = rule.get("min")
+        maximum = rule.get("max")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return _rule_error(rule, key)
+        if minimum is not None and int(value) < int(minimum):
+            return _rule_error(rule, key, range_error=True)
+        if maximum is not None and int(value) > int(maximum):
+            return _rule_error(rule, key, range_error=True)
+        return ""
+    if rule_kind == "number":
+        minimum = rule.get("min")
+        maximum = rule.get("max")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _rule_error(rule, key)
+        numeric_value = float(value)
+        if minimum is not None and numeric_value < float(minimum):
+            return _rule_error(rule, key, range_error=True)
+        if maximum is not None and numeric_value > float(maximum):
+            return _rule_error(rule, key, range_error=True)
+        return ""
+    if rule_kind == "enum":
+        raw_value = str(value).strip()
+        if str(rule.get("normalize", "")).strip() == "lower":
+            raw_value = raw_value.lower()
+        allowed_values = {str(item).strip() for item in rule.get("values", []) if str(item).strip()}
+        return "" if raw_value in allowed_values else _rule_error(rule, key)
+    if rule_kind == "list":
+        return "" if isinstance(value, list) else _rule_error(rule, key)
+    if rule_kind == "list_nonempty_strings":
+        return "" if _string_list_has_content(value) else _rule_error(rule, key)
+    if rule_kind == "object":
+        return "" if isinstance(value, dict) else _rule_error(rule, key)
+    if rule_kind == "object_or_null":
+        return "" if value is None or isinstance(value, dict) else _rule_error(rule, key)
+    if rule_kind == "string_nonempty":
+        return "" if isinstance(value, str) and value.strip() else _rule_error(rule, key)
+    if rule_kind == "string_nonempty_if_present":
+        return "" if isinstance(value, str) and value.strip() else _rule_error(rule, key)
+    return ""
+
+
+def _validate_profile_object_section(
+    *,
+    section: dict[str, object],
+    value: dict[str, object],
+    violations: list[str],
+) -> None:
+    field_rules = section.get("field_rules", {})
+    field_rules = field_rules if isinstance(field_rules, dict) else {}
+    allowed_keys = section.get("allowed_keys")
+    allowed = {str(item).strip() for item in allowed_keys if str(item).strip()} if isinstance(allowed_keys, list) else None
+    unknown_key_error = str(section.get("unknown_key_error", "")).strip()
+    default_rule = section.get("default_rule", {})
+    default_rule = default_rule if isinstance(default_rule, dict) else {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        rule = field_rules.get(key)
+        if rule is None and allowed is not None and key not in allowed:
+            if unknown_key_error:
+                violations.append(unknown_key_error.replace("{key}", key))
+            continue
+        normalized_rule = dict(rule) if isinstance(rule, dict) else dict(default_rule)
+        if not normalized_rule:
+            continue
+        error = _validate_profile_rule(raw_value, normalized_rule, key=key)
+        if error:
+            violations.append(error)
+    for raw_key, raw_rule in field_rules.items():
+        key = str(raw_key).strip()
+        if not key or key in value or not isinstance(raw_rule, dict) or not bool(raw_rule.get("required", False)):
+            continue
+        error = _validate_profile_rule(None, raw_rule, key=key)
+        if error:
+            violations.append(error)
+
+
+def _validate_profile_list_section(
+    *,
+    section: dict[str, object],
+    value: list[object],
+    violations: list[str],
+) -> None:
+    item_fields = section.get("item_fields", {})
+    item_fields = item_fields if isinstance(item_fields, dict) else {}
+    item_error = str(section.get("item_error", "")).strip()
+    for item in value:
+        if not item_fields:
+            continue
+        if not isinstance(item, dict):
+            if item_error:
+                violations.append(item_error)
+            continue
+        for raw_key, raw_rule in item_fields.items():
+            key = str(raw_key).strip()
+            if not key or not isinstance(raw_rule, dict):
+                continue
+            if key not in item and not bool(raw_rule.get("required", False)):
+                continue
+            error = _validate_profile_rule(item.get(key), raw_rule, key=key)
+            if error:
+                violations.append(error)
+
+
+def _validate_artifact_profile(
+    *,
+    subsystem: str,
+    payload: dict[str, object],
+    checks: list[str],
+    violations: list[str],
+) -> None:
+    profile = _artifact_validation_profile(subsystem)
+    if not profile:
+        return
+    generation_focuses = {
+        str(item).strip() for item in profile.get("generation_focuses", []) if str(item).strip()
+    }
+    generation_focus = str(payload.get("generation_focus", "")).strip()
+    if generation_focus and generation_focuses and generation_focus not in generation_focuses:
+        violations.append(f"generation_focus must be a supported {subsystem} focus")
+    control_schema = str(profile.get("control_schema", "")).strip()
+    if control_schema and str(payload.get("control_schema", "")).strip() != control_schema:
+        violations.append(f"{subsystem} artifacts must declare control_schema {control_schema}")
+    artifact_kind = str(payload.get("artifact_kind", "")).strip()
+    sections = profile.get("sections", [])
+    if isinstance(sections, list):
+        for raw_section in sections:
+            if not isinstance(raw_section, dict):
+                continue
+            skip_kinds = {
+                str(item).strip() for item in raw_section.get("skip_for_artifact_kinds", []) if str(item).strip()
+            }
+            only_kinds = {
+                str(item).strip() for item in raw_section.get("only_for_artifact_kinds", []) if str(item).strip()
+            }
+            if artifact_kind in skip_kinds or (only_kinds and artifact_kind not in only_kinds):
+                continue
+            field = str(raw_section.get("field", "")).strip()
+            if not field:
+                continue
+            value = payload.get(field)
+            section_kind = str(raw_section.get("kind", "")).strip()
+            missing_error = str(raw_section.get("missing_error", "")).strip()
+            required = bool(raw_section.get("required", False))
+            non_empty = bool(raw_section.get("non_empty", False))
+            if section_kind == "object":
+                if not isinstance(value, dict) or (non_empty and not value):
+                    if required and missing_error:
+                        violations.append(missing_error)
+                    continue
+                _validate_profile_object_section(section=raw_section, value=value, violations=violations)
+                continue
+            if section_kind == "list":
+                if not isinstance(value, list) or (non_empty and not value):
+                    if required and missing_error:
+                        violations.append(missing_error)
+                    continue
+                _validate_profile_list_section(section=raw_section, value=value, violations=violations)
+                continue
+            if section_kind == "list_nonempty_strings":
+                if not _string_list_has_content(value):
+                    if required and missing_error:
+                        violations.append(missing_error)
+                continue
+    for raw_check in profile.get("checks", []):
+        check = str(raw_check).strip()
+        if check:
+            checks.append(check)
 
 
 def assess_artifact_compatibility(
@@ -6074,31 +6813,14 @@ def assess_artifact_compatibility(
     checks.append("spec_version")
 
     artifact_kind = str(payload.get("artifact_kind", "")).strip()
-    expected_kind = {
-        "benchmark": "benchmark_candidate_set",
-        "retrieval": "retrieval_policy_set",
-        "tolbert_model": "tolbert_model_bundle",
-        "verifier": "verifier_candidate_set",
-        "policy": "prompt_proposal_set",
-        "universe": ("universe_contract", "universe_constitution", "operating_envelope"),
-        "world_model": "world_model_policy_set",
-        "state_estimation": "state_estimation_policy_set",
-        "trust": "trust_policy_set",
-        "recovery": "recovery_policy_set",
-        "delegation": "delegated_runtime_policy_set",
-        "operator_policy": "operator_policy_set",
-        "transition_model": "transition_model_policy_set",
-        "curriculum": "curriculum_proposal_set",
-        "capabilities": "capability_module_set",
-        "tooling": "tool_candidate_set",
-        "skills": "skill_set",
-        "operators": "operator_class_set",
-    }.get(subsystem)
-    if isinstance(expected_kind, tuple):
-        if artifact_kind not in expected_kind:
-            violations.append(f"artifact_kind must be one of: {', '.join(expected_kind)}")
-    elif expected_kind and artifact_kind != expected_kind:
-        violations.append(f"artifact_kind must be {expected_kind}")
+    contract = _artifact_contract(subsystem)
+    expected_kind = contract.get("artifact_kind")
+    if isinstance(expected_kind, list):
+        expected_kinds = [kind for kind in (str(value).strip() for value in expected_kind) if kind]
+        if expected_kinds and artifact_kind not in expected_kinds:
+            violations.append(f"artifact_kind must be one of: {', '.join(expected_kinds)}")
+    elif str(expected_kind).strip() and artifact_kind != str(expected_kind).strip():
+        violations.append(f"artifact_kind must be {str(expected_kind).strip()}")
     checks.append("artifact_kind")
 
     lifecycle_state = str(payload.get("lifecycle_state", "")).strip()
@@ -6111,27 +6833,7 @@ def assess_artifact_compatibility(
             violations.append(f"artifact lifecycle_state must be one of: {allowed_text}")
     checks.append("lifecycle_state")
 
-    if subsystem in {
-        "benchmark",
-        "retrieval",
-        "verifier",
-        "policy",
-        "universe",
-        "world_model",
-        "state_estimation",
-        "trust",
-        "recovery",
-        "delegation",
-        "operator_policy",
-        "transition_model",
-        "curriculum",
-        "capabilities",
-    }:
-        retention_gate = payload.get("retention_gate", {})
-        if not isinstance(retention_gate, dict) or not retention_gate:
-            violations.append("artifact must contain a retention_gate")
-        checks.append("retention_gate")
-    elif subsystem in {"skills", "operators"}:
+    if bool(contract.get("requires_retention_gate", False)):
         retention_gate = payload.get("retention_gate", {})
         if not isinstance(retention_gate, dict) or not retention_gate:
             violations.append("artifact must contain a retention_gate")
@@ -6167,22 +6869,42 @@ def assess_artifact_compatibility(
         if not isinstance(dataset_manifest, dict) or int(dataset_manifest.get("total_examples", 0)) <= 0:
             violations.append("Tolbert model artifact must contain a non-empty dataset_manifest")
         checks.append("tolbert_model_surface")
+    if subsystem == "qwen_adapter":
+        runtime_paths = payload.get("runtime_paths", {})
+        training_dataset_manifest = payload.get("training_dataset_manifest", {})
+        runtime_policy = payload.get("runtime_policy", {})
+        supported_benchmark_families = payload.get("supported_benchmark_families", [])
+        if not str(payload.get("base_model_name", "")).strip():
+            violations.append("Qwen adapter artifact must contain a base_model_name")
+        if not isinstance(runtime_paths, dict):
+            violations.append("Qwen adapter artifact must contain runtime_paths")
+        if not isinstance(training_dataset_manifest, dict) or int(training_dataset_manifest.get("total_examples", 0) or 0) <= 0:
+            violations.append("Qwen adapter artifact must contain a non-empty training_dataset_manifest")
+        if not isinstance(runtime_policy, dict) or not runtime_policy:
+            violations.append("Qwen adapter artifact must contain runtime_policy")
+        if not isinstance(supported_benchmark_families, list) or not supported_benchmark_families:
+            violations.append("Qwen adapter artifact must contain supported_benchmark_families")
+        checks.append("qwen_adapter_surface")
+    if subsystem == "tooling":
+        candidates = payload.get("candidates", [])
+    if subsystem == "operators":
+        operators = payload.get("operators", [])
+        if not isinstance(operators, list) or not operators:
+            violations.append("artifact must contain a non-empty operators list")
+        checks.append("operators")
+
+    _validate_artifact_profile(
+        subsystem=subsystem,
+        payload=payload,
+        checks=checks,
+        violations=violations,
+    )
+
     if subsystem == "benchmark":
         proposals = payload.get("proposals", [])
         for proposal in proposals:
             if not isinstance(proposal, dict):
-                violations.append("every benchmark proposal must be an object")
                 continue
-            if not str(proposal.get("proposal_id", "")).strip():
-                violations.append("every benchmark proposal must contain a proposal_id")
-            if not str(proposal.get("source_task_id", "")).strip():
-                violations.append("every benchmark proposal must contain a source_task_id")
-            if not str(proposal.get("benchmark_family", "")).strip():
-                violations.append("every benchmark proposal must contain a benchmark_family")
-            if not str(proposal.get("kind", "")).strip():
-                violations.append("every benchmark proposal must contain a kind")
-            if not str(proposal.get("prompt", "")).strip():
-                violations.append("every benchmark proposal must contain a prompt")
             if not (
                 isinstance(proposal.get("failure_types"), list)
                 or isinstance(proposal.get("transition_failures"), list)
@@ -6191,112 +6913,7 @@ def assess_artifact_compatibility(
                 violations.append(
                     "every benchmark proposal must contain discriminative source details such as failure_types, transition_failures, or command_count"
                 )
-        checks.append("benchmark_proposals")
-    if subsystem == "tooling":
-        candidates = payload.get("candidates", [])
-        if not isinstance(candidates, list) or not candidates:
-            violations.append("artifact must contain a non-empty candidates list")
-        checks.append("candidates")
-    if subsystem == "skills":
-        skills = payload.get("skills", [])
-        if not isinstance(skills, list) or not skills:
-            violations.append("artifact must contain a non-empty skills list")
-        else:
-            for skill in skills:
-                if not isinstance(skill, dict):
-                    violations.append("every skill must be an object")
-                    continue
-                if not str(skill.get("skill_id", "")).strip():
-                    violations.append("every skill must contain a skill_id")
-                if not str(skill.get("source_task_id", "")).strip():
-                    violations.append("every skill must contain a source_task_id")
-                if not str(skill.get("benchmark_family", "")).strip():
-                    violations.append("every skill must contain a benchmark_family")
-                quality = skill.get("quality")
-                if isinstance(quality, bool) or not isinstance(quality, (int, float)):
-                    violations.append("every skill must contain a numeric quality")
-                if not isinstance(skill.get("procedure"), dict):
-                    violations.append("every skill must contain a procedure object")
-                if not isinstance(skill.get("task_contract"), dict):
-                    violations.append("every skill must contain a task_contract object")
-                if not isinstance(skill.get("verifier"), dict):
-                    violations.append("every skill must contain a verifier object")
-        checks.append("skills")
-        checks.append("skill_contracts")
-    if subsystem == "operators":
-        operators = payload.get("operators", [])
-        if not isinstance(operators, list) or not operators:
-            violations.append("artifact must contain a non-empty operators list")
-        checks.append("operators")
-    if subsystem == "capabilities":
-        modules = payload.get("modules", [])
-        if not isinstance(modules, list) or not modules:
-            violations.append("artifact must contain a non-empty modules list")
-        checks.append("modules")
 
-    if subsystem == "verifier":
-        proposals = payload.get("proposals", [])
-        for proposal in proposals:
-            if not isinstance(proposal, dict):
-                violations.append("every verifier proposal must be an object")
-                continue
-            if not str(proposal.get("proposal_id", "")).strip():
-                violations.append("every verifier proposal must contain a proposal_id")
-            if not str(proposal.get("source_task_id", "")).strip():
-                violations.append("every verifier proposal must contain a source_task_id")
-            if not str(proposal.get("benchmark_family", "")).strip():
-                violations.append("every verifier proposal must contain a benchmark_family")
-        if any(not isinstance(proposal.get("contract"), dict) for proposal in proposals if isinstance(proposal, dict)):
-            violations.append("every verifier proposal must contain a contract object")
-        checks.append("verifier_contracts")
-    if subsystem == "policy":
-        proposals = payload.get("proposals", [])
-        for proposal in proposals:
-            if not isinstance(proposal, dict):
-                violations.append("every prompt proposal must be an object")
-                continue
-            if not str(proposal.get("area", "")).strip():
-                violations.append("every prompt proposal must contain an area")
-            if not _is_positive_int(proposal.get("priority", 0)):
-                violations.append("every prompt proposal must contain a positive integer priority")
-            if not str(proposal.get("reason", "")).strip():
-                violations.append("every prompt proposal must contain a reason")
-            if not str(proposal.get("suggestion", "")).strip():
-                violations.append("every prompt proposal must contain a suggestion")
-        checks.append("prompt_proposals")
-    if subsystem == "curriculum":
-        proposals = payload.get("proposals", [])
-        for proposal in proposals:
-            if not isinstance(proposal, dict):
-                violations.append("every curriculum proposal must be an object")
-                continue
-            if not str(proposal.get("area", "")).strip():
-                violations.append("every curriculum proposal must contain an area")
-            if not _is_positive_int(proposal.get("priority", 0)):
-                violations.append("every curriculum proposal must contain a positive integer priority")
-            if not str(proposal.get("reason", "")).strip():
-                violations.append("every curriculum proposal must contain a reason")
-            if not str(proposal.get("suggestion", "")).strip():
-                violations.append("every curriculum proposal must contain a suggestion")
-        checks.append("curriculum_proposals")
-    if subsystem == "retrieval":
-        proposals = payload.get("proposals", [])
-        overrides = payload.get("overrides", {})
-        if not isinstance(overrides, dict):
-            violations.append("retrieval artifact must contain an overrides object")
-        for proposal in proposals:
-            if not isinstance(proposal, dict):
-                violations.append("every retrieval proposal must be an object")
-                continue
-            if not str(proposal.get("proposal_id", "")).strip():
-                violations.append("every retrieval proposal must contain a proposal_id")
-            if not str(proposal.get("area", "")).strip():
-                violations.append("every retrieval proposal must contain an area")
-            if not str(proposal.get("reason", "")).strip():
-                violations.append("every retrieval proposal must contain a reason")
-        if any(not isinstance(proposal.get("overrides"), dict) for proposal in proposals if isinstance(proposal, dict)):
-            violations.append("every retrieval proposal must contain an overrides object")
-        checks.append("retrieval_overrides")
     if subsystem == "tolbert_model":
         generation_focus = str(payload.get("generation_focus", "")).strip()
         if generation_focus and generation_focus not in _TOLBERT_MODEL_GENERATION_FOCI:
@@ -6488,6 +7105,8 @@ def assess_artifact_compatibility(
                     "allow_kernel_autobuild",
                     "allow_kernel_rebuild",
                     "require_synthetic_dataset",
+                    "require_head_targets",
+                    "require_long_horizon_head_targets",
                 }:
                     if not isinstance(value, bool):
                         violations.append(f"Tolbert build policy {key} must be boolean")
@@ -6508,10 +7127,27 @@ def assess_artifact_compatibility(
                     violations.append(f"Tolbert model runtime_paths must include {key}")
         checks.append("tolbert_model_surface")
         checks.append("tolbert_model_runtime_paths")
+    if subsystem == "qwen_adapter":
+        runtime_policy = payload.get("runtime_policy", {})
+        retention_gate = payload.get("retention_gate", {})
+        runtime_paths = payload.get("runtime_paths", {})
+        if isinstance(runtime_policy, dict):
+            if bool(runtime_policy.get("allow_primary_routing", False)):
+                violations.append("Qwen adapter runtime_policy.allow_primary_routing must remain false before liftoff")
+            if not bool(runtime_policy.get("allow_teacher_generation", False)):
+                violations.append("Qwen adapter runtime_policy.allow_teacher_generation must be true")
+        if isinstance(retention_gate, dict) and not bool(retention_gate.get("disallow_liftoff_authority", False)):
+            violations.append("Qwen adapter retention_gate.disallow_liftoff_authority must be true")
+        if isinstance(runtime_paths, dict):
+            runtime_target = str(
+                runtime_paths.get("served_model_name")
+                or runtime_paths.get("merged_output_dir")
+                or runtime_paths.get("adapter_output_dir")
+            ).strip()
+            if not runtime_target:
+                violations.append("Qwen adapter runtime_paths must declare served_model_name, merged_output_dir, or adapter_output_dir")
+        checks.append("qwen_adapter_runtime_paths")
     if subsystem == "universe":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _UNIVERSE_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported universe focus")
         artifact_kind = str(payload.get("artifact_kind", "")).strip()
         control_schema = str(payload.get("control_schema", "")).strip()
         if artifact_kind == "universe_constitution":
@@ -6522,302 +7158,14 @@ def assess_artifact_compatibility(
                 violations.append("operating envelope artifacts must declare control_schema operating_envelope_v1")
         elif control_schema != "universe_contract_v1":
             violations.append("universe artifacts must declare control_schema universe_contract_v1")
-        governance = payload.get("governance", {})
-        if artifact_kind != "operating_envelope" and (not isinstance(governance, dict) or not governance):
-            violations.append("universe artifact must contain a non-empty governance object")
-        elif isinstance(governance, dict) and governance:
-            for key, value in governance.items():
-                if key not in _UNIVERSE_GOVERNANCE_KEYS:
-                    violations.append(f"universe governance control is unsupported: {key}")
-                    continue
-                if not isinstance(value, bool):
-                    violations.append(f"universe governance control {key} must be boolean")
-        action_risk_controls = payload.get("action_risk_controls", {})
-        if artifact_kind != "universe_constitution" and (
-            not isinstance(action_risk_controls, dict) or not action_risk_controls
-        ):
-            violations.append("universe artifact must contain a non-empty action_risk_controls object")
-        elif isinstance(action_risk_controls, dict) and action_risk_controls:
-            for key, value in action_risk_controls.items():
-                if key not in _UNIVERSE_ACTION_RISK_KEYS:
-                    violations.append(f"universe action risk control is unsupported: {key}")
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int) or int(value) <= 0:
-                    violations.append(f"universe action risk control {key} must be a positive integer")
-        environment_assumptions = payload.get("environment_assumptions", {})
-        if artifact_kind != "universe_constitution" and (
-            not isinstance(environment_assumptions, dict) or not environment_assumptions
-        ):
-            violations.append("universe artifact must contain a non-empty environment_assumptions object")
-        elif isinstance(environment_assumptions, dict) and environment_assumptions:
-            for key, allowed_values in _UNIVERSE_ENVIRONMENT_ENUM_FIELDS.items():
-                value = str(environment_assumptions.get(key, "")).strip().lower()
-                if value not in allowed_values:
-                    violations.append(f"universe environment assumption {key} must be one of {sorted(allowed_values)}")
-            for key in sorted(_UNIVERSE_ENVIRONMENT_BOOL_FIELDS):
-                if key not in environment_assumptions or not isinstance(environment_assumptions.get(key), bool):
-                    violations.append(f"universe environment assumption {key} must be boolean")
-        invariants = payload.get("invariants", [])
-        if artifact_kind != "operating_envelope" and (
-            not isinstance(invariants, list) or not [str(item).strip() for item in invariants if str(item).strip()]
-        ):
-            violations.append("universe artifact must contain a non-empty invariants list")
-        forbidden_patterns = payload.get("forbidden_command_patterns", [])
-        if artifact_kind != "operating_envelope" and (
-            not isinstance(forbidden_patterns, list)
-            or not [str(item).strip() for item in forbidden_patterns if str(item).strip()]
-        ):
-            violations.append("universe artifact must contain a non-empty forbidden_command_patterns list")
-        preferred_prefixes = payload.get("preferred_command_prefixes", [])
-        if artifact_kind != "operating_envelope" and (
-            not isinstance(preferred_prefixes, list)
-            or not [str(item).strip() for item in preferred_prefixes if str(item).strip()]
-        ):
-            violations.append("universe artifact must contain a non-empty preferred_command_prefixes list")
-        checks.append("universe_controls")
-    if subsystem == "world_model":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _WORLD_MODEL_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported world_model focus")
-        if str(payload.get("control_schema", "")).strip() != "world_model_behavior_controls_v1":
-            violations.append("world_model artifacts must declare control_schema world_model_behavior_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("world_model artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _WORLD_MODEL_CONTROL_KEYS:
-                    violations.append(f"world_model control is unsupported: {key}")
-                    continue
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    violations.append(f"world_model control {key} must be numeric")
-                    continue
-                if float(value) < 0.0:
-                    violations.append(f"world_model control {key} must be non-negative")
-        planning_controls = payload.get("planning_controls", {})
-        if not isinstance(planning_controls, dict) or not planning_controls:
-            violations.append("world_model artifact must contain a non-empty planning_controls object")
-        else:
-            for key, value in planning_controls.items():
-                if key not in _WORLD_MODEL_PLANNING_CONTROL_KEYS:
-                    violations.append(f"world_model planning control is unsupported: {key}")
-                    continue
-                if key == "max_preserved_artifacts":
-                    if isinstance(value, bool) or not isinstance(value, int) or int(value) < 0:
-                        violations.append(
-                            "world_model planning control max_preserved_artifacts must be a non-negative integer"
-                        )
-                elif not isinstance(value, bool):
-                    violations.append(f"world_model planning control {key} must be boolean")
-        checks.append("world_model_controls")
-    if subsystem == "state_estimation":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _STATE_ESTIMATION_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported state_estimation focus")
-        if str(payload.get("control_schema", "")).strip() != "state_estimation_controls_v1":
-            violations.append("state_estimation artifacts must declare control_schema state_estimation_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("state_estimation artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _STATE_ESTIMATION_CONTROL_KEYS:
-                    violations.append(f"state_estimation control is unsupported: {key}")
-                    continue
-                if key in {"min_state_change_score_for_progress", "regression_path_budget"}:
-                    if isinstance(value, bool) or not isinstance(value, int) or int(value) < 0:
-                        violations.append(f"state_estimation control {key} must be a non-negative integer")
-                elif isinstance(value, bool) or not isinstance(value, (int, float)):
-                    violations.append(f"state_estimation control {key} must be numeric")
-                elif key in {"regression_severity_weight", "progress_recovery_credit"} and float(value) < 0.0:
-                    violations.append(f"state_estimation control {key} must be non-negative")
-        latent_controls = payload.get("latent_controls", {})
-        if not isinstance(latent_controls, dict) or not latent_controls:
-            violations.append("state_estimation artifact must contain a non-empty latent_controls object")
-        else:
-            for key, value in latent_controls.items():
-                if key not in _STATE_ESTIMATION_LATENT_KEYS:
-                    violations.append(f"state_estimation latent control is unsupported: {key}")
-                    continue
-                if key in {"regressive_regression_count", "blocked_forbidden_count", "active_path_budget"}:
-                    if isinstance(value, bool) or not isinstance(value, int) or int(value) < 1:
-                        violations.append(f"state_estimation latent control {key} must be a positive integer")
-                elif key == "advancing_completion_ratio":
-                    if isinstance(value, bool) or not isinstance(value, (int, float)):
-                        violations.append(f"state_estimation latent control {key} must be numeric")
-                    elif not 0.0 <= float(value) <= 1.0:
-                        violations.append(f"state_estimation latent control {key} must stay within [0.0, 1.0]")
-                elif isinstance(value, bool) or not isinstance(value, (int, float)):
-                    violations.append(f"state_estimation latent control {key} must be numeric")
-        policy_controls = payload.get("policy_controls", {})
-        if not isinstance(policy_controls, dict) or not policy_controls:
-            violations.append("state_estimation artifact must contain a non-empty policy_controls object")
-        else:
-            for key, value in policy_controls.items():
-                if key not in _STATE_ESTIMATION_POLICY_KEYS:
-                    violations.append(f"state_estimation policy control is unsupported: {key}")
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int) or int(value) < 0:
-                    violations.append(f"state_estimation policy control {key} must be a non-negative integer")
-        transition_summary = payload.get("transition_summary", {})
-        if not isinstance(transition_summary, dict):
-            violations.append("state_estimation artifact must contain a transition_summary object")
-        checks.append("state_estimation_controls")
-    if subsystem == "trust":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in {"balanced", "safety", "breadth", "stability"}:
-            violations.append("generation_focus must be a supported trust focus")
-        if str(payload.get("control_schema", "")).strip() != "unattended_trust_controls_v1":
-            violations.append("trust artifacts must declare control_schema unattended_trust_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("trust artifact must contain a non-empty controls object")
-        else:
-            if "required_benchmark_families" in controls:
-                families = controls.get("required_benchmark_families")
-                if not isinstance(families, list) or not [str(value).strip() for value in families if str(value).strip()]:
-                    violations.append("trust control required_benchmark_families must be a non-empty list")
-            for key in (
-                "recent_report_limit",
-                "bootstrap_min_reports",
-                "breadth_min_reports",
-                "min_distinct_families",
-            ):
-                if key in controls and (isinstance(controls[key], bool) or not isinstance(controls[key], int) or int(controls[key]) < 0):
-                    violations.append(f"trust control {key} must be a non-negative integer")
-            for key in (
-                "min_success_rate",
-                "max_unsafe_ambiguous_rate",
-                "max_hidden_side_effect_rate",
-                "max_success_hidden_side_effect_rate",
-            ):
-                if key in controls:
-                    value = controls[key]
-                    if isinstance(value, bool) or not isinstance(value, (int, float)):
-                        violations.append(f"trust control {key} must be numeric")
-                    elif not 0.0 <= float(value) <= 1.0:
-                        violations.append(f"trust control {key} must stay within [0.0, 1.0]")
-        checks.append("trust_controls")
-    if subsystem == "recovery":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _RECOVERY_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported recovery focus")
-        if str(payload.get("control_schema", "")).strip() != "workspace_recovery_controls_v1":
-            violations.append("recovery artifacts must declare control_schema workspace_recovery_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("recovery artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _RECOVERY_CONTROL_KEYS:
-                    violations.append(f"recovery control is unsupported: {key}")
-                    continue
-                if key == "max_post_rollback_file_count":
-                    if isinstance(value, bool) or not isinstance(value, int) or int(value) < 0:
-                        violations.append("recovery control max_post_rollback_file_count must be a non-negative integer")
-                    continue
-                if not isinstance(value, bool):
-                    violations.append(f"recovery control {key} must be boolean")
-        checks.append("recovery_controls")
-    if subsystem == "delegation":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _DELEGATION_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported delegation focus")
-        if str(payload.get("control_schema", "")).strip() != "delegated_resource_controls_v1":
-            violations.append("delegation artifacts must declare control_schema delegated_resource_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("delegation artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _DELEGATION_CONTROL_KEYS:
-                    violations.append(f"delegation control is unsupported: {key}")
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int) or int(value) < 0:
-                    violations.append(f"delegation control {key} must be a non-negative integer")
-        checks.append("delegation_controls")
-    if subsystem == "operator_policy":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _OPERATOR_POLICY_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported operator_policy focus")
-        if str(payload.get("control_schema", "")).strip() != "unattended_operator_controls_v1":
-            violations.append("operator_policy artifacts must declare control_schema unattended_operator_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("operator_policy artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _OPERATOR_POLICY_CONTROL_KEYS:
-                    violations.append(f"operator_policy control is unsupported: {key}")
-                    continue
-                if key in {"unattended_allow_git_commands", "unattended_allow_http_requests", "unattended_allow_generated_path_mutations"}:
-                    if not isinstance(value, bool):
-                        violations.append(f"operator_policy control {key} must be boolean")
-                elif key in {"unattended_http_timeout_seconds", "unattended_http_max_body_bytes"}:
-                    if isinstance(value, bool) or not isinstance(value, int) or int(value) < 1:
-                        violations.append(f"operator_policy control {key} must be a positive integer")
-                elif key in {"unattended_allowed_benchmark_families", "unattended_http_allowed_hosts", "unattended_generated_path_prefixes"}:
-                    if not isinstance(value, list) or not [str(item).strip() for item in value if str(item).strip()]:
-                        violations.append(f"operator_policy control {key} must be a non-empty list")
-        checks.append("operator_policy_controls")
-    if subsystem == "transition_model":
-        generation_focus = str(payload.get("generation_focus", "")).strip()
-        if generation_focus and generation_focus not in _TRANSITION_MODEL_GENERATION_FOCI:
-            violations.append("generation_focus must be a supported transition_model focus")
-        if str(payload.get("control_schema", "")).strip() != "transition_model_controls_v1":
-            violations.append("transition_model artifacts must declare control_schema transition_model_controls_v1")
-        controls = payload.get("controls", {})
-        if not isinstance(controls, dict) or not controls:
-            violations.append("transition_model artifact must contain a non-empty controls object")
-        else:
-            for key, value in controls.items():
-                if key not in _TRANSITION_MODEL_CONTROL_KEYS:
-                    violations.append(f"transition_model control is unsupported: {key}")
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int) or int(value) < 1:
-                    violations.append(f"transition_model control {key} must be a positive integer")
-        signatures = payload.get("signatures", [])
-        if not isinstance(signatures, list):
-            violations.append("transition_model artifact must contain a signatures list")
-        else:
-            for signature in signatures:
-                if not isinstance(signature, dict):
-                    violations.append("every transition_model signature must be an object")
-                    continue
-                signal = str(signature.get("signal", "")).strip()
-                if signal not in {"no_state_progress", "state_regression"}:
-                    violations.append("transition_model signature must contain a supported signal")
-                if not str(signature.get("command", "")).strip():
-                    violations.append("transition_model signature must contain a non-empty command")
-                command_pattern = signature.get("command_pattern", "")
-                if command_pattern not in {"", None} and not str(command_pattern).strip():
-                    violations.append("transition_model signature command_pattern must be a non-empty string when present")
-                support = signature.get("support", 0)
-                if isinstance(support, bool) or not isinstance(support, int) or int(support) <= 0:
-                    violations.append("transition_model signature support must be a positive integer")
-                regressions = signature.get("regressions", [])
-                if regressions is not None and not isinstance(regressions, list):
-                    violations.append("transition_model signature regressions must be a list")
-        checks.append("transition_model_controls")
     if subsystem == "tooling":
         candidates = payload.get("candidates", [])
         for candidate in candidates:
             if not isinstance(candidate, dict):
-                violations.append("every tool candidate must be an object")
                 continue
-            if str(candidate.get("spec_version", "")).strip() not in {"", "asi_v1"}:
-                violations.append("every tool candidate spec_version must be asi_v1 when present")
-            if not str(candidate.get("tool_id", "")).strip():
-                violations.append("every tool candidate must contain a tool_id")
-            if str(candidate.get("kind", "")).strip() != "local_shell_procedure":
-                violations.append("every tool candidate must use kind local_shell_procedure")
             candidate_lifecycle_state = _tool_candidate_lifecycle_state(candidate)
-            if not candidate_lifecycle_state:
-                violations.append("every tool candidate must contain a lifecycle_state")
             promotion_stage = _tool_candidate_stage(candidate.get("promotion_stage", ""))
-            if not promotion_stage:
-                violations.append("every tool candidate must contain a promotion_stage")
-            else:
+            if promotion_stage:
                 allowed_stage_states = {
                     "candidate_procedure": "candidate",
                     "replay_verified": "replay_verified",
@@ -6831,23 +7179,6 @@ def assess_artifact_compatibility(
                     violations.append(
                         f"tool candidate lifecycle_state must be {expected_lifecycle_state} when promotion_stage is {promotion_stage}"
                     )
-            if not str(candidate.get("source_task_id", "")).strip():
-                violations.append("every tool candidate must contain a source_task_id")
-            if not str(candidate.get("benchmark_family", "")).strip():
-                violations.append("every tool candidate must contain a benchmark_family")
-            quality = candidate.get("quality")
-            if isinstance(quality, bool) or not isinstance(quality, (int, float)):
-                violations.append("every tool candidate must contain a numeric quality")
-            if not str(candidate.get("script_name", "")).strip():
-                violations.append("every tool candidate must contain a script_name")
-            if not str(candidate.get("script_body", "")).strip():
-                violations.append("every tool candidate must contain a script_body")
-            if not isinstance(candidate.get("procedure"), dict):
-                violations.append("every tool candidate must contain a procedure object")
-            if not isinstance(candidate.get("task_contract"), dict):
-                violations.append("every tool candidate must contain a task_contract object")
-            if not isinstance(candidate.get("verifier"), dict):
-                violations.append("every tool candidate must contain a verifier object")
         expected_top_level_stage = {
             "candidate": "candidate_procedure",
             "replay_verified": "replay_verified",
@@ -6861,8 +7192,6 @@ def assess_artifact_compatibility(
             violations.append(
                 f"tool artifact lifecycle_state {lifecycle_state} requires all candidates to be in promotion_stage {expected_top_level_stage}"
             )
-        checks.append("tool_ids")
-        checks.append("tool_candidate_contracts")
     if subsystem == "operators":
         operators = payload.get("operators", [])
         for operator in operators:
@@ -6886,17 +7215,8 @@ def assess_artifact_compatibility(
         modules = payload.get("modules", [])
         for module in modules:
             if not isinstance(module, dict):
-                violations.append("every capability module must be an object")
                 continue
-            if not str(module.get("module_id", "")).strip():
-                violations.append("every capability module must contain a module_id")
-            capabilities = module.get("capabilities", [])
-            if not isinstance(capabilities, list):
-                violations.append("every capability module must contain a capabilities list")
             settings = module.get("settings", {})
-            if settings is not None and not isinstance(settings, dict):
-                violations.append("every capability module settings entry must be an object")
-                continue
             if not isinstance(settings, dict):
                 continue
             improvement_subsystems = settings.get("improvement_subsystems", [])
@@ -6912,26 +7232,6 @@ def assess_artifact_compatibility(
                 if not str(surface.get("subsystem_id", "")).strip():
                     violations.append("every capability improvement surface must contain a subsystem_id")
                 base_subsystem = str(surface.get("base_subsystem", "")).strip()
-                base_artifact_kinds = {
-                    "benchmark": "benchmark_candidate_set",
-                    "retrieval": "retrieval_policy_set",
-                    "tolbert_model": "tolbert_model_bundle",
-                    "verifier": "verifier_candidate_set",
-                    "policy": "prompt_proposal_set",
-                    "universe": "universe_contract",
-                    "world_model": "world_model_policy_set",
-                    "state_estimation": "state_estimation_policy_set",
-                    "trust": "trust_policy_set",
-                    "recovery": "recovery_policy_set",
-                    "delegation": "delegated_runtime_policy_set",
-                    "operator_policy": "operator_policy_set",
-                    "transition_model": "transition_model_policy_set",
-                    "curriculum": "curriculum_proposal_set",
-                    "tooling": "tool_candidate_set",
-                    "skills": "skill_set",
-                    "operators": "operator_class_set",
-                    "capabilities": "capability_module_set",
-                }
                 if base_subsystem not in {
                     "benchmark",
                     "retrieval",
@@ -6963,7 +7263,7 @@ def assess_artifact_compatibility(
                 if generator_kind and generator_kind != base_subsystem:
                     violations.append("capability improvement surfaces must use the base_subsystem generator_kind")
                 artifact_kind_override = str(surface.get("artifact_kind", "")).strip()
-                expected_artifact_kind = base_artifact_kinds.get(base_subsystem, "")
+                expected_artifact_kind = str(_CAPABILITY_SURFACE_ARTIFACT_KINDS.get(base_subsystem, "")).strip()
                 if artifact_kind_override and artifact_kind_override != expected_artifact_kind:
                     violations.append("capability improvement surfaces must use the base_subsystem artifact_kind")
         checks.append("capability_modules")
@@ -7039,6 +7339,11 @@ def _update_tool_candidate_states(
     candidates = payload.get("candidates", [])
     if not isinstance(candidates, list):
         return
+    if decision_state == "retain":
+        payload["candidates"] = _normalized_tool_candidates_for_retention(candidates)
+        candidates = payload.get("candidates", [])
+        if not isinstance(candidates, list):
+            return
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -7056,44 +7361,7 @@ def _retention_gate(subsystem: str, payload: dict[str, object] | None) -> dict[s
         retention_gate = payload.get("retention_gate", {})
         if isinstance(retention_gate, dict):
             return retention_gate
-    defaults: dict[str, dict[str, object]] = {
-        "benchmark": retention_gate_preset("benchmark"),
-        "curriculum": retention_gate_preset("curriculum"),
-        "verifier": retention_gate_preset("verifier"),
-        "policy": retention_gate_preset("policy"),
-        "universe": retention_gate_preset("universe"),
-        "world_model": retention_gate_preset("world_model"),
-        "state_estimation": retention_gate_preset("state_estimation"),
-        "trust": retention_gate_preset("trust"),
-        "recovery": retention_gate_preset("recovery"),
-        "delegation": retention_gate_preset("delegation"),
-        "operator_policy": retention_gate_preset("operator_policy"),
-        "transition_model": retention_gate_preset("transition_model"),
-        "capabilities": retention_gate_preset("capabilities"),
-        "retrieval": retention_gate_preset("retrieval"),
-        "tolbert_model": retention_gate_preset("tolbert_model"),
-        "skills": {
-            "require_non_regression": True,
-            "max_step_regression": 0.0,
-            "max_regressed_families": 0,
-            "require_generated_lane_non_regression": True,
-            "require_failure_recovery_non_regression": True,
-        },
-        "tooling": {
-            "require_replay_verification": True,
-            "require_future_task_gain": True,
-            "max_step_regression": 0.0,
-            "max_regressed_families": 0,
-            "require_generated_lane_non_regression": True,
-            "require_failure_recovery_non_regression": True,
-        },
-        "operators": {
-            "min_transfer_pass_rate_delta_abs": 0.05,
-            "require_cross_task_support": True,
-            "min_support": 2,
-        },
-    }
-    return defaults.get(subsystem, {})
+    return retention_gate_preset(subsystem)
 
 
 def retention_gate_for_payload(
@@ -7111,6 +7379,36 @@ def _candidate_family_failure_rate(metrics: EvalMetrics, family: str) -> float:
         return 1.0
     passed = metrics.passed_by_benchmark_family.get(family, 0)
     return max(0.0, min(1.0, 1.0 - (passed / total)))
+
+
+def _trusted_carryover_repair_rate(metrics: EvalMetrics) -> float:
+    if metrics.total == 0 or not isinstance(metrics.task_outcomes, dict):
+        return 0.0
+    eligible_successes = 0
+    converted_repairs = 0
+    for outcome in metrics.task_outcomes.values():
+        if not isinstance(outcome, dict):
+            continue
+        if str(outcome.get("termination_reason", "")).strip() != "success":
+            continue
+        if str(outcome.get("difficulty", "")).strip() != "long_horizon":
+            continue
+        eligible_successes += 1
+        if int(outcome.get("trusted_retrieval_carryover_verified_steps", 0) or 0) <= 0:
+            continue
+        converted_repairs += 1
+    return converted_repairs / max(1, eligible_successes)
+
+
+def _trusted_carryover_verified_steps(metrics: EvalMetrics) -> int:
+    if not isinstance(metrics.task_outcomes, dict):
+        return 0
+    verified_steps = 0
+    for outcome in metrics.task_outcomes.values():
+        if not isinstance(outcome, dict):
+            continue
+        verified_steps += int(outcome.get("trusted_retrieval_carryover_verified_steps", 0) or 0)
+    return verified_steps
 
 
 def _family_discrimination_gain(baseline_metrics: EvalMetrics, candidate_metrics: EvalMetrics) -> float:
@@ -7249,6 +7547,228 @@ def _generated_family_worst_delta(baseline_metrics: EvalMetrics, candidate_metri
     )
 
 
+def _difficulty_pass_rate_delta_map(baseline_metrics: EvalMetrics, candidate_metrics: EvalMetrics) -> dict[str, float]:
+    difficulties = {
+        difficulty
+        for difficulty in (
+            set(baseline_metrics.total_by_difficulty) | set(candidate_metrics.total_by_difficulty)
+        )
+        if baseline_metrics.total_by_difficulty.get(difficulty, 0) > 0
+        or candidate_metrics.total_by_difficulty.get(difficulty, 0) > 0
+    }
+    return {
+        difficulty: round(
+            candidate_metrics.difficulty_pass_rate(difficulty) - baseline_metrics.difficulty_pass_rate(difficulty),
+            4,
+        )
+        for difficulty in sorted(difficulties)
+    }
+
+
+def _proposal_metrics_by_difficulty(metrics: EvalMetrics) -> dict[str, dict[str, object]]:
+    payload = getattr(metrics, "proposal_metrics_by_difficulty", {})
+    if isinstance(payload, dict) and payload:
+        return {
+            str(difficulty): dict(values)
+            for difficulty, values in payload.items()
+            if isinstance(values, dict)
+        }
+    trajectories = metrics.task_trajectories or {}
+    if not isinstance(trajectories, dict):
+        return {}
+    summary: dict[str, dict[str, object]] = {}
+    for payload in trajectories.values():
+        if not isinstance(payload, dict):
+            continue
+        difficulty = str(payload.get("difficulty", "unknown")).strip() or "unknown"
+        row = summary.setdefault(
+            difficulty,
+            {
+                "task_count": 0,
+                "success_count": 0,
+                "proposal_selected_steps": 0,
+                "novel_command_steps": 0,
+                "novel_valid_command_steps": 0,
+                "novel_valid_command_rate": 0.0,
+            },
+        )
+        row["task_count"] = int(row.get("task_count", 0) or 0) + 1
+        row["success_count"] = int(row.get("success_count", 0) or 0) + int(bool(payload.get("success", False)))
+        steps = payload.get("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("proposal_source", "")).strip():
+                row["proposal_selected_steps"] = int(row.get("proposal_selected_steps", 0) or 0) + 1
+            if bool(step.get("proposal_novel", False)):
+                row["novel_command_steps"] = int(row.get("novel_command_steps", 0) or 0) + 1
+                if bool(step.get("verification_passed", False)):
+                    row["novel_valid_command_steps"] = int(row.get("novel_valid_command_steps", 0) or 0) + 1
+    for row in summary.values():
+        novel_command_steps = int(row.get("novel_command_steps", 0) or 0)
+        novel_valid_steps = int(row.get("novel_valid_command_steps", 0) or 0)
+        row["novel_valid_command_rate"] = (
+            0.0 if novel_command_steps <= 0 else round(novel_valid_steps / novel_command_steps, 4)
+        )
+    return summary
+
+
+def _world_feedback_by_difficulty(metrics: EvalMetrics) -> dict[str, dict[str, object]]:
+    payload = getattr(metrics, "world_feedback_by_difficulty", {})
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(difficulty): dict(values)
+        for difficulty, values in payload.items()
+        if isinstance(values, dict)
+    }
+
+
+def _world_feedback_by_benchmark_family(metrics: EvalMetrics) -> dict[str, dict[str, object]]:
+    payload = getattr(metrics, "world_feedback_by_benchmark_family", {})
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(family): dict(values)
+        for family, values in payload.items()
+        if isinstance(values, dict)
+    }
+
+
+def _world_feedback_delta(baseline: dict[str, object], candidate: dict[str, object]) -> dict[str, object]:
+    baseline_progress_mae = float(baseline.get("progress_calibration_mae", 0.0) or 0.0)
+    candidate_progress_mae = float(candidate.get("progress_calibration_mae", 0.0) or 0.0)
+    baseline_risk_mae = float(baseline.get("risk_calibration_mae", 0.0) or 0.0)
+    candidate_risk_mae = float(candidate.get("risk_calibration_mae", 0.0) or 0.0)
+    return {
+        "baseline": dict(baseline),
+        "candidate": dict(candidate),
+        "progress_calibration_mae_gain": round(baseline_progress_mae - candidate_progress_mae, 4),
+        "risk_calibration_mae_gain": round(baseline_risk_mae - candidate_risk_mae, 4),
+    }
+
+
+def _long_horizon_summary(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+) -> dict[str, object]:
+    difficulty = "long_horizon"
+    baseline_total = int(baseline_metrics.total_by_difficulty.get(difficulty, 0) or 0)
+    candidate_total = int(candidate_metrics.total_by_difficulty.get(difficulty, 0) or 0)
+    baseline_rate = baseline_metrics.difficulty_pass_rate(difficulty)
+    candidate_rate = candidate_metrics.difficulty_pass_rate(difficulty)
+    baseline_proposal = _proposal_metrics_by_difficulty(baseline_metrics).get(difficulty, {})
+    candidate_proposal = _proposal_metrics_by_difficulty(candidate_metrics).get(difficulty, {})
+    baseline_world = _world_feedback_by_difficulty(baseline_metrics).get(difficulty, {})
+    candidate_world = _world_feedback_by_difficulty(candidate_metrics).get(difficulty, {})
+    baseline_proposal_steps = int(baseline_proposal.get("proposal_selected_steps", 0) or 0)
+    candidate_proposal_steps = int(candidate_proposal.get("proposal_selected_steps", 0) or 0)
+    baseline_novel_valid_steps = int(baseline_proposal.get("novel_valid_command_steps", 0) or 0)
+    candidate_novel_valid_steps = int(candidate_proposal.get("novel_valid_command_steps", 0) or 0)
+    baseline_novel_valid_rate = float(baseline_proposal.get("novel_valid_command_rate", 0.0) or 0.0)
+    candidate_novel_valid_rate = float(candidate_proposal.get("novel_valid_command_rate", 0.0) or 0.0)
+    world_feedback_delta = _world_feedback_delta(
+        dict(baseline_world) if isinstance(baseline_world, dict) else {},
+        dict(candidate_world) if isinstance(candidate_world, dict) else {},
+    )
+    return {
+        "difficulty": difficulty,
+        "baseline_task_count": baseline_total,
+        "candidate_task_count": candidate_total,
+        "baseline_pass_rate": round(baseline_rate, 4),
+        "candidate_pass_rate": round(candidate_rate, 4),
+        "pass_rate_delta": round(candidate_rate - baseline_rate, 4),
+        "baseline_proposal_selected_steps": baseline_proposal_steps,
+        "candidate_proposal_selected_steps": candidate_proposal_steps,
+        "proposal_selected_steps_delta": candidate_proposal_steps - baseline_proposal_steps,
+        "baseline_novel_valid_command_steps": baseline_novel_valid_steps,
+        "candidate_novel_valid_command_steps": candidate_novel_valid_steps,
+        "novel_valid_command_steps_delta": candidate_novel_valid_steps - baseline_novel_valid_steps,
+        "baseline_novel_valid_command_rate": round(baseline_novel_valid_rate, 4),
+        "candidate_novel_valid_command_rate": round(candidate_novel_valid_rate, 4),
+        "novel_valid_command_rate_delta": round(candidate_novel_valid_rate - baseline_novel_valid_rate, 4),
+        "baseline_world_feedback_step_count": int(baseline_world.get("step_count", 0) or 0)
+        if isinstance(baseline_world, dict)
+        else 0,
+        "candidate_world_feedback_step_count": int(candidate_world.get("step_count", 0) or 0)
+        if isinstance(candidate_world, dict)
+        else 0,
+        "world_feedback": world_feedback_delta,
+    }
+
+
+def _benchmark_family_summary(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+    *,
+    family: str,
+) -> dict[str, object]:
+    family = str(family).strip()
+    if not family:
+        return {}
+    baseline_primary_total = int(baseline_metrics.total_by_benchmark_family.get(family, 0) or 0)
+    candidate_primary_total = int(candidate_metrics.total_by_benchmark_family.get(family, 0) or 0)
+    baseline_generated_total = int(baseline_metrics.generated_by_benchmark_family.get(family, 0) or 0)
+    candidate_generated_total = int(candidate_metrics.generated_by_benchmark_family.get(family, 0) or 0)
+    baseline_primary_rate = baseline_metrics.benchmark_family_pass_rate(family)
+    candidate_primary_rate = candidate_metrics.benchmark_family_pass_rate(family)
+    baseline_generated_rate = _generated_family_pass_rate(baseline_metrics, family)
+    candidate_generated_rate = _generated_family_pass_rate(candidate_metrics, family)
+    baseline_proposal = _proposal_metrics_by_benchmark_family(baseline_metrics).get(family, {})
+    candidate_proposal = _proposal_metrics_by_benchmark_family(candidate_metrics).get(family, {})
+    baseline_world = _world_feedback_by_benchmark_family(baseline_metrics).get(family, {})
+    candidate_world = _world_feedback_by_benchmark_family(candidate_metrics).get(family, {})
+    baseline_proposal_steps = int(baseline_proposal.get("proposal_selected_steps", 0) or 0)
+    candidate_proposal_steps = int(candidate_proposal.get("proposal_selected_steps", 0) or 0)
+    baseline_novel_valid_steps = int(baseline_proposal.get("novel_valid_command_steps", 0) or 0)
+    candidate_novel_valid_steps = int(candidate_proposal.get("novel_valid_command_steps", 0) or 0)
+    baseline_novel_valid_rate = float(baseline_proposal.get("novel_valid_command_rate", 0.0) or 0.0)
+    candidate_novel_valid_rate = float(candidate_proposal.get("novel_valid_command_rate", 0.0) or 0.0)
+    if (
+        baseline_primary_total + candidate_primary_total + baseline_generated_total + candidate_generated_total <= 0
+        and not baseline_proposal
+        and not candidate_proposal
+        and not baseline_world
+        and not candidate_world
+    ):
+        return {}
+    world_feedback_delta = _world_feedback_delta(
+        dict(baseline_world) if isinstance(baseline_world, dict) else {},
+        dict(candidate_world) if isinstance(candidate_world, dict) else {},
+    )
+    return {
+        "benchmark_family": family,
+        "baseline_primary_task_count": baseline_primary_total,
+        "candidate_primary_task_count": candidate_primary_total,
+        "baseline_primary_pass_rate": round(baseline_primary_rate, 4),
+        "candidate_primary_pass_rate": round(candidate_primary_rate, 4),
+        "primary_pass_rate_delta": round(candidate_primary_rate - baseline_primary_rate, 4),
+        "baseline_generated_task_count": baseline_generated_total,
+        "candidate_generated_task_count": candidate_generated_total,
+        "baseline_generated_pass_rate": round(baseline_generated_rate, 4),
+        "candidate_generated_pass_rate": round(candidate_generated_rate, 4),
+        "generated_pass_rate_delta": round(candidate_generated_rate - baseline_generated_rate, 4),
+        "baseline_proposal_selected_steps": baseline_proposal_steps,
+        "candidate_proposal_selected_steps": candidate_proposal_steps,
+        "proposal_selected_steps_delta": candidate_proposal_steps - baseline_proposal_steps,
+        "baseline_novel_valid_command_steps": baseline_novel_valid_steps,
+        "candidate_novel_valid_command_steps": candidate_novel_valid_steps,
+        "novel_valid_command_steps_delta": candidate_novel_valid_steps - baseline_novel_valid_steps,
+        "baseline_novel_valid_command_rate": round(baseline_novel_valid_rate, 4),
+        "candidate_novel_valid_command_rate": round(candidate_novel_valid_rate, 4),
+        "novel_valid_command_rate_delta": round(candidate_novel_valid_rate - baseline_novel_valid_rate, 4),
+        "baseline_world_feedback_step_count": int(baseline_world.get("step_count", 0) or 0)
+        if isinstance(baseline_world, dict)
+        else 0,
+        "candidate_world_feedback_step_count": int(candidate_world.get("step_count", 0) or 0)
+        if isinstance(candidate_world, dict)
+        else 0,
+        "world_feedback": world_feedback_delta,
+    }
+
+
 def _proposal_metrics_by_benchmark_family(metrics: EvalMetrics) -> dict[str, dict[str, object]]:
     payload = getattr(metrics, "proposal_metrics_by_benchmark_family", {})
     if isinstance(payload, dict) and payload:
@@ -7343,6 +7863,68 @@ def _proposal_metrics_delta_by_benchmark_family(
     return delta_summary
 
 
+def _proposal_metrics_delta_by_difficulty(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+) -> dict[str, dict[str, object]]:
+    baseline_summary = _proposal_metrics_by_difficulty(baseline_metrics)
+    candidate_summary = _proposal_metrics_by_difficulty(candidate_metrics)
+    difficulties = sorted(set(baseline_summary) | set(candidate_summary))
+    if not difficulties:
+        return {}
+    delta_summary: dict[str, dict[str, object]] = {}
+    for difficulty in difficulties:
+        baseline = baseline_summary.get(difficulty, {})
+        candidate = candidate_summary.get(difficulty, {})
+        baseline_task_count = int(baseline.get("task_count", 0) or 0)
+        candidate_task_count = int(candidate.get("task_count", 0) or 0)
+        if baseline_task_count + candidate_task_count <= 0:
+            continue
+        baseline_proposal_steps = int(baseline.get("proposal_selected_steps", 0) or 0)
+        candidate_proposal_steps = int(candidate.get("proposal_selected_steps", 0) or 0)
+        baseline_novel_steps = int(baseline.get("novel_command_steps", 0) or 0)
+        candidate_novel_steps = int(candidate.get("novel_command_steps", 0) or 0)
+        baseline_valid_steps = int(baseline.get("novel_valid_command_steps", 0) or 0)
+        candidate_valid_steps = int(candidate.get("novel_valid_command_steps", 0) or 0)
+        baseline_valid_rate = float(baseline.get("novel_valid_command_rate", 0.0) or 0.0)
+        candidate_valid_rate = float(candidate.get("novel_valid_command_rate", 0.0) or 0.0)
+        delta_summary[difficulty] = {
+            "baseline_task_count": baseline_task_count,
+            "candidate_task_count": candidate_task_count,
+            "baseline_proposal_selected_steps": baseline_proposal_steps,
+            "candidate_proposal_selected_steps": candidate_proposal_steps,
+            "proposal_selected_steps_delta": candidate_proposal_steps - baseline_proposal_steps,
+            "baseline_novel_command_steps": baseline_novel_steps,
+            "candidate_novel_command_steps": candidate_novel_steps,
+            "novel_command_steps_delta": candidate_novel_steps - baseline_novel_steps,
+            "baseline_novel_valid_command_steps": baseline_valid_steps,
+            "candidate_novel_valid_command_steps": candidate_valid_steps,
+            "novel_valid_command_steps_delta": candidate_valid_steps - baseline_valid_steps,
+            "baseline_novel_valid_command_rate": round(baseline_valid_rate, 4),
+            "candidate_novel_valid_command_rate": round(candidate_valid_rate, 4),
+            "novel_valid_command_rate_delta": round(candidate_valid_rate - baseline_valid_rate, 4),
+        }
+    return delta_summary
+
+
+def _world_feedback_delta_by_difficulty(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+) -> dict[str, dict[str, object]]:
+    baseline_summary = _world_feedback_by_difficulty(baseline_metrics)
+    candidate_summary = _world_feedback_by_difficulty(candidate_metrics)
+    difficulties = sorted(set(baseline_summary) | set(candidate_summary))
+    if not difficulties:
+        return {}
+    return {
+        difficulty: _world_feedback_delta(
+            dict(baseline_summary.get(difficulty, {})),
+            dict(candidate_summary.get(difficulty, {})),
+        )
+        for difficulty in difficulties
+    }
+
+
 def _verifier_discrimination_gain(payload: dict[str, object] | None) -> float:
     if not isinstance(payload, dict):
         return 0.0
@@ -7378,6 +7960,7 @@ def _validate_cycle_record_consistency(record: ImprovementCycleRecord) -> None:
         "benchmark": "benchmark_candidate_set",
         "retrieval": "retrieval_policy_set",
         "tolbert_model": "tolbert_model_bundle",
+        "qwen_adapter": "qwen_adapter_bundle",
         "verifier": "verifier_candidate_set",
         "policy": "prompt_proposal_set",
         "universe": "universe_contract",
@@ -7604,6 +8187,284 @@ def _tool_candidates_have_stage(payload: dict[str, object] | None, stage: str) -
     )
 
 
+def tool_shared_repo_bundle_evidence(payload: dict[str, object] | None) -> dict[str, object]:
+    return _tool_shared_repo_bundle_evidence(payload)
+
+
+def artifact_retrieval_reuse_evidence(
+    payload: dict[str, object] | None,
+    *,
+    subsystem: str = "",
+) -> dict[str, object]:
+    return _artifact_retrieval_reuse_evidence(payload, subsystem=subsystem)
+
+
+def _artifact_retrieval_reuse_evidence(
+    payload: dict[str, object] | None,
+    *,
+    subsystem: str = "",
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    effective_subsystem = str(subsystem).strip()
+    if not effective_subsystem:
+        artifact_kind = str(payload.get("artifact_kind", "")).strip()
+        if artifact_kind == "skill_set":
+            effective_subsystem = "skills"
+        elif artifact_kind == "tool_candidate_set":
+            effective_subsystem = "tooling"
+    collection_key = ""
+    if effective_subsystem == "skills":
+        collection_key = "skills"
+    elif effective_subsystem == "tooling":
+        collection_key = "candidates"
+    if not collection_key:
+        return {}
+    records = payload.get(collection_key, [])
+    if not isinstance(records, list) or not records:
+        return {}
+
+    procedure_count = 0
+    retrieval_backed_procedure_count = 0
+    trusted_retrieval_procedure_count = 0
+    retrieval_selected_step_count = 0
+    retrieval_influenced_step_count = 0
+    trusted_retrieval_step_count = 0
+    selected_retrieval_span_ids: set[str] = set()
+    verified_retrieval_commands: set[str] = set()
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        procedure = dict(record.get("procedure", {})) if isinstance(record.get("procedure", {}), dict) else {}
+        commands = [str(value).strip() for value in procedure.get("commands", []) if str(value).strip()]
+        if not commands:
+            continue
+        procedure_count += 1
+
+        retrieval_selected_steps = int(record.get("retrieval_selected_steps", 0) or 0)
+        retrieval_influenced_steps = int(record.get("retrieval_influenced_steps", 0) or 0)
+        trusted_retrieval_steps = int(record.get("trusted_retrieval_steps", 0) or 0)
+        retrieval_backed = bool(record.get("retrieval_backed", False)) or bool(
+            retrieval_selected_steps > 0
+            or retrieval_influenced_steps > 0
+            or trusted_retrieval_steps > 0
+            or any(str(value).strip() for value in record.get("retrieval_backed_commands", []))
+        )
+        if retrieval_backed:
+            retrieval_backed_procedure_count += 1
+        if trusted_retrieval_steps > 0:
+            trusted_retrieval_procedure_count += 1
+        retrieval_selected_step_count += retrieval_selected_steps
+        retrieval_influenced_step_count += retrieval_influenced_steps
+        trusted_retrieval_step_count += trusted_retrieval_steps
+        selected_retrieval_span_ids.update(
+            str(value).strip()
+            for value in record.get("selected_retrieval_span_ids", [])
+            if str(value).strip()
+        )
+        verified_retrieval_commands.update(
+            str(value).strip()
+            for value in record.get("retrieval_backed_commands", [])
+            if str(value).strip()
+        )
+
+    if procedure_count <= 0:
+        return {}
+    return {
+        "procedure_count": procedure_count,
+        "retrieval_backed_procedure_count": retrieval_backed_procedure_count,
+        "trusted_retrieval_procedure_count": trusted_retrieval_procedure_count,
+        "retrieval_selected_step_count": retrieval_selected_step_count,
+        "retrieval_influenced_step_count": retrieval_influenced_step_count,
+        "trusted_retrieval_step_count": trusted_retrieval_step_count,
+        "selected_retrieval_span_count": len(selected_retrieval_span_ids),
+        "verified_retrieval_command_count": len(verified_retrieval_commands),
+    }
+
+
+def _artifact_retrieval_reuse_comparison(
+    payload: dict[str, object] | None,
+    *,
+    subsystem: str,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    baseline_payload = _active_artifact_payload_from_generation_context(payload)
+    candidate_summary = _artifact_retrieval_reuse_evidence(payload, subsystem=subsystem)
+    baseline_summary = _artifact_retrieval_reuse_evidence(baseline_payload, subsystem=subsystem)
+    if not candidate_summary and not baseline_summary:
+        return {}
+    keys = (
+        "procedure_count",
+        "retrieval_backed_procedure_count",
+        "trusted_retrieval_procedure_count",
+        "retrieval_selected_step_count",
+        "retrieval_influenced_step_count",
+        "trusted_retrieval_step_count",
+        "selected_retrieval_span_count",
+        "verified_retrieval_command_count",
+    )
+    comparison: dict[str, object] = {}
+    for key in keys:
+        baseline_value = int(baseline_summary.get(key, 0) or 0)
+        candidate_value = int(candidate_summary.get(key, 0) or 0)
+        comparison[f"baseline_{key}"] = baseline_value
+        comparison[f"candidate_{key}"] = candidate_value
+        comparison[f"{key}_delta"] = candidate_value - baseline_value
+    comparison["retrieval_reuse_delta"] = int(
+        comparison.get("retrieval_backed_procedure_count_delta", 0) or 0
+    ) + int(comparison.get("trusted_retrieval_procedure_count_delta", 0) or 0)
+    return comparison
+
+
+def _tool_shared_repo_bundle_evidence(payload: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    candidates = payload.get("candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        return {}
+    shared_repo_candidate_count = 0
+    shared_repo_worker_candidate_count = 0
+    shared_repo_complete_integrator_candidate_count = 0
+    shared_repo_incomplete_integrator_candidate_count = 0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        bundle = _tool_candidate_shared_repo_bundle(candidate)
+        if not bundle:
+            continue
+        shared_repo_candidate_count += 1
+        role = str(bundle.get("role", "")).strip()
+        if role == "worker":
+            shared_repo_worker_candidate_count += 1
+            continue
+        if bool(bundle.get("bundle_complete", False)):
+            shared_repo_complete_integrator_candidate_count += 1
+        else:
+            shared_repo_incomplete_integrator_candidate_count += 1
+    return {
+        "shared_repo_candidate_count": shared_repo_candidate_count,
+        "shared_repo_worker_candidate_count": shared_repo_worker_candidate_count,
+        "shared_repo_complete_integrator_candidate_count": shared_repo_complete_integrator_candidate_count,
+        "shared_repo_incomplete_integrator_candidate_count": shared_repo_incomplete_integrator_candidate_count,
+        "shared_repo_complete_candidate_count": (
+            shared_repo_worker_candidate_count + shared_repo_complete_integrator_candidate_count
+        ),
+    }
+
+
+def _tool_shared_repo_bundle_comparison(payload: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    baseline_payload = _active_artifact_payload_from_generation_context(payload)
+    candidate_summary = _tool_shared_repo_bundle_evidence(payload)
+    baseline_summary = _tool_shared_repo_bundle_evidence(baseline_payload)
+    if not candidate_summary and not baseline_summary:
+        return {}
+    keys = (
+        "shared_repo_candidate_count",
+        "shared_repo_worker_candidate_count",
+        "shared_repo_complete_integrator_candidate_count",
+        "shared_repo_incomplete_integrator_candidate_count",
+        "shared_repo_complete_candidate_count",
+    )
+    comparison: dict[str, object] = {}
+    for key in keys:
+        baseline_value = int(baseline_summary.get(key, 0) or 0)
+        candidate_value = int(candidate_summary.get(key, 0) or 0)
+        comparison[f"baseline_{key}"] = baseline_value
+        comparison[f"candidate_{key}"] = candidate_value
+        comparison[f"{key}_delta"] = candidate_value - baseline_value
+    comparison["candidate_bundle_coherence_delta"] = int(
+        comparison.get("shared_repo_complete_candidate_count_delta", 0) or 0
+    ) - int(comparison.get("shared_repo_incomplete_integrator_candidate_count_delta", 0) or 0)
+    return comparison
+
+
+def _tool_candidate_shared_repo_bundle(candidate: dict[str, object]) -> dict[str, object]:
+    if not isinstance(candidate, dict):
+        return {}
+    procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
+    commands = [str(command).strip() for command in procedure.get("commands", []) if str(command).strip()]
+    bundle = dict(candidate.get("shared_repo_bundle", {})) if isinstance(candidate.get("shared_repo_bundle", {}), dict) else {}
+    task_contract = dict(candidate.get("task_contract", {})) if isinstance(candidate.get("task_contract", {}), dict) else {}
+    metadata = dict(task_contract.get("metadata", {})) if isinstance(task_contract.get("metadata", {}), dict) else {}
+    workflow_guard = dict(metadata.get("workflow_guard", {})) if isinstance(metadata.get("workflow_guard", {}), dict) else {}
+    verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
+    repo_id = str(bundle.get("shared_repo_id", workflow_guard.get("shared_repo_id", ""))).strip()
+    worker_branch = str(bundle.get("worker_branch", workflow_guard.get("worker_branch", ""))).strip()
+    role = str(bundle.get("role", "")).strip()
+    try:
+        shared_repo_order = int(bundle.get("shared_repo_order", metadata.get("shared_repo_order", 0)) or 0)
+    except (TypeError, ValueError):
+        shared_repo_order = 0
+    required_merged_branches = [
+        str(value).strip()
+        for value in (
+            bundle.get("required_merged_branches", verifier.get("required_merged_branches", []))
+            if isinstance(bundle.get("required_merged_branches", verifier.get("required_merged_branches", [])), list)
+            else verifier.get("required_merged_branches", [])
+        )
+        if str(value).strip()
+    ]
+    observed_merged_branches = [
+        branch for branch in required_merged_branches if any(branch in command for command in commands)
+    ]
+    if not role:
+        if shared_repo_order > 0 or required_merged_branches:
+            role = "integrator"
+        elif repo_id or worker_branch:
+            role = "worker"
+    if not role:
+        return {}
+    bundle_complete = bool(bundle.get("bundle_complete", False))
+    if role == "worker":
+        bundle_complete = True
+    elif required_merged_branches:
+        bundle_complete = len(observed_merged_branches) >= len(required_merged_branches)
+    return {
+        "shared_repo_id": repo_id,
+        "worker_branch": worker_branch,
+        "role": role,
+        "shared_repo_order": shared_repo_order,
+        "required_merged_branches": required_merged_branches,
+        "observed_merged_branches": observed_merged_branches,
+        "bundle_complete": bundle_complete,
+    }
+
+
+def _tool_candidate_retention_sort_key(candidate: dict[str, object]) -> tuple[int, float, str]:
+    bundle = _tool_candidate_shared_repo_bundle(candidate)
+    role = str(bundle.get("role", "")).strip()
+    if role == "worker":
+        priority = 0
+    elif role == "integrator" and bool(bundle.get("bundle_complete", False)):
+        priority = 1
+    elif role == "integrator":
+        priority = 3
+    else:
+        priority = 2
+    quality = float(candidate.get("quality", 0.0) or 0.0)
+    tool_id = str(candidate.get("tool_id", "")).strip()
+    return (priority, -quality, tool_id)
+
+
+def _normalized_tool_candidates_for_retention(candidates: list[object]) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        bundle = _tool_candidate_shared_repo_bundle(candidate)
+        if str(bundle.get("role", "")).strip() == "integrator" and not bool(bundle.get("bundle_complete", False)):
+            continue
+        updated = dict(candidate)
+        if bundle:
+            updated["shared_repo_bundle"] = bundle
+        normalized.append(updated)
+    return sorted(normalized, key=_tool_candidate_retention_sort_key)
+
+
 def _operator_support_count(payload: dict[str, object] | None) -> int:
     if not isinstance(payload, dict):
         return 0
@@ -7618,7 +8479,12 @@ def _operator_support_count(payload: dict[str, object] | None) -> int:
     return min(counts) if counts else 0
 
 
-def stamp_artifact_experiment_variant(artifact_path: Path, variant: ImprovementVariant) -> None:
+def stamp_artifact_experiment_variant(
+    artifact_path: Path,
+    variant: ImprovementVariant,
+    *,
+    runtime_config: KernelConfig | None = None,
+) -> None:
     if not artifact_path.exists():
         return
     payload = _load_json_payload(artifact_path)
@@ -7633,7 +8499,7 @@ def stamp_artifact_experiment_variant(artifact_path: Path, variant: ImprovementV
         "score": variant.score,
         "controls": dict(variant.controls),
     }
-    artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(artifact_path, payload, config=runtime_config)
 
 
 def stamp_artifact_generation_context(
@@ -7645,6 +8511,7 @@ def stamp_artifact_generation_context(
     prior_active_artifact_path: Path | None = None,
     prior_retained_cycle_id: str | None = None,
     prior_retained_artifact_snapshot_path: Path | None = None,
+    runtime_config: KernelConfig | None = None,
 ) -> None:
     if not artifact_path.exists():
         return
@@ -7665,7 +8532,7 @@ def stamp_artifact_generation_context(
     if prior_retained_artifact_snapshot_path is not None:
         context["prior_retained_artifact_snapshot_path"] = str(prior_retained_artifact_snapshot_path)
     payload["generation_context"] = context
-    artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(artifact_path, payload, config=runtime_config)
 
 
 def payload_with_active_artifact_context(

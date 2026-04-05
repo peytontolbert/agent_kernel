@@ -56,9 +56,6 @@ def train_hybrid_runtime_from_dataset(
         training_mode = "injected_lora_plus_structured_adapters"
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    bce = nn.BCEWithLogitsLoss()
-    mse = nn.MSELoss()
-    kl_div = nn.KLDivLoss(reduction="batchmean")
     for _ in range(max(1, epochs)):
         for offset in range(0, len(examples), max(1, batch_size)):
             batch_examples = examples[offset : offset + max(1, batch_size)]
@@ -76,16 +73,24 @@ def train_hybrid_runtime_from_dataset(
                 prefer_python_world_ref=_prefer_python_ref_for_device(device),
             )
             loss = (
-                mse(output.score, batch["score_target"])
-                + bce(output.policy_logits, batch["policy_target"])
-                + mse(output.value, batch["value_target"])
-                + bce(output.stop_logits, batch["stop_target"])
-                + bce(output.risk_logits, batch["risk_target"])
-                + mse(output.transition, batch["transition_target"])
-                + _decoder_cross_entropy(output.decoder_logits, batch["decoder_target_ids"])
+                _weighted_mse(output.score, batch["score_target"], batch["example_weight"])
+                + _weighted_bce(output.policy_logits, batch["policy_target"], batch["example_weight"])
+                + _weighted_mse(output.value, batch["value_target"], batch["example_weight"])
+                + _weighted_bce(output.stop_logits, batch["stop_target"], batch["example_weight"])
+                + _weighted_bce(output.risk_logits, batch["risk_target"], batch["example_weight"])
+                + _weighted_mse(output.transition, batch["transition_target"], batch["example_weight"])
+                + _weighted_decoder_cross_entropy(
+                    output.decoder_logits,
+                    batch["decoder_target_ids"],
+                    batch["example_weight"],
+                )
             )
             if output.world_final_belief is not None:
-                loss = loss + kl_div(output.world_final_belief, batch["world_target"])
+                loss = loss + _weighted_kl_div(
+                    output.world_final_belief,
+                    batch["world_target"],
+                    batch["example_weight"],
+                )
             loss.backward()
             if adapter_state is not None:
                 torch.nn.utils.clip_grad_norm_(list(adapter_state.parameters()), max_norm=1.0)
@@ -139,6 +144,22 @@ def train_hybrid_runtime_from_dataset(
             "lr": float(lr),
             "decoder_vocab_path": str(dataset_manifest.get("decoder_vocab_path", "")).strip(),
             "decoder_vocab_entry_count": int(dataset_manifest.get("decoder_vocab_entry_count", 0) or 0),
+            "difficulty_counts": dict(dataset_manifest.get("difficulty_counts", {}))
+            if isinstance(dataset_manifest.get("difficulty_counts", {}), dict)
+            else {},
+            "long_horizon_example_count": int(dataset_manifest.get("long_horizon_example_count", 0) or 0),
+            "long_horizon_weighted_example_share": float(
+                dataset_manifest.get("long_horizon_weighted_example_share", 0.0) or 0.0
+            ),
+            "trusted_retrieval_aligned_example_count": int(
+                dataset_manifest.get("trusted_retrieval_aligned_example_count", 0) or 0
+            ),
+            "transfer_novelty_example_count": int(
+                dataset_manifest.get("transfer_novelty_example_count", 0) or 0
+            ),
+            "environment_safe_example_count": int(
+                dataset_manifest.get("environment_safe_example_count", 0) or 0
+            ),
             "training_mode": training_mode,
             "adapter_training_stats": dict(adapter_state.stats()) if adapter_state is not None else {},
         },
@@ -198,6 +219,11 @@ def _tensorize_batch(examples: list[dict[str, Any]], *, device: str) -> dict[str
         "risk_target": torch.tensor([float(example["risk_target"]) for example in examples], dtype=torch.float32, device=device),
         "transition_target": torch.tensor([example["transition_target"] for example in examples], dtype=torch.float32, device=device),
         "world_target": torch.tensor([example["world_target"] for example in examples], dtype=torch.float32, device=device),
+        "example_weight": torch.tensor(
+            [float(example.get("example_weight", 1.0) or 1.0) for example in examples],
+            dtype=torch.float32,
+            device=device,
+        ),
     }
 
 
@@ -249,13 +275,45 @@ def _load_compatible_state_dict(model: HybridTolbertSSMModel, state_dict: dict[s
         raise RuntimeError(f"missing parameters in hybrid runtime parent checkpoint: {sorted(disallowed_missing)}")
 
 
-def _decoder_cross_entropy(decoder_logits: torch.Tensor, decoder_target_ids: torch.Tensor) -> torch.Tensor:
+def _weighted_mse(prediction: torch.Tensor, target: torch.Tensor, example_weight: torch.Tensor) -> torch.Tensor:
+    if prediction.ndim > 1:
+        per_example = (prediction - target).pow(2).mean(dim=-1)
+    else:
+        per_example = (prediction - target).pow(2)
+    return (per_example * example_weight).sum() / example_weight.sum().clamp_min(1.0)
+
+
+def _weighted_bce(logits: torch.Tensor, target: torch.Tensor, example_weight: torch.Tensor) -> torch.Tensor:
+    per_example = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    if per_example.ndim > 1:
+        per_example = per_example.mean(dim=-1)
+    return (per_example * example_weight).sum() / example_weight.sum().clamp_min(1.0)
+
+
+def _weighted_decoder_cross_entropy(
+    decoder_logits: torch.Tensor,
+    decoder_target_ids: torch.Tensor,
+    example_weight: torch.Tensor,
+) -> torch.Tensor:
     vocab_size = int(decoder_logits.shape[-1])
-    return nn.functional.cross_entropy(
+    per_token = nn.functional.cross_entropy(
         decoder_logits.reshape(-1, vocab_size),
         decoder_target_ids.reshape(-1),
         ignore_index=0,
-    )
+        reduction="none",
+    ).reshape(decoder_target_ids.shape[0], -1)
+    mask = (decoder_target_ids != 0).float()
+    per_example = (per_token * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+    return (per_example * example_weight).sum() / example_weight.sum().clamp_min(1.0)
+
+
+def _weighted_kl_div(
+    log_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    example_weight: torch.Tensor,
+) -> torch.Tensor:
+    per_example = nn.functional.kl_div(log_probs, target_probs, reduction="none").sum(dim=-1)
+    return (per_example * example_weight).sum() / example_weight.sum().clamp_min(1.0)
 
 
 def _should_wrap_lora_module(module_path: str, module: nn.Module) -> bool:

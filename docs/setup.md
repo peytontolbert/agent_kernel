@@ -30,7 +30,7 @@ pip install -e .
 pytest -q
 ```
 
-As of March 19, 2026, the suite currently reports `187 passed in 16.28s`.
+Use the live output in your environment as the source of truth instead of relying on a hard-coded count in the docs.
 
 ## Model setup
 
@@ -147,7 +147,7 @@ TOLBERT-specific settings:
 
 ## First run
 
-Minimal live run:
+Boot sanity check:
 
 ```bash
 AGENT_KERNEL_PROVIDER=vllm \
@@ -156,19 +156,34 @@ AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000 \
 python scripts/run_agent.py --task-id hello_task
 ```
 
+Expected shape:
+
+```text
+task=hello_task success=True
+```
+
+Representative coding task:
+
+```bash
+AGENT_KERNEL_PROVIDER=vllm \
+AGENT_KERNEL_MODEL=Qwen/Qwen3.5-9B \
+AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000 \
+python scripts/run_agent.py --task-id git_repo_test_repair_task
+```
+
 Native wrapper with preconfigured asset paths:
 
 ```bash
 AGENT_KERNEL_PROVIDER=vllm \
 AGENT_KERNEL_MODEL=Qwen/Qwen3.5-9B \
 AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000 \
-./scripts/run_native_agent.sh hello_task
+./scripts/run_native_agent.sh git_repo_test_repair_task
 ```
 
 Expected shape:
 
 ```text
-task=hello_task success=True steps=1
+task=git_repo_test_repair_task success=True
 ```
 
 ## Full runtime verification
@@ -184,7 +199,8 @@ AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000 \
 
 That script runs:
 
-- a live single-task check
+- a live boot-check task
+- a higher-value repo workflow task
 - full eval with TOLBERT and skills
 - TOLBERT comparison
 - TOLBERT feature-mode comparison

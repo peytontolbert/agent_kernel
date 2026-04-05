@@ -8,18 +8,21 @@ from .benchmark_synthesis import synthesize_benchmark_candidates
 from .capabilities import load_capability_modules
 from .capability_improvement import build_capability_module_artifact
 from .config import KernelConfig
+from .modeling.qwen import build_qwen_adapter_candidate_artifact
 from .modeling.tolbert.delta import resolve_tolbert_runtime_checkpoint_path
 from .curriculum_improvement import build_curriculum_proposal_artifact
 from .delegation_improvement import build_delegation_proposal_artifact
+from .export_governance import govern_improvement_export_storage
 from .extractors import extract_operator_classes, extract_successful_command_skills, extract_tool_candidates
 from .operator_policy_improvement import build_operator_policy_proposal_artifact
 from .policy_improvement import build_policy_proposal_artifact
 from .recovery_improvement import build_recovery_proposal_artifact
 from .retrieval_improvement import build_retrieval_proposal_artifact
 from .state_estimation_improvement import build_state_estimation_proposal_artifact
-from .tolbert_model_improvement import build_tolbert_model_candidate_artifact
+from .tolbert_model_improvement import build_tolbert_model_candidate_artifact, cleanup_tolbert_model_candidate_storage
 from .transition_model_improvement import build_transition_model_proposal_artifact
 from .trust_improvement import build_trust_proposal_artifact
+from .kernel_catalog import kernel_catalog_list, kernel_catalog_mapping
 from .universe_improvement import (
     build_operating_envelope_artifact,
     build_universe_constitution_artifact,
@@ -47,203 +50,42 @@ class SubsystemSpec:
 
 
 _BASE_FLAGS = {
-    "include_discovered_tasks": True,
-    "include_episode_memory": True,
-    "include_skill_memory": False,
-    "include_skill_transfer": False,
-    "include_operator_memory": False,
-    "include_tool_memory": False,
-    "include_verifier_memory": False,
-    "include_benchmark_candidates": False,
-    "include_verifier_candidates": False,
-    "include_generated": True,
-    "include_failure_generated": True,
+    str(key): bool(value)
+    for key, value in kernel_catalog_mapping("subsystems", "base_flags").items()
 }
 
 
-_BUILTIN_SPECS: dict[str, SubsystemSpec] = {
-    "benchmark": SubsystemSpec(
-        subsystem="benchmark",
-        base_subsystem="benchmark",
-        artifact_path_attr="benchmark_candidates_path",
-        generator_kind="benchmark",
-        artifact_kind="benchmark_candidate_set",
-        action="synthesize_benchmarks",
-        candidate_flag_updates={"include_benchmark_candidates": True},
-    ),
-    "skills": SubsystemSpec(
-        subsystem="skills",
-        base_subsystem="skills",
-        artifact_path_attr="skills_path",
-        generator_kind="skills",
-        artifact_kind="skill_set",
-        action="extract_skills",
-        candidate_flag_updates={"include_skill_memory": True},
-    ),
-    "operators": SubsystemSpec(
-        subsystem="operators",
-        base_subsystem="operators",
-        artifact_path_attr="operator_classes_path",
-        generator_kind="operators",
-        artifact_kind="operator_class_set",
-        action="extract_operators",
-        baseline_flag_updates={"include_skill_transfer": True},
-        candidate_flag_updates={"include_operator_memory": True},
-    ),
-    "tooling": SubsystemSpec(
-        subsystem="tooling",
-        base_subsystem="tooling",
-        artifact_path_attr="tool_candidates_path",
-        generator_kind="tooling",
-        artifact_kind="tool_candidate_set",
-        action="extract_tools",
-        candidate_flag_updates={"include_tool_memory": True},
-    ),
-    "verifier": SubsystemSpec(
-        subsystem="verifier",
-        base_subsystem="verifier",
-        artifact_path_attr="verifier_contracts_path",
-        generator_kind="verifier",
-        artifact_kind="verifier_candidate_set",
-        action="synthesize_verifiers",
-        candidate_flag_updates={"include_verifier_candidates": True},
-    ),
-    "retrieval": SubsystemSpec(
-        subsystem="retrieval",
-        base_subsystem="retrieval",
-        artifact_path_attr="retrieval_proposals_path",
-        proposal_toggle_attr="use_retrieval_proposals",
-        generator_kind="retrieval",
-        artifact_kind="retrieval_policy_set",
-        action="propose_retrieval_update",
-        baseline_flag_updates={"include_benchmark_candidates": True},
-        candidate_flag_updates={"include_benchmark_candidates": True},
-    ),
-    "tolbert_model": SubsystemSpec(
-        subsystem="tolbert_model",
-        base_subsystem="tolbert_model",
-        artifact_path_attr="tolbert_model_artifact_path",
-        proposal_toggle_attr="use_tolbert_model_artifacts",
-        generator_kind="tolbert_model",
-        artifact_kind="tolbert_model_bundle",
-        action="propose_tolbert_model_update",
-        baseline_flag_updates={"include_benchmark_candidates": True},
-        candidate_flag_updates={"include_benchmark_candidates": True},
-    ),
-    "policy": SubsystemSpec(
-        subsystem="policy",
-        base_subsystem="policy",
-        artifact_path_attr="prompt_proposals_path",
-        proposal_toggle_attr="use_prompt_proposals",
-        generator_kind="policy",
-        artifact_kind="prompt_proposal_set",
-        action="propose_prompt_update",
-    ),
-    "universe": SubsystemSpec(
-        subsystem="universe",
-        base_subsystem="universe",
-        artifact_path_attr="universe_contract_path",
-        generator_kind="universe",
-        artifact_kind="universe_contract",
-        action="propose_universe_update",
-    ),
-    "universe_constitution": SubsystemSpec(
-        subsystem="universe_constitution",
-        base_subsystem="universe",
-        artifact_path_attr="universe_constitution_path",
-        generator_kind="universe_constitution",
-        artifact_kind="universe_constitution",
-        action="propose_universe_constitution_update",
-    ),
-    "operating_envelope": SubsystemSpec(
-        subsystem="operating_envelope",
-        base_subsystem="universe",
-        artifact_path_attr="operating_envelope_path",
-        generator_kind="operating_envelope",
-        artifact_kind="operating_envelope",
-        action="propose_operating_envelope_update",
-    ),
-    "curriculum": SubsystemSpec(
-        subsystem="curriculum",
-        base_subsystem="curriculum",
-        artifact_path_attr="curriculum_proposals_path",
-        proposal_toggle_attr="use_curriculum_proposals",
-        generator_kind="curriculum",
-        artifact_kind="curriculum_proposal_set",
-        action="propose_curriculum_update",
-    ),
-    "world_model": SubsystemSpec(
-        subsystem="world_model",
-        base_subsystem="world_model",
-        artifact_path_attr="world_model_proposals_path",
-        proposal_toggle_attr="use_world_model",
-        generator_kind="world_model",
-        artifact_kind="world_model_policy_set",
-        action="propose_world_model_update",
-    ),
-    "state_estimation": SubsystemSpec(
-        subsystem="state_estimation",
-        base_subsystem="state_estimation",
-        artifact_path_attr="state_estimation_proposals_path",
-        proposal_toggle_attr="use_state_estimation_proposals",
-        generator_kind="state_estimation",
-        artifact_kind="state_estimation_policy_set",
-        action="propose_state_estimation_update",
-    ),
-    "trust": SubsystemSpec(
-        subsystem="trust",
-        base_subsystem="trust",
-        artifact_path_attr="trust_proposals_path",
-        proposal_toggle_attr="use_trust_proposals",
-        generator_kind="trust",
-        artifact_kind="trust_policy_set",
-        action="propose_trust_update",
-    ),
-    "recovery": SubsystemSpec(
-        subsystem="recovery",
-        base_subsystem="recovery",
-        artifact_path_attr="recovery_proposals_path",
-        proposal_toggle_attr="use_recovery_proposals",
-        generator_kind="recovery",
-        artifact_kind="recovery_policy_set",
-        action="propose_recovery_update",
-    ),
-    "delegation": SubsystemSpec(
-        subsystem="delegation",
-        base_subsystem="delegation",
-        artifact_path_attr="delegation_proposals_path",
-        proposal_toggle_attr="use_delegation_proposals",
-        generator_kind="delegation",
-        artifact_kind="delegated_runtime_policy_set",
-        action="propose_delegation_update",
-    ),
-    "operator_policy": SubsystemSpec(
-        subsystem="operator_policy",
-        base_subsystem="operator_policy",
-        artifact_path_attr="operator_policy_proposals_path",
-        proposal_toggle_attr="use_operator_policy_proposals",
-        generator_kind="operator_policy",
-        artifact_kind="operator_policy_set",
-        action="propose_operator_policy_update",
-    ),
-    "transition_model": SubsystemSpec(
-        subsystem="transition_model",
-        base_subsystem="transition_model",
-        artifact_path_attr="transition_model_proposals_path",
-        proposal_toggle_attr="use_transition_model_proposals",
-        generator_kind="transition_model",
-        artifact_kind="transition_model_policy_set",
-        action="propose_transition_model_update",
-    ),
-    "capabilities": SubsystemSpec(
-        subsystem="capabilities",
-        base_subsystem="capabilities",
-        artifact_path_attr="capability_modules_path",
-        generator_kind="capabilities",
-        artifact_kind="capability_module_set",
-        action="propose_capability_update",
-    ),
-}
+def _load_builtin_specs() -> dict[str, SubsystemSpec]:
+    specs: dict[str, SubsystemSpec] = {}
+    for item in kernel_catalog_list("subsystems", "builtin_specs"):
+        if not isinstance(item, dict):
+            continue
+        subsystem_id = str(item.get("subsystem", "")).strip()
+        if not subsystem_id:
+            continue
+        specs[subsystem_id] = SubsystemSpec(
+            subsystem=subsystem_id,
+            base_subsystem=str(item.get("base_subsystem", "")).strip() or subsystem_id,
+            artifact_path_attr=str(item.get("artifact_path_attr", "")).strip(),
+            proposal_toggle_attr=str(item.get("proposal_toggle_attr", "")).strip() or None,
+            generator_kind=str(item.get("generator_kind", "default")).strip() or "default",
+            artifact_kind=str(item.get("artifact_kind", "")).strip(),
+            action=str(item.get("action", "observe")).strip() or "observe",
+            baseline_flag_updates={
+                str(key): bool(value)
+                for key, value in dict(item.get("baseline_flag_updates", {})).items()
+                if str(key).strip()
+            },
+            candidate_flag_updates={
+                str(key): bool(value)
+                for key, value in dict(item.get("candidate_flag_updates", {})).items()
+                if str(key).strip()
+            },
+        )
+    return specs
+
+
+_BUILTIN_SPECS: dict[str, SubsystemSpec] = _load_builtin_specs()
 _CONFIG_FIELD_NAMES = {entry.name for entry in fields(KernelConfig)}
 
 
@@ -331,6 +173,26 @@ def comparison_config_for_subsystem_artifact(
                     str(item)
                     for item in runtime_paths.get("cache_paths", candidate.tolbert_cache_paths)
                 ),
+            )
+    if spec.base_subsystem == "qwen_adapter" and artifact_path.exists():
+        payload = _load_artifact_payload(artifact_path)
+        runtime_paths = payload.get("runtime_paths", {}) if isinstance(payload, dict) else {}
+        if isinstance(runtime_paths, dict):
+            configured_model_name = str(
+                runtime_paths.get("served_model_name")
+                or payload.get("base_model_name")
+                or runtime_paths.get("merged_output_dir")
+                or runtime_paths.get("adapter_output_dir")
+                or candidate.model_name
+            ).strip()
+            configured_vllm_host = str(runtime_paths.get("vllm_host", candidate.vllm_host)).strip() or candidate.vllm_host
+            configured_provider = str(runtime_paths.get("provider", candidate.provider)).strip() or candidate.provider
+            candidate = replace(
+                candidate,
+                model_name=configured_model_name or candidate.model_name,
+                vllm_host=configured_vllm_host,
+                provider=configured_provider,
+                qwen_adapter_artifact_path=artifact_path,
             )
     if spec.proposal_toggle_attr:
         return replace(candidate, **{spec.proposal_toggle_attr: True})
@@ -476,6 +338,11 @@ def default_variant_definitions(
             _variant_definition("recovery_alignment", "fine-tune Tolbert against low-confidence and failure-aligned traces", 0.03, 4, {"focus": "recovery_alignment"}),
             _variant_definition("discovered_task_adaptation", "fine-tune Tolbert against discovered tasks and verifier-backed contracts", 0.028, 4, {"focus": "discovered_task_adaptation"}),
         ]
+    if subsystem == "qwen_adapter":
+        return [
+            _variant_definition("coding_lane_sft", "adapt Qwen on retained kernel coding traces without changing liftoff ownership", 0.025, 4, {"focus": "coding_lane_sft"}),
+            _variant_definition("teacher_shadow", "adapt Qwen for teacher and shadow-runtime roles on approved coding families", 0.022, 4, {"focus": "teacher_shadow"}),
+        ]
     if subsystem == "verifier":
         return [
             _variant_definition("false_failure_guard", "tighten false-failure controls from failed traces", 0.03, 3, {"focus": "false_failure"}),
@@ -515,6 +382,13 @@ def default_variant_definitions(
         return [
             _variant_definition("retrieval_caution", "make low-confidence retrieval less binding", 0.015, 2, {"focus": "retrieval_caution"}),
             _variant_definition("verifier_alignment", "bias decisions toward verifier-compatible artifact checks", 0.012, 2, {"focus": "verifier_alignment"}),
+            _variant_definition(
+                "long_horizon_orientation",
+                "bias coding decisions toward durable progress, preservation, and validated stops",
+                0.014,
+                3,
+                {"focus": "long_horizon_success"},
+            ),
         ]
     if resolved_subsystem == "universe_constitution":
         return [
@@ -612,6 +486,21 @@ def generate_candidate_artifact(
             repo_root=Path(__file__).resolve().parents[1],
             output_dir=candidate_artifact_path.parent / candidate_artifact_path.stem,
             metrics=metrics,
+            current_payload=current_payload,
+            **generation_kwargs,
+        )
+        candidate_artifact_path.write_text(json.dumps(candidate_payload, indent=2), encoding="utf-8")
+        candidate_payload["storage_governance"] = cleanup_tolbert_model_candidate_storage(
+            config=config,
+            preserve_paths=(candidate_artifact_path.parent,),
+        )
+        candidate_artifact_path.write_text(json.dumps(candidate_payload, indent=2), encoding="utf-8")
+        artifact = str(candidate_artifact_path)
+    elif spec.generator_kind == "qwen_adapter":
+        candidate_payload = build_qwen_adapter_candidate_artifact(
+            config=config,
+            repo_root=Path(__file__).resolve().parents[1],
+            output_dir=candidate_artifact_path.parent / candidate_artifact_path.stem,
             current_payload=current_payload,
             **generation_kwargs,
         )
@@ -726,6 +615,15 @@ def generate_candidate_artifact(
         )
         candidate_artifact_path.write_text(json.dumps(proposals, indent=2), encoding="utf-8")
         artifact = str(candidate_artifact_path)
+    if artifact:
+        govern_improvement_export_storage(
+            config,
+            preserve_paths=(Path(artifact),),
+            include_cycle_exports=False,
+            include_report_exports=False,
+            include_run_reports=False,
+            include_run_checkpoints=False,
+        )
     return artifact, spec.action, spec.artifact_kind
 
 

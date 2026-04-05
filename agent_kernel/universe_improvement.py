@@ -6,6 +6,7 @@ from pathlib import Path
 
 from evals.metrics import EvalMetrics
 
+from .improvement_catalog import catalog_mapping, catalog_nested_string_sets, catalog_string_list, catalog_string_set
 from .improvement_common import (
     build_standard_proposal_artifact,
     ensure_proposals,
@@ -19,102 +20,24 @@ from .improvement_common import (
     retention_gate_preset,
 )
 
-UNIVERSE_PROPOSAL_AREAS = {
-    "governance",
-    "verification",
-    "operator_scope",
-    "environment_envelope",
-}
-UNIVERSE_GENERATION_FOCI = {
-    "balanced",
-    "governance",
-    "verification",
-    "operator_scope",
-    "environment_envelope",
-}
-UNIVERSE_GOVERNANCE_KEYS = {
-    "require_verification",
-    "require_bounded_steps",
-    "prefer_reversible_actions",
-    "respect_task_forbidden_artifacts",
-    "respect_preserved_artifacts",
-}
-UNIVERSE_ACTION_RISK_CONTROL_KEYS = {
-    "destructive_mutation_penalty",
-    "git_mutation_penalty",
-    "inline_destructive_interpreter_penalty",
-    "network_fetch_penalty",
-    "privileged_command_penalty",
-    "read_only_discovery_bonus",
-    "remote_execution_penalty",
-    "reversible_file_operation_bonus",
-    "scope_escape_penalty",
-    "unbounded_execution_penalty",
-    "verification_bonus",
-}
-UNIVERSE_ENVIRONMENT_ASSUMPTION_ENUM_FIELDS = {
-    "git_write_mode": {"blocked", "operator_gated", "task_scoped"},
-    "network_access_mode": {"blocked", "allowlist_only", "open"},
-    "workspace_write_scope": {"task_only", "generated_only", "shared_repo_gated"},
-}
-UNIVERSE_ENVIRONMENT_ASSUMPTION_BOOL_FIELDS = {
-    "require_path_scoped_mutations",
-    "require_rollback_on_mutation",
-}
+UNIVERSE_PROPOSAL_AREAS = catalog_string_set("universe", "proposal_areas")
+UNIVERSE_GENERATION_FOCI = catalog_string_set("universe", "generation_foci")
+UNIVERSE_GOVERNANCE_KEYS = catalog_string_set("universe", "governance_keys")
+UNIVERSE_ACTION_RISK_CONTROL_KEYS = catalog_string_set("universe", "action_risk_control_keys")
+UNIVERSE_ENVIRONMENT_ASSUMPTION_ENUM_FIELDS = catalog_nested_string_sets(
+    "universe",
+    "environment_assumption_enum_fields",
+)
+UNIVERSE_ENVIRONMENT_ASSUMPTION_BOOL_FIELDS = catalog_string_set("universe", "environment_assumption_bool_fields")
 
-_DEFAULT_INVARIANTS = [
-    "preserve verifier contract alignment",
-    "prefer measurable reversible progress",
-    "avoid destructive workspace resets",
-    "keep autonomous actions inside bounded runtime policy",
-]
-_DEFAULT_FORBIDDEN_PATTERNS = [
-    "rm -rf /",
-    "git reset --hard",
-    "git checkout --",
-    "curl -s",
-    "curl -fsSL",
-    "wget -qO-",
-    "sudo ",
-]
-_DEFAULT_PREFERRED_PREFIXES = [
-    "rg ",
-    "sed -n ",
-    "cat ",
-    "ls ",
-    "test ",
-    "pytest",
-    "python -m pytest",
-    "git diff",
-    "git status",
-]
-DEFAULT_UNIVERSE_ACTION_RISK_CONTROLS = {
-    "destructive_mutation_penalty": 12,
-    "git_mutation_penalty": 6,
-    "inline_destructive_interpreter_penalty": 8,
-    "network_fetch_penalty": 4,
-    "privileged_command_penalty": 10,
-    "read_only_discovery_bonus": 3,
-    "remote_execution_penalty": 8,
-    "reversible_file_operation_bonus": 2,
-    "scope_escape_penalty": 9,
-    "unbounded_execution_penalty": 7,
-    "verification_bonus": 4,
-}
-DEFAULT_UNIVERSE_ENVIRONMENT_ASSUMPTIONS = {
-    "git_write_mode": "operator_gated",
-    "network_access_mode": "blocked",
-    "workspace_write_scope": "task_only",
-    "require_path_scoped_mutations": True,
-    "require_rollback_on_mutation": True,
-}
-_UNIVERSE_CONSTITUTION_PROPOSAL_AREAS = {"governance", "verification", "operator_scope"}
-_OPERATING_ENVELOPE_PROPOSAL_AREAS = {"environment_envelope", "operator_scope"}
-_UNIVERSE_BUNDLE_FILENAMES = {
-    "universe": "universe_contract.json",
-    "universe_constitution": "universe_constitution.json",
-    "operating_envelope": "operating_envelope.json",
-}
+_DEFAULT_INVARIANTS = catalog_string_list("universe", "default_invariants")
+_DEFAULT_FORBIDDEN_PATTERNS = catalog_string_list("universe", "default_forbidden_patterns")
+_DEFAULT_PREFERRED_PREFIXES = catalog_string_list("universe", "default_preferred_prefixes")
+DEFAULT_UNIVERSE_ACTION_RISK_CONTROLS = catalog_mapping("universe", "default_action_risk_controls")
+DEFAULT_UNIVERSE_ENVIRONMENT_ASSUMPTIONS = catalog_mapping("universe", "default_environment_assumptions")
+_UNIVERSE_CONSTITUTION_PROPOSAL_AREAS = catalog_string_set("universe", "constitution_proposal_areas")
+_OPERATING_ENVELOPE_PROPOSAL_AREAS = catalog_string_set("universe", "operating_envelope_proposal_areas")
+_UNIVERSE_BUNDLE_FILENAMES = catalog_mapping("universe", "bundle_filenames")
 
 
 def build_universe_contract_artifact(

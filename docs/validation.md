@@ -8,15 +8,11 @@ Run:
 pytest -q
 ```
 
-Current status as of March 19, 2026:
-
-```text
-187 passed in 16.28s
-```
+Use the current `pytest -q` output in your environment as the source of truth.
 
 ## Coverage areas
 
-The suite currently contains 187 passing tests across runtime, eval, verifier, curriculum, TOLBERT asset generation, CLI flags, extraction/proposal scripts, and improvement-cycle behavior.
+The suite covers runtime, eval, verifier, curriculum, TOLBERT asset generation, CLI flags, extraction/proposal scripts, and improvement-cycle behavior.
 
 Covered areas include:
 
@@ -27,13 +23,16 @@ Covered areas include:
 - operator extraction and transfer evaluation
 - skill/tool/memory extraction
 - eval harness metrics and comparisons
+- repo review, deterministic git repair, shared-repo coordination, and workflow-guard behavior
+- unattended execution, recovery, rollback, and trust/reporting surfaces
+- prompt, curriculum, retrieval, and tooling promotion and retention behavior
 - TOLBERT asset generation
 - implementation verification script behavior
 - improvement cycle selection and finalization
 
 ## Smoke checks
 
-Single task:
+Boot sanity check:
 
 ```bash
 python scripts/run_agent.py --task-id hello_task
@@ -42,7 +41,19 @@ python scripts/run_agent.py --task-id hello_task
 Expected result shape:
 
 ```text
-task=hello_task success=True steps=1
+task=hello_task success=True
+```
+
+Representative coding task:
+
+```bash
+python scripts/run_agent.py --task-id git_repo_test_repair_task
+```
+
+Expected result shape:
+
+```text
+task=git_repo_test_repair_task success=True
 ```
 
 Full eval:
@@ -67,6 +78,7 @@ Implementation verification:
 Expected phases:
 
 - live task run
+- repo/test-repair task run
 - full eval with TOLBERT and skills
 - TOLBERT comparison
 - TOLBERT feature-mode comparison
@@ -83,3 +95,4 @@ Expected phases:
 - CUDA requested in the TOLBERT env but not actually available
 - artifact format drift between extractor/proposal output and replay loaders or retention logic
 - env vars overriding workspace or trajectory paths unexpectedly
+- repo-sandbox tasks failing because local git identity, executable test scripts, or branch/worktree assumptions are inconsistent

@@ -8,6 +8,7 @@ from agent_kernel.config import KernelConfig
 from agent_kernel.job_queue import (
     DelegatedJobQueue,
     DelegatedRuntimeController,
+    delegated_job_progress_path,
     drain_delegated_jobs,
     enqueue_with_parallel_worker_decomposition,
     run_next_delegated_job,
@@ -34,7 +35,15 @@ def _install_successful_kernel(monkeypatch):
         def __init__(self, config):
             self.config = config
 
-        def run_task(self, task, checkpoint_path=None, resume=False, runtime_overrides=None, job_id=None):
+        def run_task(
+            self,
+            task,
+            checkpoint_path=None,
+            resume=False,
+            runtime_overrides=None,
+            job_id=None,
+            progress_callback=None,
+        ):
             del resume
             runtime_task = prepare_runtime_task(
                 task,
@@ -43,6 +52,14 @@ def _install_successful_kernel(monkeypatch):
             )
             workspace = self.config.workspace_root / runtime_task.workspace_subdir
             workspace.mkdir(parents=True, exist_ok=True)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "step_start",
+                        "step_index": 1,
+                        "step_stage": "decision_pending",
+                    }
+                )
             expected_contents = dict(getattr(runtime_task, "expected_file_contents", {}))
             for relative_path, content in expected_contents.items():
                 target = workspace / relative_path
@@ -100,6 +117,15 @@ def _install_successful_kernel(monkeypatch):
                     ),
                     encoding="utf-8",
                 )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "step_complete",
+                        "step_index": 1,
+                        "step_stage": "step_complete",
+                        "verification_passed": True,
+                    }
+                )
             return episode
 
         def close(self):
@@ -121,6 +147,36 @@ def test_queue_claim_next_respects_deadline_then_priority(tmp_path):
     assert queue.get(expired.job_id).state == "expired"
     assert queue.get(low.job_id).state == "queued"
     assert queue.get(high.job_id).state == "in_progress"
+
+
+def test_queue_does_not_duplicate_claim_live_in_progress_job_by_default(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "jobs" / "queue.json")
+    first = queue.enqueue(task_id="hello_task", priority=5)
+    second = queue.enqueue(task_id="math_task", priority=1)
+
+    claimed = queue.claim_next()
+    assert claimed is not None
+    assert claimed.job_id == first.job_id
+
+    duplicate = queue.claim(first.job_id)
+    next_claimed = queue.claim_next()
+
+    assert duplicate is None
+    assert next_claimed is not None
+    assert next_claimed.job_id == second.job_id
+    updated = queue.get(first.job_id)
+    assert updated is not None
+    assert updated.attempt_count == 1
+
+
+def test_queue_list_jobs_tolerates_invalid_json_snapshot(tmp_path):
+    queue_path = tmp_path / "jobs" / "queue.json"
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.write_text("{", encoding="utf-8")
+
+    queue = DelegatedJobQueue(queue_path)
+
+    assert queue.list_jobs() == []
 
 
 def test_queue_cancel_marks_pending_and_resumable_jobs(tmp_path):
@@ -417,6 +473,85 @@ def test_drain_stops_after_interrupted_job(monkeypatch, tmp_path):
     assert remaining[1].state == "queued"
 
 
+def test_run_next_delegated_job_resumes_interrupted_job_without_active_lease(monkeypatch, tmp_path):
+    _install_successful_kernel(monkeypatch)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    resumed = queue.enqueue(task_id="hello_task", priority=5)
+    queued = queue.enqueue(task_id="math_task", priority=1)
+    queue.mark_interrupted(
+        resumed.job_id,
+        checkpoint_path=config.run_checkpoints_dir / "hello.json",
+        report_path=config.run_reports_dir / "hello.json",
+        error="runner interrupted",
+    )
+
+    claimed = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+    )
+
+    assert claimed is not None
+    assert claimed.job_id == resumed.job_id
+    assert claimed.state == "completed"
+    assert queue.get(queued.job_id).state == "queued"
+
+
+def test_run_next_delegated_job_skips_live_leased_in_progress_job(monkeypatch, tmp_path):
+    _install_successful_kernel(monkeypatch)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+        delegated_job_max_concurrency=2,
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    live = queue.enqueue(task_id="hello_task", priority=5)
+    queued = queue.enqueue(task_id="math_task", priority=1)
+    live = queue.claim(live.job_id)
+    assert live is not None
+    controller = DelegatedRuntimeController(config.delegated_job_runtime_state_path, runner_id="runner-a")
+    task = TaskBank(config=config).get("hello_task")
+    lease, reason = controller.acquire(
+        job=live,
+        task=task,
+        config=config,
+        checkpoint_path=config.run_checkpoints_dir / "live.json",
+        report_path=config.run_reports_dir / "live.json",
+    )
+
+    claimed = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+        runtime_controller=controller,
+    )
+
+    assert lease is not None
+    assert reason is None
+    assert claimed is not None
+    assert claimed.job_id == queued.job_id
+    assert claimed.state == "completed"
+    assert queue.get(live.job_id).state == "in_progress"
+
+
 def test_run_job_queue_enqueue_cli(monkeypatch, tmp_path):
     module = _load_script_module("run_job_queue.py")
 
@@ -494,6 +629,59 @@ def test_run_job_queue_enqueue_cli_records_shared_repo_claims(monkeypatch, tmp_p
         "src/api_status.txt",
         "reports/merge_report.txt",
     ]
+
+
+def test_queue_enqueue_infers_family_budget_group_from_task_payload(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "trajectories" / "jobs" / "queue.json")
+
+    job = queue.enqueue(
+        task_id="synthetic_tooling_job",
+        runtime_overrides={
+            "task_payload": TaskSpec(
+                task_id="synthetic_tooling_job",
+                prompt="run a synthetic tooling worker",
+                workspace_subdir="synthetic_tooling_job",
+                success_command="true",
+                max_steps=1,
+                metadata={"benchmark_family": "tooling", "capability": "python"},
+            ).to_dict(),
+        },
+    )
+
+    assert job.budget_group == "family_tooling"
+
+
+def test_run_job_queue_enqueue_cli_infers_family_budget_group_for_default_budget(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=tmp_path / "trajectories" / "reports",
+            run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+            delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_job_queue.py", "enqueue", "--task-id", "git_parallel_merge_acceptance_task"],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    output = stream.getvalue().strip()
+    assert "budget_group=family_repo_sandbox" in output
+    queue = DelegatedJobQueue(tmp_path / "trajectories" / "jobs" / "queue.json")
+    assert queue.list_jobs()[0].budget_group == "family_repo_sandbox"
 
 
 def test_enqueue_with_parallel_worker_decomposition_expands_integrator(tmp_path):
@@ -716,6 +904,33 @@ def test_run_next_delegated_job_defers_preflight_blocked_job_without_attempt(tmp
     assert deferred.state == "queued"
     assert deferred.attempt_count == 0
     assert deferred.last_error.startswith("preflight_blocked:operator_policy")
+
+
+def test_run_next_delegated_job_writes_progress_sidecar(monkeypatch, tmp_path):
+    _install_successful_kernel(monkeypatch)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    queued = queue.enqueue(task_id="hello_task", priority=1)
+
+    claimed = run_next_delegated_job(queue, base_config=config, repo_root=Path(__file__).resolve().parents[1])
+
+    assert claimed is not None
+    progress_payload = json.loads(delegated_job_progress_path(config, queued).read_text(encoding="utf-8"))
+    assert progress_payload["job_id"] == queued.job_id
+    assert progress_payload["task_id"] == "hello_task"
+    assert progress_payload["event"] == "delegated_job_finished"
+    assert progress_payload["terminal_state"] == "completed"
+    assert progress_payload["outcome"] == "success"
 
 
 def test_run_next_delegated_job_marks_blocked_job_ready_before_selection(tmp_path):
@@ -1160,7 +1375,57 @@ def test_task_bank_synthesizes_line_replace_edit_plan_for_partial_file_update():
             ],
         }
     ]
-    assert "sed -i 's#^SERVICE_STATE=broken$#release-ready active#'" in workers[0].suggested_commands[0]
+    assert "sed -i '2s#^SERVICE_STATE=broken$#release-ready active#'" in workers[0].suggested_commands[0]
+
+
+def test_task_bank_synthesizes_line_replace_edit_plan_with_duplicate_source_lines():
+    bank = TaskBank()
+    bank._tasks["line_edit_duplicate_integrator"] = TaskSpec(
+        task_id="line_edit_duplicate_integrator",
+        prompt="accept one worker branch with duplicate source lines",
+        workspace_subdir="line_edit_duplicate_integrator",
+        expected_files=["src/release_notes.txt", "tests/test_release.sh"],
+        expected_file_contents={
+            "src/release_notes.txt": "ITEM=pending\nrelease-ready active\nFOOTER=keep\n",
+        },
+        metadata={
+            "benchmark_family": "repo_sandbox",
+            "capability": "repo_environment",
+            "shared_repo_order": 1,
+            "shared_repo_bootstrap_commands": [
+                "mkdir -p src tests && printf 'ITEM=pending\\nITEM=pending\\nFOOTER=keep\\n' > src/release_notes.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^release-ready active$\" src/release_notes.txt\\n' > tests/test_release.sh && chmod +x tests/test_release.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add src/release_notes.txt tests/test_release.sh && git commit -m 'baseline duplicate line edit sandbox'"
+            ],
+            "shared_repo_bootstrap_managed_paths": ["src/release_notes.txt", "tests/test_release.sh"],
+            "workflow_guard": {
+                "requires_git": True,
+                "shared_repo_id": "repo-line-duplicate",
+                "target_branch": "main",
+            },
+            "semantic_verifier": {
+                "kind": "git_repo_review",
+                "expected_branch": "main",
+                "required_merged_branches": ["worker/release-ready"],
+                "expected_changed_paths": ["src/release_notes.txt"],
+                "preserved_paths": ["tests/test_release.sh"],
+                "test_commands": [
+                    {"label": "release suite", "argv": ["tests/test_release.sh"]},
+                ],
+            },
+        },
+    )
+
+    workers = bank.parallel_worker_tasks("line_edit_duplicate_integrator")
+
+    assert len(workers) == 1
+    assert workers[0].metadata["synthetic_edit_plan"][0]["edit_kind"] == "line_replace"
+    assert workers[0].metadata["synthetic_edit_plan"][0]["replacements"] == [
+        {
+            "line_number": 2,
+            "before_line": "ITEM=pending",
+            "after_line": "release-ready active",
+        }
+    ]
+    assert "sed -i '2s#^ITEM=pending$#release-ready active#'" in workers[0].suggested_commands[0]
 
 
 def test_task_bank_synthesizes_token_replace_edit_plan_for_inline_change():
@@ -1218,7 +1483,56 @@ def test_task_bank_synthesizes_token_replace_edit_plan_for_inline_change():
             ],
         }
     ]
-    assert "sed -i 's#broken#ready#' src/service_status.js" in workers[0].suggested_commands[0]
+    assert "sed -i '1s#broken#ready#' src/service_status.js" in workers[0].suggested_commands[0]
+
+
+def test_task_bank_synthesizes_token_replace_edit_plan_with_duplicate_file_tokens():
+    bank = TaskBank()
+    bank._tasks["token_edit_duplicate_integrator"] = TaskSpec(
+        task_id="token_edit_duplicate_integrator",
+        prompt="accept one worker branch with duplicate file tokens",
+        workspace_subdir="token_edit_duplicate_integrator",
+        expected_files=["src/service_status.js", "tests/test_service.sh"],
+        metadata={
+            "benchmark_family": "repo_sandbox",
+            "capability": "repo_environment",
+            "shared_repo_order": 1,
+            "shared_repo_bootstrap_commands": [
+                "mkdir -p src tests && printf 'export const serviceStatus = \"broken\";\\nexport const backupStatus = \"broken\";\\n' > src/service_status.js && printf \"#!/bin/sh\\nset -eu\\ngrep -q 'serviceStatus = \\\"ready\\\"' src/service_status.js\\ngrep -q 'backupStatus = \\\"broken\\\"' src/service_status.js\\n\" > tests/test_service.sh && chmod +x tests/test_service.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add src/service_status.js tests/test_service.sh && git commit -m 'baseline duplicate token edit sandbox'"
+            ],
+            "shared_repo_bootstrap_managed_paths": ["src/service_status.js", "tests/test_service.sh"],
+            "workflow_guard": {
+                "requires_git": True,
+                "shared_repo_id": "repo-token-duplicate",
+                "target_branch": "main",
+            },
+            "semantic_verifier": {
+                "kind": "git_repo_review",
+                "expected_branch": "main",
+                "required_merged_branches": ["worker/service-ready"],
+                "expected_changed_paths": ["src/service_status.js"],
+                "preserved_paths": ["tests/test_service.sh"],
+                "test_commands": [
+                    {"label": "service suite", "argv": ["tests/test_service.sh"]},
+                ],
+            },
+        },
+    )
+
+    workers = bank.parallel_worker_tasks("token_edit_duplicate_integrator")
+
+    assert len(workers) == 1
+    assert workers[0].metadata["synthetic_edit_plan"][0]["edit_kind"] == "token_replace"
+    assert workers[0].metadata["synthetic_edit_plan"][0]["replacements"] == [
+        {
+            "line_number": 1,
+            "before_fragment": "broken",
+            "after_fragment": "ready",
+            "before_line": 'export const serviceStatus = "broken";',
+            "after_line": 'export const serviceStatus = "ready";',
+        }
+    ]
+    assert "sed -i '1s#broken#ready#' src/service_status.js" in workers[0].suggested_commands[0]
 
 
 def test_task_bank_synthesizes_block_replace_edit_plan_for_contiguous_multiline_change():
@@ -1294,6 +1608,151 @@ def test_task_bank_synthesizes_block_replace_edit_plan_for_contiguous_multiline_
     assert "sed -i '2,3c\\" in workers[0].suggested_commands[0]
     assert "release-ready line one" in workers[0].suggested_commands[0]
     assert "release-ready line two" in workers[0].suggested_commands[0]
+
+
+def test_task_bank_synthesizes_line_insert_edit_plan_for_contiguous_insert():
+    bank = TaskBank()
+    bank._tasks["insert_edit_integrator"] = TaskSpec(
+        task_id="insert_edit_integrator",
+        prompt="accept one worker branch with inserted release notes",
+        workspace_subdir="insert_edit_integrator",
+        expected_files=["src/release_notes.txt", "tests/test_release.sh"],
+        expected_file_contents={
+            "src/release_notes.txt": "HEADER=stable\nrelease-ready line one\nrelease-ready line two\nFOOTER=keep\n",
+        },
+        metadata={
+            "benchmark_family": "repo_sandbox",
+            "capability": "repo_environment",
+            "shared_repo_order": 1,
+            "shared_repo_bootstrap_commands": [
+                "mkdir -p src tests && printf 'HEADER=stable\\nFOOTER=keep\\n' > src/release_notes.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^release-ready line one$\" src/release_notes.txt\\ngrep -q \"^release-ready line two$\" src/release_notes.txt\\n' > tests/test_release.sh && chmod +x tests/test_release.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add src/release_notes.txt tests/test_release.sh && git commit -m 'baseline insert edit sandbox'"
+            ],
+            "shared_repo_bootstrap_managed_paths": ["src/release_notes.txt", "tests/test_release.sh"],
+            "workflow_guard": {
+                "requires_git": True,
+                "shared_repo_id": "repo-insert-edit",
+                "target_branch": "main",
+            },
+            "semantic_verifier": {
+                "kind": "git_repo_review",
+                "expected_branch": "main",
+                "required_merged_branches": ["worker/release-ready"],
+                "expected_changed_paths": ["src/release_notes.txt"],
+                "preserved_paths": ["tests/test_release.sh"],
+                "test_commands": [
+                    {"label": "release suite", "argv": ["tests/test_release.sh"]},
+                ],
+            },
+        },
+    )
+
+    workers = bank.parallel_worker_tasks("insert_edit_integrator")
+
+    assert len(workers) == 1
+    insert_score = workers[0].metadata["synthetic_edit_plan"][0]["edit_score"]
+    assert workers[0].metadata["synthetic_edit_plan"] == [
+        {
+            "path": "src/release_notes.txt",
+            "baseline_content": "HEADER=stable\nFOOTER=keep\n",
+            "target_content": "HEADER=stable\nrelease-ready line one\nrelease-ready line two\nFOOTER=keep\n",
+            "edit_kind": "line_insert",
+            "intent_source": "expected_file_contents",
+            "edit_score": insert_score,
+            "insertion": {
+                "line_number": 2,
+                "mode": "before",
+                "after_lines": ["release-ready line one", "release-ready line two"],
+            },
+        }
+    ]
+    assert workers[0].metadata["synthetic_edit_candidates"] == [
+        {
+            "path": "src/release_notes.txt",
+            "selected_kind": "line_insert",
+            "selected_score": insert_score,
+            "selected": workers[0].metadata["synthetic_edit_plan"][0],
+            "candidates": workers[0].metadata["synthetic_edit_candidates"][0]["candidates"],
+        }
+    ]
+    assert workers[0].metadata["synthetic_edit_candidates"][0]["candidates"][0]["edit_kind"] == "line_insert"
+    assert any(
+        candidate["edit_kind"] == "rewrite"
+        for candidate in workers[0].metadata["synthetic_edit_candidates"][0]["candidates"]
+    )
+    assert "sed -i '2i\\" in workers[0].suggested_commands[0]
+    assert "release-ready line one" in workers[0].suggested_commands[0]
+    assert "release-ready line two" in workers[0].suggested_commands[0]
+
+
+def test_task_bank_synthesizes_line_delete_edit_plan_for_contiguous_delete():
+    bank = TaskBank()
+    bank._tasks["delete_edit_integrator"] = TaskSpec(
+        task_id="delete_edit_integrator",
+        prompt="accept one worker branch with removed release note",
+        workspace_subdir="delete_edit_integrator",
+        expected_files=["src/release_notes.txt", "tests/test_release.sh"],
+        expected_file_contents={
+            "src/release_notes.txt": "HEADER=stable\nFOOTER=keep\n",
+        },
+        metadata={
+            "benchmark_family": "repo_sandbox",
+            "capability": "repo_environment",
+            "shared_repo_order": 1,
+            "shared_repo_bootstrap_commands": [
+                "mkdir -p src tests && printf 'HEADER=stable\\nobsolete line\\nFOOTER=keep\\n' > src/release_notes.txt && printf '#!/bin/sh\\nset -eu\\n! grep -q \"^obsolete line$\" src/release_notes.txt\\n' > tests/test_release.sh && chmod +x tests/test_release.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add src/release_notes.txt tests/test_release.sh && git commit -m 'baseline delete edit sandbox'"
+            ],
+            "shared_repo_bootstrap_managed_paths": ["src/release_notes.txt", "tests/test_release.sh"],
+            "workflow_guard": {
+                "requires_git": True,
+                "shared_repo_id": "repo-delete-edit",
+                "target_branch": "main",
+            },
+            "semantic_verifier": {
+                "kind": "git_repo_review",
+                "expected_branch": "main",
+                "required_merged_branches": ["worker/release-ready"],
+                "expected_changed_paths": ["src/release_notes.txt"],
+                "preserved_paths": ["tests/test_release.sh"],
+                "test_commands": [
+                    {"label": "release suite", "argv": ["tests/test_release.sh"]},
+                ],
+            },
+        },
+    )
+
+    workers = bank.parallel_worker_tasks("delete_edit_integrator")
+
+    assert len(workers) == 1
+    delete_score = workers[0].metadata["synthetic_edit_plan"][0]["edit_score"]
+    assert workers[0].metadata["synthetic_edit_plan"] == [
+        {
+            "path": "src/release_notes.txt",
+            "baseline_content": "HEADER=stable\nobsolete line\nFOOTER=keep\n",
+            "target_content": "HEADER=stable\nFOOTER=keep\n",
+            "edit_kind": "line_delete",
+            "intent_source": "expected_file_contents",
+            "edit_score": delete_score,
+            "deletion": {
+                "start_line": 2,
+                "end_line": 2,
+                "before_lines": ["obsolete line"],
+            },
+        }
+    ]
+    assert workers[0].metadata["synthetic_edit_candidates"] == [
+        {
+            "path": "src/release_notes.txt",
+            "selected_kind": "line_delete",
+            "selected_score": delete_score,
+            "selected": workers[0].metadata["synthetic_edit_plan"][0],
+            "candidates": workers[0].metadata["synthetic_edit_candidates"][0]["candidates"],
+        }
+    ]
+    assert [candidate["edit_kind"] for candidate in workers[0].metadata["synthetic_edit_candidates"][0]["candidates"]] == [
+        "line_delete",
+        "rewrite",
+    ]
+    assert "sed -i '2,2d' src/release_notes.txt" in workers[0].suggested_commands[0]
 
 
 def test_task_bank_synthesizes_rewrite_when_scoped_edits_are_not_valid():
@@ -1589,6 +2048,24 @@ def test_runtime_controller_snapshot_applies_retained_delegation_policy(tmp_path
     assert snapshot["policy"]["max_artifact_bytes_per_job"] == 2048
     assert snapshot["policy"]["max_subprocesses_per_job"] == 2
     assert snapshot["policy"]["max_steps"] == 7
+    assert snapshot["policy"]["frontier_task_step_floor"] == config.frontier_task_step_floor
+
+
+def test_runtime_controller_snapshot_tolerates_invalid_json_state(tmp_path):
+    runtime_state_path = tmp_path / "trajectories" / "jobs" / "runtime_state.json"
+    runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_state_path.write_text("{", encoding="utf-8")
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        delegated_job_runtime_state_path=runtime_state_path,
+    )
+    controller = DelegatedRuntimeController(runtime_state_path, runner_id="runner-a")
+
+    snapshot = controller.snapshot(config=config)
+
+    assert snapshot["active_leases"] == []
+    assert snapshot["history"] == []
 
 
 def test_runtime_controller_blocks_colliding_shared_repo_claims_and_allows_disjoint_paths(tmp_path):
@@ -1707,6 +2184,25 @@ def test_run_next_delegated_jobs_complete_shared_repo_worker_then_integrator_flo
     assert (main_workspace / "reports" / "test_report.txt").read_text(encoding="utf-8") == (
         "api suite passed; docs suite passed\n"
     )
+
+
+def test_materialize_shared_repo_workspace_uses_absolute_git_paths(tmp_path):
+    from agent_kernel.shared_repo import materialize_shared_repo_workspace
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        unattended_allow_git_commands=True,
+    )
+    config.ensure_directories()
+    task = TaskBank().parallel_worker_tasks("git_generated_conflict_resolution_task")[0]
+
+    workspace = materialize_shared_repo_workspace(task, config=config)
+
+    assert workspace.exists()
+    assert (workspace / ".git").exists()
+    assert (workspace / "src" / "shared_status.txt").exists()
 
 
 def test_runtime_controller_blocks_budget_group_overcommit_and_reports_counts(tmp_path):
@@ -2043,8 +2539,10 @@ def test_run_job_queue_status_cli(monkeypatch, tmp_path):
     assert "trust_family family=repo_chore required=1 status=absent reports=0" in output
     assert "queue_status total_jobs=1 runnable_jobs=1 runnable_workers=0 blocked_jobs=0 promotable_jobs=0" in output
     assert "queue_decisions selected:runnable_job=1" in output
+    assert "queue_family family=bounded total_jobs=1 runnable_jobs=1 blocked_jobs=0 promotable_jobs=0 worker_jobs=0 integrator_jobs=0 budget_groups=campaign-a" in output
     assert "queue_fairness blocked_open_jobs=0 scheduler_selected_total=1 scheduler_blocked_total=0 scheduler_unblock_total=0 oldest_blocked_at=-" in output
     assert "scheduler_streak budget_group=campaign-a consecutive=1" in output
+    assert "active_roles total=1 worker_leases=0 integrator_leases=0 other_leases=1 families=bounded:1 budget_groups=campaign-a:1 shared_repos=-" in output
     assert "next_runnable " in output
     assert "task_id=hello_task" in output
     assert "active_leases=1" in output
@@ -2125,10 +2623,90 @@ def test_run_job_queue_status_json_includes_queue_trust_and_capability_details(m
     assert payload["trust"]["overall_assessment"]["status"] == "bootstrap"
     assert payload["queue"]["totals"]["runnable_jobs"] == 1
     assert payload["queue"]["state_counts"]["queued"] == 1
+    assert payload["queue"]["benchmark_families"]["bounded"]["total_jobs"] == 1
+    assert payload["queue"]["benchmark_families"]["bounded"]["budget_groups"] == ["campaign-a"]
     assert payload["queue"]["decision_counts"]["selected:runnable_job"] == 1
     assert payload["queue"]["scheduler_streak"]["budget_group"] == "campaign-a"
     assert payload["queue"]["next_runnable"]["job"]["task_id"] == "hello_task"
+    assert payload["queue"]["active_lease_roles"]["total"] == 1
+    assert payload["queue"]["active_lease_roles"]["other_jobs"] == 1
+    assert payload["queue"]["active_lease_roles"]["benchmark_families"] == {"bounded": 1}
+    assert payload["queue"]["active_lease_roles"]["budget_groups"] == {"campaign-a": 1}
     assert payload["queue"]["active_leases"][0]["budget_group"] == "campaign-a"
+
+
+def test_run_job_queue_status_json_reports_active_integrator_and_worker_leases(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    runtime_state_path = tmp_path / "trajectories" / "jobs" / "runtime_state.json"
+    queue_path = tmp_path / "trajectories" / "jobs" / "queue.json"
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            model_name="mock-model",
+            use_tolbert_context=False,
+            sandbox_command_containment_mode="disabled",
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=tmp_path / "trajectories" / "reports",
+            run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+            delegated_job_queue_path=queue_path,
+            delegated_job_runtime_state_path=runtime_state_path,
+            delegated_job_max_concurrency=2,
+            delegated_job_max_active_per_budget_group=2,
+            unattended_allow_git_commands=True,
+        ),
+    )
+    queue = DelegatedJobQueue(queue_path)
+    worker = queue.enqueue(task_id="git_parallel_worker_api_task", budget_group="family_repo_sandbox")
+    integrator = queue.enqueue(task_id="git_release_train_acceptance_task", budget_group="family_repo_sandbox")
+    controller = DelegatedRuntimeController(runtime_state_path, runner_id="runner-a")
+    config = KernelConfig(
+        provider="mock",
+        model_name="mock-model",
+        use_tolbert_context=False,
+        sandbox_command_containment_mode="disabled",
+        workspace_root=tmp_path / "workspace",
+        delegated_job_runtime_state_path=runtime_state_path,
+        delegated_job_max_concurrency=2,
+        delegated_job_max_active_per_budget_group=2,
+        unattended_allow_git_commands=True,
+    )
+    bank = TaskBank()
+    controller.acquire(
+        job=queue.get(worker.job_id),
+        task=bank.get("git_parallel_worker_api_task"),
+        config=config,
+        checkpoint_path=tmp_path / "trajectories" / "checkpoints" / "worker.json",
+        report_path=tmp_path / "trajectories" / "reports" / "worker.json",
+    )
+    controller.acquire(
+        job=queue.get(integrator.job_id),
+        task=bank.get("git_release_train_acceptance_task"),
+        config=config,
+        checkpoint_path=tmp_path / "trajectories" / "checkpoints" / "integrator.json",
+        report_path=tmp_path / "trajectories" / "reports" / "integrator.json",
+    )
+
+    monkeypatch.setattr(sys, "argv", ["run_job_queue.py", "status", "--json"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["queue"]["active_lease_roles"]["total"] == 2
+    assert payload["queue"]["active_lease_roles"]["worker_jobs"] == 1
+    assert payload["queue"]["active_lease_roles"]["integrator_jobs"] == 1
+    assert payload["queue"]["active_lease_roles"]["other_jobs"] == 0
+    assert payload["queue"]["active_lease_roles"]["benchmark_families"] == {"repo_sandbox": 2}
+    assert payload["queue"]["active_lease_roles"]["budget_groups"] == {"family_repo_sandbox": 2}
+    assert payload["queue"]["active_lease_roles"]["shared_repo_ids"] == {
+        "repo_sandbox_parallel_merge": 1,
+        "repo_sandbox_release_train": 1,
+    }
 
 
 def test_run_job_queue_status_uses_retained_operator_policy(monkeypatch, tmp_path):
@@ -2461,6 +3039,227 @@ def test_run_job_queue_promotable_cli_excludes_synthetic_workers(monkeypatch, tm
     output = stream.getvalue()
     assert "task_id=git_parallel_merge_acceptance_task" in output
     assert "task_id=git_parallel_worker_api_task" not in output
+
+
+def test_run_job_queue_acceptance_review_cli_isolates_unpromoted_integrators(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    queue_path = tmp_path / "trajectories" / "jobs" / "queue.json"
+    reports_dir = tmp_path / "trajectories" / "reports"
+    checkpoints_dir = tmp_path / "trajectories" / "checkpoints"
+    reports_dir.mkdir(parents=True)
+    checkpoints_dir.mkdir(parents=True)
+    merge_report = reports_dir / "merge_integrator.json"
+    merge_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
+                    "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    release_report = reports_dir / "release_integrator.json"
+    release_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
+                    "required_merged_branches": [
+                        "worker/api-cutover",
+                        "worker/docs-cutover",
+                        "worker/ops-cutover",
+                    ],
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker_report = reports_dir / "worker.json"
+    worker_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "synthetic_worker": True,
+                    "expected_branch": "worker/api-status",
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            model_name="mock-model",
+            use_tolbert_context=False,
+            sandbox_command_containment_mode="disabled",
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=reports_dir,
+            run_checkpoints_dir=checkpoints_dir,
+            delegated_job_queue_path=queue_path,
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+            unattended_allow_git_commands=True,
+        ),
+    )
+    queue = DelegatedJobQueue(queue_path)
+    unpromoted = queue.enqueue(task_id="git_parallel_merge_acceptance_task")
+    promoted = queue.enqueue(task_id="git_release_train_acceptance_task")
+    worker = queue.enqueue(task_id="git_parallel_worker_api_task")
+    queue.finalize(
+        unpromoted.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "merge_integrator.json",
+        report_path=merge_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.finalize(
+        promoted.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "release_integrator.json",
+        report_path=release_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.finalize(
+        worker.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "worker.json",
+        report_path=worker_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.promote(promoted.job_id, detail="accepted by operator")
+
+    monkeypatch.setattr(sys, "argv", ["run_job_queue.py", "acceptance-review"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    output = stream.getvalue()
+    assert "acceptance_review total_jobs=1 promotable_jobs=1 promoted_jobs=0" in output
+    assert "task_id=git_parallel_merge_acceptance_task" in output
+    assert "shared_repo_id=repo_sandbox_parallel_merge" in output
+    assert "task_id=git_release_train_acceptance_task" not in output
+    assert "task_id=git_parallel_worker_api_task" not in output
+
+
+def test_run_job_queue_acceptance_review_json_includes_rollup_and_promoted_jobs(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    queue_path = tmp_path / "trajectories" / "jobs" / "queue.json"
+    reports_dir = tmp_path / "trajectories" / "reports"
+    checkpoints_dir = tmp_path / "trajectories" / "checkpoints"
+    reports_dir.mkdir(parents=True)
+    checkpoints_dir.mkdir(parents=True)
+    merge_report = reports_dir / "merge_integrator.json"
+    merge_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
+                    "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    release_report = reports_dir / "release_integrator.json"
+    release_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
+                    "required_merged_branches": [
+                        "worker/api-cutover",
+                        "worker/docs-cutover",
+                        "worker/ops-cutover",
+                    ],
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            model_name="mock-model",
+            use_tolbert_context=False,
+            sandbox_command_containment_mode="disabled",
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=reports_dir,
+            run_checkpoints_dir=checkpoints_dir,
+            delegated_job_queue_path=queue_path,
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+            unattended_allow_git_commands=True,
+        ),
+    )
+    queue = DelegatedJobQueue(queue_path)
+    merge_job = queue.enqueue(task_id="git_parallel_merge_acceptance_task")
+    release_job = queue.enqueue(task_id="git_release_train_acceptance_task")
+    queue.finalize(
+        merge_job.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "merge_integrator.json",
+        report_path=merge_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.finalize(
+        release_job.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "release_integrator.json",
+        report_path=release_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.promote(release_job.job_id, detail="accepted by operator")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_job_queue.py", "acceptance-review", "--include-promoted", "1", "--json"],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["review"]["total_jobs"] == 2
+    assert payload["review"]["promotable_jobs"] == 1
+    assert payload["review"]["promoted_jobs"] == 1
+    assert payload["review"]["benchmark_families"] == {"repo_sandbox": 2}
+    assert payload["review"]["shared_repo_ids"] == {
+        "repo_sandbox_parallel_merge": 1,
+        "repo_sandbox_release_train": 1,
+    }
+    assert payload["review"]["target_branches"] == {"main": 2}
+    assert [job["job"]["job"]["task_id"] for job in payload["jobs"]] == [
+        "git_parallel_merge_acceptance_task",
+        "git_release_train_acceptance_task",
+    ]
+    assert payload["jobs"][0]["shared_repo_id"] == "repo_sandbox_parallel_merge"
+    assert payload["jobs"][1]["job"]["readiness"]["promoted"] is True
 
 
 def test_run_job_queue_inspect_cli_surfaces_acceptance_trust_and_capabilities(monkeypatch, tmp_path):

@@ -20,8 +20,10 @@ from .capabilities import (
 )
 from .config import KernelConfig
 from .operator_policy import operator_policy_snapshot
+from .runtime_supervision import atomic_write_json
 from .schemas import EpisodeRecord, StepRecord, TaskSpec
 from .sandbox import sandbox_containment_status
+from .syntax_motor import build_syntax_motor_summary, syntax_preflight_check
 from .tolbert import _paper_research_runtime_paths
 from .tolbert_assets import retained_tolbert_runtime_paths
 from .trust import evaluate_unattended_trust, trust_policy_snapshot
@@ -76,6 +78,7 @@ def run_unattended_preflight(
         _paper_research_assets_check(config, repo_root=repo_root),
         _verifier_inputs_check(task),
         _workspace_readiness_check(config, task),
+        _syntax_preflight_check(config, task),
         _execution_containment_check(config),
         _operator_policy_check(config, task),
         _trust_posture_check(config, task),
@@ -143,6 +146,7 @@ def build_unattended_task_report(
         benchmark_family=str(task.metadata.get("benchmark_family", "bounded")).strip() or "bounded",
         reports_dir=config.run_reports_dir,
     )
+    trust_breadth_summary = _report_trust_breadth_summary(trust_evaluation, config=config)
     uncertainties = summarize_run_uncertainties(
         outcome=outcome,
         outcome_reasons=outcome_reasons,
@@ -155,6 +159,11 @@ def build_unattended_task_report(
     capability_usage = capability_usage_summary(task, command_steps)
     task_contract = _report_task_contract(task, episode)
     edit_synthesis = _report_edit_synthesis(task, episode)
+    syntax_motor = build_syntax_motor_summary(
+        task,
+        workspace=workspace,
+        task_contract=task_contract,
+    )
     acceptance_packet = _report_acceptance_packet(
         task,
         episode,
@@ -162,6 +171,20 @@ def build_unattended_task_report(
         outcome=outcome,
         outcome_reasons=outcome_reasons,
         capability_usage=capability_usage,
+    )
+    trust_scope = _report_trust_scope(
+        task=task,
+        outcome=outcome,
+        command_steps=command_steps,
+        side_effects=side_effects,
+    )
+    supervision = _report_supervision(
+        task=task,
+        episode=episode,
+        outcome=outcome,
+        command_steps=command_steps,
+        side_effects=side_effects,
+        preflight=preflight,
     )
     return {
         "report_kind": "unattended_task_report",
@@ -180,10 +203,14 @@ def build_unattended_task_report(
         ),
         "task_metadata": dict(task.metadata),
         "task_contract": task_contract,
+        "trust_scope": trust_scope,
+        "supervision": supervision,
         "edit_synthesis": edit_synthesis,
+        "syntax_motor": syntax_motor,
         "acceptance_packet": acceptance_packet,
         "operator_policy": operator_policy,
         "trust": trust_evaluation,
+        "trust_breadth_summary": trust_breadth_summary,
         "preflight": preflight.to_dict() if preflight is not None else None,
         "summary": {
             "command_steps": len(command_steps),
@@ -337,6 +364,134 @@ def _report_acceptance_packet(
     }
 
 
+def _report_trust_scope(
+    *,
+    task: TaskSpec,
+    outcome: str,
+    command_steps: list[StepRecord],
+    side_effects: dict[str, Any],
+) -> str:
+    metadata = dict(task.metadata)
+    if outcome == "safe_stop" and not command_steps:
+        return "coverage_only"
+    is_retrieval_companion = bool(metadata.get("requires_retrieval")) and bool(
+        str(metadata.get("source_task", "")).strip()
+    )
+    changed_files = (
+        len(side_effects.get("created_files", []))
+        + len(side_effects.get("modified_files", []))
+        + len(side_effects.get("deleted_files", []))
+    )
+    if is_retrieval_companion and outcome == "safe_stop" and not command_steps and changed_files == 0:
+        return "coverage_only"
+    return "gated"
+
+
+def _report_supervision(
+    *,
+    task: TaskSpec,
+    episode: EpisodeRecord | None,
+    outcome: str,
+    command_steps: list[StepRecord],
+    side_effects: dict[str, Any],
+    preflight: PreflightReport | None,
+) -> dict[str, Any]:
+    metadata = dict(task.metadata)
+    mode = _normalize_supervision_mode(metadata)
+    operator_turns = _supervision_operator_turns(metadata)
+    verifier_defined = _task_has_acceptance_contract(task, episode)
+    changed_files = int(side_effects.get("changed_files_total", 0) or 0)
+    hidden_side_effect_risk = bool(side_effects.get("hidden_side_effect_risk", False))
+    unexpected_change_file_count = len(side_effects.get("unexpected_change_files", []))
+    independent_execution = operator_turns <= 1
+    contract_candidate = metadata.get("light_supervision_candidate")
+    if isinstance(contract_candidate, bool):
+        light_supervision_candidate = mode in {"light_supervision", "unattended"} and contract_candidate
+    else:
+        light_supervision_candidate = mode in {"light_supervision", "unattended"} and verifier_defined
+    successful_outcome = bool(episode.success) if episode is not None else outcome == "success"
+    clean_success = successful_outcome and not hidden_side_effect_risk and unexpected_change_file_count <= 0
+    light_supervision_success = light_supervision_candidate and independent_execution and successful_outcome
+    light_supervision_clean_success = light_supervision_candidate and independent_execution and clean_success
+    contract_clean_failure_recovery_origin = bool(metadata.get("contract_clean_failure_recovery_origin", False))
+    contract_clean_failure_recovery_step_floor = 0
+    try:
+        contract_clean_failure_recovery_step_floor = max(
+            0,
+            int(
+                metadata.get(
+                    "contract_clean_failure_recovery_step_floor",
+                    metadata.get("step_floor", 0),
+                )
+                or 0
+            ),
+        )
+    except (TypeError, ValueError):
+        contract_clean_failure_recovery_step_floor = 0
+    contract_clean_failure_recovery_candidate = (
+        mode in {"light_supervision", "unattended"} and contract_clean_failure_recovery_origin
+    )
+    contract_clean_failure_recovery_success = (
+        contract_clean_failure_recovery_candidate and independent_execution and successful_outcome
+    )
+    contract_clean_failure_recovery_clean_success = (
+        contract_clean_failure_recovery_candidate and independent_execution and clean_success
+    )
+    return {
+        "mode": mode,
+        "operator_turns": operator_turns,
+        "verifier_defined": verifier_defined,
+        "independent_execution": independent_execution,
+        "preflight_passed": bool(preflight.passed) if preflight is not None else True,
+        "command_steps": len(command_steps),
+        "changed_files": changed_files,
+        "hidden_side_effect_risk": hidden_side_effect_risk,
+        "light_supervision_candidate": light_supervision_candidate,
+        "light_supervision_success": light_supervision_success,
+        "light_supervision_clean_success": light_supervision_clean_success,
+        "contract_clean_failure_recovery_origin": contract_clean_failure_recovery_origin,
+        "contract_clean_failure_recovery_step_floor": contract_clean_failure_recovery_step_floor,
+        "contract_clean_failure_recovery_candidate": contract_clean_failure_recovery_candidate,
+        "contract_clean_failure_recovery_success": contract_clean_failure_recovery_success,
+        "contract_clean_failure_recovery_clean_success": contract_clean_failure_recovery_clean_success,
+    }
+
+
+def _normalize_supervision_mode(metadata: dict[str, Any]) -> str:
+    for key in ("supervision_mode", "guidance_mode", "operator_guidance_mode"):
+        raw = str(metadata.get(key, "")).strip().lower()
+        if raw in {"unattended", "light_supervision", "guided"}:
+            return raw
+    operator_turns = _supervision_operator_turns(metadata)
+    if operator_turns <= 0:
+        return "unattended"
+    if operator_turns <= 1:
+        return "light_supervision"
+    return "guided"
+
+
+def _supervision_operator_turns(metadata: dict[str, Any]) -> int:
+    for key in ("operator_turns", "operator_interventions", "guidance_turns"):
+        raw = metadata.get(key)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _task_has_acceptance_contract(task: TaskSpec, episode: EpisodeRecord | None) -> bool:
+    contract = _report_task_contract(task, episode)
+    return bool(
+        str(contract.get("success_command", "")).strip()
+        or contract.get("expected_files")
+        or contract.get("expected_output_substrings")
+        or contract.get("forbidden_files")
+        or contract.get("forbidden_output_substrings")
+        or contract.get("expected_file_contents")
+    )
+
+
 def write_unattended_task_report(
     *,
     task: TaskSpec,
@@ -369,7 +524,7 @@ def write_unattended_task_report(
         termination_reason_override=termination_reason_override,
         extra_uncertainties=extra_uncertainties,
     )
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(target, payload, config=config, govern_storage=False)
     return target
 
 
@@ -684,6 +839,21 @@ def _workspace_readiness_check(config: KernelConfig, task: TaskSpec) -> Prefligh
     )
 
 
+def _syntax_preflight_check(config: KernelConfig, task: TaskSpec) -> PreflightCheck:
+    workspace = config.workspace_root / task.workspace_subdir
+    passed, status, detail = syntax_preflight_check(
+        task,
+        workspace=workspace if workspace.exists() else None,
+    )
+    severity = "optional" if status == "no_python_edit_targets" else "required"
+    return PreflightCheck(
+        name="syntax_preflight",
+        passed=passed,
+        detail=detail,
+        severity=severity,
+    )
+
+
 def unattended_operator_policy(config: KernelConfig, task: TaskSpec) -> dict[str, Any]:
     benchmark_family = str(task.metadata.get("benchmark_family", "bounded")).strip() or "bounded"
     snapshot = operator_policy_snapshot(config)
@@ -829,11 +999,95 @@ def _trust_posture_check(config: KernelConfig, task: TaskSpec) -> PreflightCheck
         benchmark_family=family,
         reports_dir=config.run_reports_dir,
     )
+    detail = str(evaluation["detail"])
+    breadth_detail = _trust_breadth_detail(
+        _report_trust_breadth_summary(evaluation, config=config),
+        family=family,
+    )
+    if breadth_detail:
+        detail = f"{detail} | {breadth_detail}"
     return PreflightCheck(
         name="trust_posture",
         passed=bool(evaluation["passed"]),
-        detail=str(evaluation["detail"]),
+        detail=detail,
         severity="required",
+    )
+
+
+def _report_trust_breadth_summary(
+    evaluation: dict[str, Any],
+    *,
+    config: KernelConfig,
+) -> dict[str, Any]:
+    family = str(evaluation.get("benchmark_family", "bounded")).strip() or "bounded"
+    policy = trust_policy_snapshot(config)
+    family_summary = (
+        dict(evaluation.get("family_summary", {}))
+        if isinstance(evaluation.get("family_summary", {}), dict)
+        else {}
+    )
+    coverage_summary = (
+        dict(evaluation.get("coverage_summary", {}))
+        if isinstance(evaluation.get("coverage_summary", {}), dict)
+        else {}
+    )
+    clean_task_roots = [
+        str(value).strip()
+        for value in family_summary.get("clean_success_task_roots", [])
+        if str(value).strip()
+    ]
+    min_distinct_task_roots = int(policy.get("family_breadth_min_distinct_task_roots", 0) or 0)
+    distinct_clean_task_roots = int(family_summary.get("distinct_clean_success_task_roots", 0) or 0)
+    required_family_clean_task_root_counts = (
+        dict(coverage_summary.get("required_family_clean_task_root_counts", {}))
+        if isinstance(coverage_summary.get("required_family_clean_task_root_counts", {}), dict)
+        else {}
+    )
+    return {
+        "benchmark_family": family,
+        "required": bool(evaluation.get("required", False)),
+        "status": str(evaluation.get("status", "")).strip(),
+        "reports": int(family_summary.get("total", 0) or 0),
+        "bootstrap_min_reports": int(policy.get("bootstrap_min_reports", 0) or 0),
+        "breadth_min_reports": int(policy.get("breadth_min_reports", 0) or 0),
+        "min_distinct_task_roots": min_distinct_task_roots,
+        "distinct_clean_success_task_roots": distinct_clean_task_roots,
+        "clean_success_task_roots": clean_task_roots,
+        "remaining_distinct_task_roots": max(0, min_distinct_task_roots - distinct_clean_task_roots),
+        "required_family_clean_task_root_count": int(required_family_clean_task_root_counts.get(family, 0) or 0),
+        "light_supervision_reports": int(family_summary.get("light_supervision_candidate_count", 0) or 0),
+        "light_supervision_successes": int(family_summary.get("light_supervision_success_count", 0) or 0),
+        "light_supervision_clean_successes": int(
+            family_summary.get("light_supervision_clean_success_count", 0) or 0
+        ),
+        "contract_clean_failure_recovery_reports": int(
+            family_summary.get("contract_clean_failure_recovery_candidate_count", 0) or 0
+        ),
+        "contract_clean_failure_recovery_successes": int(
+            family_summary.get("contract_clean_failure_recovery_success_count", 0) or 0
+        ),
+        "contract_clean_failure_recovery_clean_successes": int(
+            family_summary.get("contract_clean_failure_recovery_clean_success_count", 0) or 0
+        ),
+    }
+
+
+def _trust_breadth_detail(summary: dict[str, Any], *, family: str) -> str:
+    if not summary or not bool(summary.get("required", False)):
+        return ""
+    min_distinct_task_roots = int(summary.get("min_distinct_task_roots", 0) or 0)
+    if min_distinct_task_roots <= 0:
+        return ""
+    observed_roots = [
+        str(value).strip()
+        for value in summary.get("clean_success_task_roots", [])
+        if str(value).strip()
+    ]
+    remaining = int(summary.get("remaining_distinct_task_roots", 0) or 0)
+    observed_text = ",".join(observed_roots) if observed_roots else "<none>"
+    return (
+        f"{family} clean task-root breadth: observed={len(observed_roots)}/{min_distinct_task_roots} "
+        f"remaining={remaining} roots=[{observed_text}]"
     )
 
 
@@ -867,9 +1121,22 @@ def _unexpected_side_effects(
     deleted: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
     managed_paths, delete_paths = _side_effect_contract_paths(task)
-    unexpected_created = [path for path in created if path not in managed_paths]
-    unexpected_modified = [path for path in modified if path not in managed_paths]
-    unexpected_deleted = [path for path in deleted if path not in delete_paths]
+    allow_git_internal_changes = bool(task is not None and task.metadata.get("requires_git", False))
+    unexpected_created = [
+        path
+        for path in created
+        if path not in managed_paths and not _git_internal_path_allowed(path, allow_git_internal_changes)
+    ]
+    unexpected_modified = [
+        path
+        for path in modified
+        if path not in managed_paths and not _git_internal_path_allowed(path, allow_git_internal_changes)
+    ]
+    unexpected_deleted = [
+        path
+        for path in deleted
+        if path not in delete_paths and not _git_internal_path_allowed(path, allow_git_internal_changes)
+    ]
     return unexpected_created, unexpected_modified, unexpected_deleted
 
 
@@ -897,6 +1164,13 @@ def _normalized_path_set(paths: list[str]) -> set[str]:
         if value:
             normalized.add(value)
     return normalized
+
+
+def _git_internal_path_allowed(path: str, allow_git_internal_changes: bool) -> bool:
+    if not allow_git_internal_changes:
+        return False
+    normalized = str(path).strip().strip("/")
+    return normalized == ".git" or normalized.startswith(".git/")
 
 
 def _changed_file_details(
@@ -966,6 +1240,8 @@ def _serialize_command_step(step: StepRecord) -> dict[str, Any]:
         "blocked": _step_blocked(step),
         "verification_passed": _step_verified(step),
         "verification_reasons": list(step.verification.get("reasons", [])),
+        "decision_source": str(step.decision_source).strip(),
+        "tolbert_route_mode": str(step.tolbert_route_mode).strip(),
         "capabilities_used": [
             str(value).strip()
             for value in command_result.get("capabilities_used", [])

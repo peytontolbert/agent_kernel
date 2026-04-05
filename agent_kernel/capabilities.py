@@ -8,162 +8,22 @@ from urllib import parse as url_parse
 
 from .config import KernelConfig
 from .improvement_common import retained_artifact_payload
+from .kernel_catalog import kernel_catalog_mapping, kernel_catalog_string_set
 from .operator_policy import operator_policy_snapshot
 from .schemas import StepRecord, TaskSpec
 
 
-_SHELL_OPERATORS = {"&&", "|", "||", ";", "&", "<", "<<", ">", ">>"}
-_FILESYSTEM_COMMANDS = {"cat", "mkdir", "rm", "mv", "cp", "touch", "grep", "test", "tee"}
-_BUILTIN_CAPABILITY_NAMES = {
-    "workspace_fs",
-    "workspace_exec",
-    "git_commands",
-    "generated_path_mutation",
-    "http_request",
-}
+_SHELL_OPERATORS = kernel_catalog_string_set("capabilities", "shell_operators")
+_FILESYSTEM_COMMANDS = kernel_catalog_string_set("capabilities", "filesystem_commands")
+_BUILTIN_CAPABILITY_NAMES = kernel_catalog_string_set("capabilities", "builtin_capability_names")
 _TIER_ORDER = {
-    "none": 0,
-    "read": 1,
-    "write": 2,
-    "admin": 3,
+    str(key): int(value)
+    for key, value in kernel_catalog_mapping("capabilities", "tier_order").items()
 }
 _ADAPTER_CATALOG: dict[str, dict[str, Any]] = {
-    "github": {
-        "label": "GitHub",
-        "default_capabilities": ["github_read"],
-        "default_settings": {
-            "http_allowed_hosts": ["api.github.com", "uploads.github.com"],
-            "repo_scopes": [],
-            "account_scopes": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["repo_metadata", "readme", "releases", "account_profile"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {
-            "github_read": {
-                "access_tier": "read",
-                "write_tier": "none",
-                "read_only": True,
-            },
-            "github_repo_write": {
-                "access_tier": "write",
-                "write_tier": "branch_only",
-                "read_only": False,
-            },
-        },
-    },
-    "youtube": {
-        "label": "YouTube",
-        "default_capabilities": ["youtube_read"],
-        "default_settings": {
-            "http_allowed_hosts": ["www.googleapis.com"],
-            "account_scopes": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["seed_urls"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {
-            "youtube_read": {
-                "access_tier": "read",
-                "write_tier": "none",
-                "read_only": True,
-            }
-        },
-    },
-    "twitter": {
-        "label": "Twitter",
-        "default_capabilities": ["twitter_read"],
-        "default_settings": {
-            "http_allowed_hosts": ["api.twitter.com"],
-            "account_scopes": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["seed_urls"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {
-            "twitter_read": {
-                "access_tier": "read",
-                "write_tier": "none",
-                "read_only": True,
-            },
-            "twitter_post": {
-                "access_tier": "write",
-                "write_tier": "content_post",
-                "read_only": False,
-            },
-        },
-    },
-    "gitlab": {
-        "label": "GitLab",
-        "default_capabilities": ["gitlab_read"],
-        "default_settings": {
-            "http_allowed_hosts": ["gitlab.com"],
-            "repo_scopes": [],
-            "account_scopes": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["project_metadata", "readme", "releases", "merge_requests", "account_profile"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {
-            "gitlab_read": {
-                "access_tier": "read",
-                "write_tier": "none",
-                "read_only": True,
-            },
-            "gitlab_repo_write": {
-                "access_tier": "write",
-                "write_tier": "branch_merge_request",
-                "read_only": False,
-            },
-        },
-    },
-    "slack": {
-        "label": "Slack",
-        "default_capabilities": ["slack_read"],
-        "default_settings": {
-            "http_allowed_hosts": ["slack.com"],
-            "account_scopes": [],
-            "channel_scopes": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["channel_history", "channel_pins", "account_profile"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {
-            "slack_read": {
-                "access_tier": "read",
-                "write_tier": "none",
-                "read_only": True,
-            },
-            "slack_post": {
-                "access_tier": "write",
-                "write_tier": "channel_message",
-                "read_only": False,
-            },
-        },
-    },
-    "generic_http": {
-        "label": "Generic HTTP",
-        "default_capabilities": ["http_service_read"],
-        "default_settings": {
-            "http_allowed_hosts": [],
-            "corpus_seed_urls": [],
-            "corpus_modes": ["seed_urls"],
-            "access_tier": "read",
-            "write_tier": "none",
-            "read_only": True,
-        },
-        "capability_defaults": {},
-    },
+    str(key): dict(value)
+    for key, value in kernel_catalog_mapping("capabilities", "adapter_catalog").items()
+    if isinstance(value, dict)
 }
 
 

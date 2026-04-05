@@ -11,6 +11,11 @@ from .sandbox import Sandbox
 from .schemas import TaskSpec
 
 
+_SHARED_REPO_FIXTURES_ROOT = (
+    Path(__file__).resolve().parent.parent / "datasets" / "task_bank" / "shared_repo_fixtures"
+)
+
+
 def shared_repo_claim(
     task: TaskSpec,
     *,
@@ -57,6 +62,10 @@ def uses_shared_repo(
     return bool(claim["shared_repo_id"])
 
 
+def _has_shared_repo_bootstrap(metadata: dict[str, object]) -> bool:
+    return bool(metadata.get("shared_repo_bootstrap_commands") or str(metadata.get("shared_repo_bootstrap_fixture_dir", "")).strip())
+
+
 def prepare_runtime_task(
     task: TaskSpec,
     *,
@@ -92,9 +101,9 @@ def prepare_runtime_task(
     prepared.setup_commands = [
         command
         for command in prepared.setup_commands
-        if command.strip() and not bool(prepared.metadata.get("shared_repo_bootstrap_commands"))
+        if command.strip() and not _has_shared_repo_bootstrap(prepared.metadata)
     ]
-    if prepared.metadata.get("shared_repo_bootstrap_commands"):
+    if _has_shared_repo_bootstrap(prepared.metadata):
         prepared.setup_commands = []
     return prepared
 
@@ -152,7 +161,7 @@ def materialize_shared_repo_workspace(
     if workspace.exists():
         shutil.rmtree(workspace)
     workspace.parent.mkdir(parents=True, exist_ok=True)
-    _run_git(["clone", str(origin_path), str(workspace)], cwd=shared_root)
+    _run_git(["clone", str(origin_path.resolve()), str(workspace.resolve())], cwd=shared_root)
     _run_git(["config", "user.email", "agent@example.com"], cwd=workspace)
     _run_git(["config", "user.name", "Agent Kernel"], cwd=workspace)
     _checkout_clone_branch(workspace, claim)
@@ -182,36 +191,32 @@ def publish_shared_repo_branch(
     _run_git(["push", "-u", "origin", f"{branch}:{branch}"], cwd=workspace)
 
 
-def _ensure_shared_repo_origin(task: TaskSpec, *, config: KernelConfig, origin_path: Path) -> None:
-    if origin_path.exists():
-        return
+def bootstrap_shared_repo_seed(
+    task: TaskSpec,
+    *,
+    workspace: Path,
+    config: KernelConfig,
+) -> None:
     metadata = dict(task.metadata)
     bootstrap_commands = [
         str(command).strip()
         for command in metadata.get("shared_repo_bootstrap_commands", [])
         if str(command).strip()
     ]
-    if not bootstrap_commands:
-        bootstrap_commands = list(task.setup_commands)
-    if not bootstrap_commands:
-        raise ValueError(f"shared repo task {task.task_id} does not define bootstrap commands")
+    bootstrap_fixture_dir = str(metadata.get("shared_repo_bootstrap_fixture_dir", "")).strip()
     bootstrap_managed_paths = [
         str(path).strip()
         for path in metadata.get("shared_repo_bootstrap_managed_paths", [])
         if str(path).strip()
     ]
     claim = shared_repo_claim(task)
-    shared_root = origin_path.parent
-    seed = shared_root / "seed"
-    if seed.exists():
-        shutil.rmtree(seed)
-    seed.mkdir(parents=True, exist_ok=True)
+    workspace.mkdir(parents=True, exist_ok=True)
     bootstrap_task = TaskSpec(
         task_id=f"{task.task_id}_bootstrap",
         prompt=f"Bootstrap shared repo for {task.task_id}",
-        workspace_subdir=str(seed.relative_to(config.workspace_root))
-        if config.workspace_root in seed.parents
-        else seed.name,
+        workspace_subdir=str(workspace.relative_to(config.workspace_root))
+        if config.workspace_root in workspace.parents
+        else workspace.name,
         metadata={
             "benchmark_family": str(task.metadata.get("benchmark_family", "repo_sandbox")),
             "workflow_guard": {
@@ -226,17 +231,94 @@ def _ensure_shared_repo_origin(task: TaskSpec, *, config: KernelConfig, origin_p
         },
         expected_files=list(bootstrap_managed_paths),
     )
-    sandbox = Sandbox(config.command_timeout_seconds, config=config)
-    for command in bootstrap_commands:
-        result = sandbox.run(command, seed, task=bootstrap_task)
-        if result.exit_code != 0:
-            raise RuntimeError(
-                f"shared repo bootstrap failed for {task.task_id}: {command}: {result.stderr or result.stdout}"
-            )
+    if bootstrap_fixture_dir:
+        _materialize_shared_repo_fixture(
+            workspace,
+            fixture_dir=bootstrap_fixture_dir,
+            executable_paths=[
+                str(path).strip()
+                for path in metadata.get("shared_repo_bootstrap_executable_paths", [])
+                if str(path).strip()
+            ],
+        )
+    elif bootstrap_commands:
+        sandbox = Sandbox(config.command_timeout_seconds, config=config)
+        for command in bootstrap_commands:
+            result = sandbox.run(command, workspace, task=bootstrap_task)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"shared repo bootstrap failed for {task.task_id}: {command}: {result.stderr or result.stdout}"
+                )
+    else:
+        bootstrap_commands = list(task.setup_commands)
+        if not bootstrap_commands:
+            raise ValueError(f"shared repo task {task.task_id} does not define bootstrap content")
+        sandbox = Sandbox(config.command_timeout_seconds, config=config)
+        for command in bootstrap_commands:
+            result = sandbox.run(command, workspace, task=bootstrap_task)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"shared repo bootstrap failed for {task.task_id}: {command}: {result.stderr or result.stdout}"
+                )
+    if not (workspace / ".git").exists():
+        _initialize_shared_repo_git(
+            workspace,
+            managed_paths=bootstrap_managed_paths,
+            initial_branch=str(metadata.get("shared_repo_bootstrap_initial_branch", "main")).strip() or "main",
+            commit_message=str(metadata.get("shared_repo_bootstrap_commit_message", f"bootstrap {task.task_id}")).strip() or f"bootstrap {task.task_id}",
+            tag_name=str(metadata.get("shared_repo_bootstrap_tag", "")).strip(),
+        )
+
+
+def _ensure_shared_repo_origin(task: TaskSpec, *, config: KernelConfig, origin_path: Path) -> None:
+    if origin_path.exists():
+        return
+    shared_root = origin_path.parent
+    seed = shared_root / "seed"
+    if seed.exists():
+        shutil.rmtree(seed)
+    bootstrap_shared_repo_seed(task, workspace=seed, config=config)
     if not (seed / ".git").exists():
         raise RuntimeError(f"shared repo bootstrap did not initialize git for {task.task_id}")
     origin_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_git(["clone", "--bare", str(seed), str(origin_path)], cwd=shared_root)
+    _run_git(["clone", "--bare", str(seed.resolve()), str(origin_path.resolve())], cwd=shared_root)
+
+
+def _materialize_shared_repo_fixture(workspace: Path, *, fixture_dir: str, executable_paths: list[str]) -> None:
+    source_root = (_SHARED_REPO_FIXTURES_ROOT / fixture_dir).resolve()
+    if not source_root.exists() or not source_root.is_dir():
+        raise RuntimeError(f"shared repo fixture missing: {source_root}")
+    for source in source_root.rglob('*'):
+        relative = source.relative_to(source_root)
+        destination = workspace / relative
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    for relative in executable_paths:
+        target = workspace / relative
+        if target.exists():
+            target.chmod(target.stat().st_mode | 0o111)
+
+
+def _initialize_shared_repo_git(
+    workspace: Path,
+    *,
+    managed_paths: list[str],
+    initial_branch: str,
+    commit_message: str,
+    tag_name: str,
+) -> None:
+    _run_git(["init"], cwd=workspace)
+    _run_git(["checkout", "-b", initial_branch], cwd=workspace)
+    _run_git(["config", "user.email", "agent@example.com"], cwd=workspace)
+    _run_git(["config", "user.name", "Agent Kernel"], cwd=workspace)
+    existing_paths = [path for path in managed_paths if (workspace / path).exists()]
+    _run_git(["add", "--", *existing_paths] if existing_paths else ["add", "."], cwd=workspace)
+    _run_git(["commit", "-m", commit_message], cwd=workspace)
+    if tag_name:
+        _run_git(["tag", tag_name], cwd=workspace)
 
 
 def _checkout_clone_branch(workspace: Path, claim: dict[str, object]) -> None:

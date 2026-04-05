@@ -57,6 +57,15 @@ class TolbertServiceClient:
     ) -> None:
         self.repo_root = repo_root
         self.service_timeout_seconds = config.tolbert_service_timeout_seconds
+        self.service_startup_timeout_seconds = max(
+            float(self.service_timeout_seconds),
+            float(os.getenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "45")),
+        )
+        self.service_startup_grace_seconds = max(
+            0.0,
+            float(os.getenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_GRACE_SECONDS", "10")),
+        )
+        self.service_startup_attempts = max(1, int(config.tolbert_service_startup_attempts))
         resolved_runtime_paths = runtime_paths or retained_tolbert_runtime_paths(config, repo_root=repo_root)
         labels = {
             "tolbert_config_path": (
@@ -140,7 +149,17 @@ class TolbertServiceClient:
 
         self.env = dict(os.environ)
         self.env["PYTHONNOUSERSITE"] = "1"
-        self.process = self._spawn_process()
+        self.process: subprocess.Popen[str] | None = None
+
+    @staticmethod
+    def _is_retryable_startup_failure(error_text: str) -> bool:
+        normalized = str(error_text).strip().lower()
+        if not normalized:
+            return False
+        return (
+            "tolbert service failed to become ready" in normalized
+            or "tolbert service exited before startup ready" in normalized
+        )
 
     def close(self) -> None:
         self._terminate_process()
@@ -160,9 +179,8 @@ class TolbertServiceClient:
         low_confidence_global_multiplier: float,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        if self.process.poll() is not None:
-            self.process = self._spawn_process()
-        if self.process.stdin is None or self.process.stdout is None:
+        process = self._ensure_process()
+        if process.stdin is None or process.stdout is None:
             raise RuntimeError("TOLBERT service pipes are unavailable.")
 
         request = {
@@ -177,11 +195,11 @@ class TolbertServiceClient:
             "low_confidence_branch_multiplier": low_confidence_branch_multiplier,
             "low_confidence_global_multiplier": low_confidence_global_multiplier,
         }
-        self.process.stdin.write(json.dumps(request) + "\n")
-        self.process.stdin.flush()
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
 
         selector = selectors.DefaultSelector()
-        selector.register(self.process.stdout, selectors.EVENT_READ)
+        selector.register(process.stdout, selectors.EVENT_READ)
         timeout_window = self.service_timeout_seconds
         if timeout_seconds is not None:
             timeout_window = max(0.05, min(float(timeout_seconds), float(self.service_timeout_seconds)))
@@ -192,16 +210,16 @@ class TolbertServiceClient:
             raise RuntimeError(
                 f"TOLBERT service timed out after {timeout_window:.3f} seconds."
             )
-        line = self.process.stdout.readline()
+        line = process.stdout.readline()
         if not line:
             stderr = ""
-            if self.process.stderr is not None:
+            if process.stderr is not None:
                 try:
-                    stderr = self.process.stderr.read()
+                    stderr = process.stderr.read()
                 except Exception:
                     stderr = ""
             raise RuntimeError(
-                f"TOLBERT service exited unexpectedly with code {self.process.poll()}. {stderr}".strip()
+                f"TOLBERT service exited unexpectedly with code {process.poll()}. {stderr}".strip()
             )
 
         response = json.loads(line)
@@ -209,31 +227,57 @@ class TolbertServiceClient:
             raise RuntimeError(response["error"])
         return response
 
-    def _spawn_process(self) -> subprocess.Popen[str]:
-        process = subprocess.Popen(
-            self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=self.repo_root,
-            env=self.env,
-        )
-        self._wait_for_process_ready(process)
+    def _ensure_process(self) -> subprocess.Popen[str]:
+        process = self.process
+        if process is None or process.poll() is not None:
+            process = self._spawn_process()
+            self.process = process
         return process
+
+    def _spawn_process(self) -> subprocess.Popen[str]:
+        last_error: RuntimeError | None = None
+        for attempt_index in range(self.service_startup_attempts):
+            process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=self.repo_root,
+                env=self.env,
+            )
+            try:
+                self._wait_for_process_ready(process)
+                return process
+            except RuntimeError as exc:
+                last_error = exc
+                retryable = self._is_retryable_startup_failure(str(exc))
+                if not retryable or attempt_index + 1 >= self.service_startup_attempts:
+                    break
+        if last_error is None:
+            raise RuntimeError("TOLBERT service failed to start for an unknown reason.")
+        if self.service_startup_attempts <= 1:
+            raise last_error
+        raise RuntimeError(
+            f"{last_error} (attempted startup {self.service_startup_attempts} times)"
+        ) from last_error
 
     def _reset_process(self) -> None:
         self._terminate_process()
         self.process = self._spawn_process()
 
     def _terminate_process(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
+        process = self.process
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
             try:
-                self.process.wait(timeout=2)
+                process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=2)
+                process.kill()
+                process.wait(timeout=2)
+        self.process = None
 
     def _wait_for_process_ready(self, process: subprocess.Popen[str]) -> None:
         stderr = process.stderr
@@ -241,7 +285,10 @@ class TolbertServiceClient:
             return
         selector = selectors.DefaultSelector()
         selector.register(stderr, selectors.EVENT_READ)
-        deadline = time.monotonic() + max(0.05, float(self.service_timeout_seconds))
+        startup_timeout_seconds = max(0.05, float(self.service_startup_timeout_seconds))
+        startup_grace_seconds = max(0.0, float(self.service_startup_grace_seconds))
+        deadline = time.monotonic() + startup_timeout_seconds
+        grace_deadline = None
         buffered_stderr: list[str] = []
         try:
             while True:
@@ -255,18 +302,25 @@ class TolbertServiceClient:
                     raise RuntimeError(
                         f"TOLBERT service exited before startup ready with code {process.poll()}. {details}".strip()
                     )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
+                now = time.monotonic()
+                if grace_deadline is None and now >= deadline:
+                    if startup_grace_seconds <= 0.0:
+                        self._terminate_process_handle(process)
+                        raise RuntimeError(
+                            f"TOLBERT service failed to become ready after {startup_timeout_seconds:.3f} seconds."
+                        )
+                    grace_deadline = now + startup_grace_seconds
+                if grace_deadline is not None and now >= grace_deadline:
                     self._terminate_process_handle(process)
                     raise RuntimeError(
-                        f"TOLBERT service failed to become ready after {float(self.service_timeout_seconds):.3f} seconds."
+                        "TOLBERT service failed to become ready after "
+                        f"{startup_timeout_seconds:.3f} seconds "
+                        f"(plus {startup_grace_seconds:.3f} seconds grace)."
                     )
+                remaining = (grace_deadline if grace_deadline is not None else deadline) - now
                 events = selector.select(remaining)
                 if not events:
-                    self._terminate_process_handle(process)
-                    raise RuntimeError(
-                        f"TOLBERT service failed to become ready after {float(self.service_timeout_seconds):.3f} seconds."
-                    )
+                    continue
                 line = stderr.readline()
                 if not line:
                     continue
@@ -407,7 +461,10 @@ class TolbertContextCompiler:
             subphase_started_at=retrieval_normalize_started_at,
         )
         retrieval = self._normalize_retrieval(
-            tolbert_result["retrieval"],
+            self._merge_carried_retrieval(
+                tolbert_result["retrieval"],
+                state=state,
+            ),
             state=state,
             level_focus=str(tolbert_result.get("level_focus", "skill")),
             retrieval_config=retrieval_config,
@@ -491,6 +548,8 @@ class TolbertContextCompiler:
         retrieval_guidance = self._build_retrieval_guidance(retrieval, state=state)
         path_confidence = self._path_confidence(tolbert_result["path_prediction"])
         trust_retrieval = path_confidence >= float(retrieval_config["tolbert_deterministic_command_confidence"])
+        if not trust_retrieval and self._workflow_guarded_guidance_is_trustworthy(state, retrieval_guidance):
+            trust_retrieval = True
         self._enforce_compile_budget(
             "guidance_build",
             compile_started_at=compile_started_at,
@@ -601,7 +660,43 @@ class TolbertContextCompiler:
             reasons = last_step.verification.get("reasons", [])
             if reasons:
                 parts.append(" ".join(reasons))
+        carry_summary = self._retrieval_carry_summary(state)
+        if carry_summary:
+            parts.append(carry_summary)
         return "\n".join(part for part in parts if part).strip()
+
+    def _merge_carried_retrieval(
+        self,
+        retrieval: dict[str, list[dict[str, Any]]],
+        *,
+        state: AgentState,
+    ) -> dict[str, list[dict[str, Any]]]:
+        seed = self._retrieval_carry_seed(state)
+        if not seed:
+            return retrieval
+        merged = {
+            "branch_scoped": list(retrieval.get("branch_scoped", [])),
+            "fallback_scoped": list(retrieval.get("fallback_scoped", [])),
+            "global": list(retrieval.get("global", [])),
+        }
+        seen = {
+            str(item.get("span_id", "")).strip()
+            for bucket in merged.values()
+            for item in bucket
+            if isinstance(item, dict)
+        }
+        carry_items = [
+            dict(item)
+            for item in seed.get("items", [])
+            if isinstance(item, dict)
+        ]
+        for item in reversed(carry_items):
+            span_id = str(item.get("span_id", "")).strip()
+            if not span_id or span_id in seen:
+                continue
+            merged["branch_scoped"].insert(0, item)
+            seen.add(span_id)
+        return merged
 
     def _normalize_retrieval(
         self,
@@ -729,9 +824,13 @@ class TolbertContextCompiler:
             rank += self.config.tolbert_source_task_weight
         if distractor_tasks and item_task_id in distractor_tasks:
             rank -= float(retrieval_config["tolbert_distractor_penalty"])
+        if bool(metadata.get("carried_retrieval", False)):
+            rank += 6.0
         broad_focus = level_focus in {"domain", "subdomain", "repo", "pillar", "theme", "corpus"}
         if span_type == "agent:command_template":
             rank += 2 if broad_focus else 6
+        elif span_type in {"agent:tool_template", "agent:procedure_span"}:
+            rank += 4 if broad_focus else 7
         elif span_type == "agent:skill_fragment":
             rank += 3 if broad_focus else 5
         elif span_type == "agent:procedure":
@@ -751,9 +850,42 @@ class TolbertContextCompiler:
                 rank += 6
             elif span_type.startswith("doc:"):
                 rank += 2
+        rank += self._artifact_alignment_bonus(state, item)
         rank += self.world_model.score_retrieved_span(state.world_model_summary, item)
         rank += self._role_retrieval_bonus(state, item)
         return rank
+
+    @staticmethod
+    def _artifact_alignment_bonus(state: AgentState, item: dict[str, Any]) -> float:
+        metadata = item.get("metadata") or {}
+        touched_files = {
+            str(value).strip()
+            for value in metadata.get("touched_files", [])
+            if str(value).strip()
+        }
+        benchmark_family = str(state.task.metadata.get("benchmark_family", "")).strip()
+        item_benchmark_family = str(metadata.get("benchmark_family", "")).strip()
+        task_capability = str(state.task.metadata.get("capability", "")).strip()
+        item_capability = str(metadata.get("capability", "")).strip()
+        desired_paths = {
+            str(path).strip()
+            for path in (
+                *state.task.expected_files,
+                *state.task.expected_file_contents.keys(),
+                *(state.task.metadata.get("workflow_guard", {}) or {}).get("claimed_paths", []),
+            )
+            if str(path).strip()
+        }
+        bonus = 0.0
+        if touched_files and desired_paths and touched_files & desired_paths:
+            bonus += 5.0
+        elif touched_files and desired_paths:
+            bonus += 1.0
+        if benchmark_family and item_benchmark_family and benchmark_family == item_benchmark_family:
+            bonus += 1.5
+        if task_capability and item_capability and task_capability == item_capability:
+            bonus += 1.5
+        return bonus
 
     @staticmethod
     def _role_retrieval_bonus(state: AgentState, item: dict[str, Any]) -> int:
@@ -817,58 +949,102 @@ class TolbertContextCompiler:
                 values[key] = value
         return values
 
+    @staticmethod
+    def _adjacent_success_shortcut_enabled(state: AgentState) -> bool:
+        return str(state.task.metadata.get("curriculum_kind", "")).strip() == "adjacent_success"
+
+    def _build_adjacent_success_guidance(self, state: AgentState) -> dict[str, Any]:
+        recommended_commands = self._dedupe_strings(
+            [str(command).strip() for command in state.task.suggested_commands if str(command).strip()]
+        )[:3]
+        recommended_command_spans = [
+            {"span_id": f"task:{state.task.task_id}:suggested:{index + 1}", "command": command}
+            for index, command in enumerate(recommended_commands)
+        ]
+        evidence = [f"task:{state.task.task_id}: adjacent success task contract"]
+        parent_task = str(state.task.metadata.get("parent_task", "")).strip()
+        if parent_task:
+            evidence.append(f"task:{parent_task}: successful parent episode")
+        return {
+            "recommended_commands": recommended_commands,
+            "recommended_command_spans": recommended_command_spans,
+            "avoidance_notes": [],
+            "evidence": evidence,
+        }
+
     def _build_retrieval_guidance(
         self,
         retrieval: dict[str, list[dict[str, Any]]],
         *,
         state: AgentState,
     ) -> dict[str, Any]:
-        recommended_commands: list[str] = []
-        recommended_command_spans: list[dict[str, str]] = []
-        avoidance_notes: list[str] = []
-        evidence: list[str] = []
-        for item in [
-            *retrieval.get("branch_scoped", []),
-            *retrieval.get("fallback_scoped", []),
-            *retrieval.get("global", []),
-        ]:
-            span_type = str(item.get("span_type", ""))
-            text = str(item.get("text", "")).strip()
-            metadata = dict(item.get("metadata") or {})
-            if not text:
-                continue
-            if span_type in {"agent:command_template", "agent:setup_command"}:
-                recommended_commands.append(text)
-                recommended_command_spans.append({"span_id": str(item["span_id"]), "command": text})
-                evidence.append(f"{item['span_id']}: template command")
-            elif span_type == "agent:skill_fragment":
-                for line in text.splitlines():
-                    command = line.strip()
-                    if command:
+        adjacent_success = self._adjacent_success_shortcut_enabled(state)
+        seeded_guidance = self._build_adjacent_success_guidance(state) if adjacent_success else {}
+        carry_guidance = {} if adjacent_success else self._retrieval_carry_seed(state)
+        recommended_commands = [
+            *list(carry_guidance.get("recommended_commands", [])),
+            *list(seeded_guidance.get("recommended_commands", [])),
+        ]
+        recommended_command_spans = [
+            *list(carry_guidance.get("recommended_command_spans", [])),
+            *list(seeded_guidance.get("recommended_command_spans", [])),
+        ]
+        avoidance_notes = list(seeded_guidance.get("avoidance_notes", []))
+        learned_avoidance_notes: list[str] = []
+        evidence = [
+            *list(carry_guidance.get("evidence", [])),
+            *list(seeded_guidance.get("evidence", [])),
+        ]
+        if not adjacent_success:
+            for item in [
+                *retrieval.get("branch_scoped", []),
+                *retrieval.get("fallback_scoped", []),
+                *retrieval.get("global", []),
+            ]:
+                span_type = str(item.get("span_type", ""))
+                text = str(item.get("text", "")).strip()
+                metadata = dict(item.get("metadata") or {})
+                if not text:
+                    continue
+                if span_type in {"agent:command_template", "agent:setup_command"}:
+                    recommended_commands.append(text)
+                    recommended_command_spans.append({"span_id": str(item["span_id"]), "command": text})
+                    evidence.append(f"{item['span_id']}: template command")
+                elif span_type in {"agent:tool_template", "agent:procedure", "agent:procedure_span"}:
+                    for command in self._procedure_commands(text):
+                        recommended_commands.append(command)
+                        recommended_command_spans.append({"span_id": str(item["span_id"]), "command": command})
+                    evidence.append(f"{item['span_id']}: procedure guidance")
+                elif span_type == "agent:skill_fragment":
+                    for line in text.splitlines():
+                        command = line.strip()
+                        if command:
+                            recommended_commands.append(command)
+                            recommended_command_spans.append(
+                                {"span_id": str(item["span_id"]), "command": command}
+                            )
+                    evidence.append(f"{item['span_id']}: skill fragment")
+                elif span_type == "agent:episode_step":
+                    parsed = self._parse_episode_step_span(text)
+                    command = parsed.get("content", "")
+                    if parsed.get("verification_passed") == "True" and command:
                         recommended_commands.append(command)
                         recommended_command_spans.append(
                             {"span_id": str(item["span_id"]), "command": command}
                         )
-                evidence.append(f"{item['span_id']}: skill fragment")
-            elif span_type == "agent:episode_step":
-                parsed = self._parse_episode_step_span(text)
-                command = parsed.get("content", "")
-                if parsed.get("verification_passed") == "True" and command:
-                    recommended_commands.append(command)
-                    recommended_command_spans.append(
-                        {"span_id": str(item["span_id"]), "command": command}
-                    )
-                    evidence.append(f"{item['span_id']}: successful episode step")
-                elif command:
-                    reasons = parsed.get("verification_reasons", "")
-                    avoidance_notes.append(f"avoid repeating {command!r} when {reasons}")
-            elif span_type == "agent:task":
-                evidence.append(f"{item['span_id']}: task overview")
-            elif span_type.startswith("doc:"):
-                title = str(metadata.get("title", "")).strip()
-                path = str(metadata.get("path", metadata.get("pdf_path", ""))).strip()
-                label = title or path or str(item.get("source_id", item["span_id"]))
-                evidence.append(f"{item['span_id']}: reference evidence from {label}")
+                        evidence.append(f"{item['span_id']}: successful episode step")
+                    elif command:
+                        reasons = parsed.get("verification_reasons", "")
+                        avoidance_notes.append(f"avoid repeating {command!r} when {reasons}")
+                elif span_type == "agent:task":
+                    evidence.append(f"{item['span_id']}: task overview")
+                elif span_type == "agent:tool_candidate":
+                    evidence.append(f"{item['span_id']}: reusable tool candidate")
+                elif span_type.startswith("doc:"):
+                    title = str(metadata.get("title", "")).strip()
+                    path = str(metadata.get("path", metadata.get("pdf_path", ""))).strip()
+                    label = title or path or str(item.get("source_id", item["span_id"]))
+                    evidence.append(f"{item['span_id']}: reference evidence from {label}")
         for candidate in matching_learning_candidates(
             self.config.learning_artifacts_path,
             config=self.config,
@@ -882,6 +1058,7 @@ class TolbertContextCompiler:
             candidate_id = str(candidate.get("candidate_id", "")).strip()
             candidate_memory_source = str(candidate.get("memory_source", "")).strip()
             source_suffix = f" via {candidate_memory_source} memory" if candidate_memory_source else ""
+            retrieval_prefix = self._learning_candidate_retrieval_prefix(candidate)
             if artifact_kind in {"success_skill_candidate", "recovery_case"}:
                 procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
                 commands = [
@@ -893,7 +1070,7 @@ class TolbertContextCompiler:
                     recommended_commands.append(command)
                     recommended_command_spans.append({"span_id": candidate_id or artifact_kind, "command": command})
                 evidence.append(
-                    f"{candidate_id or artifact_kind}: learned {artifact_kind} from {str(candidate.get('source_task_id', '')).strip()}{source_suffix}"
+                    f"{candidate_id or artifact_kind}: learned {retrieval_prefix}{artifact_kind} from {str(candidate.get('source_task_id', '')).strip()}{source_suffix}"
                 )
             elif artifact_kind == "negative_command_pattern":
                 command = str(candidate.get("command", "")).strip()
@@ -903,7 +1080,7 @@ class TolbertContextCompiler:
                     if str(reason).strip()
                 )
                 if command:
-                    avoidance_notes.append(
+                    learned_avoidance_notes.append(
                         f"avoid repeating {command!r} when {reasons or 'it previously failed verification'}"
                     )
                 evidence.append(
@@ -924,9 +1101,19 @@ class TolbertContextCompiler:
         return {
             "recommended_commands": self._dedupe_strings(recommended_commands)[:5],
             "recommended_command_spans": deduped_command_spans[:5],
-            "avoidance_notes": self._dedupe_strings(avoidance_notes)[:3],
+            "avoidance_notes": self._dedupe_strings([*learned_avoidance_notes, *avoidance_notes])[:3],
             "evidence": self._dedupe_strings(evidence)[:5],
         }
+
+    @staticmethod
+    def _learning_candidate_retrieval_prefix(candidate: dict[str, Any]) -> str:
+        if not bool(candidate.get("retrieval_backed", False)):
+            return ""
+        if int(candidate.get("trusted_retrieval_steps", 0) or 0) > 0:
+            return "trusted retrieval-backed "
+        if int(candidate.get("retrieval_influenced_steps", 0) or 0) > 0:
+            return "retrieval-backed "
+        return ""
 
     def _select_context_chunks(
         self,
@@ -1201,6 +1388,68 @@ class TolbertContextCompiler:
         return parsed
 
     @staticmethod
+    def _procedure_commands(text: str) -> list[str]:
+        stripped = str(text).strip()
+        if not stripped:
+            return []
+        commands = [line.strip() for line in stripped.splitlines() if line.strip()]
+        return commands or [stripped]
+
+    def _workflow_guarded_guidance_is_trustworthy(
+        self,
+        state: AgentState,
+        retrieval_guidance: dict[str, Any],
+    ) -> bool:
+        workflow_guard = state.task.metadata.get("workflow_guard", {}) or {}
+        if not isinstance(workflow_guard, dict):
+            return False
+        claimed_paths = [
+            str(path).strip()
+            for path in workflow_guard.get("claimed_paths", [])
+            if str(path).strip()
+        ]
+        if not claimed_paths:
+            return False
+        for entry in retrieval_guidance.get("recommended_command_spans", [])[:2]:
+            command = str(entry.get("command", "")).strip()
+            span_id = str(entry.get("span_id", "")).strip()
+            if not command or not self._first_step_guarded_command_coverage(state, command, claimed_paths):
+                continue
+            if span_id.startswith("learning:success_skill:") or span_id.startswith("learning:recovery_case:"):
+                return True
+            if span_id.startswith("procedure:") or span_id.startswith("tool:"):
+                return True
+        return False
+
+    @staticmethod
+    def _first_step_guarded_command_coverage(
+        state: AgentState,
+        command: str,
+        claimed_paths: list[str],
+    ) -> bool:
+        desired_paths = {
+            str(path).strip()
+            for path in (
+                *claimed_paths,
+                *state.task.expected_files,
+                *state.task.expected_file_contents.keys(),
+            )
+            if str(path).strip()
+        }
+        covered_paths = {path for path in desired_paths if path in command}
+        if len(covered_paths) >= 2:
+            return True
+        expected_outputs = {
+            str(path).strip()
+            for path in (
+                *state.task.expected_files,
+                *state.task.expected_file_contents.keys(),
+            )
+            if str(path).strip()
+        }
+        return bool(covered_paths and covered_paths & expected_outputs and "git " in command)
+
+    @staticmethod
     def _dedupe_strings(values: list[str]) -> list[str]:
         seen: set[str] = set()
         deduped: list[str] = []
@@ -1211,6 +1460,125 @@ class TolbertContextCompiler:
             seen.add(normalized)
             deduped.append(normalized)
         return deduped
+
+    def _retrieval_carry_summary(self, state: AgentState) -> str:
+        seed = self._retrieval_carry_seed(state)
+        summaries = [
+            str(value).strip()
+            for value in seed.get("summaries", [])
+            if str(value).strip()
+        ]
+        return "\n".join(summaries[:2])
+
+    def _retrieval_carry_seed(self, state: AgentState) -> dict[str, Any]:
+        packet = state.context_packet
+        if packet is None or not state.history:
+            return {}
+        guidance = packet.control.get("retrieval_guidance", {})
+        if not isinstance(guidance, dict):
+            guidance = {}
+        guidance_spans = guidance.get("recommended_command_spans", [])
+        if not isinstance(guidance_spans, list):
+            guidance_spans = []
+        by_span_id: dict[str, str] = {}
+        by_command: dict[str, str] = {}
+        for entry in guidance_spans:
+            if not isinstance(entry, dict):
+                continue
+            span_id = str(entry.get("span_id", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            if not span_id or not command:
+                continue
+            by_span_id[span_id] = command
+            by_command[command] = span_id
+        retrieval_items: dict[str, dict[str, Any]] = {}
+        for bucket in ("branch_scoped", "fallback_scoped", "global"):
+            items = packet.retrieval.get(bucket, [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                span_id = str(item.get("span_id", "")).strip()
+                if span_id and span_id not in retrieval_items:
+                    retrieval_items[span_id] = dict(item)
+
+        recommended_commands: list[str] = []
+        recommended_command_spans: list[dict[str, str]] = []
+        evidence: list[str] = []
+        summaries: list[str] = []
+        carry_items: list[dict[str, Any]] = []
+        seen_spans: set[str] = set()
+        seen_commands: set[str] = set()
+
+        def append_carry(*, span_id: str, command: str, step_index: int, reason: str) -> None:
+            normalized_span_id = str(span_id).strip()
+            normalized_command = str(command).strip()
+            if not normalized_command:
+                return
+            carry_span_id = normalized_span_id or f"carry:{state.task.task_id}:{step_index}"
+            if carry_span_id in seen_spans or normalized_command in seen_commands:
+                return
+            seen_spans.add(carry_span_id)
+            seen_commands.add(normalized_command)
+            recommended_commands.append(normalized_command)
+            recommended_command_spans.append({"span_id": carry_span_id, "command": normalized_command})
+            evidence.append(f"{carry_span_id}: carried retrieval guidance from step {step_index} ({reason})")
+            summaries.append(f"retrieval carry step={step_index} command={normalized_command}")
+            carried_item = retrieval_items.get(normalized_span_id, {})
+            if carried_item:
+                metadata = dict(carried_item.get("metadata") or {})
+                metadata["carried_retrieval"] = True
+                metadata["carry_step_index"] = step_index
+                metadata["carry_reason"] = reason
+                carry_items.append({**carried_item, "metadata": metadata})
+                return
+            carry_items.append(
+                {
+                    "span_id": carry_span_id,
+                    "text": normalized_command,
+                    "source_id": state.task.task_id,
+                    "span_type": "agent:command_template",
+                    "score": 0.0,
+                    "node_path": [0, 0, 0],
+                    "metadata": {
+                        "span_type": "agent:command_template",
+                        "task_id": state.task.task_id,
+                        "carried_retrieval": True,
+                        "carry_step_index": step_index,
+                        "carry_reason": reason,
+                    },
+                }
+            )
+
+        for step in reversed(state.history[-3:]):
+            selected_span_id = str(step.selected_retrieval_span_id or "").strip()
+            step_verified = bool(step.verification.get("passed", False))
+            if selected_span_id and (step_verified or not bool(step.retrieval_command_match)):
+                append_carry(
+                    span_id=selected_span_id,
+                    command=by_span_id.get(selected_span_id, ""),
+                    step_index=int(step.index),
+                    reason="selected_span",
+                )
+            if step_verified and str(step.content).strip() and (step.retrieval_influenced or step.trust_retrieval):
+                append_carry(
+                    span_id=by_command.get(str(step.content).strip(), ""),
+                    command=str(step.content).strip(),
+                    step_index=int(step.index),
+                    reason="trusted_or_influenced_command",
+                )
+            if recommended_commands:
+                break
+        if not recommended_commands:
+            return {}
+        return {
+            "recommended_commands": recommended_commands,
+            "recommended_command_spans": recommended_command_spans,
+            "evidence": evidence,
+            "summaries": summaries,
+            "items": carry_items,
+        }
 
 
 class MockTolbertContextCompiler:

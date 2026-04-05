@@ -4,6 +4,19 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 import os
 
+from .kernel_catalog import kernel_catalog_string_list
+
+
+_DEFAULT_UNATTENDED_ALLOWED_BENCHMARK_FAMILIES = tuple(
+    kernel_catalog_string_list("runtime_defaults", "unattended_allowed_benchmark_families")
+)
+_DEFAULT_UNATTENDED_GENERATED_PATH_PREFIXES = tuple(
+    kernel_catalog_string_list("runtime_defaults", "unattended_generated_path_prefixes")
+)
+_DEFAULT_UNATTENDED_TRUST_REQUIRED_BENCHMARK_FAMILIES = tuple(
+    kernel_catalog_string_list("trust", "default_required_benchmark_families")
+)
+
 
 def _split_env_paths(name: str) -> tuple[str, ...]:
     raw = os.getenv(name, "")
@@ -17,6 +30,82 @@ def _split_env_csv(name: str) -> tuple[str, ...]:
 
 def current_external_task_manifests_paths() -> tuple[str, ...]:
     return _split_env_paths("AGENT_KERNEL_EXTERNAL_TASK_MANIFESTS_PATHS")
+
+
+def current_storage_governance_config() -> "KernelConfig":
+    base = KernelConfig()
+    return KernelConfig(
+        storage_backend=os.getenv("AGENT_KERNEL_STORAGE_BACKEND", base.storage_backend),
+        improvement_cycles_path=Path(
+            os.getenv("AGENT_KERNEL_IMPROVEMENT_CYCLES_PATH", str(base.improvement_cycles_path))
+        ),
+        candidate_artifacts_root=Path(
+            os.getenv("AGENT_KERNEL_CANDIDATE_ARTIFACTS_ROOT", str(base.candidate_artifacts_root))
+        ),
+        improvement_reports_dir=Path(
+            os.getenv("AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR", str(base.improvement_reports_dir))
+        ),
+        run_reports_dir=Path(
+            os.getenv("AGENT_KERNEL_RUN_REPORTS_DIR", str(base.run_reports_dir))
+        ),
+        run_checkpoints_dir=Path(
+            os.getenv("AGENT_KERNEL_RUN_CHECKPOINTS_DIR", str(base.run_checkpoints_dir))
+        ),
+        unattended_trust_ledger_path=Path(
+            os.getenv("AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH", str(base.unattended_trust_ledger_path))
+        ),
+        tolbert_model_artifact_path=Path(
+            os.getenv("AGENT_KERNEL_TOLBERT_MODEL_ARTIFACT_PATH", str(base.tolbert_model_artifact_path))
+        ),
+        storage_keep_cycle_export_files=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_CYCLE_EXPORT_FILES", str(base.storage_keep_cycle_export_files))
+        ),
+        storage_keep_report_export_files=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_REPORT_EXPORT_FILES", str(base.storage_keep_report_export_files))
+        ),
+        storage_keep_candidate_export_dirs=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_CANDIDATE_EXPORT_DIRS", str(base.storage_keep_candidate_export_dirs))
+        ),
+        storage_keep_run_report_files=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_RUN_REPORT_FILES", str(base.storage_keep_run_report_files))
+        ),
+        storage_keep_run_checkpoint_files=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_RUN_CHECKPOINT_FILES", str(base.storage_keep_run_checkpoint_files))
+        ),
+        storage_keep_namespace_candidate_dirs=int(
+            os.getenv(
+                "AGENT_KERNEL_STORAGE_KEEP_NAMESPACE_CANDIDATE_DIRS",
+                str(base.storage_keep_namespace_candidate_dirs),
+            )
+        ),
+        storage_max_cycle_export_records=int(
+            os.getenv("AGENT_KERNEL_STORAGE_MAX_CYCLE_EXPORT_RECORDS", str(base.storage_max_cycle_export_records))
+        ),
+        storage_max_report_history_records=int(
+            os.getenv(
+                "AGENT_KERNEL_STORAGE_MAX_REPORT_HISTORY_RECORDS",
+                str(base.storage_max_report_history_records),
+            )
+        ),
+        storage_keep_tolbert_candidate_dirs=int(
+            os.getenv(
+                "AGENT_KERNEL_STORAGE_KEEP_TOLBERT_CANDIDATE_DIRS",
+                str(base.storage_keep_tolbert_candidate_dirs),
+            )
+        ),
+        storage_tolbert_candidate_budget_bytes=int(
+            os.getenv(
+                "AGENT_KERNEL_STORAGE_TOLBERT_CANDIDATE_BUDGET_BYTES",
+                str(base.storage_tolbert_candidate_budget_bytes),
+            )
+        ),
+        storage_tolbert_shared_store_budget_bytes=int(
+            os.getenv(
+                "AGENT_KERNEL_STORAGE_TOLBERT_SHARED_STORE_BUDGET_BYTES",
+                str(base.storage_tolbert_shared_store_budget_bytes),
+            )
+        ),
+    )
 
 
 @dataclass(slots=True)
@@ -66,6 +155,9 @@ class KernelConfig:
     )
     tolbert_service_timeout_seconds: int = int(
         os.getenv("AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS", "15")
+    )
+    tolbert_service_startup_attempts: int = int(
+        os.getenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_ATTEMPTS", "2")
     )
     llm_plan_max_items: int = int(
         os.getenv("AGENT_KERNEL_LLM_PLAN_MAX_ITEMS", "4")
@@ -177,7 +269,15 @@ class KernelConfig:
         "/data/TOLBERT_BRAIN/checkpoints/tolbert_brain/retrieval_cache/paper_spans_joint_mapped__tolbert_epoch3.pt",
     )
     tolbert_device: str = os.getenv("AGENT_KERNEL_TOLBERT_DEVICE", "cuda")
-    max_steps: int = int(os.getenv("AGENT_KERNEL_MAX_STEPS", "5"))
+    max_steps: int = int(os.getenv("AGENT_KERNEL_MAX_STEPS", "12"))
+    max_task_steps_hard_cap: int = int(os.getenv("AGENT_KERNEL_MAX_TASK_STEPS_HARD_CAP", "4096"))
+    frontier_task_step_floor: int = int(os.getenv("AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR", "50"))
+    runtime_history_step_window: int = int(os.getenv("AGENT_KERNEL_RUNTIME_HISTORY_STEP_WINDOW", "32"))
+    payload_history_step_window: int = int(os.getenv("AGENT_KERNEL_PAYLOAD_HISTORY_STEP_WINDOW", "12"))
+    checkpoint_history_step_window: int = int(os.getenv("AGENT_KERNEL_CHECKPOINT_HISTORY_STEP_WINDOW", "24"))
+    history_archive_summary_max_chars: int = int(
+        os.getenv("AGENT_KERNEL_HISTORY_ARCHIVE_SUMMARY_MAX_CHARS", "1200")
+    )
     timeout_seconds: int = int(os.getenv("AGENT_KERNEL_TIMEOUT_SECONDS", "20"))
     command_timeout_seconds: int = int(
         os.getenv(
@@ -235,6 +335,12 @@ class KernelConfig:
     )
     tolbert_supervised_datasets_dir: Path = Path(
         os.getenv("AGENT_KERNEL_TOLBERT_SUPERVISED_DATASETS_DIR", "trajectories/tolbert_model/datasets")
+    )
+    qwen_adapter_artifact_path: Path = Path(
+        os.getenv("AGENT_KERNEL_QWEN_ADAPTER_ARTIFACT_PATH", "trajectories/qwen_adapter/qwen_adapter_artifact.json")
+    )
+    qwen_supervised_datasets_dir: Path = Path(
+        os.getenv("AGENT_KERNEL_QWEN_SUPERVISED_DATASETS_DIR", "trajectories/qwen_adapter/datasets")
     )
     tolbert_liftoff_report_path: Path = Path(
         os.getenv("AGENT_KERNEL_TOLBERT_LIFTOFF_REPORT_PATH", "trajectories/tolbert_model/liftoff_gate_report.json")
@@ -314,7 +420,7 @@ class KernelConfig:
     )
     storage_write_episode_exports: bool = os.getenv(
         "AGENT_KERNEL_STORAGE_WRITE_EPISODE_EXPORTS",
-        "0",
+        "1",
     ) == "1"
     storage_write_learning_exports: bool = os.getenv(
         "AGENT_KERNEL_STORAGE_WRITE_LEARNING_EXPORTS",
@@ -328,51 +434,71 @@ class KernelConfig:
         "AGENT_KERNEL_STORAGE_WRITE_JOB_STATE_EXPORTS",
         "1",
     ) == "1"
+    storage_write_dataset_shards: bool = os.getenv(
+        "AGENT_KERNEL_STORAGE_WRITE_DATASET_SHARDS",
+        "0",
+    ) == "1"
+    storage_keep_terminal_job_records: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS", "256")
+    )
+    storage_prune_terminal_job_artifacts: bool = os.getenv(
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS",
+        "1",
+    ) == "1"
     storage_keep_cycle_export_files: int = int(
         os.getenv("AGENT_KERNEL_STORAGE_KEEP_CYCLE_EXPORT_FILES", "32")
     )
     storage_keep_report_export_files: int = int(
         os.getenv("AGENT_KERNEL_STORAGE_KEEP_REPORT_EXPORT_FILES", "64")
     )
+    storage_keep_candidate_export_dirs: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_CANDIDATE_EXPORT_DIRS", "48")
+    )
+    storage_keep_run_report_files: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_RUN_REPORT_FILES", "256")
+    )
+    storage_keep_run_checkpoint_files: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_RUN_CHECKPOINT_FILES", "128")
+    )
+    storage_keep_namespace_candidate_dirs: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_NAMESPACE_CANDIDATE_DIRS", "16")
+    )
+    storage_max_cycle_export_records: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_MAX_CYCLE_EXPORT_RECORDS", "512")
+    )
+    storage_max_report_history_records: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_MAX_REPORT_HISTORY_RECORDS", "512")
+    )
+    storage_keep_tolbert_candidate_dirs: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_KEEP_TOLBERT_CANDIDATE_DIRS", "2")
+    )
+    storage_tolbert_candidate_budget_bytes: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_TOLBERT_CANDIDATE_BUDGET_BYTES", str(2 * 1024 * 1024 * 1024))
+    )
+    storage_tolbert_shared_store_budget_bytes: int = int(
+        os.getenv("AGENT_KERNEL_STORAGE_TOLBERT_SHARED_STORE_BUDGET_BYTES", str(2 * 1024 * 1024 * 1024))
+    )
     delegated_job_max_concurrency: int = int(
-        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_CONCURRENCY", "1")
+        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_CONCURRENCY", "3")
     )
     delegated_job_max_active_per_budget_group: int = int(
-        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_ACTIVE_PER_BUDGET_GROUP", "0")
+        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_ACTIVE_PER_BUDGET_GROUP", "2")
     )
     delegated_job_max_queued_per_budget_group: int = int(
-        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_QUEUED_PER_BUDGET_GROUP", "0")
+        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_QUEUED_PER_BUDGET_GROUP", "8")
     )
     delegated_job_max_artifact_bytes: int = int(
-        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_ARTIFACT_BYTES", str(5 * 1024 * 1024))
+        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_ARTIFACT_BYTES", str(8 * 1024 * 1024))
     )
     delegated_job_max_subprocesses_per_job: int = int(
-        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_SUBPROCESSES_PER_JOB", "1")
+        os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_SUBPROCESSES_PER_JOB", "2")
     )
     delegated_job_max_consecutive_selections_per_budget_group: int = int(
         os.getenv("AGENT_KERNEL_DELEGATED_JOB_MAX_CONSECUTIVE_SELECTIONS_PER_BUDGET_GROUP", "0")
     )
     unattended_allowed_benchmark_families: tuple[str, ...] = _split_env_csv(
         "AGENT_KERNEL_UNATTENDED_ALLOWED_BENCHMARK_FAMILIES"
-    ) or (
-        "bounded",
-        "micro",
-        "workflow",
-        "project",
-        "repository",
-        "repo_chore",
-        "repo_sandbox",
-        "tooling",
-        "integration",
-        "episode_memory",
-        "skill_memory",
-        "skill_transfer",
-        "operator_memory",
-        "verifier_memory",
-        "tool_memory",
-        "benchmark_candidate",
-        "verifier_candidate",
-    )
+    ) or _DEFAULT_UNATTENDED_ALLOWED_BENCHMARK_FAMILIES
     unattended_allow_git_commands: bool = os.getenv(
         "AGENT_KERNEL_UNATTENDED_ALLOW_GIT_COMMANDS",
         "0",
@@ -396,14 +522,7 @@ class KernelConfig:
     )
     unattended_generated_path_prefixes: tuple[str, ...] = _split_env_csv(
         "AGENT_KERNEL_UNATTENDED_GENERATED_PATH_PREFIXES"
-    ) or (
-        "dist",
-        "build",
-        "node_modules",
-        "coverage",
-        ".pytest_cache",
-        "__pycache__",
-    )
+    ) or _DEFAULT_UNATTENDED_GENERATED_PATH_PREFIXES
     unattended_workspace_snapshot_root: Path = Path(
         os.getenv(
             "AGENT_KERNEL_UNATTENDED_WORKSPACE_SNAPSHOT_ROOT",
@@ -429,13 +548,7 @@ class KernelConfig:
     )
     unattended_trust_required_benchmark_families: tuple[str, ...] = _split_env_csv(
         "AGENT_KERNEL_UNATTENDED_TRUST_REQUIRED_BENCHMARK_FAMILIES"
-    ) or (
-        "repo_chore",
-        "repo_sandbox",
-        "project",
-        "repository",
-        "integration",
-    )
+    ) or _DEFAULT_UNATTENDED_TRUST_REQUIRED_BENCHMARK_FAMILIES
     unattended_trust_bootstrap_min_reports: int = int(
         os.getenv("AGENT_KERNEL_UNATTENDED_TRUST_BOOTSTRAP_MIN_REPORTS", "5")
     )
@@ -459,6 +572,86 @@ class KernelConfig:
     )
     min_skill_quality: float = float(os.getenv("AGENT_KERNEL_MIN_SKILL_QUALITY", "0.75"))
 
+    def validate(self) -> None:
+        provider = self.provider.strip().lower()
+        if provider not in {"mock", "ollama", "tolbert", "vllm"}:
+            raise ValueError(f"unsupported provider: {self.provider}")
+        if provider == "ollama" and not self.ollama_host.strip():
+            raise ValueError("ollama_host must be non-empty when provider='ollama'")
+        if provider == "vllm" and not self.vllm_host.strip():
+            raise ValueError("vllm_host must be non-empty when provider='vllm'")
+        if not self.model_name.strip():
+            raise ValueError("model_name must be non-empty")
+
+        storage_backend = self.storage_backend.strip().lower()
+        if storage_backend not in {"json", "sqlite"}:
+            raise ValueError(f"unsupported storage backend: {self.storage_backend}")
+
+        _require_positive_int("max_steps", self.max_steps)
+        _require_positive_int("max_task_steps_hard_cap", self.max_task_steps_hard_cap)
+        _require_positive_int("frontier_task_step_floor", self.frontier_task_step_floor)
+        _require_positive_int("runtime_history_step_window", self.runtime_history_step_window)
+        _require_positive_int("payload_history_step_window", self.payload_history_step_window)
+        _require_positive_int("checkpoint_history_step_window", self.checkpoint_history_step_window)
+        _require_positive_int("history_archive_summary_max_chars", self.history_archive_summary_max_chars)
+        _require_positive_int("timeout_seconds", self.timeout_seconds)
+        _require_positive_int("command_timeout_seconds", self.command_timeout_seconds)
+        _require_positive_int("llm_timeout_seconds", self.llm_timeout_seconds)
+        _require_non_negative_int("llm_retry_attempts", self.llm_retry_attempts)
+        _require_non_negative_float("llm_retry_backoff_seconds", self.llm_retry_backoff_seconds)
+
+        _require_positive_int("delegated_job_max_concurrency", self.delegated_job_max_concurrency)
+        _require_positive_int("delegated_job_max_subprocesses_per_job", self.delegated_job_max_subprocesses_per_job)
+        _require_non_negative_int(
+            "delegated_job_max_active_per_budget_group",
+            self.delegated_job_max_active_per_budget_group,
+        )
+        _require_non_negative_int(
+            "delegated_job_max_queued_per_budget_group",
+            self.delegated_job_max_queued_per_budget_group,
+        )
+        _require_non_negative_int(
+            "delegated_job_max_consecutive_selections_per_budget_group",
+            self.delegated_job_max_consecutive_selections_per_budget_group,
+        )
+        _require_positive_int("delegated_job_max_artifact_bytes", self.delegated_job_max_artifact_bytes)
+
+        _require_positive_int("unattended_http_timeout_seconds", self.unattended_http_timeout_seconds)
+        _require_positive_int("unattended_http_max_body_bytes", self.unattended_http_max_body_bytes)
+
+        _require_probability("tolbert_confidence_threshold", self.tolbert_confidence_threshold)
+        _require_probability("tolbert_branch_confidence_margin", self.tolbert_branch_confidence_margin)
+        _require_probability(
+            "tolbert_low_confidence_widen_threshold",
+            self.tolbert_low_confidence_widen_threshold,
+        )
+        _require_probability(
+            "tolbert_deterministic_command_confidence",
+            self.tolbert_deterministic_command_confidence,
+        )
+        _require_probability(
+            "tolbert_first_step_direct_command_confidence",
+            self.tolbert_first_step_direct_command_confidence,
+        )
+        _require_probability(
+            "tolbert_skill_ranking_min_confidence",
+            self.tolbert_skill_ranking_min_confidence,
+        )
+        _require_probability("min_skill_quality", self.min_skill_quality)
+        _require_probability("unattended_trust_min_success_rate", self.unattended_trust_min_success_rate)
+        _require_probability(
+            "unattended_trust_max_unsafe_ambiguous_rate",
+            self.unattended_trust_max_unsafe_ambiguous_rate,
+        )
+        _require_probability(
+            "unattended_trust_max_hidden_side_effect_rate",
+            self.unattended_trust_max_hidden_side_effect_rate,
+        )
+        _require_probability(
+            "unattended_trust_max_success_hidden_side_effect_rate",
+            self.unattended_trust_max_success_hidden_side_effect_rate,
+        )
+
     def to_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
         for field in fields(self):
@@ -468,6 +661,7 @@ class KernelConfig:
         return env
 
     def ensure_directories(self) -> None:
+        self.validate()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.trajectories_root.mkdir(parents=True, exist_ok=True)
         self.skills_path.parent.mkdir(parents=True, exist_ok=True)
@@ -478,6 +672,8 @@ class KernelConfig:
         self.retrieval_asset_bundle_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_model_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_supervised_datasets_dir.mkdir(parents=True, exist_ok=True)
+        self.qwen_adapter_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        self.qwen_supervised_datasets_dir.mkdir(parents=True, exist_ok=True)
         self.tolbert_liftoff_report_path.parent.mkdir(parents=True, exist_ok=True)
         self.verifier_contracts_path.parent.mkdir(parents=True, exist_ok=True)
         self.prompt_proposals_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,3 +727,24 @@ def _serialize_env_value(name: str, value: object) -> str:
         separator = os.pathsep if name.endswith("_paths") else ","
         return separator.join(parts)
     return str(value)
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if int(value) <= 0:
+        raise ValueError(f"{name} must be > 0")
+
+
+def _require_non_negative_int(name: str, value: int) -> None:
+    if int(value) < 0:
+        raise ValueError(f"{name} must be >= 0")
+
+
+def _require_non_negative_float(name: str, value: float) -> None:
+    if float(value) < 0:
+        raise ValueError(f"{name} must be >= 0")
+
+
+def _require_probability(name: str, value: float) -> None:
+    numeric = float(value)
+    if numeric < 0.0 or numeric > 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")

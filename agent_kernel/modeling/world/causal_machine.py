@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -30,6 +31,8 @@ class CausalWorldPrior:
     matched_state_probability: float
     signature_norm: float
     token_count: int
+    horizon_hint: str = ""
+    applied_bias_strength: float = 1.0
 
 
 def load_causal_world_profile(profile_json_path: str | Path) -> CausalWorldProfile:
@@ -107,26 +110,55 @@ def condition_causal_world_prior(
     *,
     text_fragments: list[str] | tuple[str, ...],
     bias_strength: float = 1.0,
+    horizon_hint: str | None = None,
 ) -> CausalWorldPrior:
     base_logits = _base_profile_logits(profile)
+    resolved_horizon_hint = str(horizon_hint or "").strip()
+    applied_bias_strength = float(bias_strength)
+    if resolved_horizon_hint == "long_horizon":
+        max_horizon = max(profile.horizons, default=1)
+        if max_horizon > 1:
+            applied_bias_strength *= 1.0 + min(0.75, 0.2 * math.log1p(float(max_horizon)))
     signature_per_horizon, token_count = build_causal_state_signature(
         text_fragments,
         sketch_dim=profile.sketch_dim,
     )
     if token_count <= 0:
-        return _fallback_world_prior(base_logits, backend="mass_only")
+        return _fallback_world_prior(
+            base_logits,
+            backend="mass_only",
+            horizon_hint=resolved_horizon_hint,
+            applied_bias_strength=applied_bias_strength,
+        )
     signature = np.tile(signature_per_horizon, len(profile.horizons)).astype(np.float32, copy=False)
     if signature.shape != (profile.centroids_sketch.shape[1],):
-        return _fallback_world_prior(base_logits, backend="mass_only")
-    centroid_norms = np.linalg.norm(profile.centroids_sketch, axis=1)
+        return _fallback_world_prior(
+            base_logits,
+            backend="mass_only",
+            horizon_hint=resolved_horizon_hint,
+            applied_bias_strength=applied_bias_strength,
+        )
+    centroid_rows = profile.centroids_sketch
+    if resolved_horizon_hint == "long_horizon" and len(profile.horizons) > 1:
+        max_horizon = max(profile.horizons, default=1)
+        weighted_columns: list[np.ndarray] = []
+        for weight_index, horizon in enumerate(profile.horizons):
+            weight = 1.0 + (0.5 * float(horizon) / float(max_horizon))
+            start = weight_index * profile.sketch_dim
+            stop = start + profile.sketch_dim
+            weighted_columns.append(profile.centroids_sketch[:, start:stop] * weight)
+        centroid_rows = np.concatenate(weighted_columns, axis=1).astype(np.float32, copy=False)
+    centroid_norms = np.linalg.norm(centroid_rows, axis=1)
     safe_norms = np.where(centroid_norms > 0.0, centroid_norms, 1.0).astype(np.float32, copy=False)
-    similarities = (profile.centroids_sketch @ signature) / safe_norms
-    logits = base_logits + (float(bias_strength) * similarities.astype(np.float32, copy=False))
+    similarities = (centroid_rows @ signature) / safe_norms
+    logits = base_logits + (applied_bias_strength * similarities.astype(np.float32, copy=False))
     return _finalize_world_prior(
         logits,
         backend="profile_conditioned",
         signature_norm=float(np.linalg.norm(signature)),
         token_count=token_count,
+        horizon_hint=resolved_horizon_hint,
+        applied_bias_strength=applied_bias_strength,
     )
 
 
@@ -174,12 +206,16 @@ def _fallback_world_prior(
     logits: np.ndarray,
     *,
     backend: str,
+    horizon_hint: str,
+    applied_bias_strength: float,
 ) -> CausalWorldPrior:
     return _finalize_world_prior(
         logits,
         backend=backend,
         signature_norm=0.0,
         token_count=0,
+        horizon_hint=horizon_hint,
+        applied_bias_strength=applied_bias_strength,
     )
 
 
@@ -189,6 +225,8 @@ def _finalize_world_prior(
     backend: str,
     signature_norm: float,
     token_count: int,
+    horizon_hint: str,
+    applied_bias_strength: float,
 ) -> CausalWorldPrior:
     clipped = np.asarray(logits, dtype=np.float32)
     clipped = clipped - np.max(clipped)
@@ -207,6 +245,8 @@ def _finalize_world_prior(
         matched_state_probability=matched_state_probability,
         signature_norm=float(signature_norm),
         token_count=max(int(token_count), 0),
+        horizon_hint=str(horizon_hint).strip(),
+        applied_bias_strength=float(applied_bias_strength),
     )
 
 

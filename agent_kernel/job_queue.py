@@ -23,6 +23,7 @@ from .preflight import (
     run_unattended_preflight,
     write_unattended_task_report,
 )
+from .runtime_supervision import atomic_write_json
 from .shared_repo import (
     prepare_runtime_task,
     shared_repo_claim,
@@ -78,11 +79,8 @@ def _safe_name(value: str) -> str:
 
 
 def _storage_config_for_path(path: Path) -> KernelConfig | None:
-    storage_backend = os.getenv("AGENT_KERNEL_STORAGE_BACKEND", "sqlite").strip().lower()
-    if storage_backend != "sqlite":
-        return None
     config = KernelConfig(
-        storage_backend="sqlite",
+        storage_backend=os.getenv("AGENT_KERNEL_STORAGE_BACKEND", "sqlite").strip().lower(),
         runtime_database_path=Path(
             os.getenv("AGENT_KERNEL_RUNTIME_DATABASE_PATH", "var/runtime/agentkernel.sqlite3")
         ),
@@ -92,8 +90,22 @@ def _storage_config_for_path(path: Path) -> KernelConfig | None:
         delegated_job_runtime_state_path=Path(
             os.getenv("AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH", "trajectories/jobs/runtime_state.json")
         ),
+        run_reports_dir=Path(
+            os.getenv("AGENT_KERNEL_RUN_REPORTS_DIR", "trajectories/reports")
+        ),
+        run_checkpoints_dir=Path(
+            os.getenv("AGENT_KERNEL_RUN_CHECKPOINTS_DIR", "trajectories/checkpoints")
+        ),
         storage_write_job_state_exports=os.getenv(
             "AGENT_KERNEL_STORAGE_WRITE_JOB_STATE_EXPORTS",
+            "1",
+        )
+        == "1",
+        storage_keep_terminal_job_records=int(
+            os.getenv("AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS", "256")
+        ),
+        storage_prune_terminal_job_artifacts=os.getenv(
+            "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS",
             "1",
         )
         == "1",
@@ -110,6 +122,79 @@ def _storage_config_for_path(path: Path) -> KernelConfig | None:
     return None
 
 
+def _resolved_path(path: Path) -> Path | None:
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    resolved_path = _resolved_path(path)
+    resolved_root = _resolved_path(root)
+    if resolved_path is None or resolved_root is None:
+        return False
+    return resolved_path == resolved_root or resolved_root in resolved_path.parents
+
+
+def _cleanup_pruned_job_artifacts(job: "DelegatedJob", config: KernelConfig) -> None:
+    if not config.storage_prune_terminal_job_artifacts:
+        return
+    for raw_path, managed_root in (
+        (job.checkpoint_path, config.run_checkpoints_dir),
+        (job.report_path, config.run_reports_dir),
+    ):
+        normalized = str(raw_path).strip()
+        if not normalized:
+            continue
+        artifact_path = Path(normalized)
+        if not artifact_path.exists() or artifact_path.is_dir():
+            continue
+        if not _path_within_root(artifact_path, managed_root):
+            continue
+        try:
+            artifact_path.unlink()
+        except OSError:
+            continue
+        parent = artifact_path.parent
+        while parent != managed_root and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def _terminal_job_sort_key(job: "DelegatedJob") -> tuple[float, float, str]:
+    finished = _parse_timestamp(job.finished_at)
+    queued = _parse_timestamp(job.queued_at)
+    finished_rank = finished.timestamp() if finished is not None else float("-inf")
+    queued_rank = queued.timestamp() if queued is not None else float("-inf")
+    return (finished_rank, queued_rank, job.job_id)
+
+
+def _prune_terminal_jobs(jobs: list["DelegatedJob"], config: KernelConfig | None) -> None:
+    if config is None:
+        return
+    keep = max(0, int(config.storage_keep_terminal_job_records))
+    terminals = [
+        job
+        for job in jobs
+        if job.state in TERMINAL_JOB_STATES and not str(job.promoted_at).strip()
+    ]
+    if len(terminals) <= keep:
+        return
+    ordered = sorted(terminals, key=_terminal_job_sort_key, reverse=True)
+    keep_ids = {job.job_id for job in ordered[:keep]}
+    retained: list[DelegatedJob] = []
+    for job in jobs:
+        if job.state in TERMINAL_JOB_STATES and not str(job.promoted_at).strip() and job.job_id not in keep_ids:
+            _cleanup_pruned_job_artifacts(job, config)
+            continue
+        retained.append(job)
+    jobs[:] = retained
+
+
 def _active_budget_group_counts(leases: list["DelegatedJobLease"]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for lease in leases:
@@ -121,6 +206,39 @@ def _active_budget_group_counts(leases: list["DelegatedJobLease"]) -> dict[str, 
 def _budget_group(value: str) -> str:
     normalized = _safe_name(value.strip())
     return normalized or "default"
+
+
+def _task_payload_benchmark_family(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("benchmark_family", "")).strip()
+
+
+def _inferred_budget_group(
+    *,
+    task_id: str,
+    budget_group: str,
+    runtime_overrides: dict[str, object] | None,
+    task_bank: TaskBank | None,
+) -> str:
+    normalized_budget_group = _budget_group(budget_group)
+    if normalized_budget_group != "default":
+        return normalized_budget_group
+    overrides = dict(runtime_overrides or {})
+    benchmark_family = _task_payload_benchmark_family(overrides.get("task_payload"))
+    if not benchmark_family and task_bank is not None:
+        try:
+            task = task_bank.get(task_id)
+        except KeyError:
+            task = None
+        if task is not None:
+            benchmark_family = str(getattr(task, "metadata", {}).get("benchmark_family", "")).strip()
+    if not benchmark_family:
+        return normalized_budget_group
+    return _budget_group(f"family_{benchmark_family}")
 
 
 def _normalize_claim_paths(values: object) -> tuple[str, ...]:
@@ -335,6 +453,7 @@ class DelegatedResourcePolicy:
     command_timeout_seconds: int
     llm_timeout_seconds: int
     max_steps: int
+    frontier_task_step_floor: int
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -349,6 +468,7 @@ class DelegatedResourcePolicy:
             "command_timeout_seconds": self.command_timeout_seconds,
             "llm_timeout_seconds": self.llm_timeout_seconds,
             "max_steps": self.max_steps,
+            "frontier_task_step_floor": self.frontier_task_step_floor,
         }
 
     @classmethod
@@ -368,6 +488,7 @@ class DelegatedResourcePolicy:
             command_timeout_seconds=int(snapshot["command_timeout_seconds"]),
             llm_timeout_seconds=int(snapshot["llm_timeout_seconds"]),
             max_steps=int(snapshot["max_steps"]),
+            frontier_task_step_floor=int(config.frontier_task_step_floor),
         )
 
 
@@ -674,7 +795,7 @@ class DelegatedRuntimeController:
 
     def _read_payload(self) -> dict[str, object]:
         storage_config = _storage_config_for_path(self.runtime_state_path)
-        if storage_config is not None:
+        if storage_config is not None and storage_config.uses_sqlite_storage():
             payload = storage_config.sqlite_store().load_runtime_state(runtime_path=self.runtime_state_path)
             if payload:
                 return payload
@@ -687,7 +808,13 @@ class DelegatedRuntimeController:
                 "scheduler": {},
                 "history": [],
             }
-        raw = self.runtime_state_path.read_text(encoding="utf-8").strip()
+        with self.runtime_state_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         if not raw:
             return {
                 "spec_version": "asi_v1",
@@ -697,7 +824,10 @@ class DelegatedRuntimeController:
                 "scheduler": {},
                 "history": [],
             }
-        payload = json.loads(raw)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {}
         if not isinstance(payload, dict):
             return {
                 "spec_version": "asi_v1",
@@ -715,7 +845,7 @@ class DelegatedRuntimeController:
         storage_config = _storage_config_for_path(self.runtime_state_path)
         with self.runtime_state_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            if storage_config is not None:
+            if storage_config is not None and storage_config.uses_sqlite_storage():
                 payload = storage_config.sqlite_store().load_runtime_state(runtime_path=self.runtime_state_path)
             else:
                 handle.seek(0)
@@ -726,7 +856,7 @@ class DelegatedRuntimeController:
             try:
                 yield payload
             finally:
-                if storage_config is not None:
+                if storage_config is not None and storage_config.uses_sqlite_storage():
                     storage_config.sqlite_store().replace_runtime_state(
                         runtime_path=self.runtime_state_path,
                         payload=payload,
@@ -776,9 +906,15 @@ class DelegatedJobQueue:
         checkpoint_path: str = "",
         report_path: str = "",
         max_queued_jobs_for_budget_group: int = 0,
+        task_bank: TaskBank | None = None,
     ) -> DelegatedJob:
         with self._locked_jobs() as jobs:
-            normalized_budget_group = _budget_group(budget_group)
+            normalized_budget_group = _inferred_budget_group(
+                task_id=task_id,
+                budget_group=budget_group,
+                runtime_overrides=runtime_overrides,
+                task_bank=task_bank,
+            )
             if max_queued_jobs_for_budget_group > 0:
                 queued_in_group = sum(
                     1
@@ -827,7 +963,16 @@ class DelegatedJobQueue:
                 return job
         raise ValueError(f"unknown job_id: {job_id}")
 
-    def claim_next(self, *, exclude_job_ids: set[str] | None = None) -> DelegatedJob | None:
+    @staticmethod
+    def _resumable_in_progress(job: "DelegatedJob") -> bool:
+        return bool(job.state == "in_progress" and str(job.last_error).strip())
+
+    def claim_next(
+        self,
+        *,
+        exclude_job_ids: set[str] | None = None,
+        allow_in_progress: bool = False,
+    ) -> DelegatedJob | None:
         excluded = exclude_job_ids or set()
         with self._locked_jobs() as jobs:
             ordered_indices = sorted(range(len(jobs)), key=lambda index: self._claim_sort_key(jobs[index]))
@@ -853,7 +998,9 @@ class DelegatedJobQueue:
                     self._append_history(job, event="expired", detail="job deadline elapsed before execution")
                     jobs[index] = job
                     continue
-                if job.state in {"queued", "in_progress"}:
+                if job.state == "queued" or (
+                    allow_in_progress and self._resumable_in_progress(job)
+                ):
                     job.state = "in_progress"
                     job.started_at = job.started_at or _utcnow()
                     job.attempt_count += 1
@@ -866,7 +1013,7 @@ class DelegatedJobQueue:
                     return job
             return None
 
-    def claim(self, job_id: str) -> DelegatedJob | None:
+    def claim(self, job_id: str, *, allow_in_progress: bool = False) -> DelegatedJob | None:
         with self._locked_jobs() as jobs:
             for index, job in enumerate(jobs):
                 if job.job_id != job_id:
@@ -889,7 +1036,9 @@ class DelegatedJobQueue:
                     self._append_history(job, event="expired", detail="job deadline elapsed before execution")
                     jobs[index] = job
                     return None
-                if job.state in {"queued", "in_progress"}:
+                if job.state == "queued" or (
+                    allow_in_progress and self._resumable_in_progress(job)
+                ):
                     job.state = "in_progress"
                     job.started_at = job.started_at or _utcnow()
                     job.attempt_count += 1
@@ -1062,13 +1211,25 @@ class DelegatedJobQueue:
 
     def _load_jobs(self) -> list[DelegatedJob]:
         storage_config = _storage_config_for_path(self.queue_path)
-        if storage_config is not None:
+        if storage_config is not None and storage_config.uses_sqlite_storage():
             raw_jobs = storage_config.sqlite_store().load_job_queue(queue_path=self.queue_path)
             if raw_jobs:
                 return [DelegatedJob.from_dict(job) for job in raw_jobs if isinstance(job, dict)]
         if not self.queue_path.exists():
             return []
-        payload = json.loads(self.queue_path.read_text(encoding="utf-8"))
+        with self.queue_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
         if not isinstance(payload, dict):
             return []
         raw_jobs = payload.get("jobs", [])
@@ -1077,14 +1238,15 @@ class DelegatedJobQueue:
         return [DelegatedJob.from_dict(job) for job in raw_jobs if isinstance(job, dict)]
 
     def _write_jobs(self, jobs: list[DelegatedJob]) -> None:
+        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        storage_config = _storage_config_for_path(self.queue_path)
+        _prune_terminal_jobs(jobs, storage_config)
         payload = {
             "spec_version": "asi_v1",
             "queue_kind": "delegated_job_queue",
             "jobs": [job.to_dict() for job in jobs],
         }
-        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
-        storage_config = _storage_config_for_path(self.queue_path)
-        if storage_config is not None:
+        if storage_config is not None and storage_config.uses_sqlite_storage():
             storage_config.sqlite_store().replace_job_queue(
                 queue_path=self.queue_path,
                 jobs=list(payload["jobs"]),
@@ -1099,7 +1261,7 @@ class DelegatedJobQueue:
         storage_config = _storage_config_for_path(self.queue_path)
         with self.queue_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            if storage_config is not None:
+            if storage_config is not None and storage_config.uses_sqlite_storage():
                 raw_jobs = storage_config.sqlite_store().load_job_queue(queue_path=self.queue_path)
             else:
                 handle.seek(0)
@@ -1112,12 +1274,13 @@ class DelegatedJobQueue:
             try:
                 yield jobs
             finally:
+                _prune_terminal_jobs(jobs, storage_config)
                 persisted = {
                     "spec_version": "asi_v1",
                     "queue_kind": "delegated_job_queue",
                     "jobs": [job.to_dict() for job in jobs],
                 }
-                if storage_config is not None:
+                if storage_config is not None and storage_config.uses_sqlite_storage():
                     storage_config.sqlite_store().replace_job_queue(
                         queue_path=self.queue_path,
                         jobs=list(persisted["jobs"]),
@@ -1154,6 +1317,31 @@ def delegated_job_paths(config: KernelConfig, job: DelegatedJob) -> tuple[Path, 
     return checkpoint_path, report_path
 
 
+def delegated_job_progress_path(config: KernelConfig, job: DelegatedJob) -> Path:
+    checkpoint_path, _ = delegated_job_paths(config, job)
+    return checkpoint_path.with_name(f"{checkpoint_path.stem}.progress.json")
+
+
+def _write_delegated_job_progress(
+    progress_path: Path,
+    *,
+    config: KernelConfig,
+    job_id: str,
+    task_id: str,
+    payload: dict[str, object],
+) -> None:
+    record = {
+        "recorded_at": _utcnow(),
+        "job_id": job_id,
+        "task_id": task_id,
+    }
+    record.update(dict(payload))
+    try:
+        atomic_write_json(progress_path, record, config=config, govern_storage=False)
+    except OSError:
+        return
+
+
 def enqueue_with_parallel_worker_decomposition(
     queue: DelegatedJobQueue,
     *,
@@ -1182,6 +1370,7 @@ def enqueue_with_parallel_worker_decomposition(
                 notes=notes,
                 runtime_overrides=parent_overrides,
                 max_queued_jobs_for_budget_group=max_queued_jobs_for_budget_group,
+                task_bank=bank,
             )
         ]
     enqueued: list[DelegatedJob] = []
@@ -1208,6 +1397,7 @@ def enqueue_with_parallel_worker_decomposition(
             notes=worker_notes,
             runtime_overrides=worker_runtime_overrides,
             max_queued_jobs_for_budget_group=max_queued_jobs_for_budget_group,
+            task_bank=bank,
         )
         enqueued.append(worker_job)
         dependency_job_ids.append(worker_job.job_id)
@@ -1228,6 +1418,7 @@ def enqueue_with_parallel_worker_decomposition(
             notes=integrator_notes,
             runtime_overrides=integrator_overrides,
             max_queued_jobs_for_budget_group=max_queued_jobs_for_budget_group,
+            task_bank=bank,
         )
     )
     return enqueued
@@ -1282,6 +1473,9 @@ def _config_for_job(base_config: KernelConfig, job: DelegatedJob) -> KernelConfi
         if hasattr(config, field):
             setattr(config, field, value)
     for field, value in job.runtime_overrides.items():
+        if field == "task_step_floor":
+            config.frontier_task_step_floor = max(1, int(value))
+            continue
         if not hasattr(config, field):
             continue
         current = getattr(config, field)
@@ -1504,11 +1698,24 @@ def run_next_delegated_job(
         resolved_config.delegated_job_runtime_state_path
     )
     while True:
+        runtime_snapshot = controller.snapshot(config=resolved_config)
+        active_lease_job_ids = {
+            str(lease.get("job_id", "")).strip()
+            for lease in runtime_snapshot.get("active_leases", [])
+            if isinstance(lease, dict) and str(lease.get("job_id", "")).strip()
+        }
         raw_candidates = queue.list_jobs(states={"queued", "in_progress", "cancel_requested"})
-        prepared_candidates: list[tuple[DelegatedJob, KernelConfig, Any, Any, bool]] = []
+        prepared_candidates: list[tuple[DelegatedJob, KernelConfig, Any, Any, bool, bool]] = []
         repo = repo_root or Path(__file__).resolve().parents[1]
         for candidate in raw_candidates:
             if candidate.job_id in attempted_budget_blocked | attempted_dependency_blocked | attempted_preflight_blocked:
+                continue
+            resumable = bool(
+                candidate.state == "in_progress"
+                and candidate.job_id not in active_lease_job_ids
+                and DelegatedJobQueue._resumable_in_progress(candidate)
+            )
+            if candidate.state == "in_progress" and not resumable:
                 continue
             candidate_config = _config_for_job(resolved_config, candidate)
             candidate_task = resolve_job_task(bank, candidate)
@@ -1529,6 +1736,7 @@ def run_next_delegated_job(
                     candidate_task,
                     candidate_runtime_task,
                     bool(str(workflow_guard.get("worker_branch", "")).strip()),
+                    resumable,
                 )
             )
         prepared_candidates.sort(
@@ -1540,8 +1748,12 @@ def run_next_delegated_job(
         runtime_task = None
         preflight = None
         starvation_candidates: list[tuple[DelegatedJob, KernelConfig, Any, Any, bool]] = []
-        scheduler_state = controller.scheduler_state()
-        for candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job in prepared_candidates:
+        scheduler_state = (
+            dict(runtime_snapshot.get("scheduler", {}))
+            if isinstance(runtime_snapshot.get("scheduler", {}), dict)
+            else {}
+        )
+        for candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job, resumable in prepared_candidates:
             config = candidate_config
             task = candidate_task
             dependencies_ready, dependency_reason = delegated_job_dependency_status(queue, candidate)
@@ -1588,7 +1800,7 @@ def run_next_delegated_job(
                     ),
                 )
                 starvation_candidates.append(
-                    (candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job)
+                    (candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job, resumable)
                 )
                 preflight = None
                 continue
@@ -1598,7 +1810,7 @@ def run_next_delegated_job(
                     decision="ready:runnable",
                     detail=f"priority={candidate.priority}",
                 )
-            claimed_job = queue.claim(candidate.job_id)
+            claimed_job = queue.claim(candidate.job_id, allow_in_progress=resumable)
             if claimed_job is None:
                 preflight = None
                 task = None
@@ -1627,7 +1839,7 @@ def run_next_delegated_job(
             queue.record_scheduler_decision(candidate.job_id, decision=decision, detail=f"priority={candidate.priority}")
             break
         if claimed_job is None and starvation_candidates:
-            for candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job in starvation_candidates:
+            for candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job, resumable in starvation_candidates:
                 config = candidate_config
                 task = candidate_task
                 runtime_task = candidate_runtime_task
@@ -1637,7 +1849,7 @@ def run_next_delegated_job(
                         decision="ready:runnable",
                         detail=f"priority={candidate.priority}",
                     )
-                claimed_job = queue.claim(candidate.job_id)
+                claimed_job = queue.claim(candidate.job_id, allow_in_progress=resumable)
                 if claimed_job is None:
                     continue
                 workflow_guard = (
@@ -1667,6 +1879,7 @@ def run_next_delegated_job(
 
         job = claimed_job
         checkpoint_path, report_path = delegated_job_paths(config, job)
+        progress_path = delegated_job_progress_path(config, job)
         queue.set_paths(job.job_id, checkpoint_path=checkpoint_path, report_path=report_path)
         controller = runtime_controller or DelegatedRuntimeController(config.delegated_job_runtime_state_path)
         lease, denied_reason = controller.acquire(
@@ -1708,6 +1921,16 @@ def run_next_delegated_job(
         release_detail = "delegated job did not reach a terminal state"
         final_job: DelegatedJob | None = None
         try:
+            _write_delegated_job_progress(
+                progress_path,
+                config=config,
+                job_id=job.job_id,
+                task_id=runtime_task.task_id,
+                payload={
+                    "event": "delegated_job_started",
+                    "step_stage": "setup_pending",
+                },
+            )
             if enforce_preflight and preflight is None:
                 preflight = run_unattended_preflight(config, runtime_task, repo_root=repo)
                 if not preflight.passed:
@@ -1769,6 +1992,13 @@ def run_next_delegated_job(
                         resume=checkpoint_path.exists(),
                         runtime_overrides=job.runtime_overrides,
                         job_id=job.job_id,
+                        progress_callback=lambda payload: _write_delegated_job_progress(
+                            progress_path,
+                            config=config,
+                            job_id=job.job_id,
+                            task_id=runtime_task.task_id,
+                            payload=payload,
+                        ),
                     )
             except KeyboardInterrupt as exc:
                 release_state = "in_progress"
@@ -1877,6 +2107,18 @@ def run_next_delegated_job(
                 outcome=outcome,
                 outcome_reasons=outcome_reasons,
                 last_error=last_error,
+            )
+            _write_delegated_job_progress(
+                progress_path,
+                config=config,
+                job_id=job.job_id,
+                task_id=runtime_task.task_id,
+                payload={
+                    "event": "delegated_job_finished",
+                    "terminal_state": terminal_state,
+                    "outcome": outcome,
+                    "outcome_reasons": list(outcome_reasons),
+                },
             )
             return final_job
         finally:

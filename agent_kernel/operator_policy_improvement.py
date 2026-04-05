@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from .config import KernelConfig
+from .improvement_catalog import catalog_string_list
 from .improvement_common import (
     build_standard_proposal_artifact,
     ensure_proposals,
@@ -16,18 +17,8 @@ from .improvement_common import (
 )
 
 
-_DEFAULT_FAMILIES = [
-    "bounded",
-    "micro",
-    "workflow",
-    "project",
-    "repository",
-    "repo_chore",
-    "repo_sandbox",
-    "tooling",
-    "integration",
-]
-_DEFAULT_GENERATED_PREFIXES = ["build", "dist", "generated", "reports", "tmp"]
+_DEFAULT_FAMILIES = catalog_string_list("operator_policy", "default_families")
+_DEFAULT_GENERATED_PREFIXES = catalog_string_list("operator_policy", "default_generated_prefixes")
 
 
 def operator_policy_controls(

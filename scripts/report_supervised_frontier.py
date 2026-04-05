@@ -12,6 +12,8 @@ import json
 from datetime import datetime, timezone
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.improvement import artifact_retrieval_reuse_evidence, tool_shared_repo_bundle_evidence
+from agent_kernel.runtime_supervision import atomic_write_json
 
 
 def _load_cycle_records(path: Path, *, config: KernelConfig | None = None) -> list[dict[str, object]]:
@@ -84,12 +86,177 @@ def _safe_float(value: object) -> float:
         return 0.0
 
 
+def _followup_summary_metrics(observe_metrics: dict[str, object], kind: str) -> tuple[int, int]:
+    followups = observe_metrics.get("observation_curriculum_followups", [])
+    if not isinstance(followups, list):
+        return 0, 0
+    for item in followups:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "")).strip() != kind:
+            continue
+        return (
+            int(item.get("generated_total", 0) or 0),
+            int(item.get("generated_passed", 0) or 0),
+        )
+    return 0, 0
+
+
 def _candidate_sha256(path: Path) -> str:
     try:
         data = path.read_bytes()
     except OSError:
         return ""
     return sha256(data).hexdigest()
+
+
+def _load_json_object(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _difficulty_slice(metrics: dict[str, object], field: str, difficulty: str) -> dict[str, object]:
+    payload = metrics.get(field, {})
+    if not isinstance(payload, dict):
+        return {}
+    item = payload.get(difficulty, {})
+    return dict(item) if isinstance(item, dict) else {}
+
+
+def _benchmark_family_slice(metrics: dict[str, object], field: str, family: str) -> dict[str, object]:
+    payload = metrics.get(field, {})
+    if not isinstance(payload, dict):
+        return {}
+    item = payload.get(family, {})
+    return dict(item) if isinstance(item, dict) else {}
+
+
+def _observed_benchmark_families(observe_metrics: dict[str, object]) -> list[str]:
+    families: set[str] = set()
+    for field in (
+        "total_by_benchmark_family",
+        "passed_by_benchmark_family",
+        "generated_by_benchmark_family",
+        "generated_passed_by_benchmark_family",
+        "total_by_origin_benchmark_family",
+        "passed_by_origin_benchmark_family",
+        "generated_by_origin_benchmark_family",
+        "generated_passed_by_origin_benchmark_family",
+        "proposal_metrics_by_benchmark_family",
+        "world_feedback_by_benchmark_family",
+    ):
+        payload = observe_metrics.get(field, {})
+        if not isinstance(payload, dict):
+            continue
+        for family in payload:
+            normalized = str(family).strip()
+            if normalized:
+                families.add(normalized)
+    return sorted(families)
+
+
+def _long_horizon_summary(observe_metrics: dict[str, object]) -> dict[str, object]:
+    difficulty = "long_horizon"
+    total_by_difficulty = observe_metrics.get("total_by_difficulty", {})
+    passed_by_difficulty = observe_metrics.get("passed_by_difficulty", {})
+    total = int(total_by_difficulty.get(difficulty, 0) or 0) if isinstance(total_by_difficulty, dict) else 0
+    passed = int(passed_by_difficulty.get(difficulty, 0) or 0) if isinstance(passed_by_difficulty, dict) else 0
+    proposal = _difficulty_slice(observe_metrics, "proposal_metrics_by_difficulty", difficulty)
+    world_feedback = _difficulty_slice(observe_metrics, "world_feedback_by_difficulty", difficulty)
+    if total <= 0 and not proposal and not world_feedback:
+        return {}
+    world_feedback_summary = {
+        key: value
+        for key, value in world_feedback.items()
+        if key
+        in {
+            "step_count",
+            "progress_calibration_mae",
+            "risk_calibration_mae",
+            "decoder_progress_calibration_mae",
+            "decoder_risk_calibration_mae",
+        }
+    }
+    return {
+        "difficulty": difficulty,
+        "task_count": total,
+        "passed": passed,
+        "pass_rate": round((float(passed) / float(total)) if total > 0 else 0.0, 4),
+        "proposal_selected_steps": int(proposal.get("proposal_selected_steps", 0) or 0),
+        "novel_valid_command_steps": int(proposal.get("novel_valid_command_steps", 0) or 0),
+        "novel_valid_command_rate": round(float(proposal.get("novel_valid_command_rate", 0.0) or 0.0), 4),
+        "world_feedback_step_count": int(world_feedback.get("step_count", 0) or 0),
+        "world_feedback": world_feedback_summary,
+    }
+
+
+def _benchmark_family_summary(observe_metrics: dict[str, object], family: str) -> dict[str, object]:
+    total_by_family = observe_metrics.get("total_by_benchmark_family", {})
+    passed_by_family = observe_metrics.get("passed_by_benchmark_family", {})
+    generated_by_family = observe_metrics.get("generated_by_benchmark_family", {})
+    generated_passed_by_family = observe_metrics.get("generated_passed_by_benchmark_family", {})
+    primary_total = int(total_by_family.get(family, 0) or 0) if isinstance(total_by_family, dict) else 0
+    primary_passed = int(passed_by_family.get(family, 0) or 0) if isinstance(passed_by_family, dict) else 0
+    generated_total = int(generated_by_family.get(family, 0) or 0) if isinstance(generated_by_family, dict) else 0
+    generated_passed = (
+        int(generated_passed_by_family.get(family, 0) or 0) if isinstance(generated_passed_by_family, dict) else 0
+    )
+    proposal = _benchmark_family_slice(observe_metrics, "proposal_metrics_by_benchmark_family", family)
+    world_feedback = _benchmark_family_slice(observe_metrics, "world_feedback_by_benchmark_family", family)
+    if primary_total <= 0 and generated_total <= 0 and not proposal and not world_feedback:
+        return {}
+    world_feedback_summary = {
+        key: value
+        for key, value in world_feedback.items()
+        if key
+        in {
+            "step_count",
+            "progress_calibration_mae",
+            "risk_calibration_mae",
+            "decoder_progress_calibration_mae",
+            "decoder_risk_calibration_mae",
+        }
+    }
+    return {
+        "benchmark_family": family,
+        "primary_task_count": primary_total,
+        "primary_passed": primary_passed,
+        "primary_pass_rate": round((float(primary_passed) / float(primary_total)) if primary_total > 0 else 0.0, 4),
+        "generated_task_count": generated_total,
+        "generated_passed": generated_passed,
+        "generated_pass_rate": round(
+            (float(generated_passed) / float(generated_total)) if generated_total > 0 else 0.0,
+            4,
+        ),
+        "proposal_selected_steps": int(proposal.get("proposal_selected_steps", 0) or 0),
+        "novel_valid_command_steps": int(proposal.get("novel_valid_command_steps", 0) or 0),
+        "novel_valid_command_rate": round(float(proposal.get("novel_valid_command_rate", 0.0) or 0.0), 4),
+        "world_feedback_step_count": int(world_feedback.get("step_count", 0) or 0),
+        "world_feedback": world_feedback_summary,
+    }
+
+
+def _validation_family_compare_guard_reasons(summary: dict[str, object]) -> list[str]:
+    if not isinstance(summary, dict) or not summary:
+        return []
+    reasons: list[str] = []
+    primary_task_count = int(summary.get("primary_task_count", 0) or 0)
+    generated_task_count = int(summary.get("generated_task_count", 0) or 0)
+    world_feedback_step_count = int(summary.get("world_feedback_step_count", 0) or 0)
+    if primary_task_count > 0:
+        reasons.append("validation_family_pass_rate_regressed")
+    if generated_task_count > 0:
+        reasons.append("validation_family_generated_pass_rate_regressed")
+    if primary_task_count + generated_task_count > 0:
+        reasons.append("validation_family_novel_command_rate_regressed")
+    if world_feedback_step_count > 0:
+        reasons.append("validation_family_world_feedback_regressed")
+    return reasons
 
 
 def _state_rank(state: str) -> int:
@@ -149,11 +316,53 @@ def _scope_summary(*, cycles_path: Path, config: KernelConfig) -> dict[str, obje
     candidate_path = Path(candidate_artifact_path) if candidate_artifact_path else None
     candidate_exists = bool(candidate_path and candidate_path.exists())
     candidate_digest = _candidate_sha256(candidate_path) if candidate_path is not None and candidate_exists else ""
-    observation_timed_out = bool(
-        observe_metrics.get("observation_timed_out", False) or observe_metrics.get("observation_budget_exceeded", False)
+    candidate_payload = (
+        _load_json_object(candidate_path)
+        if candidate_exists and selected_subsystem in {"skills", "tooling"}
+        else {}
     )
+    observed_benchmark_families = _observed_benchmark_families(observe_metrics)
+    long_horizon_summary = _long_horizon_summary(observe_metrics)
+    validation_family_summary = _benchmark_family_summary(observe_metrics, "validation")
+    validation_family_compare_guard_reasons = _validation_family_compare_guard_reasons(validation_family_summary)
+    retrieval_reuse_summary = (
+        artifact_retrieval_reuse_evidence(candidate_payload, subsystem=selected_subsystem)
+        if isinstance(candidate_payload, dict) and candidate_payload
+        else {}
+    )
+    shared_repo_bundle_summary = (
+        tool_shared_repo_bundle_evidence(candidate_payload)
+        if selected_subsystem == "tooling" and isinstance(candidate_payload, dict) and candidate_payload
+        else {}
+    )
+    observation_timed_out = bool(observe_metrics.get("observation_timed_out", False))
+    observation_budget_exceeded = bool(observe_metrics.get("observation_budget_exceeded", False))
+    primary_total = int(observe_metrics.get("total", 0) or 0)
+    primary_passed = int(observe_metrics.get("passed", 0) or 0)
+    generated_total = int(observe_metrics.get("generated_total", 0) or 0)
+    generated_passed = int(observe_metrics.get("generated_passed", 0) or 0)
+    generated_success_total, generated_success_passed = _followup_summary_metrics(
+        observe_metrics,
+        "generated_success",
+    )
+    generated_failure_total, generated_failure_passed = _followup_summary_metrics(
+        observe_metrics,
+        "generated_failure",
+    )
+    if generated_total <= 0 and generated_success_total > 0:
+        generated_total = generated_success_total
+    if generated_passed <= 0 and generated_success_passed > 0:
+        generated_passed = generated_success_passed
+    observation_returncode = int(observe_metrics.get("observation_returncode", 0) or 0)
+    run_completed = bool(observe_record)
+    process_succeeded = bool(run_completed and observation_returncode == 0 and not observation_timed_out)
+    healthy_run = bool(process_succeeded and not str(observe_metrics.get("observation_warning", "")).strip())
+    status = str(latest.get("state", "")).strip() or "unknown"
+    if run_completed:
+        status = "healthy" if healthy_run else ("completed_with_warnings" if process_succeeded else "failed")
     return {
         "scope_id": scope_id,
+        "scope_label": scope_id,
         "cycles_path": str(cycles_path),
         "cycle_id": str(latest.get("cycle_id", "")).strip(),
         "protocol": str(
@@ -169,14 +378,35 @@ def _scope_summary(*, cycles_path: Path, config: KernelConfig) -> dict[str, obje
         "selected_subsystem": selected_subsystem,
         "selected_variant_id": selected_variant_id,
         "last_state": str(latest.get("state", "")).strip(),
+        "status": status,
+        "run_completed": run_completed,
+        "run_succeeded": process_succeeded,
+        "process_succeeded": process_succeeded,
+        "healthy_run": healthy_run,
+        "observation_returncode": observation_returncode,
         "generated_candidate": bool(generate_record) and bool(candidate_artifact_path),
         "candidate_artifact_path": candidate_artifact_path,
         "candidate_exists": candidate_exists,
         "candidate_sha256": candidate_digest,
+        "observed_benchmark_families": observed_benchmark_families,
+        "long_horizon_summary": long_horizon_summary,
+        "validation_family_summary": validation_family_summary,
+        "validation_family_compare_guard_reasons": validation_family_compare_guard_reasons,
+        "retrieval_reuse_summary": retrieval_reuse_summary,
+        "shared_repo_bundle_summary": shared_repo_bundle_summary,
         "candidate_artifact_kind": str(
             generate_record.get("artifact_kind", "") or latest.get("artifact_kind", "")
         ).strip(),
+        "primary_total": primary_total,
+        "primary_passed": primary_passed,
+        "primary_pass_rate": _safe_float(observe_metrics.get("pass_rate", 0.0)),
+        "generated_success_total": generated_total,
+        "generated_success_passed": generated_passed,
+        "generated_success_pass_rate": _safe_float(observe_metrics.get("generated_pass_rate", 0.0)),
+        "generated_failure_total": generated_failure_total,
+        "generated_failure_passed": generated_failure_passed,
         "observation_timed_out": observation_timed_out,
+        "observation_budget_exceeded": observation_budget_exceeded,
         "observation_warning": str(observe_metrics.get("observation_warning", "")).strip(),
         "observation_elapsed_seconds": _safe_float(observe_metrics.get("observation_elapsed_seconds", 0.0)),
         "observation_timeout_budget_source": str(
@@ -237,12 +467,70 @@ def _summary_payload(runs: list[dict[str, object]], frontier: list[dict[str, obj
         for run in runs
         if str(run.get("observation_timeout_budget_source", "")).strip()
     )
+    validation_compare_guard_counter = Counter(
+        str(reason).strip()
+        for run in runs
+        for reason in (run.get("validation_family_compare_guard_reasons", []) if isinstance(run.get("validation_family_compare_guard_reasons", []), list) else [])
+        if str(reason).strip()
+    )
+    retrieval_reuse_runs = [
+        run for run in runs if isinstance(run.get("retrieval_reuse_summary", {}), dict) and run.get("retrieval_reuse_summary")
+    ]
+    validation_runs = [
+        run for run in runs if isinstance(run.get("validation_family_summary", {}), dict) and run.get("validation_family_summary")
+    ]
     return {
         "scoped_run_count": len(runs),
+        "completed_runs": sum(1 for run in runs if bool(run.get("run_completed", False))),
+        "successful_runs": sum(1 for run in runs if bool(run.get("process_succeeded", False))),
+        "healthy_runs": sum(1 for run in runs if bool(run.get("healthy_run", False))),
+        "warning_runs": sum(
+            1
+            for run in runs
+            if bool(run.get("process_succeeded", False)) and not bool(run.get("healthy_run", False))
+        ),
+        "primary_passed_runs": sum(1 for run in runs if int(run.get("primary_passed", 0) or 0) > 0),
+        "generated_success_runs": sum(1 for run in runs if int(run.get("generated_success_passed", 0) or 0) > 0),
+        "generated_failure_runs": sum(1 for run in runs if int(run.get("generated_failure_passed", 0) or 0) > 0),
+        "primary_total": sum(int(run.get("primary_total", 0) or 0) for run in runs),
+        "primary_passed": sum(int(run.get("primary_passed", 0) or 0) for run in runs),
+        "generated_success_total": sum(int(run.get("generated_success_total", 0) or 0) for run in runs),
+        "generated_success_passed": sum(int(run.get("generated_success_passed", 0) or 0) for run in runs),
+        "generated_failure_total": sum(int(run.get("generated_failure_total", 0) or 0) for run in runs),
+        "generated_failure_passed": sum(int(run.get("generated_failure_passed", 0) or 0) for run in runs),
         "frontier_candidate_count": len(frontier),
         "generated_candidate_runs": sum(1 for run in runs if bool(run.get("generated_candidate", False))),
         "timed_out_runs": sum(1 for run in runs if bool(run.get("observation_timed_out", False))),
+        "budget_exceeded_runs": sum(1 for run in runs if bool(run.get("observation_budget_exceeded", False))),
         "deduped_runs": sum(int(item.get("duplicate_count", 0) or 0) for item in frontier),
+        "retrieval_reuse_runs": len(retrieval_reuse_runs),
+        "retrieval_backed_procedure_total": sum(
+            int(((run.get("retrieval_reuse_summary", {}) or {}).get("retrieval_backed_procedure_count", 0) or 0))
+            for run in retrieval_reuse_runs
+        ),
+        "trusted_retrieval_procedure_total": sum(
+            int(((run.get("retrieval_reuse_summary", {}) or {}).get("trusted_retrieval_procedure_count", 0) or 0))
+            for run in retrieval_reuse_runs
+        ),
+        "verified_retrieval_command_total": sum(
+            int(((run.get("retrieval_reuse_summary", {}) or {}).get("verified_retrieval_command_count", 0) or 0))
+            for run in retrieval_reuse_runs
+        ),
+        "validation_family_runs": len(validation_runs),
+        "validation_generated_runs": sum(
+            1
+            for run in validation_runs
+            if int(((run.get("validation_family_summary", {}) or {}).get("generated_task_count", 0) or 0)) > 0
+        ),
+        "validation_generated_total": sum(
+            int(((run.get("validation_family_summary", {}) or {}).get("generated_task_count", 0) or 0))
+            for run in validation_runs
+        ),
+        "validation_generated_passed": sum(
+            int(((run.get("validation_family_summary", {}) or {}).get("generated_passed", 0) or 0))
+            for run in validation_runs
+        ),
+        "validation_family_compare_guard_reason_counts": dict(sorted(validation_compare_guard_counter.items())),
         "subsystems": dict(sorted(subsystem_counter.items())),
         "timeout_budget_sources": dict(sorted(timeout_source_counter.items())),
     }
@@ -300,8 +588,7 @@ def main() -> None:
         "frontier_candidates": frontier,
         "scoped_runs": sorted(runs, key=_frontier_sort_key),
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output_path, payload, config=config)
     print(output_path)
 
 

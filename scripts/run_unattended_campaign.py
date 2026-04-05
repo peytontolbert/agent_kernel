@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import selectors
@@ -22,6 +23,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.curriculum_improvement import retained_curriculum_controls
 from agent_kernel.runtime_supervision import (
     append_jsonl,
     atomic_write_json,
@@ -60,6 +62,19 @@ _PRIORITY_BENCHMARK_FAMILY_ORDER = (
     "repo_chore",
     "repo_sandbox",
 )
+_REPO_SETTING_FAMILY_NEIGHBOR_WEIGHTS: dict[str, dict[str, float]] = {
+    "project": {"repository": 0.45},
+    "repository": {"project": 0.45, "workflow": 0.65},
+    "workflow": {"repository": 0.55, "tooling": 0.75},
+    "tooling": {"workflow": 0.75, "integration": 0.7},
+    "integration": {"tooling": 0.7, "repo_chore": 0.55},
+    "repo_chore": {"integration": 0.55, "validation": 0.65},
+    "validation": {"repo_chore": 0.65, "governance": 0.7},
+    "governance": {"validation": 0.7, "oversight": 0.7},
+    "oversight": {"governance": 0.7, "assurance": 0.7},
+    "assurance": {"oversight": 0.7, "adjudication": 0.65},
+    "adjudication": {"assurance": 0.65},
+}
 _PRIORITY_FAMILY_LOW_RETURN_MIN_DECISIONS = 2
 _PRIORITY_FAMILY_LOW_RETURN_MIN_ESTIMATED_COST = 4.0
 _PRIORITY_FAMILY_EXPLORATION_WEIGHT = 0.05
@@ -69,8 +84,8 @@ def _progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def _write_report(report_path: Path, payload: dict[str, object]) -> None:
-    atomic_write_json(report_path, payload)
+def _write_report(report_path: Path, payload: dict[str, object], *, config: KernelConfig | None = None) -> None:
+    atomic_write_json(report_path, payload, config=config)
 
 
 def _cleanup_bootstrap_artifacts(paths: list[Path]) -> None:
@@ -82,9 +97,35 @@ def _cleanup_bootstrap_artifacts(paths: list[Path]) -> None:
             continue
 
 
-def _write_status(status_path: Path | None, *, report_path: Path, payload: dict[str, object]) -> None:
+def _write_status(
+    status_path: Path | None,
+    *,
+    report_path: Path,
+    payload: dict[str, object],
+    config: KernelConfig | None = None,
+) -> None:
     if status_path is None:
         return
+    existing_status: dict[str, object] = {}
+    if status_path.exists():
+        try:
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            persisted = {}
+        if isinstance(persisted, dict):
+            existing_status = persisted
+    active_run = payload.get("active_run", {})
+    if not isinstance(active_run, dict):
+        active_run = {}
+    existing_active_run = existing_status.get("active_run", {})
+    if isinstance(existing_active_run, dict):
+        active_run = {
+            **existing_active_run,
+            **active_run,
+        }
+    active_run_policy = active_run.get("policy")
+    if not isinstance(active_run_policy, dict):
+        active_run_policy = None
     active_child = payload.get("active_child", {})
     cleanup = payload.get("cleanup", {})
     preflight = payload.get("preflight", {})
@@ -132,6 +173,13 @@ def _write_status(status_path: Path | None, *, report_path: Path, payload: dict[
         "child_failure_recovery_budget": int(payload.get("child_failure_recovery_budget", 0) or 0),
         "child_failure_recoveries_used": int(payload.get("child_failure_recoveries_used", 0) or 0),
         "current_policy": payload.get("current_policy", {}),
+        "active_run_policy": active_run_policy,
+        "active_run": active_run,
+        "requested_priority_benchmark_families": _normalize_benchmark_families(
+            payload.get("current_policy", {}).get("priority_benchmark_families", [])
+            if isinstance(payload.get("current_policy", {}), dict)
+            else []
+        ),
         "policy_shift_summary": payload.get("policy_shift_summary", {}),
         "policy_shift_alert_subscriptions": policy_shift_subscriptions,
         "latest_round_policy_shift_rationale": latest_round.get("policy_shift_rationale", {})
@@ -157,7 +205,15 @@ def _write_status(status_path: Path | None, *, report_path: Path, payload: dict[
         "lock_path": str(payload.get("lock_path", "")).strip(),
         "event_log_path": str(payload.get("event_log_path", "")).strip(),
     }
-    atomic_write_json(status_path, status_payload)
+    for key in (
+        "families_sampled",
+        "families_never_sampled",
+        "pressure_families_without_sampling",
+        "partial_frontier_expansion_summary",
+    ):
+        if key in existing_status and key not in status_payload:
+            status_payload[key] = existing_status[key]
+    atomic_write_json(status_path, status_payload, config=config)
 
 
 def _normalize_benchmark_families(values: object) -> list[str]:
@@ -194,6 +250,47 @@ def _load_retained_improvement_planner_controls(config: KernelConfig) -> dict[st
     except (OSError, json.JSONDecodeError):
         return {}
     return retained_improvement_planner_controls(payload)
+
+
+def _load_retained_curriculum_controls(config: KernelConfig) -> dict[str, object]:
+    if not bool(getattr(config, "use_curriculum_proposals", True)):
+        return {}
+    path = getattr(config, "curriculum_proposals_path", None)
+    if not isinstance(path, Path) or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return retained_curriculum_controls(payload)
+
+
+def _curriculum_control_family_signal_pairs(
+    controls: dict[str, object] | None,
+    field: str,
+) -> list[tuple[str, str]]:
+    payload = controls if isinstance(controls, dict) else {}
+    raw_values = payload.get(field, [])
+    if isinstance(raw_values, str):
+        values = [raw_values]
+    elif isinstance(raw_values, list):
+        values = [str(value) for value in raw_values]
+    else:
+        values = []
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        family, _, signal = str(value).strip().partition(":")
+        normalized_family = family.strip()
+        normalized_signal = signal.strip().lower()
+        if not normalized_family or not normalized_signal:
+            continue
+        pair = (normalized_family, normalized_signal)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
 
 
 def _planner_control_float(
@@ -238,6 +335,7 @@ def _select_priority_benchmark_families(
     missing_required_families: object,
     current_priority_families: object,
     ranked_priority_families: object | None = None,
+    repo_setting_priority_families: object | None = None,
     priority_family_selection_scores: dict[str, object] | None = None,
     min_selection_score: float = 0.0,
     productive_priority_families: object | None = None,
@@ -263,6 +361,11 @@ def _select_priority_benchmark_families(
         family for family in _rank_priority_benchmark_families(low_return_priority_families or []) if family not in productive_set
     ]
     low_return_set = set(ranked_low_return)
+    ranked_repo_setting = [
+        family
+        for family in _rank_priority_benchmark_families(repo_setting_priority_families or [])
+        if family not in productive_set and family not in low_return_set
+    ]
     ranked_under_sampled = [
         family
         for family in _rank_priority_benchmark_families(under_sampled_priority_families or [])
@@ -279,6 +382,7 @@ def _select_priority_benchmark_families(
     ]
     selected: list[str] = []
     for family in [
+        *ranked_repo_setting,
         *ranked_priority,
         *ranked_under_sampled,
         *ranked_required_without_productive,
@@ -297,12 +401,33 @@ def _select_priority_benchmark_families(
     return selected
 
 
+def _repo_setting_focus_priority_families(
+    *,
+    current_priority_families: object,
+    ranked_priority_families: object | None = None,
+    frontier_repo_setting_families: object | None = None,
+    missing_required_families: object | None = None,
+) -> list[str]:
+    selected: list[str] = []
+    for families in (
+        frontier_repo_setting_families,
+        missing_required_families,
+        ranked_priority_families,
+        current_priority_families,
+    ):
+        for family in _rank_priority_benchmark_families(families):
+            if family not in selected:
+                selected.append(family)
+    return selected
+
+
 def _priority_family_history_summary(
     *,
     prior_rounds: list[dict[str, object]],
     current_campaign_report: dict[str, object],
     current_priority_families: object,
     planner_controls: dict[str, object] | None = None,
+    curriculum_controls: dict[str, object] | None = None,
 ) -> dict[str, object]:
     def _empty_summary() -> dict[str, object]:
         return {
@@ -404,6 +529,29 @@ def _priority_family_history_summary(
             priority_families.append(family)
         family_summaries.setdefault(family, _empty_summary())
     resolved_planner_controls = planner_controls if isinstance(planner_controls, dict) else {}
+    resolved_curriculum_controls = curriculum_controls if isinstance(curriculum_controls, dict) else {}
+    frontier_failure_motif_pairs = _curriculum_control_family_signal_pairs(
+        resolved_curriculum_controls,
+        "frontier_failure_motif_priority_pairs",
+    )
+    frontier_repo_setting_pairs = _curriculum_control_family_signal_pairs(
+        resolved_curriculum_controls,
+        "frontier_repo_setting_priority_pairs",
+    )
+    frontier_failure_motif_counts: dict[str, int] = {}
+    for family, _ in frontier_failure_motif_pairs:
+        frontier_failure_motif_counts[family] = frontier_failure_motif_counts.get(family, 0) + 1
+    frontier_repo_setting_counts: dict[str, int] = {}
+    for family, _ in frontier_repo_setting_pairs:
+        frontier_repo_setting_counts[family] = frontier_repo_setting_counts.get(family, 0) + 1
+    failure_motif_selection_bonus_scale = min(
+        0.2,
+        0.01 * max(1, int(resolved_curriculum_controls.get("frontier_failure_motif_bonus", 0) or 0)),
+    )
+    repo_setting_selection_bonus_scale = min(
+        0.25,
+        0.01 * max(1, int(resolved_curriculum_controls.get("frontier_repo_setting_bonus", 0) or 0)),
+    )
     priority_family_categories: dict[str, str] = {}
     for family in priority_families:
         summary = family_summaries.setdefault(family, _empty_summary())
@@ -494,13 +642,29 @@ def _priority_family_history_summary(
             if family in priority_families_under_sampled
             else 0.0
         )
+        failure_motif_selection_bonus = failure_motif_selection_bonus_scale * min(
+            2.0,
+            float(frontier_failure_motif_counts.get(family, 0)),
+        )
+        repo_setting_selection_bonus = repo_setting_selection_bonus_scale * min(
+            2.0,
+            float(frontier_repo_setting_counts.get(family, 0)),
+        )
         summary["selection_return_on_cost"] = return_on_cost
         summary["selection_adjusted_return_on_cost"] = adjusted_return_on_cost
         summary["selection_gain_multiplier"] = gain_multiplier
         summary["selection_cost_multiplier"] = cost_multiplier
         summary["selection_score_bias"] = score_bias
         summary["selection_exploration_bonus"] = exploration_bonus
-        summary["selection_score"] = adjusted_return_on_cost + exploration_bonus + score_bias
+        summary["selection_frontier_failure_motif_bonus"] = failure_motif_selection_bonus
+        summary["selection_frontier_repo_setting_bonus"] = repo_setting_selection_bonus
+        summary["selection_score"] = (
+            adjusted_return_on_cost
+            + exploration_bonus
+            + score_bias
+            + failure_motif_selection_bonus
+            + repo_setting_selection_bonus
+        )
         if family in priority_families_with_retained_gain:
             priority_family_categories[family] = "productive"
         elif family in priority_families_under_sampled:
@@ -539,19 +703,28 @@ def _priority_family_history_summary(
         "priority_family_selection_scores": priority_family_selection_scores,
         "priority_families_ranked_by_return_on_cost": priority_families_ranked_by_return_on_cost,
         "priority_families_ranked_by_selection_score": priority_families_ranked_by_selection_score,
+        "frontier_failure_motif_priority_pairs": [f"{family}:{signal}" for family, signal in frontier_failure_motif_pairs],
+        "frontier_repo_setting_priority_pairs": [f"{family}:{signal}" for family, signal in frontier_repo_setting_pairs],
+        "frontier_failure_motif_families": _rank_priority_benchmark_families(list(frontier_failure_motif_counts)),
+        "frontier_repo_setting_families": _rank_priority_benchmark_families(list(frontier_repo_setting_counts)),
         "low_return_min_decisions": _PRIORITY_FAMILY_LOW_RETURN_MIN_DECISIONS,
         "low_return_min_estimated_cost": _PRIORITY_FAMILY_LOW_RETURN_MIN_ESTIMATED_COST,
     }
 
 
-def _append_event(event_log_path: Path | None, payload: dict[str, object]) -> None:
+def _append_event(
+    event_log_path: Path | None,
+    payload: dict[str, object],
+    *,
+    config: KernelConfig | None = None,
+) -> None:
     if event_log_path is None:
         return
-    append_jsonl(event_log_path, payload)
+    append_jsonl(event_log_path, payload, config=config)
 
 
-def _write_controller_state(path: Path, payload: dict[str, object]) -> None:
-    atomic_write_json(path, payload)
+def _write_controller_state(path: Path, payload: dict[str, object], *, config: KernelConfig | None = None) -> None:
+    atomic_write_json(path, payload, config=config)
 
 
 def _process_alive(pid: int) -> bool:
@@ -774,6 +947,14 @@ def _attached_campaign_report_path(lock_result: dict[str, object]) -> Path | Non
     return path
 
 
+def _child_improvement_reports_dir(report_path: Path) -> Path:
+    resolved = report_path.resolve()
+    parent = resolved.parent
+    if parent.name == "reports":
+        return parent.parent / "improvement_reports"
+    return parent / "improvement_reports"
+
+
 def _release_campaign_lock(lock_path: Path | None, *, pid: int) -> None:
     if lock_path is None:
         return
@@ -841,6 +1022,7 @@ def _persist_emergency_state(
     report_path: Path,
     payload: dict[str, object],
     *,
+    config: KernelConfig | None = None,
     status_path: Path | None = None,
     error: OSError | None = None,
 ) -> Path | None:
@@ -854,7 +1036,7 @@ def _persist_emergency_state(
         "persisted_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        atomic_write_json(emergency_path, emergency_payload)
+        atomic_write_json(emergency_path, emergency_payload, config=config)
     except OSError:
         return None
     return emergency_path
@@ -864,6 +1046,7 @@ def _persist_report_state(
     report_path: Path,
     payload: dict[str, object],
     *,
+    config: KernelConfig | None = None,
     status_path: Path | None = None,
     lock_path: Path | None = None,
     external_lease_backend: str = "",
@@ -877,8 +1060,8 @@ def _persist_report_state(
     if not str(external_lease_token).strip():
         external_lease_token = str(_EXTERNAL_LEASE_STATE.get("token", "")).strip()
     try:
-        _write_report(report_path, payload)
-        _write_status(status_path, report_path=report_path, payload=payload)
+        _write_report(report_path, payload, config=config)
+        _write_status(status_path, report_path=report_path, payload=payload, config=config)
         _refresh_campaign_lock(
             lock_path,
             pid=os.getpid(),
@@ -899,13 +1082,14 @@ def _persist_report_state(
         emergency_path = _persist_emergency_state(
             report_path,
             payload,
+            config=config,
             status_path=status_path,
             error=exc,
         )
         if emergency_path is not None:
             payload["emergency_report_path"] = str(emergency_path)
             try:
-                _write_status(status_path, report_path=emergency_path, payload=payload)
+                _write_status(status_path, report_path=emergency_path, payload=payload, config=config)
             except OSError:
                 pass
         return {
@@ -943,6 +1127,238 @@ def _subsystem_from_progress_line(line: str) -> str:
     if not match:
         return ""
     return str(match.group(1)).strip()
+
+
+def _phase_from_progress_line(line: str) -> str:
+    match = re.search(r"phase=([A-Za-z0-9_:-]+)", str(line).strip())
+    if not match:
+        return ""
+    return str(match.group(1)).strip()
+
+
+def _task_from_progress_line(line: str) -> dict[str, object]:
+    match = re.search(
+        r"task (?P<index>\d+)/(?P<total>\d+) (?P<task_id>\S+) family=(?P<family>[a-z_]+)",
+        str(line).strip(),
+    )
+    if not match:
+        return {}
+    return {
+        "index": int(match.group("index")),
+        "total": int(match.group("total")),
+        "task_id": str(match.group("task_id")).strip(),
+        "family": str(match.group("family")).strip(),
+    }
+
+
+_UNATTENDED_CHILD_GENERATED_SUCCESS_COMPLETION_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_GENERATED_FAILURE_SEED_ACTIVE_GRACE_SECONDS = 240.0
+_UNATTENDED_CHILD_GENERATED_FAILURE_SEED_COMPLETION_GRACE_SECONDS = 180.0
+_UNATTENDED_CHILD_GENERATED_FAILURE_ACTIVE_GRACE_SECONDS = 180.0
+_UNATTENDED_CHILD_GENERATED_FAILURE_COMPLETION_GRACE_SECONDS = 180.0
+_UNATTENDED_CHILD_METRICS_FINALIZE_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_FINALIZE_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_PREVIEW_COMPLETION_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_HOLDOUT_MIN_PROGRESS_SAMPLES = 3
+_UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_TASKS = 5
+_UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_SECONDS = 30.0
+_UNATTENDED_CHILD_HOLDOUT_RUNTIME_BUFFER_SECONDS = 120.0
+_UNATTENDED_CHILD_HOLDOUT_RUNTIME_SAFETY_MULTIPLIER = 1.15
+_UNATTENDED_CHILD_RUNTIME_EMERGENCY_MULTIPLIER = 2.0
+
+
+def _child_runtime_extension_plan(*, last_progress_phase: str, current_task: object) -> tuple[str, float]:
+    task = current_task if isinstance(current_task, dict) else {}
+    task_index = int(task.get("index", 0) or 0)
+    task_total = int(task.get("total", 0) or 0)
+    phase = str(last_progress_phase).strip()
+    task_phase = str(task.get("phase", "")).strip() or phase
+    task_completed = task_total > 0 and task_index >= task_total
+    if phase in {"preview_baseline_complete", "preview_candidate_complete", "preview_complete"}:
+        return ("preview_completion", _UNATTENDED_CHILD_PREVIEW_COMPLETION_GRACE_SECONDS)
+    if phase == "generated_success" and task_total > 0 and task_index >= task_total:
+        return ("generated_success_completion", _UNATTENDED_CHILD_GENERATED_SUCCESS_COMPLETION_GRACE_SECONDS)
+    if task_phase == "generated_failure_seed":
+        if task_completed:
+            return (
+                "generated_failure_seed_completion",
+                _UNATTENDED_CHILD_GENERATED_FAILURE_SEED_COMPLETION_GRACE_SECONDS,
+            )
+        return (
+            "generated_failure_seed_active",
+            _UNATTENDED_CHILD_GENERATED_FAILURE_SEED_ACTIVE_GRACE_SECONDS,
+        )
+    if task_phase == "generated_failure":
+        if task_completed:
+            return ("generated_failure_completion", _UNATTENDED_CHILD_GENERATED_FAILURE_COMPLETION_GRACE_SECONDS)
+        return ("generated_failure_active", _UNATTENDED_CHILD_GENERATED_FAILURE_ACTIVE_GRACE_SECONDS)
+    if phase == "metrics_finalize":
+        return ("metrics_finalize", _UNATTENDED_CHILD_METRICS_FINALIZE_GRACE_SECONDS)
+    if phase == "finalize":
+        return ("finalize", _UNATTENDED_CHILD_FINALIZE_GRACE_SECONDS)
+    return ("", 0.0)
+
+
+def _child_runtime_extension_seconds(*, last_progress_phase: str, current_task: object) -> float:
+    return _child_runtime_extension_plan(
+        last_progress_phase=last_progress_phase,
+        current_task=current_task,
+    )[1]
+
+
+def _runtime_grace_marker(*, grace_key: str, progress_epoch: int) -> tuple[str, int] | None:
+    key = str(grace_key).strip()
+    epoch = int(progress_epoch or 0)
+    if not key or epoch <= 0:
+        return None
+    return (key, epoch)
+
+
+def _holdout_progress_budget_summary(
+    progress_samples: list[dict[str, float | int]],
+) -> dict[str, object]:
+    if len(progress_samples) < _UNATTENDED_CHILD_HOLDOUT_MIN_PROGRESS_SAMPLES:
+        return {}
+    first = progress_samples[0]
+    last = progress_samples[-1]
+    first_index = int(first.get("index", 0) or 0)
+    last_index = int(last.get("index", 0) or 0)
+    total = int(last.get("total", 0) or 0)
+    started_at = float(first.get("timestamp", 0.0) or 0.0)
+    last_at = float(last.get("timestamp", 0.0) or 0.0)
+    observed_tasks = max(0, last_index - first_index)
+    observed_seconds = max(0.0, last_at - started_at)
+    if (
+        total <= 0
+        or observed_tasks < _UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_TASKS
+        or observed_seconds < _UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_SECONDS
+    ):
+        return {}
+    seconds_per_task = observed_seconds / float(observed_tasks)
+    remaining_tasks = max(0, total - last_index)
+    projected_remaining_seconds = remaining_tasks * seconds_per_task
+    elapsed_seconds = max(0.0, last_at - started_at)
+    projected_total_seconds = (
+        elapsed_seconds + projected_remaining_seconds
+    ) * _UNATTENDED_CHILD_HOLDOUT_RUNTIME_SAFETY_MULTIPLIER + _UNATTENDED_CHILD_HOLDOUT_RUNTIME_BUFFER_SECONDS
+    return {
+        "phase": "holdout_eval",
+        "started_at": started_at,
+        "last_progress_at": last_at,
+        "observed_tasks": observed_tasks,
+        "observed_seconds": observed_seconds,
+        "seconds_per_task": seconds_per_task,
+        "completed_tasks": last_index,
+        "total_tasks": total,
+        "remaining_tasks": remaining_tasks,
+        "projected_remaining_seconds": projected_remaining_seconds,
+        "projected_total_seconds": projected_total_seconds,
+        "projected_completion_seconds": started_at + projected_total_seconds,
+    }
+
+
+def _holdout_budget_fit(
+    summary: dict[str, object],
+    *,
+    started_at: float,
+    max_runtime_seconds: float,
+    emergency_multiplier: float = _UNATTENDED_CHILD_RUNTIME_EMERGENCY_MULTIPLIER,
+) -> dict[str, object]:
+    if not summary:
+        return {"status": "unknown", "detail": "insufficient holdout progress samples"}
+    emergency_ceiling_seconds = (
+        max(0.0, float(max_runtime_seconds)) * max(1.0, float(emergency_multiplier))
+        if max_runtime_seconds > 0.0
+        else 0.0
+    )
+    projected_total_seconds = float(summary.get("projected_total_seconds", 0.0) or 0.0)
+    if emergency_ceiling_seconds <= 0.0:
+        return {
+            "status": "unbounded",
+            "projected_total_seconds": projected_total_seconds,
+            "emergency_ceiling_seconds": 0.0,
+            "detail": "no runtime emergency ceiling configured",
+        }
+    if projected_total_seconds <= emergency_ceiling_seconds:
+        return {
+            "status": "within_budget",
+            "projected_total_seconds": projected_total_seconds,
+            "emergency_ceiling_seconds": emergency_ceiling_seconds,
+            "headroom_seconds": max(0.0, emergency_ceiling_seconds - projected_total_seconds),
+            "detail": "projected holdout completion fits within emergency runtime ceiling",
+        }
+    return {
+        "status": "over_budget",
+        "projected_total_seconds": projected_total_seconds,
+        "emergency_ceiling_seconds": emergency_ceiling_seconds,
+        "excess_seconds": max(0.0, projected_total_seconds - emergency_ceiling_seconds),
+        "detail": "projected holdout completion exceeds emergency runtime ceiling",
+    }
+
+
+def _adaptive_child_progress_state(
+    *,
+    last_progress_phase: str,
+    progress_samples: list[dict[str, float | int]],
+    started_at: float,
+    now: float,
+    max_runtime_seconds: float,
+    max_progress_stall_seconds: float,
+) -> dict[str, object]:
+    phase = str(last_progress_phase).strip()
+    if phase != "holdout_eval":
+        return {
+            "phase": phase,
+            "status": "active",
+            "progress_class": "unknown",
+            "detail": "adaptive progress classification is only available during holdout_eval",
+        }
+    summary = _holdout_progress_budget_summary(progress_samples)
+    if not summary:
+        return {
+            "phase": phase,
+            "status": "sampling",
+            "progress_class": "unknown",
+            "detail": "collecting holdout throughput samples",
+        }
+    fit = _holdout_budget_fit(
+        summary,
+        started_at=started_at,
+        max_runtime_seconds=max_runtime_seconds,
+    )
+    last_progress_at = float(summary.get("last_progress_at", 0.0) or 0.0)
+    progress_silence_seconds = max(0.0, now - last_progress_at)
+    stall_threshold = max(0.0, float(max_progress_stall_seconds))
+    progress_class = "healthy"
+    status = str(fit.get("status", "unknown")).strip() or "unknown"
+    if stall_threshold > 0.0 and progress_silence_seconds >= stall_threshold:
+        progress_class = "stuck"
+    elif status == "over_budget":
+        progress_class = "degraded"
+    detail = (
+        "holdout progressing within projected budget"
+        if progress_class == "healthy"
+        else "holdout is still progressing but projected budget is over emergency ceiling"
+        if progress_class == "degraded"
+        else "holdout has stopped making meaningful progress"
+        if progress_class == "stuck"
+        else "adaptive progress classification unavailable"
+    )
+    return {
+        "phase": phase,
+        "status": status,
+        "progress_class": progress_class,
+        "progress_silence_seconds": progress_silence_seconds,
+        "detail": detail,
+        "budget_fit": fit,
+        "holdout_budget": summary,
+    }
+
+
+def _adaptive_progress_state_signature(state: Mapping[str, object]) -> str:
+    payload = dict(state)
+    payload.pop("progress_silence_seconds", None)
+    return json.dumps(payload, sort_keys=True)
 
 
 def _normalize_excluded_subsystems(values: object) -> list[str]:
@@ -1063,7 +1479,10 @@ def _stalled_subsystem_from_round(round_payload: dict[str, object] | None) -> st
     progress_line = ""
     if isinstance(active_child, dict):
         progress_line = str(
-            active_child.get("last_progress_line") or active_child.get("last_output_line") or ""
+            active_child.get("last_subsystem_progress_line")
+            or active_child.get("last_progress_line")
+            or active_child.get("last_output_line")
+            or ""
         ).strip()
     return _subsystem_from_progress_line(progress_line or phase_detail)
 
@@ -1073,6 +1492,7 @@ def _child_failure_recovery_policy(
     *,
     round_payload: dict[str, object] | None,
     phase: str,
+    reason: str = "",
     max_cycles: int,
     max_task_limit: int,
     max_campaign_width: int,
@@ -1080,7 +1500,9 @@ def _child_failure_recovery_policy(
 ) -> dict[str, object]:
     next_policy = _advance_subsystem_cooldowns(current_policy)
     stalled_subsystem = _stalled_subsystem_from_round(round_payload)
-    if stalled_subsystem:
+    normalized_reason = str(reason).strip().lower()
+    allow_stalled_subsystem_cooldown = "campaign report showed no runtime-managed decisions" not in normalized_reason
+    if stalled_subsystem and allow_stalled_subsystem_cooldown:
         next_policy = _apply_subsystem_cooldown(next_policy, subsystem=stalled_subsystem, rounds=2)
     next_policy["adaptive_search"] = True
     next_policy["focus"] = "recovery_alignment"
@@ -1368,11 +1790,25 @@ def _governed_global_storage_cleanup(
     top_k: int,
 ) -> dict[str, object]:
     before_disk = _disk_preflight(root, min_free_gib=0.0)
+    target_free = max(0.0, float(target_free_gib))
+    if float(before_disk.get("free_gib", 0.0)) >= target_free:
+        return {
+            "before_disk": before_disk,
+            "after_disk": before_disk,
+            "before_snapshot": {},
+            "after_snapshot": {},
+            "cleanup": {
+                "removed_entries": [],
+                "skipped": True,
+                "reason": "disk already above target",
+                "target_free_gib": target_free,
+            },
+        }
     before_snapshot = _global_storage_snapshot(root, top_k=top_k, managed_entries=policy_entries)
     cleanup: dict[str, object] = {"removed_entries": []}
     after_disk = before_disk
     after_snapshot = before_snapshot
-    if policy_entries and float(before_disk.get("free_gib", 0.0)) < max(0.0, float(target_free_gib)):
+    if policy_entries:
         cleanup = {
             "removed_entries": _cleanup_global_storage_entries(policy_entries),
         }
@@ -1610,7 +2046,13 @@ def _should_emit_alert(
     return True, state, 1
 
 
-def _record_alert_state(state_path: Path | None, *, payload: dict[str, object], repeat_count: int) -> None:
+def _record_alert_state(
+    state_path: Path | None,
+    *,
+    payload: dict[str, object],
+    repeat_count: int,
+    config: KernelConfig | None = None,
+) -> None:
     if state_path is None:
         return
     atomic_write_json(
@@ -1624,6 +2066,7 @@ def _record_alert_state(state_path: Path | None, *, payload: dict[str, object], 
             "phase": str(payload.get("phase", "")).strip(),
             "reason": str(payload.get("reason", "")).strip(),
         },
+        config=config,
     )
 
 
@@ -1709,6 +2152,7 @@ def _dispatch_alerts(
     payload: dict[str, object],
     state_path: Path | None = None,
     rate_limit_seconds: float = 900.0,
+    config: KernelConfig | None = None,
 ) -> dict[str, object]:
     should_emit, prior_state, repeat_count = _should_emit_alert(
         state_path,
@@ -1759,7 +2203,7 @@ def _dispatch_alerts(
     results["ran"] = True
     results["severity"] = severity
     results["repeat_count"] = repeat_count
-    _record_alert_state(state_path, payload=payload, repeat_count=repeat_count)
+    _record_alert_state(state_path, payload=payload, repeat_count=repeat_count, config=config)
     return results
 
 
@@ -1817,6 +2261,20 @@ def _run_and_stream(
     max_silence = max(0.0, float(max_silence_seconds))
     max_runtime = max(0.0, float(max_runtime_seconds))
     max_progress_stall = max(0.0, float(max_progress_stall_seconds))
+    last_progress_phase = ""
+    current_task: dict[str, object] = {}
+    runtime_grace_markers: set[tuple[str, int]] = set()
+    progress_epoch = 0
+    holdout_progress_samples: list[dict[str, float | int]] = []
+    last_holdout_task_index = 0
+    last_holdout_budget_deadline = 0.0
+    last_adaptive_state_signature = ""
+    runtime_deadline = started_at + max_runtime if max_runtime > 0.0 else 0.0
+    emergency_runtime_deadline = (
+        started_at + (max_runtime * _UNATTENDED_CHILD_RUNTIME_EMERGENCY_MULTIPLIER)
+        if max_runtime > 0.0
+        else 0.0
+    )
     try:
         while True:
             events = selector.select(timeout=1.0)
@@ -1831,6 +2289,33 @@ def _run_and_stream(
                     last_output_at = now
                     if _is_significant_child_output(line):
                         last_progress_at = now
+                        progress_epoch += 1
+                        phase_name = _phase_from_progress_line(line)
+                        if phase_name:
+                            last_progress_phase = phase_name
+                        parsed_task = _task_from_progress_line(line)
+                        if parsed_task:
+                            current_task = parsed_task
+                            if last_progress_phase:
+                                current_task["phase"] = last_progress_phase
+                            if last_progress_phase == "holdout_eval":
+                                task_index = int(current_task.get("index", 0) or 0)
+                                task_total = int(current_task.get("total", 0) or 0)
+                                if holdout_progress_samples:
+                                    previous_total = int(holdout_progress_samples[-1].get("total", 0) or 0)
+                                    if previous_total > 0 and task_total > 0 and previous_total != task_total:
+                                        holdout_progress_samples = []
+                                        last_holdout_task_index = 0
+                                        last_holdout_budget_deadline = 0.0
+                                if task_index > last_holdout_task_index:
+                                    holdout_progress_samples.append(
+                                        {
+                                            "timestamp": now,
+                                            "index": task_index,
+                                            "total": task_total,
+                                        }
+                                    )
+                                    last_holdout_task_index = task_index
                     print(line, end="", file=sys.stderr, flush=True)
                     _emit_event(
                         {
@@ -1860,7 +2345,78 @@ def _run_and_stream(
                     }
                 )
                 last_heartbeat_at = now
-            if max_runtime > 0.0 and runtime_elapsed >= max_runtime:
+            adaptive_state = _adaptive_child_progress_state(
+                last_progress_phase=last_progress_phase,
+                progress_samples=holdout_progress_samples,
+                started_at=started_at,
+                now=now,
+                max_runtime_seconds=max_runtime,
+                max_progress_stall_seconds=max_progress_stall,
+            )
+            adaptive_signature = _adaptive_progress_state_signature(adaptive_state)
+            if adaptive_signature != last_adaptive_state_signature:
+                last_adaptive_state_signature = adaptive_signature
+                _emit_event(
+                    {
+                        "event": "adaptive_progress_state",
+                        "pid": process_pid,
+                        "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
+                        "timestamp": time.time(),
+                        **adaptive_state,
+                    }
+                )
+            if runtime_deadline > 0.0 and now >= runtime_deadline:
+                holdout_budget = adaptive_state.get("holdout_budget", {}) if isinstance(adaptive_state, dict) else {}
+                if holdout_budget:
+                    adaptive_deadline = float(holdout_budget.get("projected_completion_seconds", 0.0) or 0.0)
+                    proposed_deadline = max(runtime_deadline, adaptive_deadline)
+                    if emergency_runtime_deadline > 0.0:
+                        proposed_deadline = min(proposed_deadline, emergency_runtime_deadline)
+                    if proposed_deadline > now and proposed_deadline > (last_holdout_budget_deadline + 1.0):
+                        runtime_deadline = proposed_deadline
+                        last_holdout_budget_deadline = proposed_deadline
+                        _emit_event(
+                            {
+                                "event": "adaptive_runtime_budget",
+                                "pid": process_pid,
+                                "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
+                                "timestamp": time.time(),
+                                "runtime_seconds": int(runtime_elapsed),
+                                "runtime_deadline_seconds": int(max(0.0, runtime_deadline - started_at)),
+                                "emergency_runtime_deadline_seconds": int(max(0.0, emergency_runtime_deadline - started_at)),
+                                "adaptive_progress_class": str(adaptive_state.get("progress_class", "")).strip(),
+                                "adaptive_budget_status": str(adaptive_state.get("status", "")).strip(),
+                                **holdout_budget,
+                            }
+                        )
+                        continue
+                grace_key, extension_seconds = _child_runtime_extension_plan(
+                    last_progress_phase=last_progress_phase,
+                    current_task=current_task,
+                )
+                grace_marker = _runtime_grace_marker(
+                    grace_key=grace_key,
+                    progress_epoch=progress_epoch,
+                )
+                if grace_marker and extension_seconds > 0.0 and grace_marker not in runtime_grace_markers:
+                    runtime_grace_markers.add(grace_marker)
+                    runtime_deadline = now + extension_seconds
+                    _emit_event(
+                        {
+                            "event": "runtime_grace",
+                            "pid": process_pid,
+                            "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
+                            "timestamp": time.time(),
+                            "runtime_seconds": int(runtime_elapsed),
+                            "grace_seconds": int(extension_seconds),
+                            "grace_key": grace_key,
+                            "progress_epoch": progress_epoch,
+                            "runtime_deadline_seconds": int(max(0.0, runtime_deadline - started_at)),
+                            "last_progress_phase": last_progress_phase,
+                            "current_task": dict(current_task),
+                        }
+                    )
+                    continue
                 terminate_process_tree(process)
                 _emit_event(
                     {
@@ -1869,14 +2425,26 @@ def _run_and_stream(
                         "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
                         "runtime_seconds": int(runtime_elapsed),
                         "timestamp": time.time(),
-                        "timeout_reason": f"child exceeded max runtime of {int(max_runtime)} seconds",
+                        "runtime_deadline_seconds": int(max(0.0, runtime_deadline - started_at)),
+                        "emergency_runtime_deadline_seconds": int(max(0.0, emergency_runtime_deadline - started_at)),
+                        "adaptive_progress_class": str(adaptive_state.get("progress_class", "")).strip(),
+                        "adaptive_budget_status": str(adaptive_state.get("status", "")).strip(),
+                        "timeout_reason": (
+                            f"child exceeded adaptive runtime safety ceiling of {int(max_runtime)} seconds"
+                            if str(adaptive_state.get("status", "")).strip() == "over_budget"
+                            else f"child exceeded max runtime safety ceiling of {int(max_runtime)} seconds"
+                        ),
                     }
                 )
                 return {
                     "returncode": -9,
                     "stdout": "".join(completed_output).strip(),
                     "timed_out": True,
-                    "timeout_reason": f"child exceeded max runtime of {int(max_runtime)} seconds",
+                    "timeout_reason": (
+                        f"child exceeded adaptive runtime safety ceiling of {int(max_runtime)} seconds"
+                        if str(adaptive_state.get("status", "")).strip() == "over_budget"
+                        else f"child exceeded max runtime safety ceiling of {int(max_runtime)} seconds"
+                    ),
                 }
             if max_silence > 0.0 and silence >= max_silence:
                 terminate_process_tree(process)
@@ -1962,6 +2530,54 @@ def _read_json(path: Path | None) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _mirrored_child_status_from_parent_status(status_path: Path | None) -> dict[str, object]:
+    payload = _read_json(status_path)
+    if not payload:
+        return {}
+    active_run = payload.get("active_run", {})
+    if not isinstance(active_run, dict):
+        return {}
+    child_status = active_run.get("child_status", {})
+    return dict(child_status) if isinstance(child_status, dict) else {}
+
+
+def _accept_productive_partial_child_timeout(
+    campaign_run: Mapping[str, object],
+    *,
+    mirrored_child_status: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if int(campaign_run.get("returncode", 0) or 0) == 0:
+        return {"accepted": False, "reason": "child_completed_cleanly"}
+    timeout_reason = str(campaign_run.get("timeout_reason", "")).strip()
+    if "max runtime" not in timeout_reason:
+        return {"accepted": False, "reason": "timeout_not_runtime_cap"}
+    child_status = mirrored_child_status if isinstance(mirrored_child_status, Mapping) else {}
+    active_cycle_progress = child_status.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    partial_progress_summary = child_status.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, Mapping):
+        partial_progress_summary = {}
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False)) or int(
+        partial_progress_summary.get("generated_success_completed_runs", 0) or 0
+    ) > 0
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or int(
+        child_status.get("partial_productive_runs", 0) or 0
+    ) > 0
+    report_path = Path(str(child_status.get("report_path", "")).strip()) if str(child_status.get("report_path", "")).strip() else None
+    if not productive_partial:
+        return {"accepted": False, "reason": "child_status_missing_productive_partial"}
+    if not generated_success_completed:
+        return {"accepted": False, "reason": "generated_success_not_completed"}
+    if report_path is None or not report_path.exists():
+        return {"accepted": False, "reason": "child_report_path_missing"}
+    return {
+        "accepted": True,
+        "reason": "generated_success_completed_before_runtime_cap",
+        "report_path": str(report_path),
+    }
+
+
 def _is_significant_child_output(line: str) -> bool:
     normalized = str(line).strip()
     if not normalized:
@@ -1975,6 +2591,7 @@ def _make_child_progress_callback(
     report: dict[str, object],
     status_path: Path | None,
     lock_path: Path | None,
+    config: KernelConfig,
     round_payload: dict[str, object],
     round_index: int,
     phase: str,
@@ -2009,6 +2626,16 @@ def _make_child_progress_callback(
                 active_child["last_output_at"] = timestamp
                 if _is_significant_child_output(line):
                     active_child["last_progress_line"] = line
+                    phase_name = _phase_from_progress_line(line)
+                    if phase_name:
+                        active_child["last_progress_phase"] = phase_name
+                    parsed_task = _task_from_progress_line(line)
+                    if parsed_task:
+                        if phase_name:
+                            parsed_task["phase"] = phase_name
+                        active_child["current_task"] = parsed_task
+                    if _subsystem_from_progress_line(line):
+                        active_child["last_subsystem_progress_line"] = line
                 candidate_path = Path(line)
                 if candidate_path.exists():
                     active_child["last_report_path"] = str(candidate_path)
@@ -2021,6 +2648,45 @@ def _make_child_progress_callback(
             active_child["ended_at"] = timestamp
             active_child["silence_seconds"] = int(event.get("silence_seconds", 0) or 0)
             active_child["timeout_reason"] = str(event.get("timeout_reason", "")).strip()
+        elif event_name == "runtime_grace":
+            active_child["runtime_grace_applied"] = True
+            active_child["runtime_grace_seconds"] = int(event.get("grace_seconds", 0) or 0)
+            active_child["runtime_deadline_seconds"] = int(event.get("runtime_deadline_seconds", 0) or 0)
+            active_child["last_progress_phase"] = str(event.get("last_progress_phase", "")).strip()
+            if isinstance(event.get("current_task"), dict):
+                active_child["current_task"] = dict(event["current_task"])
+        elif event_name == "adaptive_runtime_budget":
+            active_child["adaptive_runtime_budget"] = {
+                "phase": str(event.get("phase", "")).strip(),
+                "observed_tasks": int(event.get("observed_tasks", 0) or 0),
+                "observed_seconds": float(event.get("observed_seconds", 0.0) or 0.0),
+                "seconds_per_task": float(event.get("seconds_per_task", 0.0) or 0.0),
+                "completed_tasks": int(event.get("completed_tasks", 0) or 0),
+                "total_tasks": int(event.get("total_tasks", 0) or 0),
+                "remaining_tasks": int(event.get("remaining_tasks", 0) or 0),
+                "projected_remaining_seconds": float(event.get("projected_remaining_seconds", 0.0) or 0.0),
+                "projected_total_seconds": float(event.get("projected_total_seconds", 0.0) or 0.0),
+            }
+            active_child["runtime_deadline_seconds"] = int(event.get("runtime_deadline_seconds", 0) or 0)
+            active_child["emergency_runtime_deadline_seconds"] = int(
+                event.get("emergency_runtime_deadline_seconds", 0) or 0
+            )
+            active_child["adaptive_progress_class"] = str(event.get("adaptive_progress_class", "")).strip()
+            active_child["adaptive_budget_status"] = str(event.get("adaptive_budget_status", "")).strip()
+        elif event_name == "adaptive_progress_state":
+            active_child["adaptive_progress_state"] = {
+                "phase": str(event.get("phase", "")).strip(),
+                "status": str(event.get("status", "")).strip(),
+                "progress_class": str(event.get("progress_class", "")).strip(),
+                "progress_silence_seconds": float(event.get("progress_silence_seconds", 0.0) or 0.0),
+                "detail": str(event.get("detail", "")).strip(),
+            }
+            budget_fit = event.get("budget_fit", {})
+            if isinstance(budget_fit, dict) and budget_fit:
+                active_child["adaptive_progress_state"]["budget_fit"] = dict(budget_fit)
+            holdout_budget = event.get("holdout_budget", {})
+            if isinstance(holdout_budget, dict) and holdout_budget:
+                active_child["adaptive_progress_state"]["holdout_budget"] = dict(holdout_budget)
         elif event_name == "exit":
             active_child["state"] = "completed"
             active_child["ended_at"] = timestamp
@@ -2037,6 +2703,7 @@ def _make_child_progress_callback(
                 "child_label": child_label,
                 **{key: value for key, value in event.items()},
             },
+            config=config,
         )
         detail = str(active_child.get("last_progress_line") or active_child.get("last_output_line") or "").strip()
         if detail:
@@ -2054,7 +2721,7 @@ def _make_child_progress_callback(
         if event_name == "output" and not output_progress_changed and (now - last_write_at) < max(0.0, float(min_write_interval_seconds)):
             return
         last_write_at = now
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
 
     return _persist_if_needed
 
@@ -2198,6 +2865,10 @@ def _trust_scope_snapshot(summary: object) -> dict[str, object]:
         "distinct_external_benchmark_families": int(
             payload.get("distinct_external_benchmark_families", 0) or 0
         ),
+        "distinct_clean_success_task_roots": int(payload.get("distinct_clean_success_task_roots", 0) or 0),
+        "clean_success_task_roots": list(payload.get("clean_success_task_roots", []))
+        if isinstance(payload.get("clean_success_task_roots", []), list)
+        else [],
         "benchmark_families": list(payload.get("benchmark_families", []))
         if isinstance(payload.get("benchmark_families", []), list)
         else [],
@@ -2231,6 +2902,10 @@ def _family_evidence_snapshot(summary: object, assessment: object) -> dict[str, 
         "hidden_side_effect_risk_rate": float(summary_payload.get("hidden_side_effect_risk_rate", 0.0) or 0.0),
         "false_pass_risk_rate": float(summary_payload.get("false_pass_risk_rate", 0.0) or 0.0),
         "clean_success_streak": int(summary_payload.get("clean_success_streak", 0) or 0),
+        "distinct_clean_success_task_roots": int(summary_payload.get("distinct_clean_success_task_roots", 0) or 0),
+        "clean_success_task_roots": list(summary_payload.get("clean_success_task_roots", []))
+        if isinstance(summary_payload.get("clean_success_task_roots", []), list)
+        else [],
         "failing_thresholds": list(assessment_payload.get("failing_thresholds", []))
         if isinstance(assessment_payload.get("failing_thresholds", []), list)
         else [],
@@ -2248,6 +2923,9 @@ def _unattended_evidence_snapshot(config: KernelConfig) -> dict[str, object]:
     policy = ledger.get("policy", {})
     if not isinstance(policy, dict):
         policy = {}
+    coverage_summary = ledger.get("coverage_summary", {})
+    if not isinstance(coverage_summary, dict):
+        coverage_summary = {}
     required_families = [
         str(family).strip()
         for family in policy.get("required_benchmark_families", [])
@@ -2267,6 +2945,17 @@ def _unattended_evidence_snapshot(config: KernelConfig) -> dict[str, object]:
             if str(family).strip()
         }
     )
+    required_family_clean_task_root_counts = (
+        dict(coverage_summary.get("required_family_clean_task_root_counts", {}))
+        if isinstance(coverage_summary.get("required_family_clean_task_root_counts", {}), dict)
+        else {}
+    )
+    family_breadth_min_distinct_task_roots = int(policy.get("family_breadth_min_distinct_task_roots", 0) or 0)
+    required_families_missing_clean_task_root_breadth = [
+        family
+        for family in required_families
+        if int(required_family_clean_task_root_counts.get(family, 0) or 0) < family_breadth_min_distinct_task_roots
+    ]
     return {
         "generated_at": str(ledger.get("generated_at", "")).strip(),
         "reports_considered": int(ledger.get("reports_considered", 0) or 0),
@@ -2280,6 +2969,9 @@ def _unattended_evidence_snapshot(config: KernelConfig) -> dict[str, object]:
             for family, snapshot in required_family_statuses.items()
             if int(snapshot.get("reports", 0) or 0) <= 0
         ],
+        "family_breadth_min_distinct_task_roots": family_breadth_min_distinct_task_roots,
+        "required_family_clean_task_root_counts": required_family_clean_task_root_counts,
+        "required_families_missing_clean_task_root_breadth": required_families_missing_clean_task_root_breadth,
         "observed_families": observed_families,
     }
 
@@ -2670,6 +3362,20 @@ def _governed_cleanup_runtime_state(
     target_free_gib: float,
 ) -> dict[str, object]:
     before_disk = _disk_preflight(config.workspace_root, min_free_gib=0.0)
+    target_free = max(0.0, float(target_free_gib))
+    if float(before_disk.get("free_gib", 0.0)) >= target_free:
+        return {
+            "before_disk": before_disk,
+            "after_disk": before_disk,
+            "before_storage": {},
+            "after_storage": {},
+            "cleanup": {
+                "skipped": True,
+                "reason": "disk already above target",
+                "target_free_gib": target_free,
+            },
+            "emergency_cleanup": {},
+        }
     before_storage = _storage_governance_snapshot(config)
     cleanup = _cleanup_runtime_state(
         config,
@@ -2687,7 +3393,7 @@ def _governed_cleanup_runtime_state(
     after_disk = _disk_preflight(config.workspace_root, min_free_gib=0.0)
     after_storage = _storage_governance_snapshot(config)
     emergency_cleanup: dict[str, object] = {}
-    if float(after_disk.get("free_gib", 0.0)) < max(0.0, float(target_free_gib)):
+    if float(after_disk.get("free_gib", 0.0)) < target_free:
         emergency_cleanup = _cleanup_runtime_state(
             config,
             keep_reports=max(0, min(5, keep_reports // 2)),
@@ -2738,10 +3444,15 @@ def _initial_round_policy(args, config: KernelConfig) -> dict[str, object]:
         "variant_width": max(1, args.variant_width),
         "adaptive_search": bool(args.adaptive_search),
         "task_limit": max(0, args.task_limit),
-        "priority_benchmark_families": _select_priority_benchmark_families(
-            required_families=requested_priority_families or list(config.unattended_trust_required_benchmark_families),
-            missing_required_families=requested_priority_families,
-            current_priority_families=requested_priority_families,
+        "task_step_floor": max(1, int(args.task_step_floor or config.frontier_task_step_floor)),
+        "priority_benchmark_families": (
+            list(requested_priority_families)
+            if requested_priority_families
+            else _select_priority_benchmark_families(
+                required_families=list(config.unattended_trust_required_benchmark_families),
+                missing_required_families=[],
+                current_priority_families=[],
+            )
         ),
         "tolbert_device": config.tolbert_device,
         "focus": args.focus,
@@ -2857,6 +3568,13 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         "rejected_cycles": int(production.get("rejected_cycles", 0) or 0),
         "average_retained_pass_rate_delta": float(production.get("average_retained_pass_rate_delta", 0.0) or 0.0),
         "average_retained_step_delta": float(production.get("average_retained_step_delta", 0.0) or 0.0),
+        "productive_depth_retained_cycles": int(production.get("productive_depth_retained_cycles", 0) or 0),
+        "average_productive_depth_step_delta": float(
+            production.get("average_productive_depth_step_delta", 0.0) or 0.0
+        ),
+        "depth_drift_cycles": int(production.get("depth_drift_cycles", 0) or 0),
+        "average_depth_drift_step_delta": float(production.get("average_depth_drift_step_delta", 0.0) or 0.0),
+        "long_horizon_retained_cycles": int(production.get("long_horizon_retained_cycles", 0) or 0),
         "all_retained_phase_gates_passed": bool(phase_gate.get("all_retained_phase_gates_passed", True)),
         "failed_decisions": int(phase_gate.get("failed_decisions", 0) or 0),
         "runtime_managed_decisions": int(
@@ -2972,6 +3690,29 @@ def _subsystem_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     recent_production = campaign_report.get("recent_production_decisions", [])
     if not isinstance(recent_production, list):
         recent_production = []
+    if not recent_production:
+        fallback_runs = campaign_report.get("runs", [])
+        if isinstance(fallback_runs, list):
+            for run in fallback_runs:
+                if not isinstance(run, dict):
+                    continue
+                subsystem = str(run.get("subsystem", "")).strip()
+                if not subsystem:
+                    continue
+                runtime_managed_decisions = int(run.get("runtime_managed_decisions", 0) or 0)
+                if runtime_managed_decisions > 0:
+                    continue
+                if bool(run.get("retained_gain", False)):
+                    retained_by_subsystem[subsystem] = retained_by_subsystem.get(subsystem, 0) + 1
+                    continue
+                decision_conversion_state = str(run.get("decision_conversion_state", "")).strip()
+                if decision_conversion_state not in {"partial_productive_without_decision", "no_decision"}:
+                    continue
+                stdout = str(run.get("stdout", ""))
+                finalized_reject_marker = f"finalized subsystem={subsystem} state=reject"
+                apply_decision_reject_marker = f"finalize phase=apply_decision subsystem={subsystem} state=reject"
+                if finalized_reject_marker in stdout or apply_decision_reject_marker in stdout:
+                    rejected_by_subsystem[subsystem] = rejected_by_subsystem.get(subsystem, 0) + 1
     average_pass_delta_by_subsystem: dict[str, list[float]] = {}
     for record in recent_production:
         if not isinstance(record, dict):
@@ -2998,20 +3739,120 @@ def _subsystem_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         for subsystem, values in average_pass_delta_by_subsystem.items()
         if values
     }
+    cooldown_rounds_by_subsystem: dict[str, int] = {}
+    zero_yield_dominant_subsystems: list[str] = []
+    for subsystem, rejected in rejected_by_subsystem.items():
+        retained = retained_by_subsystem.get(subsystem, 0)
+        total_decisions = rejected + retained
+        average_pass_delta = averaged.get(subsystem, 0.0)
+        if rejected > retained and average_pass_delta <= 0.0:
+            cooldown_rounds = 2
+            if retained <= 0 and rejected >= 3 and total_decisions >= 3:
+                cooldown_rounds = 3
+                zero_yield_dominant_subsystems.append(subsystem)
+            cooldown_rounds_by_subsystem[subsystem] = cooldown_rounds
     cooldown_candidates = [
         subsystem
-        for subsystem, rejected in rejected_by_subsystem.items()
-        if rejected > retained_by_subsystem.get(subsystem, 0) and averaged.get(subsystem, 0.0) <= 0.0
+        for subsystem in sorted(
+            cooldown_rounds_by_subsystem,
+            key=lambda token: (
+                -int(cooldown_rounds_by_subsystem.get(token, 0)),
+                -int(rejected_by_subsystem.get(token, 0)),
+                token,
+            ),
+        )
     ]
     return {
         "retained_by_subsystem": retained_by_subsystem,
         "rejected_by_subsystem": rejected_by_subsystem,
         "average_pass_delta_by_subsystem": averaged,
-        "cooldown_candidates": sorted(cooldown_candidates),
+        "cooldown_rounds_by_subsystem": cooldown_rounds_by_subsystem,
+        "cooldown_candidates": cooldown_candidates,
+        "zero_yield_dominant_subsystems": sorted(zero_yield_dominant_subsystems),
     }
 
 
-def _planner_pressure_signal(campaign_report: dict[str, object]) -> dict[str, object]:
+def _subsystem_monoculture_signal(
+    campaign_report: dict[str, object],
+    *,
+    subsystem_signal: dict[str, object] | None = None,
+    planner_pressure_signal: dict[str, object] | None = None,
+) -> dict[str, object]:
+    subsystem = subsystem_signal if isinstance(subsystem_signal, dict) else _subsystem_signal(campaign_report)
+    pressure = (
+        planner_pressure_signal
+        if isinstance(planner_pressure_signal, dict)
+        else _planner_pressure_signal(campaign_report)
+    )
+    dominant_subsystem = str(pressure.get("dominant_subsystem", "")).strip()
+    retained_by_subsystem = (
+        dict(subsystem.get("retained_by_subsystem", {}))
+        if isinstance(subsystem.get("retained_by_subsystem", {}), dict)
+        else {}
+    )
+    rejected_by_subsystem = (
+        dict(subsystem.get("rejected_by_subsystem", {}))
+        if isinstance(subsystem.get("rejected_by_subsystem", {}), dict)
+        else {}
+    )
+    total_retained = sum(max(0, int(value or 0)) for value in retained_by_subsystem.values())
+    total_rejected = sum(max(0, int(value or 0)) for value in rejected_by_subsystem.values())
+    total_decisions = total_retained + total_rejected
+    dominant_retained = max(0, int(retained_by_subsystem.get(dominant_subsystem, 0) or 0))
+    dominant_rejected = max(0, int(rejected_by_subsystem.get(dominant_subsystem, 0) or 0))
+    dominant_total = dominant_retained + dominant_rejected
+    campaign_breadth_pressure_cycles = max(0, int(pressure.get("campaign_breadth_pressure_cycles", 0) or 0))
+    variant_breadth_pressure_cycles = max(0, int(pressure.get("variant_breadth_pressure_cycles", 0) or 0))
+    retained_cycles = max(
+        0,
+        int(
+            (
+                campaign_report.get("production_yield_summary", {})
+                if isinstance(campaign_report.get("production_yield_summary", {}), dict)
+                else {}
+            ).get("retained_cycles", 0)
+            or 0
+        ),
+    )
+    zero_yield_dominant_subsystems = set(
+        _normalize_excluded_subsystems(subsystem.get("zero_yield_dominant_subsystems", []))
+    )
+    dominant_share = (float(dominant_total) / float(total_decisions)) if total_decisions > 0 else 0.0
+    breadth_pressure = campaign_breadth_pressure_cycles > 0 or variant_breadth_pressure_cycles > 0
+    no_yield = retained_cycles <= 0
+    active = bool(
+        dominant_subsystem
+        and dominant_total >= 2
+        and dominant_share >= 0.6
+        and dominant_rejected > dominant_retained
+        and (breadth_pressure or no_yield or dominant_subsystem in zero_yield_dominant_subsystems)
+    )
+    severe = bool(
+        active
+        and no_yield
+        and dominant_retained <= 0
+        and dominant_rejected >= 3
+        and dominant_share >= 0.75
+    )
+    return {
+        "active": active,
+        "severe": severe,
+        "dominant_subsystem": dominant_subsystem,
+        "dominant_share": round(dominant_share, 4),
+        "dominant_rejected": dominant_rejected,
+        "dominant_retained": dominant_retained,
+        "dominant_decisions": dominant_total,
+        "total_decisions": total_decisions,
+        "breadth_pressure": breadth_pressure,
+        "no_yield": no_yield,
+    }
+
+
+def _planner_pressure_signal(
+    campaign_report: dict[str, object],
+    *,
+    curriculum_controls: dict[str, object] | None = None,
+) -> dict[str, object]:
     payload = campaign_report.get("planner_pressure_summary", {})
     if not isinstance(payload, dict):
         payload = {}
@@ -3032,11 +3873,1156 @@ def _planner_pressure_signal(campaign_report: dict[str, object]) -> dict[str, ob
         subsystem_counts,
         key=lambda subsystem: (-subsystem_counts[subsystem], subsystem),
     )
+    frontier_failure_motif_pairs = _curriculum_control_family_signal_pairs(
+        curriculum_controls,
+        "frontier_failure_motif_priority_pairs",
+    )
+    frontier_repo_setting_pairs = _curriculum_control_family_signal_pairs(
+        curriculum_controls,
+        "frontier_repo_setting_priority_pairs",
+    )
     return {
         "campaign_breadth_pressure_cycles": int(payload.get("campaign_breadth_pressure_cycles", 0) or 0),
         "variant_breadth_pressure_cycles": int(payload.get("variant_breadth_pressure_cycles", 0) or 0),
         "pressured_subsystems": pressured_subsystems,
         "dominant_subsystem": pressured_subsystems[0] if pressured_subsystems else "",
+        "frontier_failure_motif_priority_pairs": [f"{family}:{signal}" for family, signal in frontier_failure_motif_pairs],
+        "frontier_repo_setting_priority_pairs": [f"{family}:{signal}" for family, signal in frontier_repo_setting_pairs],
+        "frontier_failure_motif_families": _rank_priority_benchmark_families(
+            [family for family, _ in frontier_failure_motif_pairs]
+        ),
+        "frontier_repo_setting_families": _rank_priority_benchmark_families(
+            [family for family, _ in frontier_repo_setting_pairs]
+        ),
+    }
+
+
+def _productive_partial_conversion_signal(
+    round_payload: Mapping[str, object] | None,
+    *,
+    priority_families: object,
+) -> dict[str, object]:
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    active_child = payload.get("active_child", {})
+    if not isinstance(active_child, Mapping):
+        active_child = {}
+    active_cycle_progress = active_child.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    sampled_families = _normalize_benchmark_families(
+        active_child.get("families_sampled", active_child.get("sampled_families_from_progress", []))
+    )
+    if not sampled_families:
+        sampled_families = _normalize_benchmark_families(active_cycle_progress.get("sampled_families_from_progress", []))
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or bool(
+        active_child.get("partial_productive_runs", 0) or 0
+    )
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False))
+    priority_family_set = set(_normalize_benchmark_families(priority_families))
+    sampled_priority_families = [
+        family for family in sampled_families if not priority_family_set or family in priority_family_set
+    ]
+    return {
+        "productive_partial": productive_partial,
+        "generated_success_completed": generated_success_completed,
+        "sampled_families": sampled_families,
+        "sampled_priority_families": sampled_priority_families,
+        "sampled_priority_family_count": len(sampled_priority_families),
+        "conversion_gap": productive_partial and generated_success_completed and len(sampled_priority_families) >= 2,
+    }
+
+
+def _repo_setting_policy_pressure(
+    *,
+    frontier_repo_setting_priority_pairs: object,
+    priority_families: object,
+) -> dict[str, object]:
+    pairs = _normalize_benchmark_families(frontier_repo_setting_priority_pairs)
+    prioritized_families = set(_normalize_benchmark_families(priority_families))
+    focused_pairs: list[str] = []
+    signal_counts: dict[str, int] = {}
+    family_counts: dict[str, int] = {}
+    for value in pairs:
+        family, _, signal = str(value).strip().partition(":")
+        normalized_family = family.strip()
+        normalized_signal = signal.strip().lower()
+        if not normalized_family or not normalized_signal:
+            continue
+        if prioritized_families and normalized_family not in prioritized_families:
+            continue
+        focused_pairs.append(f"{normalized_family}:{normalized_signal}")
+        signal_counts[normalized_signal] = signal_counts.get(normalized_signal, 0) + 1
+        family_counts[normalized_family] = family_counts.get(normalized_family, 0) + 1
+    campaign_width_signals = [
+        signal
+        for signal in ("worker_handoff", "integrator_handoff", "shared_repo", "repo_sandbox")
+        if signal_counts.get(signal, 0) > 0
+    ]
+    task_step_floor_signals = [
+        signal
+        for signal in ("validation_lane", "cleanup_lane", "audit_lane", "long_horizon", "repo_sandbox")
+        if signal_counts.get(signal, 0) > 0
+    ]
+    adaptive_search_signals = [
+        signal
+        for signal in (
+            "worker_handoff",
+            "integrator_handoff",
+            "shared_repo",
+            "repo_sandbox",
+            "validation_lane",
+            "cleanup_lane",
+            "audit_lane",
+            "long_horizon",
+        )
+        if signal_counts.get(signal, 0) > 0
+    ]
+    return {
+        "focused_pairs": focused_pairs,
+        "focused_families": _rank_priority_benchmark_families(list(family_counts)),
+        "signal_counts": dict(sorted(signal_counts.items())),
+        "campaign_width_signals": campaign_width_signals,
+        "task_step_floor_signals": task_step_floor_signals,
+        "adaptive_search_signals": adaptive_search_signals,
+    }
+
+
+def _clamp_float(value: float, *, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, float(value)))
+
+
+def _weighted_linear_slope(samples: list[tuple[float, float, float]]) -> float:
+    total_weight = sum(max(0.0, float(weight)) for _, _, weight in samples)
+    if total_weight <= 0.0:
+        return 0.0
+    weighted_x = sum(float(x) * max(0.0, float(weight)) for x, _, weight in samples)
+    weighted_y = sum(float(y) * max(0.0, float(weight)) for _, y, weight in samples)
+    weighted_xx = sum(float(x) * float(x) * max(0.0, float(weight)) for x, _, weight in samples)
+    weighted_xy = sum(float(x) * float(y) * max(0.0, float(weight)) for x, y, weight in samples)
+    denominator = weighted_xx - ((weighted_x * weighted_x) / total_weight)
+    if abs(denominator) <= 1e-9:
+        return 0.0
+    numerator = weighted_xy - ((weighted_x * weighted_y) / total_weight)
+    return numerator / denominator
+
+
+def _repo_setting_retained_outcome_score(campaign_report: Mapping[str, object] | None) -> float:
+    signal = _campaign_signal(dict(campaign_report) if isinstance(campaign_report, Mapping) else {})
+    retained_cycles = max(0, int(signal.get("retained_cycles", 0) or 0))
+    rejected_cycles = max(0, int(signal.get("rejected_cycles", 0) or 0))
+    productive_depth_retained_cycles = max(0, int(signal.get("productive_depth_retained_cycles", 0) or 0))
+    long_horizon_retained_cycles = max(0, int(signal.get("long_horizon_retained_cycles", 0) or 0))
+    failed_decisions = max(0, int(signal.get("failed_decisions", 0) or 0))
+    retained_phase_gates_passed = bool(signal.get("all_retained_phase_gates_passed", True))
+    average_retained_pass_rate_delta = float(signal.get("average_retained_pass_rate_delta", 0.0) or 0.0)
+    average_retained_step_delta = float(signal.get("average_retained_step_delta", 0.0) or 0.0)
+    score = 0.0
+    score += min(2.0, 0.75 * float(retained_cycles))
+    score -= min(1.5, 0.5 * float(rejected_cycles))
+    score += _clamp_float(average_retained_pass_rate_delta * 12.0, min_value=-1.5, max_value=1.5)
+    score += _clamp_float(average_retained_step_delta / 16.0, min_value=-0.75, max_value=1.0)
+    score += min(1.0, 0.35 * float(productive_depth_retained_cycles))
+    score += min(0.75, 0.25 * float(long_horizon_retained_cycles))
+    if failed_decisions > 0 or not retained_phase_gates_passed:
+        score -= 1.5
+    return score
+
+
+def _empty_repo_setting_regression_stats() -> dict[str, object]:
+    return {
+        "observations": 0,
+        "sum_w": 0.0,
+        "sum_x": 0.0,
+        "sum_y": 0.0,
+        "sum_x2": 0.0,
+        "sum_xy": 0.0,
+    }
+
+
+def _empty_repo_setting_adaptive_stats() -> dict[str, object]:
+    return {
+        "observations": 0,
+        "true_count": 0,
+        "false_count": 0,
+        "true_score_sum": 0.0,
+        "false_score_sum": 0.0,
+    }
+
+
+def _empty_repo_setting_prior_entry() -> dict[str, object]:
+    return {
+        "observations": 0,
+        "last_outcome_score": 0.0,
+        "campaign_width_stats": _empty_repo_setting_regression_stats(),
+        "task_step_floor_stats": _empty_repo_setting_regression_stats(),
+        "adaptive_search_stats": _empty_repo_setting_adaptive_stats(),
+        "family_priors": {},
+    }
+
+
+def _decay_repo_setting_regression_stats(
+    stats: Mapping[str, object] | None,
+    *,
+    decay: float,
+) -> dict[str, object]:
+    payload = stats if isinstance(stats, Mapping) else {}
+    resolved_decay = _clamp_float(float(decay), min_value=0.0, max_value=1.0)
+    return {
+        "observations": max(0, int(round(max(0, int(payload.get("observations", 0) or 0)) * resolved_decay))),
+        "sum_w": max(0.0, float(payload.get("sum_w", 0.0) or 0.0) * resolved_decay),
+        "sum_x": float(payload.get("sum_x", 0.0) or 0.0) * resolved_decay,
+        "sum_y": float(payload.get("sum_y", 0.0) or 0.0) * resolved_decay,
+        "sum_x2": max(0.0, float(payload.get("sum_x2", 0.0) or 0.0) * resolved_decay),
+        "sum_xy": float(payload.get("sum_xy", 0.0) or 0.0) * resolved_decay,
+    }
+
+
+def _decay_repo_setting_adaptive_stats(
+    stats: Mapping[str, object] | None,
+    *,
+    decay: float,
+) -> dict[str, object]:
+    payload = stats if isinstance(stats, Mapping) else {}
+    resolved_decay = _clamp_float(float(decay), min_value=0.0, max_value=1.0)
+    return {
+        "observations": max(0, int(round(max(0, int(payload.get("observations", 0) or 0)) * resolved_decay))),
+        "true_count": max(0, int(round(max(0, int(payload.get("true_count", 0) or 0)) * resolved_decay))),
+        "false_count": max(0, int(round(max(0, int(payload.get("false_count", 0) or 0)) * resolved_decay))),
+        "true_score_sum": float(payload.get("true_score_sum", 0.0) or 0.0) * resolved_decay,
+        "false_score_sum": float(payload.get("false_score_sum", 0.0) or 0.0) * resolved_decay,
+    }
+
+
+def _decay_repo_setting_prior_entry(
+    entry: Mapping[str, object] | None,
+    *,
+    decay: float,
+) -> dict[str, object]:
+    payload = entry if isinstance(entry, Mapping) else {}
+    resolved_decay = _clamp_float(float(decay), min_value=0.0, max_value=1.0)
+    decayed_families: dict[str, dict[str, object]] = {}
+    family_priors = payload.get("family_priors", {})
+    if isinstance(family_priors, Mapping):
+        for family, family_entry in family_priors.items():
+            token = str(family).strip().lower()
+            if not token or not isinstance(family_entry, Mapping):
+                continue
+            decayed_families[token] = {
+                "observations": max(
+                    0,
+                    int(round(max(0, int(family_entry.get("observations", 0) or 0)) * resolved_decay)),
+                ),
+                "last_outcome_score": float(family_entry.get("last_outcome_score", 0.0) or 0.0) * resolved_decay,
+                "campaign_width_stats": _decay_repo_setting_regression_stats(
+                    family_entry.get("campaign_width_stats", {}),
+                    decay=resolved_decay,
+                ),
+                "task_step_floor_stats": _decay_repo_setting_regression_stats(
+                    family_entry.get("task_step_floor_stats", {}),
+                    decay=resolved_decay,
+                ),
+                "adaptive_search_stats": _decay_repo_setting_adaptive_stats(
+                    family_entry.get("adaptive_search_stats", {}),
+                    decay=resolved_decay,
+                ),
+            }
+    return {
+        "observations": max(0, int(round(max(0, int(payload.get("observations", 0) or 0)) * resolved_decay))),
+        "last_outcome_score": float(payload.get("last_outcome_score", 0.0) or 0.0) * resolved_decay,
+        "campaign_width_stats": _decay_repo_setting_regression_stats(
+            payload.get("campaign_width_stats", {}),
+            decay=resolved_decay,
+        ),
+        "task_step_floor_stats": _decay_repo_setting_regression_stats(
+            payload.get("task_step_floor_stats", {}),
+            decay=resolved_decay,
+        ),
+        "adaptive_search_stats": _decay_repo_setting_adaptive_stats(
+            payload.get("adaptive_search_stats", {}),
+            decay=resolved_decay,
+        ),
+        "family_priors": decayed_families,
+    }
+
+
+def _normalize_repo_setting_policy_priors(payload: object) -> dict[str, dict[str, object]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    normalized: dict[str, dict[str, object]] = {}
+    for signal, raw_entry in payload.items():
+        token = str(signal).strip().lower()
+        if not token or not isinstance(raw_entry, Mapping):
+            continue
+        normalized[token] = {
+            **_empty_repo_setting_prior_entry(),
+            **dict(raw_entry),
+            "campaign_width_stats": {
+                **_empty_repo_setting_regression_stats(),
+                **(
+                    dict(raw_entry.get("campaign_width_stats", {}))
+                    if isinstance(raw_entry.get("campaign_width_stats", {}), Mapping)
+                    else {}
+                ),
+            },
+            "task_step_floor_stats": {
+                **_empty_repo_setting_regression_stats(),
+                **(
+                    dict(raw_entry.get("task_step_floor_stats", {}))
+                    if isinstance(raw_entry.get("task_step_floor_stats", {}), Mapping)
+                    else {}
+                ),
+            },
+            "adaptive_search_stats": {
+                **_empty_repo_setting_adaptive_stats(),
+                **(
+                    dict(raw_entry.get("adaptive_search_stats", {}))
+                    if isinstance(raw_entry.get("adaptive_search_stats", {}), Mapping)
+                    else {}
+                ),
+            },
+            "family_priors": {
+                str(family).strip().lower(): {
+                    **_empty_repo_setting_prior_entry(),
+                    **dict(family_entry),
+                    "campaign_width_stats": {
+                        **_empty_repo_setting_regression_stats(),
+                        **(
+                            dict(family_entry.get("campaign_width_stats", {}))
+                            if isinstance(family_entry.get("campaign_width_stats", {}), Mapping)
+                            else {}
+                        ),
+                    },
+                    "task_step_floor_stats": {
+                        **_empty_repo_setting_regression_stats(),
+                        **(
+                            dict(family_entry.get("task_step_floor_stats", {}))
+                            if isinstance(family_entry.get("task_step_floor_stats", {}), Mapping)
+                            else {}
+                        ),
+                    },
+                    "adaptive_search_stats": {
+                        **_empty_repo_setting_adaptive_stats(),
+                        **(
+                            dict(family_entry.get("adaptive_search_stats", {}))
+                            if isinstance(family_entry.get("adaptive_search_stats", {}), Mapping)
+                            else {}
+                        ),
+                    },
+                    "family_priors": {},
+                }
+                for family, family_entry in dict(raw_entry.get("family_priors", {})).items()
+                if str(family).strip() and isinstance(family_entry, Mapping)
+            }
+            if isinstance(raw_entry.get("family_priors", {}), Mapping)
+            else {},
+        }
+    return normalized
+
+
+def _repo_setting_regression_stats_from_samples(samples: list[tuple[float, float, float]]) -> dict[str, object]:
+    stats = _empty_repo_setting_regression_stats()
+    for x_value, y_value, weight in samples:
+        resolved_weight = max(0.0, float(weight))
+        if resolved_weight <= 0.0:
+            continue
+        x_float = float(x_value)
+        y_float = float(y_value)
+        stats["observations"] = int(stats["observations"]) + 1
+        stats["sum_w"] = float(stats["sum_w"]) + resolved_weight
+        stats["sum_x"] = float(stats["sum_x"]) + (resolved_weight * x_float)
+        stats["sum_y"] = float(stats["sum_y"]) + (resolved_weight * y_float)
+        stats["sum_x2"] = float(stats["sum_x2"]) + (resolved_weight * x_float * x_float)
+        stats["sum_xy"] = float(stats["sum_xy"]) + (resolved_weight * x_float * y_float)
+    return stats
+
+
+def _merge_repo_setting_regression_stats(*stats_payloads: object) -> dict[str, object]:
+    merged = _empty_repo_setting_regression_stats()
+    for raw_stats in stats_payloads:
+        if not isinstance(raw_stats, Mapping):
+            continue
+        merged["observations"] = int(merged["observations"]) + max(0, int(raw_stats.get("observations", 0) or 0))
+        merged["sum_w"] = float(merged["sum_w"]) + max(0.0, float(raw_stats.get("sum_w", 0.0) or 0.0))
+        merged["sum_x"] = float(merged["sum_x"]) + float(raw_stats.get("sum_x", 0.0) or 0.0)
+        merged["sum_y"] = float(merged["sum_y"]) + float(raw_stats.get("sum_y", 0.0) or 0.0)
+        merged["sum_x2"] = float(merged["sum_x2"]) + max(0.0, float(raw_stats.get("sum_x2", 0.0) or 0.0))
+        merged["sum_xy"] = float(merged["sum_xy"]) + float(raw_stats.get("sum_xy", 0.0) or 0.0)
+    return merged
+
+
+def _scale_repo_setting_regression_stats(
+    stats: Mapping[str, object] | None,
+    *,
+    scale: float,
+) -> dict[str, object]:
+    payload = stats if isinstance(stats, Mapping) else {}
+    factor = _clamp_float(float(scale), min_value=0.0, max_value=1.0)
+    observations = max(0, int(payload.get("observations", 0) or 0))
+    scaled_observations = int(round(float(observations) * factor))
+    if observations > 0 and factor > 0.0:
+        scaled_observations = max(1, scaled_observations)
+    return {
+        "observations": scaled_observations,
+        "sum_w": max(0.0, float(payload.get("sum_w", 0.0) or 0.0) * factor),
+        "sum_x": float(payload.get("sum_x", 0.0) or 0.0) * factor,
+        "sum_y": float(payload.get("sum_y", 0.0) or 0.0) * factor,
+        "sum_x2": max(0.0, float(payload.get("sum_x2", 0.0) or 0.0) * factor),
+        "sum_xy": float(payload.get("sum_xy", 0.0) or 0.0) * factor,
+    }
+
+
+def _weighted_linear_slope_from_stats(stats: Mapping[str, object] | None) -> float:
+    payload = stats if isinstance(stats, Mapping) else {}
+    denominator = max(0.0, float(payload.get("sum_w", 0.0) or 0.0) * float(payload.get("sum_x2", 0.0) or 0.0) - float(payload.get("sum_x", 0.0) or 0.0) ** 2)
+    if denominator <= 1e-9:
+        return 0.0
+    numerator = float(payload.get("sum_w", 0.0) or 0.0) * float(payload.get("sum_xy", 0.0) or 0.0) - float(payload.get("sum_x", 0.0) or 0.0) * float(payload.get("sum_y", 0.0) or 0.0)
+    return numerator / denominator
+
+
+def _merge_repo_setting_adaptive_stats(*stats_payloads: object) -> dict[str, object]:
+    merged = _empty_repo_setting_adaptive_stats()
+    for raw_stats in stats_payloads:
+        if not isinstance(raw_stats, Mapping):
+            continue
+        merged["observations"] = int(merged["observations"]) + max(0, int(raw_stats.get("observations", 0) or 0))
+        merged["true_count"] = int(merged["true_count"]) + max(0, int(raw_stats.get("true_count", 0) or 0))
+        merged["false_count"] = int(merged["false_count"]) + max(0, int(raw_stats.get("false_count", 0) or 0))
+        merged["true_score_sum"] = float(merged["true_score_sum"]) + float(raw_stats.get("true_score_sum", 0.0) or 0.0)
+        merged["false_score_sum"] = float(merged["false_score_sum"]) + float(raw_stats.get("false_score_sum", 0.0) or 0.0)
+    return merged
+
+
+def _scale_repo_setting_adaptive_stats(
+    stats: Mapping[str, object] | None,
+    *,
+    scale: float,
+) -> dict[str, object]:
+    payload = stats if isinstance(stats, Mapping) else {}
+    factor = _clamp_float(float(scale), min_value=0.0, max_value=1.0)
+    observations = max(0, int(payload.get("observations", 0) or 0))
+    true_count = max(0, int(payload.get("true_count", 0) or 0))
+    false_count = max(0, int(payload.get("false_count", 0) or 0))
+    scaled_observations = int(round(float(observations) * factor))
+    scaled_true_count = int(round(float(true_count) * factor))
+    scaled_false_count = int(round(float(false_count) * factor))
+    if observations > 0 and factor > 0.0:
+        scaled_observations = max(1, scaled_observations)
+    if true_count > 0 and factor > 0.0:
+        scaled_true_count = max(1, scaled_true_count)
+    if false_count > 0 and factor > 0.0:
+        scaled_false_count = max(1, scaled_false_count)
+    return {
+        "observations": scaled_observations,
+        "true_count": scaled_true_count,
+        "false_count": scaled_false_count,
+        "true_score_sum": float(payload.get("true_score_sum", 0.0) or 0.0) * factor,
+        "false_score_sum": float(payload.get("false_score_sum", 0.0) or 0.0) * factor,
+    }
+
+
+def _repo_setting_signal_set_union(*signal_groups: object) -> list[str]:
+    union: set[str] = set()
+    for group in signal_groups:
+        if isinstance(group, set):
+            union.update(_normalize_benchmark_families(list(group)))
+        else:
+            union.update(_normalize_benchmark_families(group))
+    return sorted(union)
+
+
+def _repo_setting_pair_map(focused_pairs: object) -> dict[str, set[str]]:
+    pair_map: dict[str, set[str]] = {}
+    for value in _normalize_benchmark_families(focused_pairs):
+        family, _, signal = str(value).strip().partition(":")
+        normalized_family = family.strip().lower()
+        normalized_signal = signal.strip().lower()
+        if not normalized_family or not normalized_signal:
+            continue
+        pair_map.setdefault(normalized_signal, set()).add(normalized_family)
+    return pair_map
+
+
+def _repo_setting_family_neighbor_map(
+    active_pair_map: Mapping[str, set[str]],
+    available_pair_map: Mapping[str, set[str]],
+) -> dict[str, dict[str, float]]:
+    neighbor_map: dict[str, dict[str, float]] = {}
+    for signal, active_families in active_pair_map.items():
+        available_families = {str(value).strip().lower() for value in available_pair_map.get(signal, set()) if str(value).strip()}
+        if not available_families:
+            continue
+        signal_neighbors: dict[str, float] = {}
+        for family in sorted(active_families):
+            for candidate, weight in _REPO_SETTING_FAMILY_NEIGHBOR_WEIGHTS.get(str(family).strip().lower(), {}).items():
+                normalized_candidate = str(candidate).strip().lower()
+                if not normalized_candidate or normalized_candidate not in available_families:
+                    continue
+                if normalized_candidate in active_families:
+                    continue
+                signal_neighbors[normalized_candidate] = max(
+                    float(signal_neighbors.get(normalized_candidate, 0.0) or 0.0),
+                    _clamp_float(float(weight), min_value=0.0, max_value=1.0),
+                )
+        if signal_neighbors:
+            neighbor_map[signal] = signal_neighbors
+    return neighbor_map
+
+
+def _weighted_family_repo_setting_prior_stats(
+    *,
+    state_priors: Mapping[str, object],
+    family_weight_map: Mapping[str, Mapping[str, float]],
+    stat_key: str,
+) -> dict[str, object]:
+    family_stats: list[object] = []
+    for signal, family_weights in family_weight_map.items():
+        signal_entry = state_priors.get(signal, {})
+        if not isinstance(signal_entry, Mapping):
+            continue
+        family_priors = signal_entry.get("family_priors", {})
+        if not isinstance(family_priors, Mapping):
+            continue
+        for family, weight in sorted(family_weights.items()):
+            family_entry = family_priors.get(family, {})
+            if not isinstance(family_entry, Mapping):
+                continue
+            if stat_key == "adaptive_search_stats":
+                family_stats.append(
+                    _scale_repo_setting_adaptive_stats(
+                        family_entry.get(stat_key, {}),
+                        scale=float(weight),
+                    )
+                )
+            else:
+                family_stats.append(
+                    _scale_repo_setting_regression_stats(
+                        family_entry.get(stat_key, {}),
+                        scale=float(weight),
+                    )
+                )
+    if stat_key == "adaptive_search_stats":
+        return _merge_repo_setting_adaptive_stats(*family_stats)
+    return _merge_repo_setting_regression_stats(*family_stats)
+
+
+def _learn_repo_setting_policy_priors(
+    *,
+    prior_rounds: list[dict[str, object]],
+    repo_setting_policy_pressure: Mapping[str, object] | None,
+    persisted_priors: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    pressure = repo_setting_policy_pressure if isinstance(repo_setting_policy_pressure, Mapping) else {}
+    state_priors = _normalize_repo_setting_policy_priors(persisted_priors)
+    active_campaign_width_signals = set(_normalize_benchmark_families(pressure.get("campaign_width_signals", [])))
+    active_task_step_floor_signals = set(_normalize_benchmark_families(pressure.get("task_step_floor_signals", [])))
+    active_adaptive_search_signals = set(_normalize_benchmark_families(pressure.get("adaptive_search_signals", [])))
+    active_pair_map = _repo_setting_pair_map(pressure.get("focused_pairs", []))
+    campaign_width_samples: list[tuple[float, float, float]] = []
+    task_step_floor_samples: list[tuple[float, float, float]] = []
+    adaptive_true_scores: list[float] = []
+    adaptive_false_scores: list[float] = []
+    family_campaign_width_samples: list[tuple[float, float, float]] = []
+    family_task_step_floor_samples: list[tuple[float, float, float]] = []
+    family_adaptive_true_scores: list[float] = []
+    family_adaptive_false_scores: list[float] = []
+    signal_observations: dict[str, int] = {}
+    family_signal_observations: dict[str, int] = {}
+    neighbor_signal_observations: dict[str, float] = {}
+    focused_rounds = 0
+    for round_payload in prior_rounds:
+        if not isinstance(round_payload, dict):
+            continue
+        rationale = round_payload.get("policy_shift_rationale", {})
+        if not isinstance(rationale, dict):
+            continue
+        planner_pressure = rationale.get("planner_pressure", {})
+        if not isinstance(planner_pressure, dict):
+            continue
+        prior_pressure = planner_pressure.get("repo_setting_policy_pressure", {})
+        if not isinstance(prior_pressure, Mapping):
+            continue
+        prior_pair_map = _repo_setting_pair_map(prior_pressure.get("focused_pairs", []))
+        prior_campaign_width_signals = set(_normalize_benchmark_families(prior_pressure.get("campaign_width_signals", [])))
+        prior_task_step_floor_signals = set(_normalize_benchmark_families(prior_pressure.get("task_step_floor_signals", [])))
+        prior_adaptive_search_signals = set(_normalize_benchmark_families(prior_pressure.get("adaptive_search_signals", [])))
+        campaign_width_overlap = sorted(active_campaign_width_signals & prior_campaign_width_signals)
+        task_step_floor_overlap = sorted(active_task_step_floor_signals & prior_task_step_floor_signals)
+        adaptive_search_overlap = sorted(active_adaptive_search_signals & prior_adaptive_search_signals)
+        pair_overlap_map: dict[str, set[str]] = {}
+        for signal, families in active_pair_map.items():
+            shared_families = set(families) & set(prior_pair_map.get(signal, set()))
+            if shared_families:
+                pair_overlap_map[signal] = shared_families
+        neighbor_overlap_map = _repo_setting_family_neighbor_map(active_pair_map, prior_pair_map)
+        if not campaign_width_overlap and not task_step_floor_overlap and not adaptive_search_overlap:
+            continue
+        focused_rounds += 1
+        for signal in sorted(set(campaign_width_overlap) | set(task_step_floor_overlap) | set(adaptive_search_overlap)):
+            signal_observations[signal] = signal_observations.get(signal, 0) + 1
+        for signal, families in sorted(pair_overlap_map.items()):
+            for family in sorted(families):
+                family_signal_observations[f"{family}:{signal}"] = (
+                    family_signal_observations.get(f"{family}:{signal}", 0) + 1
+                )
+        for signal, weighted_families in sorted(neighbor_overlap_map.items()):
+            for active_family in sorted(active_pair_map.get(signal, set())):
+                key = f"{active_family}:{signal}"
+                neighbor_signal_observations[key] = (
+                    float(neighbor_signal_observations.get(key, 0.0) or 0.0)
+                    + sum(float(weight) for weight in weighted_families.values())
+                )
+        policy = round_payload.get("policy", {})
+        if not isinstance(policy, Mapping):
+            continue
+        outcome_score = _repo_setting_retained_outcome_score(round_payload.get("campaign_report", {}))
+        sample_weight = max(
+            1.0,
+            float(len(campaign_width_overlap) + len(task_step_floor_overlap) + len(adaptive_search_overlap)),
+        )
+        if campaign_width_overlap:
+            campaign_width = max(1, int(policy.get("campaign_width", 1) or 1))
+            campaign_width_samples.append(
+                (float(max(0, campaign_width - 1)), outcome_score, sample_weight * float(len(campaign_width_overlap)))
+            )
+            family_overlap_count = sum(
+                len(families) for signal, families in pair_overlap_map.items() if signal in campaign_width_overlap
+            )
+            neighbor_overlap_weight = sum(
+                sum(float(weight) for weight in families.values())
+                for signal, families in neighbor_overlap_map.items()
+                if signal in campaign_width_overlap
+            )
+            if family_overlap_count > 0 or neighbor_overlap_weight > 0.0:
+                family_campaign_width_samples.append(
+                    (
+                        float(max(0, campaign_width - 1)),
+                        outcome_score,
+                        sample_weight * (float(family_overlap_count) + neighbor_overlap_weight),
+                    )
+                )
+        if task_step_floor_overlap:
+            task_step_floor = max(1, int(policy.get("task_step_floor", 1) or 1))
+            task_step_floor_samples.append(
+                (
+                    math.log2(float(task_step_floor)),
+                    outcome_score,
+                    sample_weight * float(len(task_step_floor_overlap)),
+                )
+            )
+            family_overlap_count = sum(
+                len(families) for signal, families in pair_overlap_map.items() if signal in task_step_floor_overlap
+            )
+            neighbor_overlap_weight = sum(
+                sum(float(weight) for weight in families.values())
+                for signal, families in neighbor_overlap_map.items()
+                if signal in task_step_floor_overlap
+            )
+            if family_overlap_count > 0 or neighbor_overlap_weight > 0.0:
+                family_task_step_floor_samples.append(
+                    (
+                        math.log2(float(task_step_floor)),
+                        outcome_score,
+                        sample_weight * (float(family_overlap_count) + neighbor_overlap_weight),
+                    )
+                )
+        if adaptive_search_overlap:
+            if bool(policy.get("adaptive_search", False)):
+                adaptive_true_scores.append(outcome_score)
+            else:
+                adaptive_false_scores.append(outcome_score)
+            family_overlap_count = sum(
+                len(families) for signal, families in pair_overlap_map.items() if signal in adaptive_search_overlap
+            )
+            neighbor_overlap_weight = sum(
+                sum(float(weight) for weight in families.values())
+                for signal, families in neighbor_overlap_map.items()
+                if signal in adaptive_search_overlap
+            )
+            if family_overlap_count > 0 or neighbor_overlap_weight > 0.0:
+                if bool(policy.get("adaptive_search", False)):
+                    family_adaptive_true_scores.append(outcome_score)
+                else:
+                    family_adaptive_false_scores.append(outcome_score)
+    persisted_signal_observations: dict[str, int] = {}
+    persisted_family_signal_observations: dict[str, int] = {}
+    persisted_neighbor_signal_observations: dict[str, float] = {}
+    for signal in _repo_setting_signal_set_union(
+        active_campaign_width_signals,
+        active_task_step_floor_signals,
+        active_adaptive_search_signals,
+    ):
+        prior_entry = state_priors.get(signal, {})
+        if isinstance(prior_entry, Mapping):
+            persisted_signal_observations[signal] = max(0, int(prior_entry.get("observations", 0) or 0))
+            if signal in signal_observations:
+                signal_observations[signal] += persisted_signal_observations[signal]
+            elif persisted_signal_observations[signal] > 0:
+                signal_observations[signal] = persisted_signal_observations[signal]
+    for signal, families in sorted(active_pair_map.items()):
+        prior_entry = state_priors.get(signal, {})
+        if not isinstance(prior_entry, Mapping):
+            continue
+        family_priors = prior_entry.get("family_priors", {})
+        if not isinstance(family_priors, Mapping):
+            continue
+        for family in sorted(families):
+            family_entry = family_priors.get(family, {})
+            if not isinstance(family_entry, Mapping):
+                continue
+            key = f"{family}:{signal}"
+            persisted_family_signal_observations[key] = max(0, int(family_entry.get("observations", 0) or 0))
+            if key in family_signal_observations:
+                family_signal_observations[key] += persisted_family_signal_observations[key]
+            elif persisted_family_signal_observations[key] > 0:
+                family_signal_observations[key] = persisted_family_signal_observations[key]
+    state_family_pair_map = {
+        signal: set(
+            dict(state_priors.get(signal, {})).get("family_priors", {}).keys()
+            if isinstance(state_priors.get(signal, {}), Mapping)
+            and isinstance(dict(state_priors.get(signal, {})).get("family_priors", {}), Mapping)
+            else []
+        )
+        for signal in active_pair_map
+    }
+    for signal, weighted_families in sorted(
+        _repo_setting_family_neighbor_map(
+            active_pair_map,
+            state_family_pair_map,
+        ).items()
+    ):
+        observed_sum = 0.0
+        prior_entry = state_priors.get(signal, {})
+        family_priors = prior_entry.get("family_priors", {}) if isinstance(prior_entry, Mapping) else {}
+        if not isinstance(family_priors, Mapping):
+            continue
+        for family, weight in weighted_families.items():
+            family_entry = family_priors.get(family, {})
+            if not isinstance(family_entry, Mapping):
+                continue
+            observed_sum += float(max(0, int(family_entry.get("observations", 0) or 0))) * float(weight)
+        for active_family in sorted(active_pair_map.get(signal, set())):
+            key = f"{active_family}:{signal}"
+            persisted_neighbor_signal_observations[key] = observed_sum
+            neighbor_signal_observations[key] = float(neighbor_signal_observations.get(key, 0.0) or 0.0) + observed_sum
+    persisted_campaign_width_stats = _merge_repo_setting_regression_stats(
+        *[
+            state_priors.get(signal, {}).get("campaign_width_stats", {})
+            for signal in sorted(active_campaign_width_signals)
+            if isinstance(state_priors.get(signal, {}), Mapping)
+        ]
+    )
+    persisted_task_step_floor_stats = _merge_repo_setting_regression_stats(
+        *[
+            state_priors.get(signal, {}).get("task_step_floor_stats", {})
+            for signal in sorted(active_task_step_floor_signals)
+            if isinstance(state_priors.get(signal, {}), Mapping)
+        ]
+    )
+    persisted_adaptive_search_stats = _merge_repo_setting_adaptive_stats(
+        *[
+            state_priors.get(signal, {}).get("adaptive_search_stats", {})
+            for signal in sorted(active_adaptive_search_signals)
+            if isinstance(state_priors.get(signal, {}), Mapping)
+        ]
+    )
+    persisted_family_campaign_width_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: {family: 1.0 for family in families}
+            for signal, families in active_pair_map.items()
+            if signal in active_campaign_width_signals
+        },
+        stat_key="campaign_width_stats",
+    )
+    persisted_neighbor_campaign_width_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: families
+            for signal, families in _repo_setting_family_neighbor_map(active_pair_map, state_family_pair_map).items()
+            if signal in active_campaign_width_signals
+        },
+        stat_key="campaign_width_stats",
+    )
+    persisted_family_task_step_floor_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: {family: 1.0 for family in families}
+            for signal, families in active_pair_map.items()
+            if signal in active_task_step_floor_signals
+        },
+        stat_key="task_step_floor_stats",
+    )
+    persisted_neighbor_task_step_floor_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: families
+            for signal, families in _repo_setting_family_neighbor_map(active_pair_map, state_family_pair_map).items()
+            if signal in active_task_step_floor_signals
+        },
+        stat_key="task_step_floor_stats",
+    )
+    persisted_family_adaptive_search_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: {family: 1.0 for family in families}
+            for signal, families in active_pair_map.items()
+            if signal in active_adaptive_search_signals
+        },
+        stat_key="adaptive_search_stats",
+    )
+    persisted_neighbor_adaptive_search_stats = _weighted_family_repo_setting_prior_stats(
+        state_priors=state_priors,
+        family_weight_map={
+            signal: families
+            for signal, families in _repo_setting_family_neighbor_map(active_pair_map, state_family_pair_map).items()
+            if signal in active_adaptive_search_signals
+        },
+        stat_key="adaptive_search_stats",
+    )
+    campaign_width_stats = _merge_repo_setting_regression_stats(
+        persisted_campaign_width_stats,
+        _repo_setting_regression_stats_from_samples(campaign_width_samples),
+        persisted_family_campaign_width_stats,
+        persisted_neighbor_campaign_width_stats,
+        _repo_setting_regression_stats_from_samples(family_campaign_width_samples),
+    )
+    task_step_floor_stats = _merge_repo_setting_regression_stats(
+        persisted_task_step_floor_stats,
+        _repo_setting_regression_stats_from_samples(task_step_floor_samples),
+        persisted_family_task_step_floor_stats,
+        persisted_neighbor_task_step_floor_stats,
+        _repo_setting_regression_stats_from_samples(family_task_step_floor_samples),
+    )
+    adaptive_search_stats = _merge_repo_setting_adaptive_stats(
+        persisted_adaptive_search_stats,
+        persisted_family_adaptive_search_stats,
+        persisted_neighbor_adaptive_search_stats,
+        {
+            "observations": len(adaptive_true_scores) + len(adaptive_false_scores),
+            "true_count": len(adaptive_true_scores),
+            "false_count": len(adaptive_false_scores),
+            "true_score_sum": sum(adaptive_true_scores),
+            "false_score_sum": sum(adaptive_false_scores),
+        },
+        {
+            "observations": len(family_adaptive_true_scores) + len(family_adaptive_false_scores),
+            "true_count": len(family_adaptive_true_scores),
+            "false_count": len(family_adaptive_false_scores),
+            "true_score_sum": sum(family_adaptive_true_scores),
+            "false_score_sum": sum(family_adaptive_false_scores),
+        },
+    )
+    campaign_width_slope = _weighted_linear_slope_from_stats(campaign_width_stats)
+    task_step_floor_slope = _weighted_linear_slope_from_stats(task_step_floor_stats)
+    campaign_width_neighbor_support = sum(
+        float(value)
+        for key, value in neighbor_signal_observations.items()
+        if str(key).rpartition(":")[2] in active_campaign_width_signals
+    )
+    task_step_floor_neighbor_support = sum(
+        float(value)
+        for key, value in neighbor_signal_observations.items()
+        if str(key).rpartition(":")[2] in active_task_step_floor_signals
+    )
+    adaptive_search_neighbor_support = sum(
+        float(value)
+        for key, value in neighbor_signal_observations.items()
+        if str(key).rpartition(":")[2] in active_adaptive_search_signals
+    )
+    campaign_width_unit_weight = _clamp_float(
+        0.3 + (0.18 * campaign_width_slope) + min(0.12, 0.04 * campaign_width_neighbor_support),
+        min_value=0.08,
+        max_value=0.75,
+    )
+    task_step_floor_unit_weight = _clamp_float(
+        0.4 + (0.12 * task_step_floor_slope) + min(0.12, 0.04 * task_step_floor_neighbor_support),
+        min_value=0.15,
+        max_value=0.85,
+    )
+    adaptive_search_bonus = 0.25
+    if int(adaptive_search_stats.get("true_count", 0) or 0) > 0 and int(adaptive_search_stats.get("false_count", 0) or 0) > 0:
+        adaptive_delta = (
+            float(adaptive_search_stats.get("true_score_sum", 0.0) or 0.0)
+            / float(max(1, int(adaptive_search_stats.get("true_count", 0) or 0)))
+        ) - (
+            float(adaptive_search_stats.get("false_score_sum", 0.0) or 0.0)
+            / float(max(1, int(adaptive_search_stats.get("false_count", 0) or 0)))
+        )
+        adaptive_search_bonus = _clamp_float(
+            0.25 + (0.12 * adaptive_delta) + min(0.08, 0.03 * adaptive_search_neighbor_support),
+            min_value=0.05,
+            max_value=0.45,
+        )
+    elif adaptive_search_neighbor_support > 0.0:
+        adaptive_search_bonus = _clamp_float(
+            adaptive_search_bonus + min(0.08, 0.03 * adaptive_search_neighbor_support),
+            min_value=0.05,
+            max_value=0.45,
+        )
+    return {
+        "focused_rounds": focused_rounds
+        + sum(persisted_signal_observations.values()),
+        "signal_observations": dict(sorted(signal_observations.items())),
+        "campaign_width_observations": int(
+            _merge_repo_setting_regression_stats(
+                persisted_campaign_width_stats,
+                _repo_setting_regression_stats_from_samples(campaign_width_samples),
+            ).get("observations", 0)
+            or 0
+        ),
+        "campaign_width_slope": campaign_width_slope,
+        "campaign_width_unit_weight": campaign_width_unit_weight,
+        "task_step_floor_observations": int(
+            _merge_repo_setting_regression_stats(
+                persisted_task_step_floor_stats,
+                _repo_setting_regression_stats_from_samples(task_step_floor_samples),
+            ).get("observations", 0)
+            or 0
+        ),
+        "task_step_floor_slope": task_step_floor_slope,
+        "task_step_floor_unit_weight": task_step_floor_unit_weight,
+        "adaptive_search_observations": int(
+            _merge_repo_setting_adaptive_stats(
+                persisted_adaptive_search_stats,
+                {
+                    "observations": len(adaptive_true_scores) + len(adaptive_false_scores),
+                    "true_count": len(adaptive_true_scores),
+                    "false_count": len(adaptive_false_scores),
+                    "true_score_sum": sum(adaptive_true_scores),
+                    "false_score_sum": sum(adaptive_false_scores),
+                },
+            ).get("observations", 0)
+            or 0
+        ),
+        "adaptive_search_bonus": adaptive_search_bonus,
+        "campaign_width_neighbor_support": campaign_width_neighbor_support,
+        "task_step_floor_neighbor_support": task_step_floor_neighbor_support,
+        "adaptive_search_neighbor_support": adaptive_search_neighbor_support,
+        "persisted_signal_observations": dict(sorted(persisted_signal_observations.items())),
+        "family_signal_observations": dict(sorted(family_signal_observations.items())),
+        "persisted_family_signal_observations": dict(sorted(persisted_family_signal_observations.items())),
+        "neighbor_signal_observations": dict(sorted(neighbor_signal_observations.items())),
+        "persisted_neighbor_signal_observations": dict(sorted(persisted_neighbor_signal_observations.items())),
+        "active_focused_pairs": sorted(f"{family}:{signal}" for signal, families in active_pair_map.items() for family in families),
+    }
+
+
+def _update_repo_setting_policy_priors(
+    controller_state: Mapping[str, object] | None,
+    *,
+    round_payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    repo_setting_decay = 0.92
+    state = dict(controller_state) if isinstance(controller_state, Mapping) else {}
+    priors = _normalize_repo_setting_policy_priors(state.get("repo_setting_policy_priors", {}))
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    rationale = payload.get("policy_shift_rationale", {})
+    planner_pressure = rationale.get("planner_pressure", {}) if isinstance(rationale, Mapping) else {}
+    repo_setting_policy_pressure = (
+        planner_pressure.get("repo_setting_policy_pressure", {})
+        if isinstance(planner_pressure, Mapping)
+        else {}
+    )
+    if not isinstance(repo_setting_policy_pressure, Mapping):
+        state["repo_setting_policy_priors"] = priors
+        return state
+    policy = payload.get("policy", {})
+    if not isinstance(policy, Mapping):
+        state["repo_setting_policy_priors"] = priors
+        return state
+    outcome_score = _repo_setting_retained_outcome_score(payload.get("campaign_report", {}))
+    campaign_width = max(1, int(policy.get("campaign_width", 1) or 1))
+    task_step_floor = max(1, int(policy.get("task_step_floor", 1) or 1))
+    adaptive_search = bool(policy.get("adaptive_search", False))
+    campaign_width_signals = _normalize_benchmark_families(repo_setting_policy_pressure.get("campaign_width_signals", []))
+    task_step_floor_signals = _normalize_benchmark_families(repo_setting_policy_pressure.get("task_step_floor_signals", []))
+    adaptive_search_signals = _normalize_benchmark_families(repo_setting_policy_pressure.get("adaptive_search_signals", []))
+    focused_pair_map = _repo_setting_pair_map(repo_setting_policy_pressure.get("focused_pairs", []))
+    active_signals = _repo_setting_signal_set_union(
+        campaign_width_signals,
+        task_step_floor_signals,
+        adaptive_search_signals,
+    )
+    for signal in active_signals:
+        entry = _decay_repo_setting_prior_entry(priors.get(signal, {}), decay=repo_setting_decay)
+        if not entry:
+            entry = _empty_repo_setting_prior_entry()
+        entry["observations"] = max(0, int(entry.get("observations", 0) or 0)) + 1
+        entry["last_outcome_score"] = outcome_score
+        if signal in campaign_width_signals:
+            stats = _merge_repo_setting_regression_stats(
+                entry.get("campaign_width_stats", {}),
+                _repo_setting_regression_stats_from_samples([(float(max(0, campaign_width - 1)), outcome_score, 1.0)]),
+            )
+            entry["campaign_width_stats"] = stats
+        if signal in task_step_floor_signals:
+            stats = _merge_repo_setting_regression_stats(
+                entry.get("task_step_floor_stats", {}),
+                _repo_setting_regression_stats_from_samples([(math.log2(float(task_step_floor)), outcome_score, 1.0)]),
+            )
+            entry["task_step_floor_stats"] = stats
+        if signal in adaptive_search_signals:
+            adaptive_stats = _merge_repo_setting_adaptive_stats(
+                entry.get("adaptive_search_stats", {}),
+                {
+                    "observations": 1,
+                    "true_count": 1 if adaptive_search else 0,
+                    "false_count": 0 if adaptive_search else 1,
+                    "true_score_sum": outcome_score if adaptive_search else 0.0,
+                    "false_score_sum": 0.0 if adaptive_search else outcome_score,
+                },
+            )
+            entry["adaptive_search_stats"] = adaptive_stats
+        family_priors = dict(entry.get("family_priors", {})) if isinstance(entry.get("family_priors", {}), Mapping) else {}
+        for family in sorted(focused_pair_map.get(signal, set())):
+            family_entry = _decay_repo_setting_prior_entry(family_priors.get(family, {}), decay=repo_setting_decay)
+            if not family_entry:
+                family_entry = _empty_repo_setting_prior_entry()
+            family_entry["observations"] = max(0, int(family_entry.get("observations", 0) or 0)) + 1
+            family_entry["last_outcome_score"] = outcome_score
+            if signal in campaign_width_signals:
+                family_entry["campaign_width_stats"] = _merge_repo_setting_regression_stats(
+                    family_entry.get("campaign_width_stats", {}),
+                    _repo_setting_regression_stats_from_samples(
+                        [(float(max(0, campaign_width - 1)), outcome_score, 1.0)]
+                    ),
+                )
+            if signal in task_step_floor_signals:
+                family_entry["task_step_floor_stats"] = _merge_repo_setting_regression_stats(
+                    family_entry.get("task_step_floor_stats", {}),
+                    _repo_setting_regression_stats_from_samples(
+                        [(math.log2(float(task_step_floor)), outcome_score, 1.0)]
+                    ),
+                )
+            if signal in adaptive_search_signals:
+                family_entry["adaptive_search_stats"] = _merge_repo_setting_adaptive_stats(
+                    family_entry.get("adaptive_search_stats", {}),
+                    {
+                        "observations": 1,
+                        "true_count": 1 if adaptive_search else 0,
+                        "false_count": 0 if adaptive_search else 1,
+                        "true_score_sum": outcome_score if adaptive_search else 0.0,
+                        "false_score_sum": 0.0 if adaptive_search else outcome_score,
+                    },
+                )
+            family_entry["family_priors"] = {}
+            family_priors[family] = family_entry
+        entry["family_priors"] = family_priors
+        priors[signal] = entry
+    state["repo_setting_policy_priors"] = priors
+    return state
+
+
+def _repo_setting_candidate_score_adjustment(
+    *,
+    policy: Mapping[str, object] | None,
+    current_policy: Mapping[str, object] | None,
+    repo_setting_policy_pressure: Mapping[str, object] | None,
+    learned_priors: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    proposal = policy if isinstance(policy, Mapping) else {}
+    current = current_policy if isinstance(current_policy, Mapping) else {}
+    pressure = repo_setting_policy_pressure if isinstance(repo_setting_policy_pressure, Mapping) else {}
+    priors = learned_priors if isinstance(learned_priors, Mapping) else {}
+    current_campaign_width = max(1, int(current.get("campaign_width", 1) or 1))
+    current_task_step_floor = max(1, int(current.get("task_step_floor", 1) or 1))
+    proposal_campaign_width = max(1, int(proposal.get("campaign_width", current_campaign_width) or current_campaign_width))
+    proposal_task_step_floor = max(1, int(proposal.get("task_step_floor", current_task_step_floor) or current_task_step_floor))
+    proposal_focus = str(proposal.get("focus", "")).strip()
+    proposal_adaptive = bool(proposal.get("adaptive_search", False))
+    campaign_width_signals = _normalize_benchmark_families(pressure.get("campaign_width_signals", []))
+    task_step_floor_signals = _normalize_benchmark_families(pressure.get("task_step_floor_signals", []))
+    adaptive_search_signals = _normalize_benchmark_families(pressure.get("adaptive_search_signals", []))
+    campaign_width_delta = proposal_campaign_width - current_campaign_width
+    task_step_floor_delta = proposal_task_step_floor - current_task_step_floor
+    campaign_width_unit_weight = _clamp_float(
+        float(priors.get("campaign_width_unit_weight", 0.3) or 0.3),
+        min_value=0.08,
+        max_value=0.75,
+    )
+    task_step_floor_unit_weight = _clamp_float(
+        float(priors.get("task_step_floor_unit_weight", 0.4) or 0.4),
+        min_value=0.15,
+        max_value=0.85,
+    )
+    adaptive_search_bonus = _clamp_float(
+        float(priors.get("adaptive_search_bonus", 0.25) or 0.25),
+        min_value=0.05,
+        max_value=0.45,
+    )
+
+    campaign_width_adjustment = 0.0
+    if campaign_width_signals:
+        if campaign_width_delta > 0:
+            campaign_width_adjustment = min(0.9, campaign_width_unit_weight * float(campaign_width_delta))
+        else:
+            campaign_width_adjustment = _clamp_float(
+                -0.05 - (0.5 * campaign_width_unit_weight),
+                min_value=-0.45,
+                max_value=-0.02,
+            )
+
+    task_step_floor_adjustment = 0.0
+    if task_step_floor_signals:
+        if task_step_floor_delta > 0:
+            depth_ratio = float(proposal_task_step_floor) / float(max(1, current_task_step_floor))
+            task_step_floor_adjustment = min(
+                0.9,
+                task_step_floor_unit_weight * math.log2(max(1.0, depth_ratio)),
+            )
+        elif task_step_floor_delta < 0:
+            task_step_floor_adjustment = _clamp_float(
+                -0.05 - (0.5 * task_step_floor_unit_weight),
+                min_value=-0.4,
+                max_value=-0.1,
+            )
+        else:
+            task_step_floor_adjustment = _clamp_float(
+                -0.125 * task_step_floor_unit_weight,
+                min_value=-0.12,
+                max_value=-0.02,
+            )
+
+    adaptive_search_adjustment = 0.0
+    focus_adjustment = 0.0
+    if adaptive_search_signals:
+        adaptive_search_adjustment = adaptive_search_bonus if proposal_adaptive else -adaptive_search_bonus
+        if proposal_focus == "discovered_task_adaptation":
+            focus_adjustment = 0.15
+        elif proposal_focus == "balanced":
+            focus_adjustment = 0.05
+
+    total_adjustment = (
+        campaign_width_adjustment
+        + task_step_floor_adjustment
+        + adaptive_search_adjustment
+        + focus_adjustment
+    )
+    return {
+        "score_adjustment": total_adjustment,
+        "campaign_width_adjustment": campaign_width_adjustment,
+        "task_step_floor_adjustment": task_step_floor_adjustment,
+        "adaptive_search_adjustment": adaptive_search_adjustment,
+        "focus_adjustment": focus_adjustment,
+        "campaign_width_delta": campaign_width_delta,
+        "task_step_floor_delta": task_step_floor_delta,
+        "focused_pairs": _normalize_benchmark_families(pressure.get("focused_pairs", [])),
+        "campaign_width_signals": campaign_width_signals,
+        "task_step_floor_signals": task_step_floor_signals,
+        "adaptive_search_signals": adaptive_search_signals,
+        "learned_priors": {
+            "campaign_width_unit_weight": campaign_width_unit_weight,
+            "task_step_floor_unit_weight": task_step_floor_unit_weight,
+            "adaptive_search_bonus": adaptive_search_bonus,
+            "focused_rounds": max(0, int(priors.get("focused_rounds", 0) or 0)),
+            "signal_observations": dict(priors.get("signal_observations", {}))
+            if isinstance(priors.get("signal_observations", {}), dict)
+            else {},
+            "campaign_width_observations": max(0, int(priors.get("campaign_width_observations", 0) or 0)),
+            "task_step_floor_observations": max(0, int(priors.get("task_step_floor_observations", 0) or 0)),
+            "adaptive_search_observations": max(0, int(priors.get("adaptive_search_observations", 0) or 0)),
+        },
     }
 
 
@@ -3072,6 +5058,8 @@ def _policy_shift_score_adjustment(rationale: dict[str, object]) -> float:
         score -= 0.75
     if "subsystem_reject_cooldown" in codes:
         score -= 0.5
+    if "subsystem_monoculture" in codes:
+        score -= 1.5
     if "safety_regression" in codes or "phase_gate_failure" in codes:
         score -= 3.0
     if "liftoff_reject" in codes:
@@ -3155,12 +5143,16 @@ def _controller_observation(
     *,
     campaign_report: dict[str, object] | None,
     liftoff_payload: dict[str, object] | None,
+    curriculum_controls: dict[str, object] | None = None,
 ) -> dict[str, object]:
     campaign_signal = _campaign_signal(campaign_report or {})
     return build_round_observation(
         campaign_signal=campaign_signal,
         subsystem_signal=_subsystem_signal(campaign_report or {}),
-        planner_pressure_signal=_planner_pressure_signal(campaign_report or {}),
+        planner_pressure_signal=_planner_pressure_signal(
+            campaign_report or {},
+            curriculum_controls=curriculum_controls,
+        ),
         liftoff_signal=_liftoff_signal(liftoff_payload or {}) if liftoff_payload else None,
     )
 
@@ -3170,14 +5162,26 @@ def _candidate_round_policies(
     *,
     campaign_report: dict[str, object],
     liftoff_payload: dict[str, object] | None,
+    curriculum_controls: dict[str, object] | None = None,
     max_cycles: int,
     max_task_limit: int,
     max_campaign_width: int,
     max_variant_width: int,
+    max_task_step_floor: int,
 ) -> list[dict[str, object]]:
     base = _advance_subsystem_cooldowns(current_policy)
     signal = _campaign_signal(campaign_report)
     liftoff = _liftoff_signal(liftoff_payload or {}) if liftoff_payload else {}
+    planner_pressure = _planner_pressure_signal(
+        campaign_report,
+        curriculum_controls=curriculum_controls,
+    )
+    subsystem_signal = _subsystem_signal(campaign_report)
+    subsystem_monoculture = _subsystem_monoculture_signal(
+        campaign_report,
+        subsystem_signal=subsystem_signal,
+        planner_pressure_signal=planner_pressure,
+    )
     severe_regression = (
         float(signal.get("worst_family_delta", 0.0) or 0.0) < 0.0
         or float(signal.get("worst_generated_family_delta", 0.0) or 0.0) < 0.0
@@ -3192,16 +5196,45 @@ def _candidate_round_policies(
     retained_cycles = int(signal.get("retained_cycles", 0) or 0)
     current_cycles = max(1, int(base.get("cycles", 1) or 1))
     current_task_limit = max(1, int(base.get("task_limit", 64) or 64))
+    current_task_step_floor = max(1, int(base.get("task_step_floor", 1) or 1))
     current_campaign_width = max(1, int(base.get("campaign_width", 1) or 1))
     current_variant_width = max(1, int(base.get("variant_width", 1) or 1))
+    current_priority_families = _normalize_benchmark_families(
+        current_policy.get("priority_benchmark_families", [])
+    )
+    repo_setting_priority_families = _repo_setting_focus_priority_families(
+        current_priority_families=current_priority_families,
+        frontier_repo_setting_families=planner_pressure.get("frontier_repo_setting_families", []),
+        missing_required_families=signal.get("missing_required_families", []),
+    )
+    repo_setting_policy_pressure = _repo_setting_policy_pressure(
+        frontier_repo_setting_priority_pairs=planner_pressure.get("frontier_repo_setting_priority_pairs", []),
+        priority_families=repo_setting_priority_families,
+    )
+    repo_setting_campaign_width_pressure = bool(repo_setting_policy_pressure.get("campaign_width_signals", []))
+    repo_setting_task_step_floor_pressure = bool(repo_setting_policy_pressure.get("task_step_floor_signals", []))
+    repo_setting_adaptive_search_pressure = bool(repo_setting_policy_pressure.get("adaptive_search_signals", []))
+    depth_signal_active = bool(
+        int(signal.get("productive_depth_retained_cycles", 0) or 0) > 0
+        or int(signal.get("depth_drift_cycles", 0) or 0) > 0
+        or int(signal.get("long_horizon_retained_cycles", 0) or 0) > 0
+        or repo_setting_task_step_floor_pressure
+    )
     focuses = ["balanced", "recovery_alignment", "discovered_task_adaptation"]
     adaptive_options = [False, True]
     if severe_regression:
         focuses = ["recovery_alignment", "balanced"]
         adaptive_options = [True]
+    elif bool(subsystem_monoculture.get("active", False)):
+        focuses = ["discovered_task_adaptation", "recovery_alignment", "balanced"]
+        adaptive_options = [True]
     elif low_confidence_pressure or retained_cycles <= 0:
         focuses = ["discovered_task_adaptation", "balanced"]
         adaptive_options = [True]
+    elif repo_setting_adaptive_search_pressure:
+        adaptive_options = [True]
+        if "discovered_task_adaptation" not in focuses:
+            focuses = ["discovered_task_adaptation", *focuses]
     if liftoff and str(liftoff.get("state", "")).strip() == "reject":
         adaptive_options = [True]
     cycle_options = sorted(
@@ -3218,10 +5251,31 @@ def _candidate_round_policies(
             max(1, min(max_task_limit, current_task_limit * 2)),
         }
     )
+    if bool(subsystem_monoculture.get("active", False)):
+        task_limit_options = sorted(
+            {
+                max(1, min(max_task_limit, current_task_limit)),
+                max(1, min(max_task_limit, current_task_limit * 2)),
+                max(1, min(max_task_limit, current_task_limit * (4 if bool(subsystem_monoculture.get("severe", False)) else 2))),
+            }
+        )
+    if depth_signal_active:
+        task_step_floor_options = sorted(
+            {
+                max(1, min(max_task_step_floor, current_task_step_floor)),
+                max(1, min(max_task_step_floor, max(1, current_task_step_floor // 2))),
+                max(1, min(max_task_step_floor, current_task_step_floor * 2)),
+            }
+        )
+    else:
+        task_step_floor_options = [current_task_step_floor]
     campaign_width_options = sorted(
         {
             max(1, min(max_campaign_width, current_campaign_width)),
             max(1, min(max_campaign_width, current_campaign_width + 1)),
+            max(1, min(max_campaign_width, current_campaign_width + 2))
+            if repo_setting_campaign_width_pressure
+            else max(1, min(max_campaign_width, current_campaign_width + 1)),
         }
     )
     variant_width_options = sorted(
@@ -3230,53 +5284,73 @@ def _candidate_round_policies(
             max(1, min(max_variant_width, current_variant_width + 1)),
         }
     )
+    if bool(subsystem_monoculture.get("active", False)):
+        campaign_width_options = sorted(
+            {
+                max(1, min(max_campaign_width, current_campaign_width + 1)),
+                max(1, min(max_campaign_width, current_campaign_width + 2)),
+            }
+        )
+        variant_width_options = sorted(
+            {
+                max(1, min(max_variant_width, current_variant_width + 1)),
+                max(1, min(max_variant_width, current_variant_width + (2 if bool(subsystem_monoculture.get("severe", False)) else 1))),
+            }
+        )
     candidates: list[dict[str, object]] = []
     seen: set[str] = set()
     for focus in focuses:
         for adaptive in adaptive_options:
             for cycles in cycle_options:
                 for task_limit in task_limit_options:
-                    for campaign_width in campaign_width_options:
-                        for variant_width in variant_width_options:
-                            proposal = dict(base)
-                            proposal["focus"] = focus
-                            proposal["adaptive_search"] = adaptive
-                            proposal["cycles"] = cycles
-                            proposal["task_limit"] = task_limit
-                            proposal["campaign_width"] = campaign_width
-                            proposal["variant_width"] = variant_width
-                            if focus == "recovery_alignment":
-                                proposal["cycles"] = min(max_cycles, max(proposal["cycles"], current_cycles))
-                                proposal["adaptive_search"] = True
-                            if focus == "discovered_task_adaptation":
-                                proposal["task_limit"] = min(max_task_limit, max(proposal["task_limit"], current_task_limit))
-                                proposal["variant_width"] = min(
-                                    max_variant_width,
-                                    max(proposal["variant_width"], current_variant_width),
+                    for task_step_floor in task_step_floor_options:
+                        for campaign_width in campaign_width_options:
+                            for variant_width in variant_width_options:
+                                proposal = dict(base)
+                                proposal["focus"] = focus
+                                proposal["adaptive_search"] = adaptive
+                                proposal["cycles"] = cycles
+                                proposal["task_limit"] = task_limit
+                                proposal["task_step_floor"] = task_step_floor
+                                proposal["campaign_width"] = campaign_width
+                                proposal["variant_width"] = variant_width
+                                if focus == "recovery_alignment":
+                                    proposal["cycles"] = min(max_cycles, max(proposal["cycles"], current_cycles))
+                                    proposal["adaptive_search"] = True
+                                if focus == "discovered_task_adaptation":
+                                    proposal["task_limit"] = min(max_task_limit, max(proposal["task_limit"], current_task_limit))
+                                    proposal["task_step_floor"] = min(
+                                        max_task_step_floor,
+                                        max(proposal["task_step_floor"], current_task_step_floor),
+                                    )
+                                    proposal["variant_width"] = min(
+                                        max_variant_width,
+                                        max(proposal["variant_width"], current_variant_width),
+                                    )
+                                if liftoff and not bool(liftoff.get("allow_kernel_autobuild", False)):
+                                    proposal["focus"] = "discovered_task_adaptation"
+                                    proposal["task_limit"] = min(
+                                        max_task_limit,
+                                        max(proposal["task_limit"], current_task_limit),
+                                    )
+                                proposal = _materialize_excluded_subsystems(proposal)
+                                fingerprint = json.dumps(
+                                    {
+                                        "focus": proposal["focus"],
+                                        "adaptive_search": bool(proposal["adaptive_search"]),
+                                        "cycles": int(proposal["cycles"]),
+                                        "campaign_width": int(proposal["campaign_width"]),
+                                        "variant_width": int(proposal["variant_width"]),
+                                        "task_limit": int(proposal["task_limit"]),
+                                        "task_step_floor": int(proposal["task_step_floor"]),
+                                        "excluded_subsystems": list(proposal.get("excluded_subsystems", [])),
+                                    },
+                                    sort_keys=True,
                                 )
-                            if liftoff and not bool(liftoff.get("allow_kernel_autobuild", False)):
-                                proposal["focus"] = "discovered_task_adaptation"
-                                proposal["task_limit"] = min(
-                                    max_task_limit,
-                                    max(proposal["task_limit"], current_task_limit),
-                                )
-                            proposal = _materialize_excluded_subsystems(proposal)
-                            fingerprint = json.dumps(
-                                {
-                                    "focus": proposal["focus"],
-                                    "adaptive_search": bool(proposal["adaptive_search"]),
-                                    "cycles": int(proposal["cycles"]),
-                                    "campaign_width": int(proposal["campaign_width"]),
-                                    "variant_width": int(proposal["variant_width"]),
-                                    "task_limit": int(proposal["task_limit"]),
-                                    "excluded_subsystems": list(proposal.get("excluded_subsystems", [])),
-                                },
-                                sort_keys=True,
-                            )
-                            if fingerprint in seen:
-                                continue
-                            seen.add(fingerprint)
-                            candidates.append(proposal)
+                                if fingerprint in seen:
+                                    continue
+                                seen.add(fingerprint)
+                                candidates.append(proposal)
     if not candidates:
         candidates.append(_materialize_excluded_subsystems(base))
     return candidates
@@ -3329,6 +5403,224 @@ def _liftoff_signal(liftoff_payload: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _round_stop_signal(
+    *,
+    campaign_report: dict[str, object] | None,
+    liftoff_payload: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_round = round_payload if isinstance(round_payload, dict) else {}
+    resolved_campaign = campaign_report if isinstance(campaign_report, dict) else {}
+    if not resolved_campaign and isinstance(resolved_round.get("campaign_report", {}), dict):
+        resolved_campaign = dict(resolved_round.get("campaign_report", {}))
+    resolved_liftoff = liftoff_payload if isinstance(liftoff_payload, dict) else {}
+    if not resolved_liftoff and isinstance(resolved_round.get("liftoff_report", {}), dict):
+        resolved_liftoff = dict(resolved_round.get("liftoff_report", {}))
+
+    campaign_signal = _campaign_signal(resolved_campaign or {})
+    liftoff_signal = _liftoff_signal(resolved_liftoff) if isinstance(resolved_liftoff, dict) else {}
+    rationale = resolved_round.get("policy_shift_rationale", {})
+    reason_codes = set()
+    if isinstance(rationale, dict):
+        raw_codes = rationale.get("reason_codes", [])
+        if isinstance(raw_codes, list):
+            reason_codes = {
+                str(code).strip()
+                for code in raw_codes
+                if str(code).strip()
+            }
+    planner_pressure = rationale.get("planner_pressure", {}) if isinstance(rationale, dict) else {}
+    if not isinstance(planner_pressure, dict):
+        planner_pressure = {}
+    retained_cycles = int(campaign_signal.get("retained_cycles", 0) or 0)
+    productive_depth_retained_cycles = max(
+        int(campaign_signal.get("productive_depth_retained_cycles", 0) or 0),
+        int(planner_pressure.get("productive_depth_retained_cycles", 0) or 0),
+    )
+    long_horizon_retained_cycles = max(
+        int(campaign_signal.get("long_horizon_retained_cycles", 0) or 0),
+        int(planner_pressure.get("long_horizon_retained_cycles", 0) or 0),
+    )
+    depth_drift_cycles = max(
+        int(campaign_signal.get("depth_drift_cycles", 0) or 0),
+        int(planner_pressure.get("depth_drift_cycles", 0) or 0),
+    )
+    average_retained_step_delta = float(campaign_signal.get("average_retained_step_delta", 0.0) or 0.0)
+    average_productive_depth_step_delta = max(
+        float(campaign_signal.get("average_productive_depth_step_delta", 0.0) or 0.0),
+        float(planner_pressure.get("average_productive_depth_step_delta", 0.0) or 0.0),
+    )
+    average_retained_pass_rate_delta = float(campaign_signal.get("average_retained_pass_rate_delta", 0.0) or 0.0)
+    retained_phase_gates_passed = bool(campaign_signal.get("all_retained_phase_gates_passed", True))
+    failed_decisions = int(campaign_signal.get("failed_decisions", 0) or 0)
+    productive_depth_continuation = (
+        retained_phase_gates_passed
+        and failed_decisions <= 0
+        and depth_drift_cycles <= 0
+        and average_retained_pass_rate_delta >= 0.0
+        and (
+            productive_depth_retained_cycles > 0
+            or (
+                long_horizon_retained_cycles > 0
+                and retained_cycles > 0
+                and max(average_retained_step_delta, average_productive_depth_step_delta) > 0.0
+            )
+            or (
+                "productive_depth_gain" in reason_codes
+                and "depth_drift_pressure" not in reason_codes
+                and max(average_retained_step_delta, average_productive_depth_step_delta) > 0.0
+            )
+        )
+    )
+    liftoff_state = str(liftoff_signal.get("state", "")).strip()
+    retained_or_liftoff_yield = retained_cycles > 0 or liftoff_state == "retain"
+    return {
+        "retained_cycles": retained_cycles,
+        "productive_depth_continuation": productive_depth_continuation,
+        "yield_resets_no_yield": retained_or_liftoff_yield or productive_depth_continuation,
+        "continuation_resets_policy_stall": productive_depth_continuation or liftoff_state == "retain",
+        "depth_drift_cycles": depth_drift_cycles,
+    }
+
+
+_MAX_DEPTH_RUNWAY_CREDIT = 4
+_MAX_NO_YIELD_DEPTH_RUNWAY_BONUS = 3
+_MAX_POLICY_STALL_DEPTH_RUNWAY_BONUS = 2
+_HIGH_CONFIDENCE_PRODUCTIVE_STEP_DELTA = 6.0
+
+
+def _depth_runway_signal(
+    *,
+    campaign_report: dict[str, object] | None,
+    liftoff_payload: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_round = round_payload if isinstance(round_payload, dict) else {}
+    stop_signal = _round_stop_signal(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=resolved_round,
+    )
+    campaign_signal = _campaign_signal(campaign_report if isinstance(campaign_report, dict) else {})
+    rationale = resolved_round.get("policy_shift_rationale", {})
+    planner_pressure = rationale.get("planner_pressure", {}) if isinstance(rationale, dict) else {}
+    if not isinstance(planner_pressure, dict):
+        planner_pressure = {}
+    productive_depth_retained_cycles = max(
+        int(campaign_signal.get("productive_depth_retained_cycles", 0) or 0),
+        int(planner_pressure.get("productive_depth_retained_cycles", 0) or 0),
+    )
+    long_horizon_retained_cycles = max(
+        int(campaign_signal.get("long_horizon_retained_cycles", 0) or 0),
+        int(planner_pressure.get("long_horizon_retained_cycles", 0) or 0),
+    )
+    average_productive_depth_step_delta = max(
+        float(campaign_signal.get("average_productive_depth_step_delta", 0.0) or 0.0),
+        float(planner_pressure.get("average_productive_depth_step_delta", 0.0) or 0.0),
+    )
+    depth_drift_cycles = max(
+        int(campaign_signal.get("depth_drift_cycles", 0) or 0),
+        int(planner_pressure.get("depth_drift_cycles", 0) or 0),
+    )
+    return {
+        "productive_depth_continuation": bool(stop_signal.get("productive_depth_continuation", False)),
+        "retained_cycles": int(stop_signal.get("retained_cycles", 0) or 0),
+        "depth_drift_cycles": depth_drift_cycles,
+        "productive_depth_retained_cycles": productive_depth_retained_cycles,
+        "long_horizon_retained_cycles": long_horizon_retained_cycles,
+        "average_productive_depth_step_delta": average_productive_depth_step_delta,
+        "all_retained_phase_gates_passed": bool(campaign_signal.get("all_retained_phase_gates_passed", True)),
+        "failed_decisions": int(campaign_signal.get("failed_decisions", 0) or 0),
+    }
+
+
+def _next_depth_runway_credit(
+    current_credit: int,
+    *,
+    campaign_report: dict[str, object] | None,
+    liftoff_payload: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
+) -> int:
+    signal = _depth_runway_signal(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    credit = max(0, int(current_credit))
+    if (
+        int(signal.get("depth_drift_cycles", 0) or 0) > 0
+        or int(signal.get("failed_decisions", 0) or 0) > 0
+        or not bool(signal.get("all_retained_phase_gates_passed", True))
+    ):
+        return 0
+    if bool(signal.get("productive_depth_continuation", False)):
+        gain = 1
+        if int(signal.get("long_horizon_retained_cycles", 0) or 0) > 0:
+            gain += 1
+        if float(signal.get("average_productive_depth_step_delta", 0.0) or 0.0) >= _HIGH_CONFIDENCE_PRODUCTIVE_STEP_DELTA:
+            gain += 1
+        return min(_MAX_DEPTH_RUNWAY_CREDIT, credit + gain)
+    if int(signal.get("retained_cycles", 0) or 0) > 0:
+        return credit
+    return max(0, credit - 1)
+
+
+def _adaptive_stop_budget(
+    *,
+    base_max_no_yield_rounds: int,
+    base_max_policy_stall_rounds: int,
+    depth_runway_credit: int,
+) -> dict[str, int]:
+    credit = max(0, min(_MAX_DEPTH_RUNWAY_CREDIT, int(depth_runway_credit)))
+    return {
+        "depth_runway_credit": credit,
+        "max_no_yield_rounds_base": max(0, int(base_max_no_yield_rounds)),
+        "max_policy_stall_rounds_base": max(0, int(base_max_policy_stall_rounds)),
+        "max_no_yield_rounds_effective": max(0, int(base_max_no_yield_rounds))
+        + min(_MAX_NO_YIELD_DEPTH_RUNWAY_BONUS, credit),
+        "max_policy_stall_rounds_effective": max(0, int(base_max_policy_stall_rounds))
+        + min(_MAX_POLICY_STALL_DEPTH_RUNWAY_BONUS, credit),
+    }
+
+
+def _next_no_yield_rounds(
+    current_rounds: int,
+    *,
+    campaign_report: dict[str, object] | None,
+    liftoff_payload: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
+) -> int:
+    stop_signal = _round_stop_signal(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    if bool(stop_signal.get("yield_resets_no_yield", False)):
+        return 0
+    return max(0, int(current_rounds)) + 1
+
+
+def _next_policy_stall_rounds(
+    current_rounds: int,
+    *,
+    current_policy: dict[str, object],
+    next_policy: dict[str, object],
+    campaign_report: dict[str, object] | None,
+    liftoff_payload: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
+) -> int:
+    if dict(current_policy) != dict(next_policy):
+        return 0
+    stop_signal = _round_stop_signal(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    if bool(stop_signal.get("continuation_resets_policy_stall", False)):
+        return 0
+    return max(0, int(current_rounds)) + 1
+
+
 def _validate_liftoff_report(liftoff_payload: dict[str, object]) -> dict[str, object]:
     signal = _liftoff_signal(liftoff_payload)
     if signal["report_kind"] != "tolbert_liftoff_loop_report":
@@ -3349,20 +5641,28 @@ def _next_round_policy(
     controller_state: dict[str, object] | None = None,
     prior_rounds: list[dict[str, object]] | None = None,
     planner_controls: dict[str, object] | None = None,
+    curriculum_controls: dict[str, object] | None = None,
     max_cycles: int,
     max_task_limit: int,
     max_campaign_width: int,
     max_variant_width: int,
+    max_task_step_floor: int = 4096,
 ) -> dict[str, object]:
-    observation = _controller_observation(campaign_report=campaign_report, liftoff_payload=liftoff_payload)
+    observation = _controller_observation(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        curriculum_controls=curriculum_controls,
+    )
     candidate_policies = _candidate_round_policies(
         current_policy,
         campaign_report=campaign_report,
         liftoff_payload=liftoff_payload,
+        curriculum_controls=curriculum_controls,
         max_cycles=max_cycles,
         max_task_limit=max_task_limit,
         max_campaign_width=max_campaign_width,
         max_variant_width=max_variant_width,
+        max_task_step_floor=max_task_step_floor,
     )
     next_policy, planner_diagnostics = plan_next_policy(
         controller_state,
@@ -3370,6 +5670,23 @@ def _next_round_policy(
         candidate_policies=candidate_policies,
     )
     historical_adjustments = _historical_policy_rationale_adjustments(list(prior_rounds or []))
+    candidate_repo_setting_policy_pressure = _repo_setting_policy_pressure(
+        frontier_repo_setting_priority_pairs=_planner_pressure_signal(
+            campaign_report,
+            curriculum_controls=curriculum_controls,
+        ).get("frontier_repo_setting_priority_pairs", []),
+        priority_families=_normalize_benchmark_families(current_policy.get("priority_benchmark_families", [])),
+    )
+    learned_repo_setting_priors = _learn_repo_setting_policy_priors(
+        prior_rounds=list(prior_rounds or []),
+        repo_setting_policy_pressure=candidate_repo_setting_policy_pressure,
+        persisted_priors=(
+            dict(controller_state.get("repo_setting_policy_priors", {}))
+            if isinstance(controller_state, Mapping)
+            and isinstance(controller_state.get("repo_setting_policy_priors", {}), Mapping)
+            else {}
+        ),
+    )
     adjusted_candidates: list[dict[str, object]] = []
     for candidate in planner_diagnostics.get("candidates", []):
         if not isinstance(candidate, dict):
@@ -3377,9 +5694,23 @@ def _next_round_policy(
         policy = candidate.get("policy", {})
         action_key = action_key_for_policy(policy if isinstance(policy, dict) else {})
         rationale_adjustment = float(historical_adjustments.get(action_key, 0.0) or 0.0)
-        adjusted_score = float(candidate.get("score", 0.0) or 0.0) + rationale_adjustment
+        repo_setting_score_adjustment = _repo_setting_candidate_score_adjustment(
+            policy=policy if isinstance(policy, dict) else {},
+            current_policy=current_policy,
+            repo_setting_policy_pressure=candidate_repo_setting_policy_pressure,
+            learned_priors=learned_repo_setting_priors,
+        )
+        adjusted_score = (
+            float(candidate.get("score", 0.0) or 0.0)
+            + rationale_adjustment
+            + float(repo_setting_score_adjustment.get("score_adjustment", 0.0) or 0.0)
+        )
         adjusted_candidate = dict(candidate)
         adjusted_candidate["historical_rationale_adjustment"] = rationale_adjustment
+        adjusted_candidate["repo_setting_score_adjustment"] = float(
+            repo_setting_score_adjustment.get("score_adjustment", 0.0) or 0.0
+        )
+        adjusted_candidate["repo_setting_score_rationale"] = repo_setting_score_adjustment
         adjusted_candidate["adjusted_score"] = adjusted_score
         adjusted_candidates.append(adjusted_candidate)
     if adjusted_candidates:
@@ -3394,15 +5725,37 @@ def _next_round_policy(
             planner_diagnostics["selected_historical_rationale_adjustment"] = float(
                 top_candidate.get("historical_rationale_adjustment", 0.0) or 0.0
             )
+            planner_diagnostics["selected_repo_setting_score_adjustment"] = float(
+                top_candidate.get("repo_setting_score_adjustment", 0.0) or 0.0
+            )
+            planner_diagnostics["selected_repo_setting_score_rationale"] = dict(
+                top_candidate.get("repo_setting_score_rationale", {})
+            )
+            planner_diagnostics["learned_repo_setting_priors"] = dict(learned_repo_setting_priors)
             planner_diagnostics["candidates"] = adjusted_candidates[:12]
     if isinstance(round_payload, dict):
         round_payload["controller_planner"] = planner_diagnostics
     signal = _campaign_signal(campaign_report)
     subsystem_signal = _subsystem_signal(campaign_report)
-    planner_pressure_signal = _planner_pressure_signal(campaign_report)
+    planner_pressure_signal = _planner_pressure_signal(
+        campaign_report,
+        curriculum_controls=curriculum_controls,
+    )
+    subsystem_monoculture = _subsystem_monoculture_signal(
+        campaign_report,
+        subsystem_signal=subsystem_signal,
+        planner_pressure_signal=planner_pressure_signal,
+    )
     retained_cycles = int(signal["retained_cycles"])
     rejected_cycles = int(signal["rejected_cycles"])
+    runtime_managed_decisions = int(signal["runtime_managed_decisions"])
     avg_retained_pass_delta = float(signal["average_retained_pass_rate_delta"])
+    avg_retained_step_delta = float(signal["average_retained_step_delta"])
+    productive_depth_retained_cycles = int(signal.get("productive_depth_retained_cycles", 0) or 0)
+    average_productive_depth_step_delta = float(signal.get("average_productive_depth_step_delta", 0.0) or 0.0)
+    depth_drift_cycles = int(signal.get("depth_drift_cycles", 0) or 0)
+    average_depth_drift_step_delta = float(signal.get("average_depth_drift_step_delta", 0.0) or 0.0)
+    long_horizon_retained_cycles = int(signal.get("long_horizon_retained_cycles", 0) or 0)
     retained_phase_gates_passed = bool(signal["all_retained_phase_gates_passed"])
     failed_decisions = int(signal["failed_decisions"])
     worst_family_delta = float(signal["worst_family_delta"])
@@ -3427,6 +5780,7 @@ def _next_round_policy(
         current_campaign_report=campaign_report,
         current_priority_families=priority_families,
         planner_controls=planner_controls,
+        curriculum_controls=curriculum_controls,
     )
     priority_families_with_retained_gain = _normalize_benchmark_families(
         priority_family_history.get("priority_families_with_retained_gain", [])
@@ -3436,6 +5790,15 @@ def _next_round_policy(
     )
     priority_families_under_sampled = _normalize_benchmark_families(
         priority_family_history.get("priority_families_under_sampled", [])
+    )
+    productive_partial_conversion = _productive_partial_conversion_signal(
+        round_payload,
+        priority_families=priority_families,
+    )
+    productive_partial_conversion_gap = (
+        runtime_managed_decisions <= 0
+        and retained_cycles <= 0
+        and bool(productive_partial_conversion.get("conversion_gap", False))
     )
     priority_families_low_return = _normalize_benchmark_families(
         priority_family_history.get("priority_families_low_return", [])
@@ -3454,10 +5817,43 @@ def _next_round_policy(
         else {}
     )
     priority_family_under_sampled_gap = bool(priority_families) and bool(priority_families_under_sampled)
-    current_cycles = max(1, int(next_policy.get("cycles", 1) or 1))
-    current_task_limit = max(0, int(next_policy.get("task_limit", 0) or 0))
-    current_campaign_width = max(1, int(next_policy.get("campaign_width", 1) or 1))
-    current_variant_width = max(1, int(next_policy.get("variant_width", 1) or 1))
+    repo_setting_priority_families = _repo_setting_focus_priority_families(
+        current_priority_families=priority_families,
+        ranked_priority_families=priority_families_ranked_by_selection_score,
+        frontier_repo_setting_families=priority_family_history.get("frontier_repo_setting_families", []),
+        missing_required_families=missing_required_families,
+    )
+    repo_setting_policy_pressure = _repo_setting_policy_pressure(
+        frontier_repo_setting_priority_pairs=priority_family_history.get("frontier_repo_setting_priority_pairs", []),
+        priority_families=repo_setting_priority_families,
+    )
+    current_priority_family_set = set(_normalize_benchmark_families(current_policy.get("priority_benchmark_families", [])))
+    repo_setting_family_expansion = any(
+        family not in current_priority_family_set
+        for family in _normalize_benchmark_families(repo_setting_policy_pressure.get("focused_families", []))
+    )
+    repo_setting_campaign_width_pressure = bool(repo_setting_policy_pressure.get("campaign_width_signals", []))
+    repo_setting_task_step_floor_pressure = bool(repo_setting_policy_pressure.get("task_step_floor_signals", []))
+    repo_setting_adaptive_search_pressure = bool(repo_setting_policy_pressure.get("adaptive_search_signals", []))
+    productive_priority_family_set = set(priority_families_with_retained_gain)
+    coding_frontier_expansion = (
+        retained_cycles > 0
+        and retained_phase_gates_passed
+        and failed_decisions <= 0
+        and max_regressed_families <= 0
+        and max_generated_regressed_families <= 0
+        and worst_family_delta >= 0.0
+        and worst_generated_family_delta >= 0.0
+        and productive_depth_retained_cycles > 0
+        and average_productive_depth_step_delta > 0.0
+        and {"project", "repository"}.issubset(productive_priority_family_set)
+    )
+    coding_frontier_family_expansion = coding_frontier_expansion and "integration" not in current_priority_family_set
+    current_cycles = max(1, int(current_policy.get("cycles", 1) or 1))
+    current_task_limit = max(0, int(current_policy.get("task_limit", 0) or 0))
+    current_task_step_floor = max(1, int(current_policy.get("task_step_floor", 1) or 1))
+    current_campaign_width = max(1, int(current_policy.get("campaign_width", 1) or 1))
+    current_variant_width = max(1, int(current_policy.get("variant_width", 1) or 1))
     stalled_subsystem = ""
     if isinstance(round_payload, dict):
         active_child = round_payload.get("active_child", {})
@@ -3469,6 +5865,8 @@ def _next_round_policy(
             stalled_subsystem = _subsystem_from_progress_line(str(round_payload.get("phase_detail", "")))
     if not stalled_subsystem:
         stalled_subsystem = str(planner_pressure_signal.get("dominant_subsystem", "")).strip()
+    if not stalled_subsystem and bool(subsystem_monoculture.get("active", False)):
+        stalled_subsystem = str(subsystem_monoculture.get("dominant_subsystem", "")).strip()
 
     # Hard safety envelopes remain, but they only constrain the learned planner.
     if (
@@ -3558,8 +5956,137 @@ def _next_round_policy(
     else:
         next_policy["cycles"] = max(1, min(max_cycles, int(next_policy.get("cycles", current_cycles) or current_cycles)))
 
+    if repo_setting_adaptive_search_pressure:
+        next_policy["adaptive_search"] = True
+        if retained_cycles > 0 and retained_phase_gates_passed and next_policy.get("focus") == "balanced":
+            next_policy["focus"] = "discovered_task_adaptation"
+    if productive_partial_conversion_gap:
+        next_policy["adaptive_search"] = True
+        next_policy["focus"] = "discovered_task_adaptation"
+        if stalled_subsystem:
+            next_policy = _apply_subsystem_cooldown(next_policy, subsystem=stalled_subsystem, rounds=2)
+    if bool(subsystem_monoculture.get("active", False)):
+        next_policy["adaptive_search"] = True
+        next_policy["focus"] = "discovered_task_adaptation"
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(
+                current_campaign_width + (2 if bool(subsystem_monoculture.get("severe", False)) else 1),
+                int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
+            ),
+        )
+        next_policy["variant_width"] = min(
+            max_variant_width,
+            max(
+                current_variant_width + 1,
+                int(next_policy.get("variant_width", current_variant_width) or current_variant_width),
+            ),
+        )
+        next_policy["task_limit"] = min(
+            max_task_limit,
+            max(
+                current_task_limit * (4 if bool(subsystem_monoculture.get("severe", False)) else 2),
+                int(next_policy.get("task_limit", current_task_limit) or current_task_limit),
+            ),
+        )
+        if stalled_subsystem:
+            next_policy = _apply_subsystem_cooldown(
+                next_policy,
+                subsystem=stalled_subsystem,
+                rounds=3 if bool(subsystem_monoculture.get("severe", False)) else 2,
+            )
+    if coding_frontier_expansion:
+        next_policy["adaptive_search"] = True
+        if next_policy.get("focus") == "balanced":
+            next_policy["focus"] = "discovered_task_adaptation"
+        next_policy["cycles"] = min(
+            max_cycles,
+            max(
+                current_cycles + 1,
+                int(next_policy.get("cycles", current_cycles) or current_cycles),
+            ),
+        )
+        next_policy["task_limit"] = min(
+            max_task_limit,
+            max(
+                current_task_limit * 2,
+                int(next_policy.get("task_limit", current_task_limit) or current_task_limit),
+            ),
+        )
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(
+                current_campaign_width + 1,
+                int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
+            ),
+        )
+        if long_horizon_retained_cycles > 0 and not (repo_setting_family_expansion or coding_frontier_family_expansion):
+            next_policy["variant_width"] = min(
+                max_variant_width,
+                max(
+                    current_variant_width + 1,
+                    int(next_policy.get("variant_width", current_variant_width) or current_variant_width),
+                ),
+            )
+    if (
+        repo_setting_campaign_width_pressure
+        or repo_setting_task_step_floor_pressure
+        or repo_setting_adaptive_search_pressure
+    ):
+        next_policy["cycles"] = min(
+            max_cycles,
+            max(
+                current_cycles + 1,
+                int(next_policy.get("cycles", current_cycles) or current_cycles),
+            ),
+        )
+    if repo_setting_campaign_width_pressure:
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(
+                current_campaign_width + (2 if repo_setting_family_expansion else 1),
+                int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
+            ),
+        )
+
+    next_task_step_floor = current_task_step_floor
+    if depth_drift_cycles > 0 or (avg_retained_pass_delta <= 0.0 and avg_retained_step_delta > 0.0):
+        next_task_step_floor = max(1, max(1, current_task_step_floor // 2))
+    elif (
+        retained_cycles > 0
+        and retained_phase_gates_passed
+        and max_regressed_families <= 0
+        and max_generated_regressed_families <= 0
+        and worst_family_delta >= 0.0
+        and worst_generated_family_delta >= 0.0
+        and productive_depth_retained_cycles > 0
+        and average_productive_depth_step_delta > 0.0
+    ):
+        growth_multiplier = 2.0 if long_horizon_retained_cycles > 0 else 1.5
+        if coding_frontier_family_expansion or (coding_frontier_expansion and repo_setting_family_expansion):
+            growth_multiplier = 1.5 if long_horizon_retained_cycles > 0 else 1.25
+        next_task_step_floor = min(
+            max_task_step_floor,
+            max(current_task_step_floor + 1, int(math.ceil(float(current_task_step_floor) * growth_multiplier))),
+        )
+    elif repo_setting_task_step_floor_pressure:
+        next_task_step_floor = min(
+            max_task_step_floor,
+            max(current_task_step_floor + 1, int(math.ceil(float(current_task_step_floor) * 1.5))),
+        )
+    next_policy["task_step_floor"] = max(1, next_task_step_floor)
+
+    cooldown_rounds_by_subsystem = (
+        dict(subsystem_signal.get("cooldown_rounds_by_subsystem", {}))
+        if isinstance(subsystem_signal.get("cooldown_rounds_by_subsystem", {}), dict)
+        else {}
+    )
     for subsystem in subsystem_signal["cooldown_candidates"][:2]:
-        next_policy = _apply_subsystem_cooldown(next_policy, subsystem=subsystem, rounds=2)
+        next_policy = _apply_subsystem_cooldown(
+            next_policy,
+            subsystem=subsystem,
+            rounds=max(2, int(cooldown_rounds_by_subsystem.get(subsystem, 2) or 2)),
+        )
 
     if liftoff_payload:
         liftoff = _liftoff_signal(liftoff_payload)
@@ -3586,12 +6113,20 @@ def _next_round_policy(
             current_policy.get("priority_benchmark_families", []),
         ),
         ranked_priority_families=priority_families_ranked_by_selection_score,
+        repo_setting_priority_families=priority_family_history.get("frontier_repo_setting_families", []),
         priority_family_selection_scores=priority_family_selection_scores,
         min_selection_score=float(priority_family_scoring_policy.get("priority_family_min_selection_score", 0.0) or 0.0),
         productive_priority_families=priority_families_with_retained_gain,
         under_sampled_priority_families=priority_families_under_sampled,
         low_return_priority_families=priority_families_low_return,
     )
+    if coding_frontier_expansion and not required_family_coverage_gap:
+        widened_priority_families: list[str] = []
+        for family in ("integration", "repository", "project", *next_policy.get("priority_benchmark_families", [])):
+            token = str(family).strip()
+            if token and token not in widened_priority_families:
+                widened_priority_families.append(token)
+        next_policy["priority_benchmark_families"] = widened_priority_families[:3]
     selected_priority_families = _normalize_benchmark_families(next_policy.get("priority_benchmark_families", []))
     priority_family_selection_cap = 3
     filtered_priority_families = [
@@ -3626,7 +6161,7 @@ def _next_round_policy(
     next_policy = _materialize_excluded_subsystems(next_policy)
     if isinstance(round_payload, dict):
         widened_dimensions: list[str] = []
-        for key in ("cycles", "task_limit", "campaign_width", "variant_width"):
+        for key in ("cycles", "task_limit", "task_step_floor", "campaign_width", "variant_width"):
             if int(next_policy.get(key, 0) or 0) > int(current_policy.get(key, 0) or 0):
                 widened_dimensions.append(key)
         previous_excluded = set(_normalize_excluded_subsystems(current_policy.get("excluded_subsystems", [])))
@@ -3643,6 +6178,10 @@ def _next_round_policy(
             reason_codes.append("phase_gate_failure")
         if max_low_confidence_episode_delta > 0 or min_trusted_retrieval_step_delta < 0:
             reason_codes.append("low_confidence_or_retrieval_gap")
+        if productive_depth_retained_cycles > 0:
+            reason_codes.append("productive_depth_gain")
+        if depth_drift_cycles > 0:
+            reason_codes.append("depth_drift_pressure")
         if campaign_breadth_pressure_cycles > 0:
             reason_codes.append("campaign_breadth_pressure")
         if variant_breadth_pressure_cycles > 0:
@@ -3653,8 +6192,18 @@ def _next_round_policy(
             reason_codes.append("required_family_coverage_gap")
         if priority_family_under_sampled_gap:
             reason_codes.append("priority_family_under_sampled")
+        if productive_partial_conversion_gap:
+            reason_codes.append("productive_partial_conversion_gap")
         if priority_families_low_return:
             reason_codes.append("priority_family_low_return")
+        if repo_setting_campaign_width_pressure:
+            reason_codes.append("frontier_repo_setting_campaign_width_pressure")
+        if repo_setting_task_step_floor_pressure:
+            reason_codes.append("frontier_repo_setting_depth_pressure")
+        if repo_setting_adaptive_search_pressure:
+            reason_codes.append("frontier_repo_setting_adaptive_search")
+        if coding_frontier_expansion:
+            reason_codes.append("coding_frontier_expansion")
         if str(priority_family_budget_warning.get("kind", "")).strip() == "selection_score_floor":
             reason_codes.append("priority_family_selection_floor_narrowing")
         elif str(priority_family_budget_warning.get("kind", "")).strip() == "limited_priority_families":
@@ -3667,6 +6216,10 @@ def _next_round_policy(
             reason_codes.append("stalled_subsystem_cooldown")
         if subsystem_signal["cooldown_candidates"]:
             reason_codes.append("subsystem_reject_cooldown")
+        if subsystem_signal.get("zero_yield_dominant_subsystems"):
+            reason_codes.append("dominant_zero_yield_subsystem_cooldown")
+        if bool(subsystem_monoculture.get("active", False)):
+            reason_codes.append("subsystem_monoculture")
         if not reason_codes:
             reason_codes.append("stable_progress")
         if liftoff_payload:
@@ -3683,6 +6236,12 @@ def _next_round_policy(
             "focus_after": str(next_policy.get("focus", "")).strip(),
             "adaptive_search_before": bool(current_policy.get("adaptive_search", False)),
             "adaptive_search_after": bool(next_policy.get("adaptive_search", False)),
+            "task_step_floor_before": int(
+                current_policy.get("task_step_floor", current_task_step_floor) or current_task_step_floor
+            ),
+            "task_step_floor_after": int(
+                next_policy.get("task_step_floor", current_task_step_floor) or current_task_step_floor
+            ),
             "widened_dimensions": widened_dimensions,
             "cooled_subsystems": sorted(next_excluded - previous_excluded),
             "priority_benchmark_families_before": _normalize_benchmark_families(
@@ -3695,7 +6254,17 @@ def _next_round_policy(
             "planner_pressure": {
                 "campaign_breadth_pressure_cycles": campaign_breadth_pressure_cycles,
                 "variant_breadth_pressure_cycles": variant_breadth_pressure_cycles,
+                "productive_depth_retained_cycles": productive_depth_retained_cycles,
+                "average_productive_depth_step_delta": average_productive_depth_step_delta,
+                "depth_drift_cycles": depth_drift_cycles,
+                "average_depth_drift_step_delta": average_depth_drift_step_delta,
+                "long_horizon_retained_cycles": long_horizon_retained_cycles,
                 "dominant_subsystem": str(planner_pressure_signal.get("dominant_subsystem", "")).strip(),
+                "subsystem_monoculture": subsystem_monoculture,
+                "cooldown_rounds_by_subsystem": cooldown_rounds_by_subsystem,
+                "zero_yield_dominant_subsystems": _normalize_excluded_subsystems(
+                    subsystem_signal.get("zero_yield_dominant_subsystems", [])
+                ),
                 "external_report_count": external_report_count,
                 "distinct_external_benchmark_families": distinct_external_benchmark_families,
                 "missing_required_families": missing_required_families,
@@ -3704,8 +6273,61 @@ def _next_round_policy(
                 "priority_families_with_retained_gain": priority_families_with_retained_gain,
                 "priority_families_without_signal": priority_families_without_signal,
                 "priority_families_under_sampled": priority_families_under_sampled,
+                "productive_partial_sampled_families": _normalize_benchmark_families(
+                    productive_partial_conversion.get("sampled_families", [])
+                ),
+                "productive_partial_sampled_priority_families": _normalize_benchmark_families(
+                    productive_partial_conversion.get("sampled_priority_families", [])
+                ),
+                "productive_partial_conversion_gap": productive_partial_conversion_gap,
                 "priority_families_low_return": priority_families_low_return,
                 "priority_families_ranked_by_selection_score": priority_families_ranked_by_selection_score,
+                "frontier_failure_motif_priority_pairs": list(
+                    priority_family_history.get("frontier_failure_motif_priority_pairs", [])
+                )
+                if isinstance(priority_family_history.get("frontier_failure_motif_priority_pairs", []), list)
+                else [],
+                "frontier_repo_setting_priority_pairs": list(
+                    priority_family_history.get("frontier_repo_setting_priority_pairs", [])
+                )
+                if isinstance(priority_family_history.get("frontier_repo_setting_priority_pairs", []), list)
+                else [],
+                "frontier_failure_motif_families": _normalize_benchmark_families(
+                    priority_family_history.get("frontier_failure_motif_families", [])
+                ),
+                "frontier_repo_setting_families": _normalize_benchmark_families(
+                    priority_family_history.get("frontier_repo_setting_families", [])
+                ),
+                "repo_setting_policy_pressure": {
+                    "focused_pairs": list(repo_setting_policy_pressure.get("focused_pairs", []))
+                    if isinstance(repo_setting_policy_pressure.get("focused_pairs", []), list)
+                    else [],
+                    "focused_families": _normalize_benchmark_families(
+                        repo_setting_policy_pressure.get("focused_families", [])
+                    ),
+                    "signal_counts": dict(repo_setting_policy_pressure.get("signal_counts", {}))
+                    if isinstance(repo_setting_policy_pressure.get("signal_counts", {}), dict)
+                    else {},
+                    "campaign_width_signals": _normalize_benchmark_families(
+                        repo_setting_policy_pressure.get("campaign_width_signals", [])
+                    ),
+                    "task_step_floor_signals": _normalize_benchmark_families(
+                        repo_setting_policy_pressure.get("task_step_floor_signals", [])
+                    ),
+                    "adaptive_search_signals": _normalize_benchmark_families(
+                        repo_setting_policy_pressure.get("adaptive_search_signals", [])
+                    ),
+                    "learned_priors": dict(learned_repo_setting_priors),
+                },
+                "coding_frontier_expansion": {
+                    "triggered": bool(coding_frontier_expansion),
+                    "productive_priority_families": _rank_priority_benchmark_families(
+                        list(productive_priority_family_set)
+                    ),
+                    "forced_priority_families": ["integration", "repository", "project"]
+                    if coding_frontier_expansion and not required_family_coverage_gap
+                    else [],
+                },
                 "priority_family_budget_warning": priority_family_budget_warning,
                 "priority_family_history": priority_family_history,
             },
@@ -3728,6 +6350,7 @@ def main() -> None:
     parser.add_argument("--variant-width", type=int, default=1)
     parser.add_argument("--adaptive-search", action="store_true")
     parser.add_argument("--task-limit", type=int, default=128)
+    parser.add_argument("--task-step-floor", type=int, default=0)
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
     parser.add_argument("--focus", choices=("balanced", "recovery_alignment", "discovered_task_adaptation"), default="balanced")
     parser.add_argument("--liftoff", choices=("auto", "always", "never"), default="auto")
@@ -3894,26 +6517,46 @@ def main() -> None:
     child_failure_recovery_budget = max(0, int(args.max_child_failure_recovery_rounds))
     no_yield_rounds = 0
     policy_stall_rounds = 0
+    depth_runway_credit = 0
     for round_payload in prior_rounds:
         if not isinstance(round_payload, dict):
             continue
-        campaign_report = round_payload.get("campaign_report", {})
-        if not isinstance(campaign_report, dict):
-            continue
-        production = campaign_report.get("production_yield_summary", {})
-        if isinstance(production, dict) and int(production.get("retained_cycles", 0) or 0) <= 0:
-            no_yield_rounds += 1
-        else:
-            no_yield_rounds = 0
+        outer_stop_signal = _round_stop_signal(
+            campaign_report=round_payload.get("campaign_report", {}),
+            liftoff_payload=round_payload.get("liftoff_report", {}),
+            round_payload=round_payload,
+        )
+        round_payload["outer_stop_signal"] = outer_stop_signal
+        no_yield_rounds = _next_no_yield_rounds(
+            no_yield_rounds,
+            campaign_report=round_payload.get("campaign_report", {}),
+            liftoff_payload=round_payload.get("liftoff_report", {}),
+            round_payload=round_payload,
+        )
         if (
             isinstance(round_payload.get("policy", {}), dict)
             and "next_policy" in round_payload
             and isinstance(round_payload.get("next_policy", {}), dict)
         ):
-            if dict(round_payload["policy"]) == dict(round_payload["next_policy"]):
-                policy_stall_rounds += 1
-            else:
-                policy_stall_rounds = 0
+            policy_stall_rounds = _next_policy_stall_rounds(
+                policy_stall_rounds,
+                current_policy=round_payload["policy"],
+                next_policy=round_payload["next_policy"],
+                campaign_report=round_payload.get("campaign_report", {}),
+                liftoff_payload=round_payload.get("liftoff_report", {}),
+                round_payload=round_payload,
+            )
+        depth_runway_credit = _next_depth_runway_credit(
+            depth_runway_credit,
+            campaign_report=round_payload.get("campaign_report", {}),
+            liftoff_payload=round_payload.get("liftoff_report", {}),
+            round_payload=round_payload,
+        )
+        round_payload["adaptive_stop_budget"] = _adaptive_stop_budget(
+            base_max_no_yield_rounds=max(0, args.max_no_yield_rounds),
+            base_max_policy_stall_rounds=max(0, args.max_policy_stall_rounds),
+            depth_runway_credit=depth_runway_credit,
+        )
     report: dict[str, object] = {
         "spec_version": "asi_v1",
         "report_kind": "unattended_campaign_report",
@@ -3956,10 +6599,11 @@ def main() -> None:
         "global_storage_policy_path": "" if global_storage_policy_path is None else str(global_storage_policy_path),
         "global_storage_policy": global_storage_policy,
     }
-    _write_controller_state(controller_state_path, controller_state)
+    _write_controller_state(controller_state_path, controller_state, config=config)
     _persist_report_state(
         report_path,
         report,
+        config=config,
         status_path=status_path,
         lock_path=lock_path,
         external_lease_backend=str(args.lease_backend or ""),
@@ -3980,10 +6624,12 @@ def main() -> None:
             payload=report,
             state_path=alert_state_path,
             rate_limit_seconds=float(args.alert_rate_limit_seconds),
+            config=config,
         )
         _persist_report_state(
             report_path,
             report,
+            config=config,
             status_path=status_path,
             lock_path=lock_path,
             external_lease_backend=str(args.lease_backend or ""),
@@ -4012,6 +6658,7 @@ def main() -> None:
             _persist_report_state(
                 report_path,
                 report,
+                config=config,
                 status_path=status_path,
                 lock_path=lock_path,
                 external_lease_backend=str(args.lease_backend or ""),
@@ -4029,6 +6676,7 @@ def main() -> None:
             _persist_report_state(
                 report_path,
                 report,
+                config=config,
                 status_path=status_path,
                 lock_path=lock_path,
                 external_lease_backend=str(args.lease_backend or ""),
@@ -4055,11 +6703,13 @@ def main() -> None:
             payload=alert_payload,
             state_path=alert_state_path,
             rate_limit_seconds=float(args.alert_rate_limit_seconds),
+            config=config,
         )
         report["policy_shift_alert"] = round_payload["policy_shift_alert"]
         _persist_report_state(
             report_path,
             report,
+            config=config,
             status_path=status_path,
             lock_path=lock_path,
             external_lease_backend=str(args.lease_backend or ""),
@@ -4100,7 +6750,7 @@ def main() -> None:
         )
         round_payload["controller_failure_update"] = controller_update
         report["controller_summary"] = controller_state_summary(controller_state)
-        _write_controller_state(controller_state_path, controller_state)
+        _write_controller_state(controller_state_path, controller_state, config=config)
 
     def _recover_child_failure_or_stop(
         *,
@@ -4117,7 +6767,7 @@ def main() -> None:
             _mark_round(round_payload, status="safe_stop", phase=phase, reason=str(reason))
             report["rounds_completed"] = _count_completed_rounds(report["rounds"])
             report["child_failure_recoveries_used"] = child_failure_recoveries_used
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             _emit_alert_if_configured()
             print(report_path)
             raise SystemExit(2)
@@ -4126,6 +6776,7 @@ def main() -> None:
             current_policy,
             round_payload=round_payload,
             phase=phase,
+            reason=reason,
             max_cycles=max(1, args.max_cycles_per_round),
             max_task_limit=max(1, args.max_task_limit),
             max_campaign_width=max(1, args.max_campaign_width),
@@ -4164,8 +6815,9 @@ def main() -> None:
                 "policy_after": dict(next_policy),
                 "timestamp": time.time(),
             },
+            config=config,
         )
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
         current_policy = next_policy
         return True
 
@@ -4203,6 +6855,7 @@ def main() -> None:
     _persist_report_state(
         report_path,
         report,
+        config=config,
         status_path=status_path,
         lock_path=lock_path,
         external_lease_backend=str(args.lease_backend or ""),
@@ -4218,12 +6871,13 @@ def main() -> None:
             "lock_path": str(lock_path),
             "lock_passed": bool(lock_result.get("passed", False)),
         },
+        config=config,
     )
     if not bool(lock_result.get("passed", False)):
         report["status"] = "safe_stop"
         report["phase"] = "preflight"
         report["reason"] = str(lock_result.get("detail", "campaign lock acquisition failed"))
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
         _emit_alert_if_configured()
         print(report_path)
         raise SystemExit(2)
@@ -4257,6 +6911,7 @@ def main() -> None:
             report["phase"] = phase
             round_payload["phase"] = phase
             report["current_policy"] = dict(current_policy)
+            round_curriculum_controls = _load_retained_curriculum_controls(config)
             controller_observation = _controller_observation(
                 campaign_report=report["rounds"][-2].get("campaign_report", {})
                 if len(report["rounds"]) > 1 and isinstance(report["rounds"][-2], dict)
@@ -4264,6 +6919,7 @@ def main() -> None:
                 liftoff_payload=report["rounds"][-2].get("liftoff_report", {})
                 if len(report["rounds"]) > 1 and isinstance(report["rounds"][-2], dict)
                 else {},
+                curriculum_controls=round_curriculum_controls,
             )
             round_payload["controller_observation"] = controller_observation
             report["controller_summary"] = controller_state_summary(controller_state)
@@ -4280,6 +6936,7 @@ def main() -> None:
                     "policy": dict(current_policy),
                     "timestamp": time.time(),
                 },
+                config=config,
             )
             disk = _disk_preflight(repo_root, min_free_gib=float(args.min_free_disk_gib))
             gpu = _gpu_preflight(str(current_policy["tolbert_device"]))
@@ -4299,14 +6956,14 @@ def main() -> None:
                 report["unattended_evidence"] = reporting
             else:
                 report["unattended_evidence"] = _unattended_evidence_snapshot(config)
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             if not bool(disk["passed"]):
                 report["status"] = "safe_stop"
                 report["phase"] = "preflight"
                 report["reason"] = str(disk["detail"])
                 _mark_round(round_payload, status="safe_stop", phase="preflight", reason=str(disk["detail"]))
                 report["rounds_completed"] = _count_completed_rounds(report["rounds"])
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 print(report_path)
                 raise SystemExit(2)
@@ -4316,7 +6973,7 @@ def main() -> None:
                 report["reason"] = str(gpu["detail"])
                 _mark_round(round_payload, status="safe_stop", phase="preflight", reason=str(gpu["detail"]))
                 report["rounds_completed"] = _count_completed_rounds(report["rounds"])
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 print(report_path)
                 raise SystemExit(2)
@@ -4326,7 +6983,7 @@ def main() -> None:
                 report["reason"] = str(trust["detail"])
                 _mark_round(round_payload, status="safe_stop", phase="preflight", reason=str(trust["detail"]))
                 report["rounds_completed"] = _count_completed_rounds(report["rounds"])
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 print(report_path)
                 raise SystemExit(2)
@@ -4343,6 +7000,7 @@ def main() -> None:
                     "round_index": round_index,
                     "timestamp": time.time(),
                 },
+                config=config,
             )
             cleanup = _governed_cleanup_runtime_state(
                 config,
@@ -4369,14 +7027,22 @@ def main() -> None:
                 target_free_gib=max(0.0, float(args.global_storage_target_free_gib)),
                 top_k=max(1, int(args.global_storage_top_k)),
             )
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
 
             phase = "campaign"
             report["phase"] = phase
             round_payload["phase"] = phase
+            round_run_match_id = f"unattended:round:{run_id}:{round_index}"
+            report["active_run"] = {
+                "run_index": round_index,
+                "run_match_id": round_run_match_id,
+                "phase": phase,
+                "policy": dict(current_policy),
+            }
             _progress(
                 f"[campaign] phase=campaign round={round_index} cycles={int(current_policy['cycles'])} "
-                f"task_limit={int(current_policy['task_limit'])} focus={current_policy['focus']} "
+                f"task_limit={int(current_policy['task_limit'])} "
+                f"task_step_floor={int(current_policy['task_step_floor'])} focus={current_policy['focus']} "
                 f"tolbert_device={current_policy['tolbert_device']}"
             )
             _append_event(
@@ -4388,6 +7054,7 @@ def main() -> None:
                     "policy": dict(current_policy),
                     "timestamp": time.time(),
                 },
+                config=config,
             )
             campaign_cmd = [
                 sys.executable,
@@ -4424,11 +7091,22 @@ def main() -> None:
                 campaign_cmd.extend(["--provider", args.provider])
             if args.model:
                 campaign_cmd.extend(["--model", args.model])
+            campaign_env = dict(env)
+            campaign_env["AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR"] = str(int(current_policy["task_step_floor"]))
+            campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH"] = str(status_path)
+            campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX"] = str(round_index)
+            campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID"] = round_run_match_id
+            child_improvement_reports_dir = _child_improvement_reports_dir(report_path)
+            campaign_env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"] = str(child_improvement_reports_dir)
+            campaign_env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"] = str(
+                child_improvement_reports_dir / "agentkernel.sqlite3"
+            )
             campaign_progress = _make_child_progress_callback(
                 report_path=report_path,
                 report=report,
                 status_path=status_path,
                 lock_path=lock_path,
+                config=config,
                 round_payload=round_payload,
                 round_index=round_index,
                 phase=phase,
@@ -4438,7 +7116,7 @@ def main() -> None:
             campaign_run = _run_and_stream(
                 campaign_cmd,
                 cwd=repo_root,
-                env=env,
+                env=campaign_env,
                 progress_label=f"campaign_round_{round_index}",
                 heartbeat_interval_seconds=float(args.child_heartbeat_seconds),
                 max_silence_seconds=float(args.max_child_silence_seconds),
@@ -4451,8 +7129,39 @@ def main() -> None:
             round_payload["campaign_report_path"] = "" if campaign_report_path is None else str(campaign_report_path)
             report["campaign_run"] = campaign_run
             report["campaign_report_path"] = round_payload["campaign_report_path"]
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             if int(campaign_run["returncode"]) != 0:
+                mirrored_child_status = _mirrored_child_status_from_parent_status(status_path)
+                partial_acceptance = _accept_productive_partial_child_timeout(
+                    campaign_run,
+                    mirrored_child_status=mirrored_child_status,
+                )
+                round_payload["campaign_partial_acceptance"] = partial_acceptance
+                if bool(partial_acceptance.get("accepted", False)):
+                    campaign_report_path = Path(str(partial_acceptance.get("report_path", "")).strip())
+                    campaign_report = _read_json(campaign_report_path)
+                    round_payload["campaign_report_path"] = str(campaign_report_path)
+                    round_payload["campaign_report"] = campaign_report
+                    round_payload["campaign_validation"] = {
+                        "passed": True,
+                        "detail": f"accepted productive partial child timeout: {partial_acceptance['reason']}",
+                        "accepted_partial_timeout": True,
+                    }
+                    round_payload["campaign_warning"] = str(campaign_run.get("timeout_reason", "")).strip()
+                    report["campaign_report_path"] = round_payload["campaign_report_path"]
+                    report["campaign_report"] = campaign_report
+                    report["campaign_validation"] = round_payload["campaign_validation"]
+                    report["phase_detail"] = round_payload["campaign_warning"]
+                    _mark_round(
+                        round_payload,
+                        status="completed",
+                        phase=phase,
+                        reason=str(round_payload["campaign_warning"]),
+                    )
+                    report["rounds_completed"] = _count_completed_rounds(report["rounds"])
+                    _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+                    round_index += 1
+                    continue
                 failure_reason = str(campaign_run.get("timeout_reason", "")) or "campaign subprocess failed"
                 _recover_child_failure_or_stop(
                     round_payload=round_payload,
@@ -4465,7 +7174,7 @@ def main() -> None:
             campaign_report = _read_json(campaign_report_path)
             round_payload["campaign_report"] = campaign_report
             report["campaign_report"] = campaign_report
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             campaign_validation = _validate_campaign_report(campaign_report)
             round_payload["campaign_validation"] = campaign_validation
             report["campaign_validation"] = campaign_validation
@@ -4484,7 +7193,7 @@ def main() -> None:
                 phase = "liftoff"
                 report["phase"] = phase
                 round_payload["phase"] = phase
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _progress(
                     f"[campaign] phase=liftoff round={round_index} focus={current_policy['focus']} "
                     f"task_limit={int(current_policy['task_limit'])}"
@@ -4498,6 +7207,7 @@ def main() -> None:
                         "policy": dict(current_policy),
                         "timestamp": time.time(),
                     },
+                    config=config,
                 )
                 liftoff_cmd = [
                     sys.executable,
@@ -4523,11 +7233,14 @@ def main() -> None:
                     liftoff_cmd.extend(["--provider", args.provider])
                 if args.model:
                     liftoff_cmd.extend(["--model", args.model])
+                liftoff_env = dict(env)
+                liftoff_env["AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR"] = str(int(current_policy["task_step_floor"]))
                 liftoff_progress = _make_child_progress_callback(
                     report_path=report_path,
                     report=report,
                     status_path=status_path,
                     lock_path=lock_path,
+                    config=config,
                     round_payload=round_payload,
                     round_index=round_index,
                     phase=phase,
@@ -4537,7 +7250,7 @@ def main() -> None:
                 liftoff_run = _run_and_stream(
                     liftoff_cmd,
                     cwd=repo_root,
-                    env=env,
+                    env=liftoff_env,
                     progress_label=f"liftoff_round_{round_index}",
                     heartbeat_interval_seconds=float(args.child_heartbeat_seconds),
                     max_silence_seconds=float(args.max_child_silence_seconds),
@@ -4550,7 +7263,7 @@ def main() -> None:
                 round_payload["liftoff_report_path"] = "" if liftoff_report_path is None else str(liftoff_report_path)
                 report["liftoff_run"] = liftoff_run
                 report["liftoff_report_path"] = round_payload["liftoff_report_path"]
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 if int(liftoff_run["returncode"]) != 0:
                     failure_reason = str(liftoff_run.get("timeout_reason", "")) or "liftoff subprocess failed"
                     _recover_child_failure_or_stop(
@@ -4581,16 +7294,10 @@ def main() -> None:
                 }
                 report["liftoff_skipped"] = round_payload["liftoff_skipped"]
 
-            production = campaign_report.get("production_yield_summary", {})
-            retained_cycles = int(production.get("retained_cycles", 0) or 0) if isinstance(production, dict) else 0
-            if retained_cycles <= 0:
-                no_yield_rounds += 1
-            else:
-                no_yield_rounds = 0
-            round_payload["no_yield_rounds"] = no_yield_rounds
             end_observation = _controller_observation(
                 campaign_report=campaign_report,
                 liftoff_payload=liftoff_payload,
+                curriculum_controls=round_curriculum_controls,
             )
             controller_state, controller_update = update_controller_state(
                 controller_state,
@@ -4598,10 +7305,14 @@ def main() -> None:
                 action_policy=round_payload.get("policy", current_policy),
                 end_observation=end_observation,
             )
+            controller_state = _update_repo_setting_policy_priors(
+                controller_state,
+                round_payload=round_payload,
+            )
             round_payload["controller_update"] = controller_update
             report["controller_summary"] = controller_state_summary(controller_state)
             report["unattended_evidence"] = _unattended_evidence_snapshot(config)
-            _write_controller_state(controller_state_path, controller_state)
+            _write_controller_state(controller_state_path, controller_state, config=config)
             round_planner_controls = _load_retained_improvement_planner_controls(config)
             current_policy = _next_round_policy(
                 current_policy,
@@ -4611,16 +7322,45 @@ def main() -> None:
                 controller_state=controller_state,
                 prior_rounds=[item for item in report["rounds"][:-1] if isinstance(item, dict)],
                 planner_controls=round_planner_controls,
+                curriculum_controls=round_curriculum_controls,
                 max_cycles=max(1, args.max_cycles_per_round),
                 max_task_limit=max(1, args.max_task_limit),
                 max_campaign_width=max(1, args.max_campaign_width),
                 max_variant_width=max(1, args.max_variant_width),
+                max_task_step_floor=max(1, config.max_task_steps_hard_cap),
             )
             round_payload["next_policy"] = dict(current_policy)
-            if dict(round_payload["policy"]) == dict(round_payload["next_policy"]):
-                policy_stall_rounds += 1
-            else:
-                policy_stall_rounds = 0
+            policy_stall_rounds = _next_policy_stall_rounds(
+                policy_stall_rounds,
+                current_policy=round_payload.get("policy", {}),
+                next_policy=round_payload.get("next_policy", {}),
+                campaign_report=campaign_report,
+                liftoff_payload=liftoff_payload,
+                round_payload=round_payload,
+            )
+            no_yield_rounds = _next_no_yield_rounds(
+                no_yield_rounds,
+                campaign_report=campaign_report,
+                liftoff_payload=liftoff_payload,
+                round_payload=round_payload,
+            )
+            depth_runway_credit = _next_depth_runway_credit(
+                depth_runway_credit,
+                campaign_report=campaign_report,
+                liftoff_payload=liftoff_payload,
+                round_payload=round_payload,
+            )
+            round_payload["outer_stop_signal"] = _round_stop_signal(
+                campaign_report=campaign_report,
+                liftoff_payload=liftoff_payload,
+                round_payload=round_payload,
+            )
+            round_payload["adaptive_stop_budget"] = _adaptive_stop_budget(
+                base_max_no_yield_rounds=max(0, args.max_no_yield_rounds),
+                base_max_policy_stall_rounds=max(0, args.max_policy_stall_rounds),
+                depth_runway_credit=depth_runway_credit,
+            )
+            round_payload["no_yield_rounds"] = no_yield_rounds
             round_payload["policy_stall_rounds"] = policy_stall_rounds
             _mark_round(round_payload, status="completed", phase="completed")
             report["rounds_completed"] = _count_completed_rounds(report["rounds"])
@@ -4629,7 +7369,7 @@ def main() -> None:
             report["campaign_report_path"] = round_payload.get("campaign_report_path", "")
             if liftoff_payload is not None:
                 report["liftoff_report_path"] = round_payload.get("liftoff_report_path", "")
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             _append_event(
                 event_log_path,
                 {
@@ -4646,6 +7386,7 @@ def main() -> None:
                     else {},
                     "timestamp": time.time(),
                 },
+                config=config,
             )
             _emit_policy_shift_alert_if_configured(round_payload)
 
@@ -4654,7 +7395,7 @@ def main() -> None:
                 report["status"] = "completed"
                 report["phase"] = "completed"
                 report["reason"] = "liftoff retain gate cleared"
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 _append_event(
                     event_log_path,
@@ -4664,14 +7405,20 @@ def main() -> None:
                         "round_index": round_index,
                         "timestamp": time.time(),
                     },
+                    config=config,
                 )
                 print(report_path)
                 return
-            if no_yield_rounds > max(0, args.max_no_yield_rounds):
+            effective_stop_budget = (
+                round_payload["adaptive_stop_budget"]
+                if isinstance(round_payload.get("adaptive_stop_budget", {}), dict)
+                else {}
+            )
+            if no_yield_rounds > int(effective_stop_budget.get("max_no_yield_rounds_effective", max(0, args.max_no_yield_rounds))):
                 report["status"] = "safe_stop"
                 report["phase"] = "completed"
                 report["reason"] = "repeated no-yield rounds exceeded unattended policy"
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 _append_event(
                     event_log_path,
@@ -4681,14 +7428,20 @@ def main() -> None:
                         "round_index": round_index,
                         "timestamp": time.time(),
                     },
+                    config=config,
                 )
                 print(report_path)
                 raise SystemExit(2)
-            if policy_stall_rounds > max(0, args.max_policy_stall_rounds):
+            if policy_stall_rounds > int(
+                effective_stop_budget.get(
+                    "max_policy_stall_rounds_effective",
+                    max(0, args.max_policy_stall_rounds),
+                )
+            ):
                 report["status"] = "safe_stop"
                 report["phase"] = "completed"
                 report["reason"] = "unattended policy stalled without discovering a new outer-loop action"
-                _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
                 _append_event(
                     event_log_path,
@@ -4698,6 +7451,7 @@ def main() -> None:
                         "round_index": round_index,
                         "timestamp": time.time(),
                     },
+                    config=config,
                 )
                 print(report_path)
                 raise SystemExit(2)
@@ -4707,7 +7461,7 @@ def main() -> None:
             report["status"] = "safe_stop"
             report["phase"] = "completed"
             report["reason"] = "child-failure recovery budget exhausted before completing requested unattended rounds"
-            _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             _emit_alert_if_configured()
             _append_event(
                 event_log_path,
@@ -4718,6 +7472,7 @@ def main() -> None:
                     "recovery_attempts": child_failure_recoveries_used,
                     "timestamp": time.time(),
                 },
+                config=config,
             )
             print(report_path)
             raise SystemExit(2)
@@ -4725,7 +7480,7 @@ def main() -> None:
         report["status"] = "completed"
         report["phase"] = "completed"
         report["reason"] = "requested unattended rounds completed"
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
         _emit_alert_if_configured()
         _append_event(
             event_log_path,
@@ -4735,6 +7490,7 @@ def main() -> None:
                 "rounds_completed": report["rounds_completed"],
                 "timestamp": time.time(),
             },
+            config=config,
         )
         print(report_path)
     except KeyboardInterrupt:
@@ -4759,7 +7515,7 @@ def main() -> None:
         report["rounds_completed"] = _count_completed_rounds(
             report.get("rounds", []) if isinstance(report.get("rounds", []), list) else []
         )
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
         _emit_alert_if_configured()
         _append_event(
             event_log_path,
@@ -4768,6 +7524,7 @@ def main() -> None:
                 "phase": phase,
                 "timestamp": time.time(),
             },
+            config=config,
         )
         print(report_path)
         raise SystemExit(130)
@@ -4793,7 +7550,7 @@ def main() -> None:
         report["rounds_completed"] = _count_completed_rounds(
             report.get("rounds", []) if isinstance(report.get("rounds", []), list) else []
         )
-        _persist_report_state(report_path, report, status_path=status_path, lock_path=lock_path)
+        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
         _emit_alert_if_configured()
         _append_event(
             event_log_path,
@@ -4803,6 +7560,7 @@ def main() -> None:
                 "exception_type": type(exc).__name__,
                 "timestamp": time.time(),
             },
+            config=config,
         )
         print(report_path)
         raise SystemExit(2) from exc

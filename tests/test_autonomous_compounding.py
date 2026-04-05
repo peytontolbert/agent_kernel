@@ -96,6 +96,17 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
         assert json.loads(Path(env["AGENT_KERNEL_CAPABILITY_MODULES_PATH"]).read_text(encoding="utf-8"))["modules"][0]["module_id"] == "github"
         assert "AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH" in env
         assert json.loads(Path(env["AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH"]).read_text(encoding="utf-8"))["ledger_kind"] == "unattended_trust_ledger"
+        scoped_curriculum = json.loads(Path(env["AGENT_KERNEL_CURRICULUM_PROPOSALS_PATH"]).read_text(encoding="utf-8"))
+        assert scoped_curriculum["artifact_kind"] == "curriculum_proposal_set"
+        assert scoped_curriculum["lifecycle_state"] == "retained"
+        assert scoped_curriculum["controls"]["frontier_priority_families"] == [
+            "workflow",
+            "project",
+            "repository",
+            "tooling",
+            "integration",
+        ]
+        assert scoped_curriculum["autonomous_frontier_curriculum_pressure"]["controls"]["frontier_outward_branch_bonus"] == 2
         assert (Path(env["AGENT_KERNEL_UNATTENDED_WORKSPACE_SNAPSHOT_ROOT"]) / "hello_task" / "state.txt").read_text(encoding="utf-8") == "snapshot"
         assert "AGENT_KERNEL_TOLBERT_CONFIDENCE_THRESHOLD" in env
         isolated_report_dir = Path(env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"])
@@ -152,6 +163,15 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
                     ["workflow", "project"] if run_index == 1 else ["workflow", "repository", "tooling"]
                 ),
                 "distinct_external_benchmark_families": 2 if run_index == 1 else 3,
+                "family_breadth_min_distinct_task_roots": 2,
+                "required_family_clean_task_root_counts": {
+                    "workflow": 2,
+                    "project": 2 if run_index == 1 else 0,
+                    "repository": 0 if run_index == 1 else 2,
+                    "tooling": 0 if run_index == 1 else 2,
+                    "integration": 0,
+                },
+                "missing_required_family_clean_task_root_breadth": [],
             },
             "priority_family_yield_summary": {
                 "priority_families": ["workflow", "project", "repository", "tooling", "integration"],
@@ -228,22 +248,22 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
                     }
                 ),
             },
-            "priority_family_allocation_summary": {
-                "priority_families": ["workflow", "project", "repository", "tooling", "integration"],
-                "planned_weight_shares": {
-                    "workflow": 0.2,
-                    "project": 0.2,
+                "priority_family_allocation_summary": {
+                    "priority_families": ["workflow", "project", "repository", "tooling", "integration"],
+                    "planned_weight_shares": {
+                        "workflow": 0.2,
+                        "project": 0.2,
                     "repository": 0.2,
                     "tooling": 0.2,
                     "integration": 0.2,
                 },
-                "aggregated_task_counts": {
-                    "workflow": 3 if run_index == 1 else 2,
-                    "project": 2 if run_index == 1 else 3,
-                    "repository": 1,
-                    "tooling": 0,
-                    "integration": 0,
-                },
+                    "aggregated_task_counts": {
+                        "workflow": 3 if run_index == 1 else 2,
+                        "project": 2 if run_index == 1 else 3,
+                        "repository": 1,
+                        "tooling": 1,
+                        "integration": 0 if run_index == 1 else 1,
+                    },
                 "aggregated_task_shares": {
                     "workflow": 0.5 if run_index == 1 else 0.333333,
                     "project": 0.333333 if run_index == 1 else 0.5,
@@ -316,12 +336,21 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
 
     report_path = Path(stream.getvalue().strip())
     payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_path = reports_dir / "autonomous_compounding_status.json"
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
     planner = ImprovementPlanner(memory_root=episodes_root, cycles_path=cycles_path)
     records = planner.load_cycle_records(cycles_path)
 
     assert payload["report_kind"] == "autonomous_compounding_report"
     assert payload["priority_benchmark_family_source"] == "default_non_replay_transfer_families"
     assert payload["priority_benchmark_families"] == [
+        "workflow",
+        "project",
+        "repository",
+        "tooling",
+        "integration",
+    ]
+    assert payload["autonomous_frontier_curriculum_pressure"]["priority_families"] == [
         "workflow",
         "project",
         "repository",
@@ -351,6 +380,12 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
     assert payload["summary"]["claim_gate_summary"]["autonomous_compounding_claim_ready"] is True
     assert payload["summary"]["claim_gate_summary"]["blockers"] == []
     assert payload["summary"]["claim_gate_summary"]["min_runtime_managed_decisions"] == 1
+    assert payload["summary"]["claim_gate_summary"]["required_family_clean_task_root_breadth"] == {
+        "families_missing_clean_task_root_breadth": [],
+        "missing_family_run_indices": {},
+        "required_family_clean_task_root_counts": {},
+        "family_breadth_min_distinct_task_roots": 0,
+    }
     family_transfer_summary = payload["summary"]["claim_gate_summary"]["family_transfer_summary"]
     assert family_transfer_summary["target_non_replay_families"] == [
         "workflow",
@@ -377,6 +412,29 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
     assert family_transfer_investment_ranking["ranked_families_by_transfer_investment"][-1] == "integration"
     assert family_transfer_investment_ranking["family_rankings"][0]["category"] == "cost_acceptable_persistent"
     assert family_transfer_investment_ranking["family_rankings"][0]["investment_score"] > family_transfer_investment_ranking["family_rankings"][1]["investment_score"]
+    frontier_expansion_summary = payload["summary"]["claim_gate_summary"]["frontier_expansion_summary"]
+    assert frontier_expansion_summary["families_sampled"] == [
+        "workflow",
+        "project",
+        "repository",
+        "tooling",
+        "integration",
+    ]
+    assert frontier_expansion_summary["families_never_sampled"] == []
+    assert frontier_expansion_summary["pressure_families_without_sampling"] == []
+    assert frontier_expansion_summary["runs_with_broad_priority_sampling"] == [1, 2]
+    assert status_payload["report_kind"] == "autonomous_compounding_status"
+    assert status_payload["state"] == "finished"
+    assert status_payload["runs_completed"] == 2
+    assert status_payload["final_report_path"] == str(report_path)
+    assert status_payload["families_sampled"] == [
+        "workflow",
+        "project",
+        "repository",
+        "tooling",
+        "integration",
+    ]
+    assert status_payload["pressure_families_without_sampling"] == []
     priority_family_allocation_audit = payload["summary"]["claim_gate_summary"]["priority_family_allocation_audit"]
     assert priority_family_allocation_audit["runs_with_allocation_summary"] == 2
     assert priority_family_allocation_audit["runs_with_top_planned_family_as_top_sampled"] == 1
@@ -390,6 +448,161 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
     assert result_stream_audit["result_streams"][0]["decision_stream_summary"]["runtime_managed"]["total_decisions"] == 1
     assert result_stream_audit["result_streams"][0]["recent_runtime_managed_decisions"][0]["cycle_id"] == "cycle:policy:1"
     assert records[-1]["artifact_kind"] == "autonomous_compounding_report"
+
+
+def test_autonomous_frontier_curriculum_pressure_prioritizes_missing_and_weak_transfer_families():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    pressure = module._autonomous_frontier_curriculum_pressure(
+        priority_benchmark_families=["workflow", "project", "repository", "tooling", "integration"],
+        priority_benchmark_family_allocation_compensation={
+            "positive_gap_families": ["integration", "tooling"],
+        },
+        prior_claim_gate_summary={
+            "family_transfer_summary": {
+                "families_missing_observation": ["integration"],
+                "families_without_retained_gain": ["tooling", "project"],
+                "families_with_negative_retained_delta": ["repository"],
+            },
+            "family_transfer_timeline": {
+                "families_with_declining_repeated_return_on_cost": ["repository"],
+                "families_with_cost_acceptable_non_declining_repeated_retained_gain": ["workflow"],
+            },
+        },
+    )
+
+    assert pressure["priority_families"] == [
+        "integration",
+        "tooling",
+        "project",
+        "repository",
+        "workflow",
+    ]
+    assert pressure["missing_observation_families"] == ["integration"]
+    assert pressure["under_sampled_families"] == ["integration", "tooling"]
+    assert pressure["generalization_priority_families"] == ["tooling", "project", "repository"]
+    assert pressure["controls"]["frontier_retention_priority_families"] == [
+        "tooling",
+        "project",
+        "repository",
+    ]
+    assert pressure["controls"]["frontier_harder_task_bonus"] == 4
+    assert pressure["controls"]["frontier_min_lineage_depth"] == 2
+
+
+def test_autonomous_frontier_curriculum_pressure_prioritizes_unsampled_pressure_families():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    pressure = module._autonomous_frontier_curriculum_pressure(
+        priority_benchmark_families=["workflow", "project", "repository", "tooling", "integration"],
+        priority_benchmark_family_allocation_compensation={"positive_gap_families": []},
+        prior_claim_gate_summary={
+            "family_transfer_summary": {
+                "families_missing_observation": [],
+                "families_without_retained_gain": ["repository"],
+                "families_with_negative_retained_delta": [],
+            },
+            "family_transfer_timeline": {
+                "families_with_declining_repeated_return_on_cost": [],
+                "families_with_cost_acceptable_non_declining_repeated_retained_gain": ["workflow"],
+            },
+            "frontier_expansion_summary": {
+                "families_never_sampled": ["integration", "tooling"],
+                "pressure_families_without_sampling": ["integration"],
+            },
+        },
+    )
+
+    assert pressure["priority_families"][:3] == ["integration", "tooling", "repository"]
+    assert pressure["unsampled_target_families"] == ["integration", "tooling"]
+    assert pressure["unsampled_pressure_families"] == ["integration"]
+    assert pressure["controls"]["frontier_missing_families"] == ["integration", "tooling"]
+
+
+def test_autonomous_frontier_live_priority_routing_boosts_unsampled_pressure_families():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    (
+        task_limit,
+        task_limit_source,
+        families,
+        weights,
+        weight_source,
+        routing,
+    ) = module._autonomous_frontier_live_priority_routing(
+        task_limit=1,
+        task_limit_source="explicit_cli",
+        priority_benchmark_families=["workflow", "project", "repository", "tooling", "integration"],
+        priority_benchmark_family_weights={
+            "workflow": 5.0,
+            "project": 4.0,
+            "repository": 3.0,
+            "tooling": 2.0,
+            "integration": 1.0,
+        },
+        priority_benchmark_family_weight_source="prior_compounding_investment_score_plus_rank_weight",
+        autonomous_frontier_curriculum_pressure={
+            "priority_families": ["repository", "integration", "workflow", "project", "tooling"],
+            "missing_observation_families": ["repository"],
+            "under_sampled_families": ["integration"],
+            "unsampled_target_families": ["integration"],
+            "unsampled_pressure_families": ["repository", "integration"],
+            "generalization_priority_families": ["integration"],
+        },
+    )
+
+    assert task_limit == 2
+    assert task_limit_source == "explicit_cli_and_autonomous_frontier_pressure_floor"
+    assert families[:3] == ["repository", "integration", "workflow"]
+    assert weights["repository"] == 8.5
+    assert weights["integration"] == 7.0
+    assert weights["repository"] > weights["workflow"]
+    assert weights["integration"] > weights["workflow"]
+    assert weight_source == "prior_compounding_investment_score_plus_rank_weight_and_autonomous_frontier_pressure"
+    assert routing["routing_pressure_families"] == ["repository", "integration"]
+    assert routing["task_limit_floor"] == 2
+    assert routing["task_limit_floor_applied"] is True
+    assert routing["weight_bonus_by_family"] == {"repository": 5.5, "integration": 6.0}
+
+
+def test_fingerprint_path_bounds_large_seed_directories(tmp_path, monkeypatch):
+    module = _load_script("run_autonomous_compounding_check.py")
+    root = tmp_path / "seed"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir(parents=True)
+    (root / "a" / "one.txt").write_text("1111", encoding="utf-8")
+    (root / "a" / "two.txt").write_text("2222", encoding="utf-8")
+    (root / "b" / "three.txt").write_text("3333", encoding="utf-8")
+
+    monkeypatch.setattr(module, "AUTONOMOUS_SEED_FINGERPRINT_MAX_FILES", 2)
+    monkeypatch.setattr(module, "AUTONOMOUS_SEED_FINGERPRINT_MAX_DIRECTORIES", 4)
+    monkeypatch.setattr(module, "AUTONOMOUS_SEED_FINGERPRINT_MAX_BYTES", 32)
+
+    fingerprint = module._fingerprint_path(root)
+
+    assert fingerprint["exists"] is True
+    assert fingerprint["type"] == "directory"
+    assert fingerprint["truncated"] is True
+    assert fingerprint["file_count"] == 2
+    assert fingerprint["directory_count"] <= 4
+    assert fingerprint["size_bytes"] == 8
+    assert fingerprint["max_files"] == 2
+
+
+def test_copy_tree_bounds_large_trajectory_seed(tmp_path):
+    module = _load_script("run_autonomous_compounding_check.py")
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src / "a").mkdir(parents=True)
+    (src / "b").mkdir(parents=True)
+    (src / "a" / "one.txt").write_text("1111", encoding="utf-8")
+    (src / "a" / "two.txt").write_text("2222", encoding="utf-8")
+    (src / "b" / "three.txt").write_text("3333", encoding="utf-8")
+
+    module._copy_tree(src, dst, max_files=2, max_directories=4, max_bytes=32)
+
+    copied = sorted(path.relative_to(dst).as_posix() for path in dst.rglob("*.txt"))
+    assert copied == ["a/one.txt", "a/two.txt"]
 
 
 def test_run_autonomous_compounding_check_reuses_prior_family_investment_ranking(tmp_path, monkeypatch):
@@ -544,6 +757,530 @@ def test_run_autonomous_compounding_check_reuses_prior_family_investment_ranking
     assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["priority_benchmark_family_source"] == "prior_compounding_ranking"
     assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["task_limit"] == 40
     assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["priority_benchmark_family_weights"]["repository"] > payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["priority_benchmark_family_weights"]["workflow"]
+
+
+def test_run_autonomous_compounding_check_applies_live_pressure_routing_to_task_budget(tmp_path, monkeypatch):
+    module = _load_script("run_autonomous_compounding_check.py")
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    prior_report_path = reports_dir / "autonomous_compounding_20260329T010000000000Z.json"
+    prior_report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "autonomous_compounding_report",
+                "summary": {
+                    "claim_gate_summary": {
+                        "family_transfer_investment_ranking": {
+                            "ranked_families_by_transfer_investment": ["workflow", "project", "repository"],
+                            "family_rankings": [
+                                {"family": "workflow", "investment_score": 0.09},
+                                {"family": "project", "investment_score": 0.07},
+                                {"family": "repository", "investment_score": 0.03},
+                            ],
+                        },
+                        "frontier_expansion_summary": {
+                            "families_never_sampled": ["repository"],
+                            "pressure_families_without_sampling": ["repository", "integration"],
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, cwd, capture_output, text, check, env):
+        del cwd, capture_output, text, check, env
+        forwarded_families = [
+            cmd[index + 1]
+            for index, token in enumerate(cmd[:-1])
+            if token == "--priority-benchmark-family"
+        ]
+        forwarded_weights = {
+            cmd[index + 1].split("=", 1)[0]: float(cmd[index + 1].split("=", 1)[1])
+            for index, token in enumerate(cmd[:-1])
+            if token == "--priority-benchmark-family-weight"
+        }
+        assert "--task-limit" in cmd
+        assert cmd[cmd.index("--task-limit") + 1] == "2"
+        assert forwarded_families[:3] == ["repository", "integration", "workflow"]
+        assert forwarded_weights["repository"] > forwarded_weights["workflow"]
+        assert forwarded_weights["integration"] > forwarded_weights["workflow"]
+        report_path = reports_dir / "campaign_report_live_routing.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "report_kind": "improvement_campaign_report",
+                    "campaign_label": "autonomous-run-1",
+                    "campaign_match_id": "autonomous:match:1",
+                    "priority_benchmark_families": forwarded_families,
+                    "record_scope": {
+                        "protocol": "autonomous",
+                        "campaign_match_id": "autonomous:match:1",
+                        "records_considered": 1,
+                        "decision_records_considered": 1,
+                        "cycle_ids": ["cycle:policy:1"],
+                    },
+                    "production_yield_summary": {
+                        "retained_cycles": 1,
+                        "rejected_cycles": 0,
+                        "total_decisions": 1,
+                        "average_retained_pass_rate_delta": 0.05,
+                        "average_retained_step_delta": -0.1,
+                        "average_retained_estimated_cost": 2.0,
+                    },
+                    "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+                    "decision_stream_summary": {
+                        "runtime_managed": {"total_decisions": 1},
+                        "non_runtime_managed": {"total_decisions": 0},
+                    },
+                    "priority_family_yield_summary": {"family_summaries": {}},
+                    "inheritance_summary": {"runtime_managed_decisions": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return CompletedProcess(cmd, 0, stdout=f"{report_path}\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=episodes_root,
+            skills_path=tmp_path / "skills" / "command_skills.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            retrieval_proposals_path=tmp_path / "retrieval" / "retrieval_proposals.json",
+            retrieval_asset_bundle_path=tmp_path / "retrieval" / "retrieval_asset_bundle.json",
+            verifier_contracts_path=tmp_path / "verifiers" / "verifier_contracts.json",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            world_model_proposals_path=tmp_path / "world_model" / "world_model_proposals.json",
+            trust_proposals_path=tmp_path / "trust" / "trust_proposals.json",
+            recovery_proposals_path=tmp_path / "recovery" / "recovery_proposals.json",
+            delegation_proposals_path=tmp_path / "delegation" / "delegation_proposals.json",
+            operator_policy_proposals_path=tmp_path / "operator_policy" / "operator_policy_proposals.json",
+            transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            capability_modules_path=tmp_path / "config" / "capabilities.json",
+            delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime_state.json",
+            run_checkpoints_dir=tmp_path / "checkpoints",
+            unattended_workspace_snapshot_root=tmp_path / "recovery" / "workspaces",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_autonomous_compounding_check.py", "--runs", "1", "--cycles", "1", "--task-limit", "1"],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    report_path = Path(stream.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert payload["requested_task_limit"] == 1
+    assert payload["task_limit"] == 2
+    assert payload["task_limit_source"] == "explicit_cli_and_autonomous_frontier_pressure_floor"
+    assert payload["priority_benchmark_families"][:3] == ["repository", "integration", "workflow"]
+    assert (
+        payload["priority_benchmark_family_weight_source"]
+        == "prior_compounding_investment_score_plus_rank_weight_and_autonomous_frontier_pressure"
+    )
+    assert payload["priority_benchmark_family_live_routing"]["routing_pressure_families"] == ["repository", "integration"]
+    assert payload["priority_benchmark_family_live_routing"]["task_limit_floor_applied"] is True
+    assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["task_limit"] == 2
+    assert (
+        payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["priority_benchmark_family_live_routing"][
+            "task_limit_floor"
+        ]
+        == 2
+    )
+
+
+def test_run_autonomous_compounding_check_uses_single_live_routing_plan_for_launch_and_manifest(tmp_path, monkeypatch):
+    module = _load_script("run_autonomous_compounding_check.py")
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    routing_calls: list[int] = []
+
+    monkeypatch.setattr(
+        module,
+        "_autonomous_frontier_curriculum_pressure",
+        lambda **kwargs: {
+            "priority_families": ["repository", "workflow", "project", "tooling", "integration"],
+            "missing_observation_families": ["repository"],
+            "under_sampled_families": [],
+            "unsampled_target_families": ["repository"],
+            "unsampled_pressure_families": ["repository"],
+            "generalization_priority_families": [],
+        },
+    )
+
+    def fake_live_routing(**kwargs):
+        del kwargs
+        routing_calls.append(len(routing_calls) + 1)
+        if len(routing_calls) == 1:
+            return (
+                2,
+                "explicit_cli_and_autonomous_frontier_pressure_floor",
+                ["repository", "workflow", "project", "tooling", "integration"],
+                {
+                    "repository": 8.0,
+                    "workflow": 5.0,
+                    "project": 4.0,
+                    "tooling": 3.0,
+                    "integration": 2.0,
+                },
+                "forced_test_routing",
+                {
+                    "routing_pressure_families": ["repository"],
+                    "task_limit_floor": 2,
+                    "task_limit_floor_applied": True,
+                },
+            )
+        return (
+            5,
+            "bad_duplicate_routing",
+            ["workflow", "project", "repository", "tooling", "integration"],
+            {
+                "workflow": 9.0,
+                "project": 8.0,
+                "repository": 1.0,
+                "tooling": 1.0,
+                "integration": 1.0,
+            },
+            "bad_duplicate_routing",
+            {
+                "routing_pressure_families": ["workflow"],
+                "task_limit_floor": 5,
+                "task_limit_floor_applied": True,
+            },
+        )
+
+    monkeypatch.setattr(module, "_autonomous_frontier_live_priority_routing", fake_live_routing)
+
+    def fake_run(cmd, cwd, capture_output, text, check, env):
+        del cwd, capture_output, text, check, env
+        forwarded_families = [
+            cmd[index + 1]
+            for index, token in enumerate(cmd[:-1])
+            if token == "--priority-benchmark-family"
+        ]
+        assert "--task-limit" in cmd
+        assert cmd[cmd.index("--task-limit") + 1] == "2"
+        assert forwarded_families[:3] == ["repository", "workflow", "project"]
+        report_path = reports_dir / "campaign_report_single_routing.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "report_kind": "improvement_campaign_report",
+                    "campaign_label": "autonomous-run-1",
+                    "campaign_match_id": "autonomous:match:1",
+                    "priority_benchmark_families": forwarded_families,
+                    "record_scope": {
+                        "protocol": "autonomous",
+                        "campaign_match_id": "autonomous:match:1",
+                        "records_considered": 1,
+                        "decision_records_considered": 1,
+                        "cycle_ids": ["cycle:policy:1"],
+                    },
+                    "production_yield_summary": {
+                        "retained_cycles": 1,
+                        "rejected_cycles": 0,
+                        "total_decisions": 1,
+                        "average_retained_pass_rate_delta": 0.05,
+                        "average_retained_step_delta": -0.1,
+                        "average_retained_estimated_cost": 2.0,
+                    },
+                    "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+                    "decision_stream_summary": {
+                        "runtime_managed": {"total_decisions": 1},
+                        "non_runtime_managed": {"total_decisions": 0},
+                    },
+                    "priority_family_yield_summary": {"family_summaries": {}},
+                    "inheritance_summary": {"runtime_managed_decisions": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return CompletedProcess(cmd, 0, stdout=f"{report_path}\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=episodes_root,
+            skills_path=tmp_path / "skills" / "command_skills.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            retrieval_proposals_path=tmp_path / "retrieval" / "retrieval_proposals.json",
+            retrieval_asset_bundle_path=tmp_path / "retrieval" / "retrieval_asset_bundle.json",
+            verifier_contracts_path=tmp_path / "verifiers" / "verifier_contracts.json",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            world_model_proposals_path=tmp_path / "world_model" / "world_model_proposals.json",
+            trust_proposals_path=tmp_path / "trust" / "trust_proposals.json",
+            recovery_proposals_path=tmp_path / "recovery" / "recovery_proposals.json",
+            delegation_proposals_path=tmp_path / "delegation" / "delegation_proposals.json",
+            operator_policy_proposals_path=tmp_path / "operator_policy" / "operator_policy_proposals.json",
+            transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            capability_modules_path=tmp_path / "config" / "capabilities.json",
+            delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime_state.json",
+            run_checkpoints_dir=tmp_path / "checkpoints",
+            unattended_workspace_snapshot_root=tmp_path / "recovery" / "workspaces",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_autonomous_compounding_check.py", "--runs", "1", "--cycles", "1", "--task-limit", "1"],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    report_path = Path(stream.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert routing_calls == [1]
+    assert payload["runs"][0]["task_limit"] == 2
+    assert payload["runs"][0]["priority_benchmark_families"][:3] == ["repository", "workflow", "project"]
+    assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["task_limit"] == 2
+    assert (
+        payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["priority_benchmark_family_live_routing"][
+            "task_limit_floor"
+        ]
+        == 2
+    )
+
+
+def test_run_autonomous_compounding_check_writes_midrun_sampling_status(tmp_path, monkeypatch):
+    module = _load_script("run_autonomous_compounding_check.py")
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    status_path = reports_dir / "autonomous_compounding_status.json"
+    observed_status_payloads: list[dict[str, object]] = []
+
+    def fake_run(cmd, cwd, capture_output, text, check, env):
+        del cwd, capture_output, text, check, env
+        run_index = 1 if "autonomous-run-1" in cmd else 2
+        if run_index == 2:
+            observed_status_payloads.append(json.loads(status_path.read_text(encoding="utf-8")))
+        report_path = reports_dir / f"campaign_report_status_{run_index}.json"
+        families = ["workflow", "project"] if run_index == 1 else ["workflow", "project", "repository"]
+        report_path.write_text(
+            json.dumps(
+                {
+                    "report_kind": "improvement_campaign_report",
+                    "campaign_label": f"autonomous-run-{run_index}",
+                    "campaign_match_id": f"autonomous:match:{run_index}",
+                    "priority_benchmark_families": ["workflow", "project", "repository", "tooling", "integration"],
+                    "record_scope": {
+                        "protocol": "autonomous",
+                        "campaign_match_id": f"autonomous:match:{run_index}",
+                        "records_considered": run_index,
+                        "decision_records_considered": run_index,
+                        "cycle_ids": [f"cycle:policy:{run_index}"],
+                    },
+                    "production_yield_summary": {
+                        "retained_cycles": 1,
+                        "rejected_cycles": 0,
+                        "total_decisions": 1,
+                        "average_retained_pass_rate_delta": 0.05,
+                        "average_retained_step_delta": -0.1,
+                        "average_retained_estimated_cost": 2.0,
+                    },
+                    "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+                    "decision_stream_summary": {
+                        "runtime_managed": {"total_decisions": 1},
+                        "non_runtime_managed": {"total_decisions": 0},
+                    },
+                    "trust_breadth_summary": {
+                        "required_families_with_reports": families,
+                        "external_benchmark_families": families,
+                        "required_family_clean_task_root_counts": {},
+                        "missing_required_family_clean_task_root_breadth": [],
+                    },
+                    "priority_family_yield_summary": {
+                        "family_summaries": {
+                            family: {
+                                "observed_decisions": 1,
+                                "retained_positive_delta_decisions": 1,
+                                "retained_negative_delta_decisions": 0,
+                                "retained_positive_pass_rate_delta_sum": 0.05,
+                                "retained_estimated_cost": 2.0,
+                            }
+                            for family in families
+                        }
+                    },
+                    "priority_family_allocation_summary": {
+                        "aggregated_task_counts": {
+                            "workflow": 1,
+                            "project": 1,
+                            "repository": 0 if run_index == 1 else 1,
+                            "tooling": 0,
+                            "integration": 0,
+                        }
+                    },
+                    "inheritance_summary": {"runtime_managed_decisions": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return CompletedProcess(cmd, 0, stdout=f"{report_path}\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=episodes_root,
+            skills_path=tmp_path / "skills" / "command_skills.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            retrieval_proposals_path=tmp_path / "retrieval" / "retrieval_proposals.json",
+            retrieval_asset_bundle_path=tmp_path / "retrieval" / "retrieval_asset_bundle.json",
+            verifier_contracts_path=tmp_path / "verifiers" / "verifier_contracts.json",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            world_model_proposals_path=tmp_path / "world_model" / "world_model_proposals.json",
+            trust_proposals_path=tmp_path / "trust" / "trust_proposals.json",
+            recovery_proposals_path=tmp_path / "recovery" / "recovery_proposals.json",
+            delegation_proposals_path=tmp_path / "delegation" / "delegation_proposals.json",
+            operator_policy_proposals_path=tmp_path / "operator_policy" / "operator_policy_proposals.json",
+            transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            capability_modules_path=tmp_path / "config" / "capabilities.json",
+            delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime_state.json",
+            run_checkpoints_dir=tmp_path / "checkpoints",
+            unattended_workspace_snapshot_root=tmp_path / "recovery" / "workspaces",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["run_autonomous_compounding_check.py", "--runs", "2", "--cycles", "1"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    assert len(observed_status_payloads) == 1
+    midrun_status = observed_status_payloads[0]
+    assert midrun_status["state"] == "running"
+    assert midrun_status["runs_completed"] == 1
+    assert midrun_status["active_run"]["run_index"] == 2
+    assert midrun_status["families_sampled"] == ["workflow", "project"]
+    assert midrun_status["pressure_families_without_sampling"] == ["repository", "tooling", "integration"]
+    assert midrun_status["latest_completed_run"]["run_index"] == 1
+
+
+def test_run_autonomous_compounding_check_marks_status_aborted_on_interrupt(tmp_path, monkeypatch):
+    module = _load_script("run_autonomous_compounding_check.py")
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    status_path = reports_dir / "autonomous_compounding_status.json"
+
+    def fake_run(cmd, cwd, capture_output, text, check, env):
+        del cmd, cwd, capture_output, text, check, env
+        status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+        child_status_path = Path(status_payload["active_run"]["child_status_path"])
+        child_status_path.parent.mkdir(parents=True, exist_ok=True)
+        child_status_payload = {
+            "report_kind": "repeated_improvement_status",
+            "state": "running",
+            "priority_benchmark_families": ["workflow", "project", "repository", "tooling", "integration"],
+            "families_sampled": ["workflow"],
+            "priority_families_without_sampling": ["project", "repository", "tooling", "integration"],
+        }
+        child_status_path.write_text(json.dumps(child_status_payload), encoding="utf-8")
+        status_payload["active_run"]["child_status"] = child_status_payload
+        status_payload["families_sampled"] = ["workflow"]
+        status_payload["families_never_sampled"] = ["project", "repository", "tooling", "integration"]
+        status_payload["pressure_families_without_sampling"] = ["project", "repository", "tooling", "integration"]
+        status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=episodes_root,
+            skills_path=tmp_path / "skills" / "command_skills.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            retrieval_proposals_path=tmp_path / "retrieval" / "retrieval_proposals.json",
+            retrieval_asset_bundle_path=tmp_path / "retrieval" / "retrieval_asset_bundle.json",
+            verifier_contracts_path=tmp_path / "verifiers" / "verifier_contracts.json",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            world_model_proposals_path=tmp_path / "world_model" / "world_model_proposals.json",
+            trust_proposals_path=tmp_path / "trust" / "trust_proposals.json",
+            recovery_proposals_path=tmp_path / "recovery" / "recovery_proposals.json",
+            delegation_proposals_path=tmp_path / "delegation" / "delegation_proposals.json",
+            operator_policy_proposals_path=tmp_path / "operator_policy" / "operator_policy_proposals.json",
+            transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            capability_modules_path=tmp_path / "config" / "capabilities.json",
+            delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime_state.json",
+            run_checkpoints_dir=tmp_path / "checkpoints",
+            unattended_workspace_snapshot_root=tmp_path / "recovery" / "workspaces",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["run_autonomous_compounding_check.py", "--runs", "1", "--cycles", "1"])
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 130
+    else:
+        raise AssertionError("expected SystemExit")
+
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_payload["state"] == "aborted"
+    assert status_payload["runs_completed"] == 0
+    assert status_payload["active_run"]["run_index"] == 1
+    assert status_payload["active_run"]["child_status"]["families_sampled"] == ["workflow"]
+    assert status_payload["families_sampled"] == ["workflow"]
+    assert status_payload["pressure_families_without_sampling"] == [
+        "project",
+        "repository",
+        "tooling",
+        "integration",
+    ]
 
 
 def test_run_autonomous_compounding_check_compensates_under_sampled_prior_family(tmp_path, monkeypatch):
@@ -2533,6 +3270,321 @@ def test_claim_gate_blocks_when_non_replay_transfer_gain_is_too_narrow():
     assert "non_replay_transfer_retained_gain_not_persistent_over_time" in claim_gate["blockers"]
     assert claim_gate["family_transfer_summary"]["distinct_target_families_observed"] == 1
     assert claim_gate["family_transfer_summary"]["distinct_target_families_with_retained_gain"] == 1
+
+
+def test_claim_gate_blocks_when_required_family_clean_task_root_breadth_is_missing():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    results = [
+        {
+            "run_match_id": "autonomous:one",
+            "run_index": 1,
+            "returncode": 0,
+            "production_yield_summary": {
+                "retained_cycles": 2,
+                "rejected_cycles": 0,
+                "average_retained_pass_rate_delta": 0.08,
+                "average_retained_step_delta": -0.1,
+                "worst_family_delta": 0.0,
+                "worst_generated_family_delta": 0.0,
+                "worst_failure_recovery_delta": 0.0,
+                "average_retained_estimated_cost": 3.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+            "report_payload": {
+                "record_scope": {
+                    "protocol": "autonomous",
+                    "campaign_match_id": "autonomous:one",
+                    "records_considered": 4,
+                    "decision_records_considered": 2,
+                    "cycle_ids": ["cycle:policy:1", "cycle:tooling:1"],
+                },
+                "decision_stream_summary": {
+                    "runtime_managed": {"total_decisions": 2},
+                    "non_runtime_managed": {"total_decisions": 0},
+                },
+                "trust_breadth_summary": {
+                    "required_families_with_reports": ["workflow", "project"],
+                    "external_benchmark_families": ["workflow", "project"],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {"workflow": 2, "project": 1},
+                    "missing_required_family_clean_task_root_breadth": ["project"],
+                },
+                "priority_family_yield_summary": {
+                    "family_summaries": {
+                        "workflow": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.08,
+                            "retained_estimated_cost": 4.0,
+                        },
+                        "project": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.05,
+                            "retained_estimated_cost": 4.0,
+                        },
+                    }
+                },
+                "inheritance_summary": {
+                    "runtime_managed_decisions": 2,
+                },
+            },
+            "seed_fingerprint": "seed-shared",
+            "retention_criteria_fingerprint": "criteria-shared",
+            "retention_criteria_manifest": {
+                "run_parameters": {
+                    "priority_benchmark_families": ["workflow", "project"]
+                }
+            },
+        },
+        {
+            "run_match_id": "autonomous:two",
+            "run_index": 2,
+            "returncode": 0,
+            "production_yield_summary": {
+                "retained_cycles": 2,
+                "rejected_cycles": 0,
+                "average_retained_pass_rate_delta": 0.09,
+                "average_retained_step_delta": -0.05,
+                "worst_family_delta": 0.0,
+                "worst_generated_family_delta": 0.0,
+                "worst_failure_recovery_delta": 0.0,
+                "average_retained_estimated_cost": 3.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+            "report_payload": {
+                "record_scope": {
+                    "protocol": "autonomous",
+                    "campaign_match_id": "autonomous:two",
+                    "records_considered": 4,
+                    "decision_records_considered": 2,
+                    "cycle_ids": ["cycle:policy:2", "cycle:tooling:2"],
+                },
+                "decision_stream_summary": {
+                    "runtime_managed": {"total_decisions": 2},
+                    "non_runtime_managed": {"total_decisions": 0},
+                },
+                "trust_breadth_summary": {
+                    "required_families_with_reports": ["workflow", "project"],
+                    "external_benchmark_families": ["workflow", "project"],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {"workflow": 2, "project": 1},
+                    "missing_required_family_clean_task_root_breadth": ["project"],
+                },
+                "priority_family_yield_summary": {
+                    "family_summaries": {
+                        "workflow": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.09,
+                            "retained_estimated_cost": 4.0,
+                        },
+                        "project": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.06,
+                            "retained_estimated_cost": 4.0,
+                        },
+                    }
+                },
+                "inheritance_summary": {
+                    "runtime_managed_decisions": 2,
+                },
+            },
+            "seed_fingerprint": "seed-shared",
+            "retention_criteria_fingerprint": "criteria-shared",
+            "retention_criteria_manifest": {
+                "run_parameters": {
+                    "priority_benchmark_families": ["workflow", "project"]
+                }
+            },
+        },
+    ]
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert claim_gate["autonomous_compounding_claim_ready"] is False
+    assert "required_family_clean_task_root_breadth_too_narrow" in claim_gate["blockers"]
+    assert claim_gate["required_family_clean_task_root_breadth"] == {
+        "families_missing_clean_task_root_breadth": ["project"],
+        "missing_family_run_indices": {"project": [1, 2]},
+        "required_family_clean_task_root_counts": {"project": 1},
+        "family_breadth_min_distinct_task_roots": 2,
+    }
+
+
+def test_claim_gate_blocks_when_autonomous_frontier_pressure_is_not_sampled():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    results = [
+        {
+            "run_match_id": "autonomous:one",
+            "run_index": 1,
+            "returncode": 0,
+            "production_yield_summary": {
+                "retained_cycles": 2,
+                "rejected_cycles": 0,
+                "average_retained_pass_rate_delta": 0.08,
+                "average_retained_step_delta": -0.1,
+                "worst_family_delta": 0.0,
+                "worst_generated_family_delta": 0.0,
+                "worst_failure_recovery_delta": 0.0,
+                "average_retained_estimated_cost": 3.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+            "report_payload": {
+                "record_scope": {
+                    "protocol": "autonomous",
+                    "campaign_match_id": "autonomous:one",
+                    "records_considered": 4,
+                    "decision_records_considered": 2,
+                    "cycle_ids": ["cycle:policy:1", "cycle:tooling:1"],
+                },
+                "decision_stream_summary": {
+                    "runtime_managed": {"total_decisions": 2},
+                    "non_runtime_managed": {"total_decisions": 0},
+                },
+                "trust_breadth_summary": {
+                    "required_families_with_reports": ["workflow", "project"],
+                    "external_benchmark_families": ["workflow", "project"],
+                },
+                "priority_family_yield_summary": {
+                    "family_summaries": {
+                        "workflow": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.08,
+                            "retained_estimated_cost": 4.0,
+                        },
+                        "project": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.05,
+                            "retained_estimated_cost": 4.0,
+                        },
+                    }
+                },
+                "priority_family_allocation_summary": {
+                    "aggregated_task_counts": {
+                        "workflow": 4,
+                        "project": 0,
+                        "repository": 0,
+                        "tooling": 0,
+                        "integration": 0,
+                    }
+                },
+                "inheritance_summary": {
+                    "runtime_managed_decisions": 2,
+                },
+            },
+            "seed_fingerprint": "seed-shared",
+            "retention_criteria_fingerprint": "criteria-shared",
+            "retention_criteria_manifest": {
+                "run_parameters": {
+                    "priority_benchmark_families": ["workflow", "project", "repository", "tooling", "integration"],
+                    "autonomous_frontier_curriculum_pressure": {
+                        "target_non_replay_families": ["workflow", "project", "repository", "tooling", "integration"],
+                        "priority_families": ["repository", "integration"],
+                        "missing_observation_families": ["integration"],
+                        "generalization_priority_families": ["repository"],
+                    },
+                }
+            },
+        },
+        {
+            "run_match_id": "autonomous:two",
+            "run_index": 2,
+            "returncode": 0,
+            "production_yield_summary": {
+                "retained_cycles": 2,
+                "rejected_cycles": 0,
+                "average_retained_pass_rate_delta": 0.09,
+                "average_retained_step_delta": -0.05,
+                "worst_family_delta": 0.0,
+                "worst_generated_family_delta": 0.0,
+                "worst_failure_recovery_delta": 0.0,
+                "average_retained_estimated_cost": 3.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+            "report_payload": {
+                "record_scope": {
+                    "protocol": "autonomous",
+                    "campaign_match_id": "autonomous:two",
+                    "records_considered": 4,
+                    "decision_records_considered": 2,
+                    "cycle_ids": ["cycle:policy:2", "cycle:tooling:2"],
+                },
+                "decision_stream_summary": {
+                    "runtime_managed": {"total_decisions": 2},
+                    "non_runtime_managed": {"total_decisions": 0},
+                },
+                "trust_breadth_summary": {
+                    "required_families_with_reports": ["workflow", "project"],
+                    "external_benchmark_families": ["workflow", "project"],
+                },
+                "priority_family_yield_summary": {
+                    "family_summaries": {
+                        "workflow": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.09,
+                            "retained_estimated_cost": 4.0,
+                        },
+                        "project": {
+                            "observed_decisions": 1,
+                            "retained_positive_delta_decisions": 1,
+                            "retained_negative_delta_decisions": 0,
+                            "retained_positive_pass_rate_delta_sum": 0.06,
+                            "retained_estimated_cost": 4.0,
+                        },
+                    }
+                },
+                "priority_family_allocation_summary": {
+                    "aggregated_task_counts": {
+                        "workflow": 3,
+                        "project": 0,
+                        "repository": 0,
+                        "tooling": 0,
+                        "integration": 0,
+                    }
+                },
+                "inheritance_summary": {
+                    "runtime_managed_decisions": 2,
+                },
+            },
+            "seed_fingerprint": "seed-shared",
+            "retention_criteria_fingerprint": "criteria-shared",
+            "retention_criteria_manifest": {
+                "run_parameters": {
+                    "priority_benchmark_families": ["workflow", "project", "repository", "tooling", "integration"],
+                    "autonomous_frontier_curriculum_pressure": {
+                        "target_non_replay_families": ["workflow", "project", "repository", "tooling", "integration"],
+                        "priority_families": ["repository", "integration"],
+                        "missing_observation_families": ["integration"],
+                        "generalization_priority_families": ["repository"],
+                    },
+                }
+            },
+        },
+    ]
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert claim_gate["autonomous_compounding_claim_ready"] is False
+    assert "autonomous_frontier_sampling_too_narrow" in claim_gate["blockers"]
+    assert "autonomous_frontier_priority_pressure_not_exercised" in claim_gate["blockers"]
+    assert claim_gate["frontier_expansion_summary"]["families_sampled"] == ["workflow"]
+    assert claim_gate["frontier_expansion_summary"]["pressure_families_without_sampling"] == ["repository", "integration"]
+    assert claim_gate["frontier_expansion_summary"]["runs_missing_priority_pressure_sampling"] == [1, 2]
+    assert claim_gate["frontier_expansion_summary"]["runs_missing_generalization_sampling"] == [1, 2]
 
 
 def test_claim_gate_blocks_when_transfer_gain_declines_over_time_despite_breadth():

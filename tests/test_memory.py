@@ -1,6 +1,8 @@
 import json
 
+from agent_kernel import task_bank as task_bank_module
 from agent_kernel.config import KernelConfig
+from agent_kernel.context_budget import ContextBudgeter
 from agent_kernel.extractors import (
     _normalize_command_for_workspace,
     extract_operator_classes,
@@ -15,7 +17,8 @@ from agent_kernel.learning_compiler import (
     matching_learning_candidates,
 )
 from agent_kernel.memory import EpisodeMemory
-from agent_kernel.schemas import EpisodeRecord, StepRecord
+from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
+from agent_kernel.state import AgentState
 from agent_kernel.task_bank import (
     load_benchmark_candidate_tasks,
     load_discovered_tasks,
@@ -28,6 +31,137 @@ from agent_kernel.task_bank import (
     load_verifier_candidate_tasks,
     load_verifier_replay_tasks,
 )
+
+
+def test_memory_task_loaders_use_bundled_rule_templates(monkeypatch, tmp_path):
+    rules_path = tmp_path / "synthesis_rules.json"
+    rules_path.write_text(
+        json.dumps(
+            {
+                "memory_task_rules": {
+                    "episode_replay": {
+                        "task_id_suffix": "_episode_clone",
+                        "workspace_suffix": "_episode_clone",
+                        "prompt_template": "EPISODE {prompt}",
+                        "metadata": {
+                            "benchmark_family": "episode_alt",
+                            "memory_source": "episode_alt",
+                            "requires_retrieval": False,
+                        },
+                    },
+                    "verifier_replay": {
+                        "task_id_suffix": "_verify_clone",
+                        "workspace_suffix": "_verify_clone",
+                        "metadata": {
+                            "benchmark_family": "verifier_alt",
+                            "memory_source": "verifier_alt",
+                        },
+                    },
+                    "skill_transfer": {
+                        "task_id_suffix": "_transfer_clone",
+                        "workspace_suffix": "_transfer_clone",
+                        "prompt_template": "TRANSFER {prompt}",
+                        "metadata": {
+                            "benchmark_family": "transfer_alt",
+                            "memory_source": "transfer_alt",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(task_bank_module, "_TASK_BANK_SYNTHESIS_RULES_PATH", rules_path)
+    task_bank_module._task_bank_synthesis_rules.cache_clear()
+
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "hello_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "hello_task",
+                "prompt": "Create hello.txt containing hello agent kernel.",
+                "workspace": str(tmp_path / "workspace" / "hello_task"),
+                "success": True,
+                "task_metadata": {"benchmark_family": "micro", "capability": "file_write"},
+                "task_contract": {
+                    "prompt": "Create hello.txt containing hello agent kernel.",
+                    "workspace_subdir": "hello_task",
+                    "setup_commands": [],
+                    "success_command": "test -f hello.txt",
+                    "suggested_commands": ["printf 'hello agent kernel\n' > hello.txt"],
+                    "expected_files": ["hello.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                    "max_steps": 5,
+                    "metadata": {"benchmark_family": "micro", "capability": "file_write"},
+                },
+                "summary": {"executed_commands": ["printf 'hello agent kernel\n' > hello.txt"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    skills_path = tmp_path / "skills.json"
+    skills_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "skill_set",
+                "lifecycle_state": "retained",
+                "skills": [
+                    {
+                        "skill_id": "skill:hello_task:primary",
+                        "source_task_id": "hello_task",
+                        "procedure": {"commands": ["printf 'hello agent kernel\n' > hello.txt"]},
+                        "task_contract": {
+                            "prompt": "Create hello.txt containing hello agent kernel.",
+                            "workspace_subdir": "hello_task",
+                            "setup_commands": [],
+                            "success_command": "true",
+                            "suggested_commands": [],
+                            "expected_files": ["hello.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "micro", "capability": "file_write"},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        episode_tasks = load_episode_replay_tasks(episodes_root)
+        verifier_tasks = load_verifier_replay_tasks(episodes_root, tmp_path / "missing_skills.json")
+        transfer_tasks = load_skill_transfer_tasks(skills_path)
+    finally:
+        task_bank_module._task_bank_synthesis_rules.cache_clear()
+
+    assert episode_tasks[0].task_id == "hello_task_episode_clone"
+    assert episode_tasks[0].workspace_subdir == "hello_task_episode_clone"
+    assert episode_tasks[0].prompt.startswith("EPISODE ")
+    assert episode_tasks[0].metadata["benchmark_family"] == "episode_alt"
+    assert episode_tasks[0].metadata["memory_source"] == "episode_alt"
+    assert episode_tasks[0].metadata["requires_retrieval"] is False
+
+    assert verifier_tasks[0].task_id == "hello_task_episode_clone_verify_clone"
+    assert verifier_tasks[0].workspace_subdir == "hello_task_episode_clone_verify_clone"
+    assert verifier_tasks[0].metadata["benchmark_family"] == "verifier_alt"
+    assert verifier_tasks[0].metadata["memory_source"] == "verifier_alt"
+
+    assert transfer_tasks[0].task_id == "hello_task_to_math_task_transfer_clone"
+    assert transfer_tasks[0].workspace_subdir == "math_task_transfer_clone"
+    assert transfer_tasks[0].prompt.startswith("TRANSFER ")
+    assert transfer_tasks[0].metadata["benchmark_family"] == "transfer_alt"
+    assert transfer_tasks[0].metadata["memory_source"] == "transfer_alt"
+
 
 
 def test_episode_memory_persists_summary_and_fragments(tmp_path):
@@ -225,6 +359,51 @@ def test_load_learning_candidates_repairs_success_only_failure_markers(tmp_path)
 
     assert [candidate["candidate_id"] for candidate in candidates] == ["learning:success-skill"]
     assert candidates[0]["known_failure_types"] == []
+
+
+def test_load_learning_candidates_respects_explicit_path_under_sqlite_config(tmp_path):
+    learning_path = tmp_path / "alt-learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:isolated-file",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "isolated_task",
+                        "benchmark_family": "workflow",
+                        "command": "false",
+                        "verification_reasons": ["exit code was 1"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        storage_backend="sqlite",
+        runtime_database_path=tmp_path / "runtime" / "agentkernel.sqlite3",
+        learning_artifacts_path=tmp_path / "learning" / "run_learning_artifacts.json",
+    )
+    config.sqlite_store().upsert_learning_candidates(
+        [
+            {
+                "candidate_id": "learning:sqlite-global",
+                "artifact_kind": "negative_command_pattern",
+                "source_task_id": "global_task",
+                "benchmark_family": "workflow",
+                "command": "printf 'global\\n'",
+                "verification_reasons": ["exit code was 1"],
+            }
+        ]
+    )
+
+    candidates = load_learning_candidates(learning_path, config=config)
+
+    assert [candidate["candidate_id"] for candidate in candidates] == ["learning:isolated-file"]
 
 
 def test_episode_memory_falls_back_to_json_exports_when_sqlite_is_empty(tmp_path):
@@ -434,6 +613,74 @@ def test_episode_memory_recurses_into_generated_phase_directories(tmp_path):
     assert documents[0]["task_metadata"]["episode_phase"] == "generated_failure"
 
 
+def test_episode_memory_includes_failure_recovery_learning_documents(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:recovery_case:repo_sync_matrix_task_path_recovery",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "repo_sync_matrix_task_path_recovery",
+                        "benchmark_family": "repository",
+                        "parent_task": "repo_sync_matrix_task",
+                        "success": True,
+                        "failure_types": ["missing_expected_file"],
+                        "recovery_commands": [
+                            "mkdir -p repo && printf 'repository recovered\\n' > repo/status.txt"
+                        ],
+                        "task_metadata": {
+                            "benchmark_family": "repository",
+                            "source_task": "repo_sync_matrix_task",
+                        },
+                    },
+                    {
+                        "candidate_id": "learning:negative_command:repo_sync_matrix_task:abc123",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "repo_sync_matrix_task",
+                        "benchmark_family": "repository",
+                        "command": "printf 'wrong\\n' > repo/output.txt",
+                        "failure_types": ["unexpected_file_content"],
+                        "verification_reasons": ["unexpected file content: repo/status.txt"],
+                        "task_metadata": {
+                            "benchmark_family": "repository",
+                            "source_task": "repo_sync_matrix_task",
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    documents = EpisodeMemory(episodes_root).list_documents()
+
+    task_ids = {document["task_id"] for document in documents}
+    assert "repo_sync_matrix_task_path_recovery" in task_ids
+    assert "repo_sync_matrix_task__negative_command_pattern" in task_ids
+
+    recovery = next(document for document in documents if document["task_id"] == "repo_sync_matrix_task_path_recovery")
+    assert recovery["success"] is True
+    assert recovery["summary"]["executed_commands"] == [
+        "mkdir -p repo && printf 'repository recovered\\n' > repo/status.txt"
+    ]
+    assert recovery["task_metadata"]["curriculum_kind"] == "failure_recovery"
+    assert recovery["episode_storage"]["phase"] == "learning_artifacts"
+
+    negative = next(
+        document for document in documents if document["task_id"] == "repo_sync_matrix_task__negative_command_pattern"
+    )
+    assert negative["success"] is False
+    assert negative["summary"]["failure_types"] == ["unexpected_file_content"]
+    assert negative["fragments"][0]["reason"] == "unexpected file content: repo/status.txt"
+
+
 def test_episode_memory_graph_summary_tracks_memory_sources(tmp_path):
     memory = EpisodeMemory(tmp_path)
     episode = EpisodeRecord(
@@ -476,6 +723,250 @@ def test_episode_memory_graph_summary_tracks_memory_sources(tmp_path):
 
     assert summary["memory_sources"] == {"episode": 1}
     assert summary["memory_source_failure_signals"] == {"episode": {"no_state_progress": 1}}
+
+
+def test_episode_memory_graph_summary_tracks_trusted_retrieval_carryover(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    episode = EpisodeRecord(
+        task_id="retrieval_memory_task",
+        prompt="Use retrieved release guidance to write release.txt.",
+        workspace=str(tmp_path / "workspace" / "retrieval_memory_task"),
+        success=True,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Use retrieved release guidance to write release.txt.",
+            "workspace_subdir": "retrieval_memory_task",
+            "setup_commands": [],
+            "success_command": "test -f app/release.txt",
+            "suggested_commands": ["mkdir -p app && printf 'release ready\\n' > app/release.txt"],
+            "expected_files": ["app/release.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"app/release.txt": "release ready\n"},
+            "max_steps": 3,
+            "metadata": {"benchmark_family": "repository", "memory_source": "episode"},
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="follow trusted release guidance",
+                action="code_execute",
+                content="mkdir -p app && printf 'release ready\\n' > app/release.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "mkdir -p app && printf 'release ready\\n' > app/release.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                selected_retrieval_span_id="learning:seed:release",
+                retrieval_influenced=True,
+                trust_retrieval=True,
+            )
+        ],
+    )
+
+    memory.save(episode)
+    summary = memory.graph_summary()
+
+    assert summary["retrieval_backed_successes"] == 1
+    assert summary["retrieval_influenced_successes"] == 1
+    assert summary["trusted_retrieval_successes"] == 1
+    assert summary["retrieval_backed_command_counts"] == {
+        "mkdir -p app && printf 'release ready\\n' > app/release.txt": 1
+    }
+    assert summary["trusted_retrieval_command_counts"] == {
+        "mkdir -p app && printf 'release ready\\n' > app/release.txt": 1
+    }
+
+
+def test_episode_memory_graph_summary_tracks_trusted_retrieval_procedures(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    episode = EpisodeRecord(
+        task_id="retrieval_sequence_task",
+        prompt="Use trusted retrieval to restore the report and verify it.",
+        workspace=str(tmp_path / "workspace" / "retrieval_sequence_task"),
+        success=True,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Use trusted retrieval to restore the report and verify it.",
+            "workspace_subdir": "retrieval_sequence_task",
+            "setup_commands": [],
+            "success_command": "pytest -q tests/test_status.py",
+            "suggested_commands": [
+                "printf 'status ready\\n' > reports/status.txt",
+                "pytest -q tests/test_status.py",
+            ],
+            "expected_files": ["reports/status.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"reports/status.txt": "status ready\n"},
+            "max_steps": 4,
+            "metadata": {"benchmark_family": "repository", "memory_source": "episode"},
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="follow trusted retrieval repair",
+                action="code_execute",
+                content="printf 'status ready\\n' > reports/status.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'status ready\\n' > reports/status.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                selected_retrieval_span_id="learning:seed:status",
+                retrieval_influenced=True,
+                trust_retrieval=True,
+            ),
+            StepRecord(
+                index=2,
+                thought="verify the repair",
+                action="code_execute",
+                content="pytest -q tests/test_status.py",
+                selected_skill_id=None,
+                command_result={
+                    "command": "pytest -q tests/test_status.py",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+            ),
+        ],
+    )
+
+    memory.save(episode)
+    summary = memory.graph_summary()
+
+    assert summary["trusted_retrieval_procedures"] == [
+        {
+            "commands": [
+                "printf 'status ready\\n' > reports/status.txt",
+                "pytest -q tests/test_status.py",
+            ],
+            "count": 1,
+        }
+    ]
+
+
+def test_context_budgeter_surfaces_trusted_retrieval_carryover_chunks():
+    task = TaskSpec(
+        task_id="release_task",
+        prompt="Prepare the release artifact.",
+        workspace_subdir="release_task",
+        success_command="test -f app/release.txt",
+        expected_files=["app/release.txt"],
+        expected_file_contents={"app/release.txt": "release ready\n"},
+        metadata={"benchmark_family": "repository"},
+    )
+    state = AgentState(task=task, current_role="planner")
+    state.recent_workspace_summary = "release artifact still missing"
+    graph_summary = {
+        "document_count": 3,
+        "benchmark_families": {"repository": 2},
+        "trusted_retrieval_successes": 2,
+        "trusted_retrieval_command_counts": {
+            "mkdir -p app && printf 'release ready\\n' > app/release.txt": 2
+        },
+    }
+    payload = ContextBudgeter(
+        KernelConfig(provider="mock", tolbert_context_char_budget=512, tolbert_context_max_chunks=6)
+    ).build_payload(
+        state=state,
+        task_payload={"task_id": "release_task"},
+        history_payload=[],
+        history_archive={},
+        llm_context_packet=None,
+        retrieval_plan={},
+        transition_preview=None,
+        available_skills=[],
+        prompt_adjustments=[],
+        allowed_actions=["code_execute"],
+        graph_summary=graph_summary,
+        universe_summary={},
+        world_model_summary={"expected_artifacts": ["app/release.txt"]},
+        plan=["materialize expected artifact app/release.txt"],
+        active_subgoal="materialize expected artifact app/release.txt",
+    )
+
+    assert payload["graph_summary"]["trusted_retrieval_successes"] == 2
+    assert payload["graph_summary"]["trusted_retrieval_command_counts"] == {
+        "mkdir -p app && printf 'release ready\\n' > app/release.txt": 2
+    }
+    assert any(
+        chunk["source"] == "graph_trusted_retrieval_command"
+        and "app/release.txt" in chunk["text"]
+        for chunk in payload["state_context_chunks"]
+    )
+
+
+def test_context_budgeter_surfaces_trusted_retrieval_procedure_chunks():
+    task = TaskSpec(
+        task_id="release_sequence_task",
+        prompt="Write the release report and then verify it.",
+        workspace_subdir="release_sequence_task",
+        success_command="pytest -q tests/test_release_status.py",
+        expected_files=["reports/status.txt"],
+        expected_file_contents={"reports/status.txt": "status ready\n"},
+        metadata={"benchmark_family": "repository"},
+    )
+    state = AgentState(task=task, current_role="planner")
+    payload = ContextBudgeter(
+        KernelConfig(provider="mock", tolbert_context_char_budget=512, tolbert_context_max_chunks=6)
+    ).build_payload(
+        state=state,
+        task_payload={"task_id": "release_sequence_task"},
+        history_payload=[],
+        history_archive={},
+        llm_context_packet=None,
+        retrieval_plan={},
+        transition_preview=None,
+        available_skills=[],
+        prompt_adjustments=[],
+        allowed_actions=["code_execute"],
+        graph_summary={
+            "trusted_retrieval_procedures": [
+                {
+                    "commands": [
+                        "printf 'status ready\\n' > reports/status.txt",
+                        "pytest -q tests/test_release_status.py",
+                    ],
+                    "count": 2,
+                }
+            ]
+        },
+        universe_summary={},
+        world_model_summary={"expected_artifacts": ["reports/status.txt"]},
+        plan=["materialize expected artifact reports/status.txt"],
+        active_subgoal="materialize expected artifact reports/status.txt",
+    )
+
+    assert payload["graph_summary"]["trusted_retrieval_procedures"] == [
+        {
+            "commands": [
+                "printf 'status ready\\n' > reports/status.txt",
+                "pytest -q tests/test_release_status.py",
+            ],
+            "count": 2,
+        }
+    ]
+    assert any(
+        chunk["source"] == "graph_trusted_retrieval_procedure"
+        and "pytest -q tests/test_release_status.py" in chunk["text"]
+        for chunk in payload["state_context_chunks"]
+    )
 
 
 def test_learning_candidates_record_and_match_memory_source(tmp_path):
@@ -570,6 +1061,171 @@ def test_learning_candidates_record_and_match_memory_source(tmp_path):
     ]
 
 
+def test_learning_candidates_capture_trusted_retrieval_backed_success(tmp_path):
+    episode = EpisodeRecord(
+        task_id="retrieval_backed_episode_task",
+        prompt="Reuse retrieved guidance to create done.txt.",
+        workspace=str(tmp_path / "workspace" / "retrieval_backed_episode_task"),
+        success=True,
+        task_metadata={"benchmark_family": "workflow"},
+        task_contract={
+            "prompt": "Reuse retrieved guidance to create done.txt.",
+            "workspace_subdir": "retrieval_backed_episode_task",
+            "setup_commands": [],
+            "success_command": "test -f done.txt",
+            "suggested_commands": ["printf 'done\\n' > done.txt"],
+            "expected_files": ["done.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"done.txt": "done\n"},
+            "max_steps": 2,
+            "metadata": {"benchmark_family": "workflow"},
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="follow the retrieved command",
+                action="code_execute",
+                content="printf 'done\\n' > done.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'done\\n' > done.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                selected_retrieval_span_id="learning:success_skill:seed_task",
+                retrieval_influenced=True,
+                trust_retrieval=True,
+            )
+        ],
+    )
+
+    candidates = compile_episode_learning_candidates(episode)
+
+    success_candidate = next(candidate for candidate in candidates if candidate["artifact_kind"] == "success_skill_candidate")
+    assert success_candidate["retrieval_backed"] is True
+    assert success_candidate["retrieval_selected_steps"] == 1
+    assert success_candidate["retrieval_influenced_steps"] == 1
+    assert success_candidate["trusted_retrieval_steps"] == 1
+    assert success_candidate["selected_retrieval_span_ids"] == ["learning:success_skill:seed_task"]
+    assert success_candidate["retrieval_backed_commands"] == ["printf 'done\\n' > done.txt"]
+    assert success_candidate["quality"] == 0.93
+
+
+def test_compile_episode_learning_candidates_strengthens_symbol_aligned_syntax_progress_success():
+    episode = EpisodeRecord(
+        task_id="syntax_learning_task",
+        prompt="Apply a localized Python fix.",
+        workspace=".",
+        success=True,
+        task_metadata={"benchmark_family": "workflow"},
+        task_contract={
+            "task_id": "syntax_learning_task",
+            "prompt": "Apply a localized Python fix.",
+            "workspace_subdir": "syntax_learning_task",
+            "setup_commands": [],
+            "success_command": "python -m py_compile service.py",
+            "suggested_commands": [],
+            "expected_files": ["service.py"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"service.py": "ok\n"},
+            "max_steps": 2,
+            "metadata": {"benchmark_family": "workflow"},
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="apply localized python edit",
+                action="code_execute",
+                content="python scripts/structured_edit.py --path service.py",
+                selected_skill_id=None,
+                command_result={
+                    "command": "python scripts/structured_edit.py --path service.py",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                proposal_source="structured_edit:line_replace",
+                proposal_metadata={
+                    "path": "service.py",
+                    "syntax_motor_progress": {
+                        "symbol_aligned": True,
+                        "syntax_safe": True,
+                        "strong_progress": True,
+                        "edited_symbol_fqn": "service.apply_status",
+                    }
+                },
+            )
+        ],
+    )
+
+    candidates = compile_episode_learning_candidates(episode)
+
+    success_candidate = next(candidate for candidate in candidates if candidate["artifact_kind"] == "success_skill_candidate")
+    assert success_candidate["syntax_motor_symbol_aligned_steps"] == 1
+    assert success_candidate["syntax_motor_strong_progress_steps"] == 1
+    assert success_candidate["syntax_motor_syntax_safe_steps"] == 1
+    assert success_candidate["syntax_motor_edited_symbols"] == ["service.apply_status"]
+    assert success_candidate["quality"] == 0.88
+
+
+def test_matching_learning_candidates_prefers_trusted_retrieval_backed_success(tmp_path):
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:generic-family",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "other_workflow_task",
+                        "benchmark_family": "workflow",
+                        "procedure": {"commands": ["printf 'generic\\n' > result.txt"]},
+                        "support_count": 8,
+                    },
+                    {
+                        "candidate_id": "learning:retrieval-backed",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "seed_workflow_task",
+                        "benchmark_family": "workflow",
+                        "procedure": {"commands": ["printf 'retrieval\\n' > result.txt"]},
+                        "retrieval_backed": True,
+                        "retrieval_selected_steps": 1,
+                        "retrieval_influenced_steps": 1,
+                        "trusted_retrieval_steps": 1,
+                        "selected_retrieval_span_ids": ["learning:success_skill:seed_workflow_task"],
+                        "retrieval_backed_commands": ["printf 'retrieval\\n' > result.txt"],
+                        "support_count": 1,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    matches = matching_learning_candidates(
+        learning_path,
+        task_id="fresh_workflow_task",
+        benchmark_family="workflow",
+    )
+
+    assert matches
+    assert matches[0]["candidate_id"] == "learning:retrieval-backed"
+
+
 def test_learning_candidates_match_applicable_transfer_tasks(tmp_path):
     learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
     learning_path.parent.mkdir(parents=True, exist_ok=True)
@@ -654,6 +1310,53 @@ def test_learning_candidates_match_replay_task_lineage(tmp_path):
 
     assert matches
     assert matches[0]["candidate_id"] == "learning:lineage-match"
+
+
+def test_learning_candidates_match_source_task_aliases_from_metadata(tmp_path):
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:alias-match",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "config_sync_retrieval_task",
+                        "benchmark_family": "workflow",
+                        "command": "cp template.env config/app.env",
+                        "verification_reasons": ["unexpected file content: config/app.env"],
+                        "task_metadata": {
+                            "source_task": "config_sync_task",
+                        },
+                        "support_count": 1,
+                    },
+                    {
+                        "candidate_id": "learning:family-only",
+                        "artifact_kind": "negative_command_pattern",
+                        "source_task_id": "other_workflow_task",
+                        "benchmark_family": "workflow",
+                        "command": "printf 'oops\\n' > result.txt",
+                        "verification_reasons": ["exit code was 1"],
+                        "support_count": 5,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    matches = matching_learning_candidates(
+        learning_path,
+        task_id="fresh_config_repair_task",
+        source_task_id="config_sync_task",
+        benchmark_family="workflow",
+    )
+
+    assert matches
+    assert matches[0]["candidate_id"] == "learning:alias-match"
 
 
 def test_skill_extractor_emits_structured_skill_records(tmp_path):
@@ -750,6 +1453,127 @@ def test_skill_extractor_includes_postrun_learning_candidates(tmp_path):
     assert payload["skills"]
     assert payload["skills"][0]["source_task_id"] == "hello_task"
     assert payload["skills"][0]["procedure"]["commands"] == ["printf 'hello agent kernel\\n' > hello.txt"]
+
+
+def test_skill_extractor_preserves_retrieval_backed_learning_provenance(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:hello_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "hello_task",
+                        "benchmark_family": "workflow",
+                        "procedure": {"commands": ["printf 'hello agent kernel\\n' > hello.txt"]},
+                        "applicable_tasks": ["hello_task"],
+                        "quality": 0.9,
+                        "retrieval_backed": True,
+                        "retrieval_selected_steps": 1,
+                        "retrieval_influenced_steps": 1,
+                        "trusted_retrieval_steps": 1,
+                        "selected_retrieval_span_ids": ["learning:seed:hello"],
+                        "retrieval_backed_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                        "task_contract": {
+                            "prompt": "Create hello.txt containing hello agent kernel.",
+                            "workspace_subdir": "hello_task",
+                            "setup_commands": [],
+                            "success_command": "true",
+                            "suggested_commands": [],
+                            "expected_files": ["hello.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "workflow"},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "skills.json"
+    extract_successful_command_skills(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    skill = payload["skills"][0]
+    assert skill["retrieval_backed"] is True
+    assert skill["retrieval_selected_steps"] == 1
+    assert skill["retrieval_influenced_steps"] == 1
+    assert skill["trusted_retrieval_steps"] == 1
+    assert skill["selected_retrieval_span_ids"] == ["learning:seed:hello"]
+    assert skill["retrieval_backed_commands"] == ["printf 'hello agent kernel\\n' > hello.txt"]
+    assert skill["quality"] == 0.98
+
+
+def test_skill_extractor_uses_successful_recovery_case_via_source_task_alias(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:recovery_case:service_release_task_repository_recovery",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "service_release_task_repository_recovery",
+                        "parent_task": "service_release_task",
+                        "benchmark_family": "repository",
+                        "success": True,
+                        "quality": 0.82,
+                        "recovery_commands": [
+                            "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+                        ],
+                        "task_contract": {
+                            "prompt": "Prepare release outputs.",
+                            "workspace_subdir": "service_release_task_repository_recovery",
+                            "setup_commands": [],
+                            "success_command": "test -f app/release.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["app/release.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"app/release.txt": "service release ready\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "repository", "source_task": "service_release_task"},
+                        },
+                        "task_metadata": {
+                            "benchmark_family": "repository",
+                            "source_task": "service_release_task",
+                            "curriculum_kind": "failure_recovery",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "skills.json"
+    extract_successful_command_skills(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert [skill["skill_id"] for skill in payload["skills"]] == ["skill:service_release_task:postrun"]
+    assert payload["skills"][0]["source_task_id"] == "service_release_task"
+    assert payload["skills"][0]["procedure"]["commands"] == [
+        "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+    ]
+    assert payload["skills"][0]["task_contract"]["metadata"]["source_task"] == "service_release_task"
+    assert payload["skills"][0]["known_failure_types"] == []
 
 
 def test_skill_extractor_can_favor_transfer_candidates(tmp_path):
@@ -980,6 +1804,32 @@ def test_dedupe_skills_prefers_higher_quality_and_shorter_sequence():
     assert deduped[0]["skill_id"] == "skill:hello_task:strong"
 
 
+def test_dedupe_skills_prefers_retrieval_backed_when_quality_ties():
+    deduped = dedupe_skills(
+        [
+            {
+                "skill_id": "skill:hello_task:plain",
+                "source_task_id": "hello_task",
+                "procedure": {"commands": ["printf 'hello\\n' > hello.txt"]},
+                "quality": 0.9,
+            },
+            {
+                "skill_id": "skill:hello_task:retrieval",
+                "source_task_id": "hello_task",
+                "procedure": {"commands": ["printf 'hello\\n' > hello.txt"]},
+                "quality": 0.9,
+                "retrieval_backed": True,
+                "retrieval_influenced_steps": 1,
+                "trusted_retrieval_steps": 1,
+                "retrieval_backed_commands": ["printf 'hello\\n' > hello.txt"],
+            },
+        ]
+    )
+
+    assert len(deduped) == 1
+    assert deduped[0]["skill_id"] == "skill:hello_task:retrieval"
+
+
 def test_episode_replay_tasks_load_from_saved_contract(tmp_path):
     episodes_root = tmp_path / "episodes"
     episodes_root.mkdir()
@@ -1020,6 +1870,58 @@ def test_episode_replay_tasks_load_from_saved_contract(tmp_path):
     assert tasks[0].metadata["benchmark_family"] == "episode_memory"
     assert tasks[0].metadata["source_task"] == "hello_task"
     assert tasks[0].suggested_commands == ["printf 'hello agent kernel\\n' > hello.txt"]
+
+
+def test_episode_replay_tasks_uplift_frontier_contract_budget(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "git_parallel_merge_acceptance_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "git_parallel_merge_acceptance_task",
+                "prompt": "accept worker branches into main",
+                "workspace": str(tmp_path / "workspace" / "git_parallel_merge_acceptance_task"),
+                "success": True,
+                "task_metadata": {"benchmark_family": "repo_sandbox", "capability": "repo_environment"},
+                "task_contract": {
+                    "prompt": "accept worker branches into main",
+                    "workspace_subdir": "git_parallel_merge_acceptance_task",
+                    "setup_commands": [],
+                    "success_command": "test -f reports/test_report.txt",
+                    "suggested_commands": [
+                        "git merge --no-ff worker/api-status -m 'merge worker/api-status'",
+                        "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                        "tests/test_api.sh",
+                        "tests/test_docs.sh",
+                    ],
+                    "expected_files": ["reports/test_report.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"reports/test_report.txt": "api suite passed; docs suite passed\n"},
+                    "max_steps": 5,
+                    "metadata": {
+                        "benchmark_family": "repo_sandbox",
+                        "capability": "repo_environment",
+                        "difficulty": "git_parallel_merge",
+                    },
+                },
+                "summary": {
+                    "executed_commands": [
+                        "git merge --no-ff worker/api-status -m 'merge worker/api-status'",
+                        "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_episode_replay_tasks(episodes_root)
+
+    assert len(tasks) == 1
+    assert tasks[0].max_steps >= 20
+    assert tasks[0].metadata["origin_benchmark_family"] == "repo_sandbox"
 
 
 def test_episode_replay_tasks_include_nested_generated_success_documents(tmp_path):
@@ -1399,6 +2301,522 @@ def test_tool_candidate_extractor_emits_local_shell_procedures(tmp_path):
     assert "set -euo pipefail" in payload["candidates"][0]["script_body"]
 
 
+def test_tool_candidate_extractor_accepts_single_command_repository_episode(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "repo_sync_matrix_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "repo_sync_matrix_task",
+                "success": True,
+                "workspace": str(tmp_path / "workspace" / "repo_sync_matrix_task"),
+                "task_metadata": {"benchmark_family": "repository"},
+                "task_contract": {
+                    "prompt": "Sync repository outputs.",
+                    "workspace_subdir": "repo_sync_matrix_task",
+                    "setup_commands": [],
+                    "success_command": "test -f reports/matrix.txt",
+                    "suggested_commands": [],
+                    "expected_files": ["reports/matrix.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"reports/matrix.txt": "repository sync recorded\n"},
+                    "max_steps": 5,
+                    "metadata": {"benchmark_family": "repository"},
+                },
+                "termination_reason": "success",
+                "summary": {"failure_types": [], "step_count": 1},
+                "fragments": [
+                    {
+                        "kind": "command",
+                        "command": "mkdir -p reports && printf 'repository sync recorded\\n' > reports/matrix.txt",
+                        "passed": True,
+                    }
+                ],
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert [candidate["tool_id"] for candidate in payload["candidates"]] == ["tool:repo_sync_matrix_task:primary"]
+    assert payload["candidates"][0]["procedure"]["commands"] == [
+        "mkdir -p reports && printf 'repository sync recorded\\n' > reports/matrix.txt"
+    ]
+
+
+def test_tool_candidate_extractor_skips_unknown_episode_tasks(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "service_release_task_repository_adjacent.json").write_text(
+        json.dumps(
+            {
+                "task_id": "service_release_task_repository_adjacent",
+                "success": True,
+                "workspace": str(tmp_path / "workspace" / "service_release_task_repository_adjacent"),
+                "task_metadata": {"benchmark_family": "repository"},
+                "task_contract": {},
+                "termination_reason": "success",
+                "summary": {"failure_types": [], "step_count": 1},
+                "fragments": [
+                    {
+                        "kind": "command",
+                        "command": "printf 'adjacent\\n' > notes.txt",
+                        "passed": True,
+                    }
+                ],
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["candidates"] == []
+
+
+def test_tool_candidate_extractor_uses_learning_success_candidates(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:service_release_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "service_release_task",
+                        "benchmark_family": "repository",
+                        "task_contract": {
+                            "prompt": "Prepare release outputs.",
+                            "workspace_subdir": "service_release_task",
+                            "setup_commands": [],
+                            "success_command": "test -f app/release.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["app/release.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"app/release.txt": "service release ready\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "repository"},
+                        },
+                        "termination_reason": "success",
+                        "quality": 0.85,
+                        "procedure": {
+                            "commands": [
+                                "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+                            ]
+                        },
+                    },
+                    {
+                        "candidate_id": "learning:success_skill:service_release_task_repository_adjacent",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "service_release_task_repository_adjacent",
+                        "benchmark_family": "repository",
+                        "task_contract": {},
+                        "termination_reason": "success",
+                        "quality": 0.9,
+                        "procedure": {"commands": ["printf 'adjacent\\n' > notes.txt"]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert [candidate["tool_id"] for candidate in payload["candidates"]] == ["tool:service_release_task:primary"]
+    assert payload["candidates"][0]["benchmark_family"] == "repository"
+    assert payload["candidates"][0]["quality"] == 0.85
+
+
+def test_tool_candidate_extractor_preserves_retrieval_backed_learning_provenance(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:service_release_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "service_release_task",
+                        "benchmark_family": "repository",
+                        "task_contract": {
+                            "prompt": "Prepare release outputs.",
+                            "workspace_subdir": "service_release_task",
+                            "setup_commands": [],
+                            "success_command": "test -f app/release.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["app/release.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"app/release.txt": "service release ready\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "repository"},
+                        },
+                        "termination_reason": "success",
+                        "quality": 0.85,
+                        "retrieval_backed": True,
+                        "retrieval_selected_steps": 1,
+                        "retrieval_influenced_steps": 1,
+                        "trusted_retrieval_steps": 1,
+                        "selected_retrieval_span_ids": ["learning:seed:release"],
+                        "retrieval_backed_commands": [
+                            "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+                        ],
+                        "procedure": {
+                            "commands": [
+                                "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+                            ]
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    candidate = payload["candidates"][0]
+    assert candidate["retrieval_backed"] is True
+    assert candidate["retrieval_selected_steps"] == 1
+    assert candidate["retrieval_influenced_steps"] == 1
+    assert candidate["trusted_retrieval_steps"] == 1
+    assert candidate["selected_retrieval_span_ids"] == ["learning:seed:release"]
+    assert candidate["retrieval_backed_commands"] == [
+        "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+    ]
+    assert candidate["quality"] == 0.93
+
+
+def test_tool_candidate_extractor_uses_successful_recovery_case_via_source_task_alias(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:recovery_case:service_release_task_repository_recovery",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "service_release_task_repository_recovery",
+                        "parent_task": "service_release_task",
+                        "benchmark_family": "repository",
+                        "success": True,
+                        "quality": 0.82,
+                        "recovery_commands": [
+                            "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+                        ],
+                        "task_contract": {
+                            "prompt": "Prepare release outputs.",
+                            "workspace_subdir": "service_release_task_repository_recovery",
+                            "setup_commands": [],
+                            "success_command": "test -f app/release.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["app/release.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"app/release.txt": "service release ready\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "repository", "source_task": "service_release_task"},
+                        },
+                        "task_metadata": {
+                            "benchmark_family": "repository",
+                            "source_task": "service_release_task",
+                            "curriculum_kind": "failure_recovery",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert [candidate["tool_id"] for candidate in payload["candidates"]] == ["tool:service_release_task:primary"]
+    assert payload["candidates"][0]["procedure"]["commands"] == [
+        "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
+    ]
+    assert payload["candidates"][0]["summary"] == "Prepare release outputs."
+
+
+def test_tool_candidate_extractor_dedupes_equivalent_command_variants_and_populates_metadata(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    escaped_command = "printf '{\"route\": \"/health\", \"method\": \"GET\"}\n' > api/request.json"
+    literal_newline_command = (
+        "printf '{\"route\": \"/health\", \"method\": \"GET\"}" + chr(10) + "' > api/request.json"
+    )
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:api_contract_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "api_contract_task",
+                        "benchmark_family": "tooling",
+                        "task_contract": {
+                            "prompt": "Prepare the API contract bundle.",
+                            "workspace_subdir": "api_contract_task",
+                            "setup_commands": [],
+                            "success_command": "test -f api/request.json",
+                            "suggested_commands": [],
+                            "expected_files": ["api/request.json"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {
+                                "api/request.json": '{"route": "/health", "method": "GET"}\n'
+                            },
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "tooling"},
+                        },
+                        "termination_reason": "success",
+                        "quality": 0.85,
+                        "procedure": {"commands": [escaped_command, literal_newline_command]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert len(payload["candidates"]) == 1
+    candidate = payload["candidates"][0]
+    assert candidate["procedure"]["commands"] == [escaped_command]
+    assert candidate["command"] == escaped_command
+    assert candidate["name"] == "api_contract_task_procedure"
+    assert candidate["title"] == "api contract task"
+    assert candidate["summary"] == "Prepare the API contract bundle."
+    assert candidate["script_body"].count("printf '") == 1
+
+
+def test_tool_candidate_extractor_skips_incomplete_shared_repo_integrator_trace(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "git_parallel_merge_acceptance_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "git_parallel_merge_acceptance_task",
+                "success": True,
+                "workspace": str(tmp_path / "workspace" / "git_parallel_merge_acceptance_task"),
+                "task_metadata": {"benchmark_family": "repo_sandbox"},
+                "termination_reason": "success",
+                "summary": {"failure_types": [], "step_count": 1},
+                "fragments": [
+                    {
+                        "kind": "command",
+                        "command": "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "tests/test_docs.sh",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "mkdir -p reports && printf 'docs only\\n' > reports/merge_report.txt",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "printf 'docs suite passed\\n' > reports/test_report.txt",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "git add reports/merge_report.txt reports/test_report.txt",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "git commit -m 'record merge acceptance reports'",
+                        "passed": True,
+                    }
+                ],
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["candidates"] == []
+
+
+def test_tool_candidate_extractor_marks_complete_shared_repo_integrator_bundle(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "git_parallel_merge_acceptance_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "git_parallel_merge_acceptance_task",
+                "success": True,
+                "workspace": str(tmp_path / "workspace" / "git_parallel_merge_acceptance_task"),
+                "task_metadata": {"benchmark_family": "repo_sandbox"},
+                "termination_reason": "success",
+                "summary": {"failure_types": [], "step_count": 1},
+                "fragments": [
+                    {
+                        "kind": "command",
+                        "command": "git merge --no-ff worker/api-status -m 'merge worker/api-status'",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "tests/test_api.sh",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "tests/test_docs.sh",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": (
+                            "mkdir -p reports && printf 'accepted worker/api-status for src/api_status.txt and "
+                            "worker/docs-status for docs/status.md into main without collisions\\n' > "
+                            "reports/merge_report.txt"
+                        ),
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "printf 'api suite passed; docs suite passed\\n' > reports/test_report.txt",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "git add reports/merge_report.txt reports/test_report.txt",
+                        "passed": True,
+                    },
+                    {
+                        "kind": "command",
+                        "command": "git commit -m 'record merge acceptance reports'",
+                        "passed": True,
+                    }
+                ],
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert [candidate["tool_id"] for candidate in payload["candidates"]] == [
+        "tool:git_parallel_merge_acceptance_task:primary"
+    ]
+    bundle = payload["candidates"][0]["shared_repo_bundle"]
+    assert bundle["role"] == "integrator"
+    assert bundle["bundle_complete"] is True
+    assert bundle["observed_merged_branches"] == ["worker/api-status", "worker/docs-status"]
+
+
+def test_tool_candidate_extractor_skips_incomplete_shared_repo_integrator_learning_candidate(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:git_parallel_merge_acceptance_task",
+                        "artifact_kind": "success_skill_candidate",
+                        "source_task_id": "git_parallel_merge_acceptance_task",
+                        "benchmark_family": "repo_sandbox",
+                        "task_contract": {
+                            "prompt": "Accept worker branches into main.",
+                            "workspace_subdir": "git_parallel_merge_acceptance_task",
+                            "expected_files": ["reports/merge_report.txt"],
+                            "metadata": {"benchmark_family": "repo_sandbox"},
+                        },
+                        "termination_reason": "success",
+                        "quality": 0.95,
+                        "procedure": {
+                            "commands": [
+                                "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                                "tests/test_docs.sh",
+                                "mkdir -p reports && printf 'docs only\\n' > reports/merge_report.txt",
+                            ]
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["candidates"] == []
+
+
 def test_tool_replay_tasks_load_from_tool_contract(tmp_path):
     tools_path = tmp_path / "tool_candidates.json"
     tools_path.write_text(
@@ -1447,6 +2865,57 @@ def test_tool_replay_tasks_load_from_tool_contract(tmp_path):
     assert tasks[0].metadata["memory_source"] == "tool"
 
 
+def test_tool_replay_tasks_uplift_frontier_contract_budget(tmp_path):
+    tools_path = tmp_path / "tool_candidates.json"
+    tools_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tool_candidate_set",
+                "lifecycle_state": "replay_verified",
+                "candidates": [
+                    {
+                        "tool_id": "tool:service_release_task:primary",
+                        "source_task_id": "service_release_task",
+                        "promotion_stage": "replay_verified",
+                        "lifecycle_state": "replay_verified",
+                        "procedure": {
+                            "commands": [
+                                "mkdir -p app config tests",
+                                "printf 'service release ready\\n' > app/release.txt",
+                            ]
+                        },
+                        "task_contract": {
+                            "prompt": "prepare service release repo slice",
+                            "workspace_subdir": "service_release_task",
+                            "setup_commands": [],
+                            "success_command": "test -f app/release.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["app/release.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"app/release.txt": "service release ready\n"},
+                            "max_steps": 5,
+                            "metadata": {
+                                "benchmark_family": "repository",
+                                "difficulty": "cross_component",
+                                "capability": "repo_environment",
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_tool_replay_tasks(tools_path)
+
+    assert len(tasks) == 1
+    assert tasks[0].max_steps >= 14
+    assert tasks[0].metadata["origin_benchmark_family"] == "repository"
+
+
 def test_tool_replay_tasks_skip_unpromoted_candidates(tmp_path):
     tools_path = tmp_path / "tool_candidates.json"
     tools_path.write_text(
@@ -1477,6 +2946,44 @@ def test_tool_replay_tasks_skip_unpromoted_candidates(tmp_path):
                             "expected_file_contents": {"gateway/routes.txt": "routes synced\n"},
                             "max_steps": 5,
                             "metadata": {"benchmark_family": "integration", "capability": "integration_environment"},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_tool_replay_tasks(tools_path)
+
+    assert tasks == []
+
+
+def test_tool_replay_tasks_skip_incomplete_shared_repo_integrator_candidates(tmp_path):
+    tools_path = tmp_path / "tool_candidates.json"
+    tools_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tool_candidate_set",
+                "lifecycle_state": "replay_verified",
+                "candidates": [
+                    {
+                        "tool_id": "tool:git_parallel_merge_acceptance_task:primary",
+                        "source_task_id": "git_parallel_merge_acceptance_task",
+                        "promotion_stage": "replay_verified",
+                        "lifecycle_state": "replay_verified",
+                        "procedure": {
+                            "commands": [
+                                "git merge --no-ff worker/docs-status -m 'merge worker/docs-status'",
+                                "tests/test_docs.sh",
+                                "mkdir -p reports && printf 'docs only\\n' > reports/merge_report.txt",
+                            ]
+                        },
+                        "task_contract": {
+                            "prompt": "Accept worker branches into main.",
+                            "workspace_subdir": "git_parallel_merge_acceptance_task",
+                            "expected_files": ["reports/merge_report.txt"],
+                            "metadata": {"benchmark_family": "repo_sandbox"},
                         },
                     }
                 ],

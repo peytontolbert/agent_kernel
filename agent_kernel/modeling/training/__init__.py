@@ -1,5 +1,6 @@
 from .hybrid_dataset import build_hybrid_training_examples, materialize_hybrid_training_dataset
 from .corpus_acquisition import external_corpus_examples, materialize_external_corpus
+from .qwen_dataset import materialize_qwen_sft_dataset
 from .universal_dataset import collect_universal_decoder_examples, materialize_universal_decoder_dataset
 
 __all__ = [
@@ -8,6 +9,7 @@ __all__ = [
     "external_corpus_examples",
     "materialize_hybrid_training_dataset",
     "materialize_external_corpus",
+    "materialize_qwen_sft_dataset",
     "materialize_universal_decoder_dataset",
     "train_hybrid_decoder_from_universal_dataset",
     "train_hybrid_runtime_from_dataset",

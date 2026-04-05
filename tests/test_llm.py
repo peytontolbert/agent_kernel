@@ -154,6 +154,7 @@ def test_vllm_client_uses_structured_chat_completion(monkeypatch):
     assert seen["timeout"] == 3
     assert seen["headers"]["Authorization"] == "Bearer secret"
     assert seen["payload"]["response_format"]["type"] == "json_schema"
+    assert seen["payload"]["chat_template_kwargs"]["enable_thinking"] is False
     assert seen["payload"]["messages"][0]["role"] == "system"
     assert seen["payload"]["messages"][1]["role"] == "user"
 
@@ -198,3 +199,91 @@ def test_vllm_client_falls_back_when_structured_output_request_fails(monkeypatch
 
     assert decision["action"] == "respond"
     assert calls["count"] == 2
+
+
+def test_vllm_client_retries_without_schema_when_structured_response_is_unparseable(monkeypatch):
+    calls = {"count": 0}
+
+    class _Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        calls["count"] += 1
+        payload = json.loads(req.data.decode("utf-8"))
+        if calls["count"] == 1:
+            assert "response_format" in payload
+            return _Response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "reasoning": "thinking without a final json object",
+                            }
+                        }
+                    ]
+                }
+            )
+        assert "response_format" not in payload
+        return _Response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"thought":"ok","action":"respond","content":"done","done":true}'
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert decision["action"] == "respond"
+    assert calls["count"] == 2
+
+
+def test_vllm_client_extracts_json_from_reasoning_when_content_is_null():
+    parsed = VLLMClient._extract_decision(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning": 'prefix {"thought":"ok","action":"respond","content":"done","done":true}',
+                    }
+                }
+            ]
+        }
+    )
+
+    assert parsed == {
+        "thought": "ok",
+        "action": "respond",
+        "content": "done",
+        "done": True,
+    }

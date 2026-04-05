@@ -51,11 +51,12 @@ def test_kernel_config_allows_runtime_toggles():
     assert str(config.run_checkpoints_dir).endswith("checkpoints")
     assert str(config.delegated_job_queue_path).endswith("jobs/queue.json")
     assert str(config.delegated_job_runtime_state_path).endswith("jobs/runtime_state.json")
-    assert config.delegated_job_max_concurrency == 1
-    assert config.delegated_job_max_active_per_budget_group == 0
-    assert config.delegated_job_max_queued_per_budget_group == 0
-    assert config.delegated_job_max_artifact_bytes == 5 * 1024 * 1024
-    assert config.delegated_job_max_subprocesses_per_job == 1
+    assert config.max_steps == 12
+    assert config.delegated_job_max_concurrency == 3
+    assert config.delegated_job_max_active_per_budget_group == 2
+    assert config.delegated_job_max_queued_per_budget_group == 8
+    assert config.delegated_job_max_artifact_bytes == 8 * 1024 * 1024
+    assert config.delegated_job_max_subprocesses_per_job == 2
     assert config.delegated_job_max_consecutive_selections_per_budget_group == 0
     assert "repo_chore" in config.unattended_allowed_benchmark_families
     assert "repo_sandbox" in config.unattended_allowed_benchmark_families

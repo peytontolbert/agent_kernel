@@ -226,10 +226,34 @@ def _normalize_runtime_artifact(path: Path, subsystem: str) -> dict[str, object]
         normalized.setdefault("runtime_paths", {})
         normalized.setdefault("proposals", [{"area": "balanced", "priority": 3, "reason": "migrated legacy Tolbert model artifact"}])
         return normalized
+    if subsystem == "qwen_adapter":
+        normalized = dict(payload) if isinstance(payload, dict) else {}
+        normalized.setdefault("spec_version", "asi_v1")
+        normalized.setdefault("artifact_kind", "qwen_adapter_bundle")
+        normalized.setdefault("lifecycle_state", "candidate")
+        normalized.setdefault("retention_gate", retention_gate_for_payload("qwen_adapter", normalized))
+        normalized.setdefault("runtime_role", "support_runtime")
+        normalized.setdefault("training_objective", "qlora_sft")
+        normalized.setdefault("base_model_name", KernelConfig().model_name)
+        normalized.setdefault(
+            "runtime_policy",
+            {
+                "allow_primary_routing": False,
+                "allow_shadow_routing": True,
+                "allow_teacher_generation": True,
+                "allow_post_liftoff_fallback": True,
+                "require_retained_promotion_for_runtime_use": True,
+            },
+        )
+        normalized.setdefault("training_dataset_manifest", {"total_examples": 0})
+        normalized.setdefault("supported_benchmark_families", ["repository", "project", "workflow"])
+        normalized.setdefault("runtime_paths", {"adapter_output_dir": "", "merged_output_dir": "", "adapter_manifest_path": ""})
+        return normalized
     artifact_kind = {
         "benchmark": "benchmark_candidate_set",
         "retrieval": "retrieval_policy_set",
         "tolbert_model": "tolbert_model_bundle",
+        "qwen_adapter": "qwen_adapter_bundle",
         "verifier": "verifier_candidate_set",
         "policy": "prompt_proposal_set",
         "world_model": "world_model_policy_set",
@@ -341,6 +365,7 @@ def main() -> None:
             "benchmark",
             "retrieval",
             "tolbert_model",
+            "qwen_adapter",
             "tooling",
             "verifier",
             "policy",
@@ -376,6 +401,7 @@ def main() -> None:
         "benchmark",
         "retrieval",
         "tolbert_model",
+        "qwen_adapter",
         "tooling",
         "verifier",
         "policy",
@@ -397,6 +423,7 @@ def main() -> None:
         "benchmark": config.benchmark_candidates_path,
         "retrieval": config.retrieval_proposals_path,
         "tolbert_model": config.tolbert_model_artifact_path,
+        "qwen_adapter": config.qwen_adapter_artifact_path,
         "tooling": config.tool_candidates_path,
         "verifier": config.verifier_contracts_path,
         "policy": config.prompt_proposals_path,

@@ -177,6 +177,13 @@ def _current_payload(path: Path) -> object | None:
         return None
 
 
+def _payload_dict(payload: object, key: str) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(key, {})
+    return dict(value) if isinstance(value, dict) else None
+
+
 def _metrics_from_summary(payload: object) -> object | None:
     if not isinstance(payload, dict) or not payload:
         return None
@@ -186,19 +193,62 @@ def _metrics_from_summary(payload: object) -> object | None:
         total=int(payload.get("total", 0) or 0),
         passed=int(payload.get("passed", 0) or 0),
         average_steps=float(payload.get("average_steps", 0.0) or 0.0),
+        average_success_steps=float(payload.get("average_success_steps", 0.0) or 0.0),
+        unsafe_ambiguous_episodes=int(payload.get("unsafe_ambiguous_episodes", 0) or 0),
+        hidden_side_effect_risk_episodes=int(payload.get("hidden_side_effect_risk_episodes", 0) or 0),
+        success_hidden_side_effect_risk_episodes=int(
+            payload.get("success_hidden_side_effect_risk_episodes", 0) or 0
+        ),
         generated_total=int(payload.get("generated_total", 0) or 0),
         generated_passed=int(payload.get("generated_passed", 0) or 0),
+        generated_by_kind=dict(payload.get("generated_by_kind", {}))
+        if isinstance(payload.get("generated_by_kind", {}), dict)
+        else {},
+        generated_passed_by_kind=dict(payload.get("generated_passed_by_kind", {}))
+        if isinstance(payload.get("generated_passed_by_kind", {}), dict)
+        else {},
+        generated_by_benchmark_family=dict(payload.get("generated_by_benchmark_family", {}))
+        if isinstance(payload.get("generated_by_benchmark_family", {}), dict)
+        else {},
+        generated_passed_by_benchmark_family=dict(payload.get("generated_passed_by_benchmark_family", {}))
+        if isinstance(payload.get("generated_passed_by_benchmark_family", {}), dict)
+        else {},
         low_confidence_episodes=int(payload.get("low_confidence_episodes", 0) or 0),
+        low_confidence_passed=int(payload.get("low_confidence_passed", 0) or 0),
+        low_confidence_steps=int(payload.get("low_confidence_steps", 0) or 0),
+        trusted_retrieval_steps=int(payload.get("trusted_retrieval_steps", 0) or 0),
+        retrieval_guided_steps=int(payload.get("retrieval_guided_steps", 0) or 0),
+        retrieval_selected_steps=int(payload.get("retrieval_selected_steps", 0) or 0),
+        retrieval_influenced_steps=int(payload.get("retrieval_influenced_steps", 0) or 0),
+        retrieval_ranked_skill_steps=int(payload.get("retrieval_ranked_skill_steps", 0) or 0),
         proposal_selected_steps=int(payload.get("proposal_selected_steps", 0) or 0),
         novel_command_steps=int(payload.get("novel_command_steps", 0) or 0),
         novel_valid_command_steps=int(payload.get("novel_valid_command_steps", 0) or 0),
+        decision_source_counts=dict(payload.get("decision_source_counts", {}))
+        if isinstance(payload.get("decision_source_counts", {}), dict)
+        else {},
+        tolbert_route_mode_counts=dict(payload.get("tolbert_route_mode_counts", {}))
+        if isinstance(payload.get("tolbert_route_mode_counts", {}), dict)
+        else {},
         tolbert_shadow_episodes=int(payload.get("tolbert_shadow_episodes", 0) or 0),
         tolbert_primary_episodes=int(payload.get("tolbert_primary_episodes", 0) or 0),
+        total_by_difficulty=dict(payload.get("total_by_difficulty", {}))
+        if isinstance(payload.get("total_by_difficulty", {}), dict)
+        else {},
+        passed_by_difficulty=dict(payload.get("passed_by_difficulty", {}))
+        if isinstance(payload.get("passed_by_difficulty", {}), dict)
+        else {},
         total_by_benchmark_family=dict(payload.get("total_by_benchmark_family", {}))
         if isinstance(payload.get("total_by_benchmark_family", {}), dict)
         else {},
         passed_by_benchmark_family=dict(payload.get("passed_by_benchmark_family", {}))
         if isinstance(payload.get("passed_by_benchmark_family", {}), dict)
+        else {},
+        total_by_origin_benchmark_family=dict(payload.get("total_by_origin_benchmark_family", {}))
+        if isinstance(payload.get("total_by_origin_benchmark_family", {}), dict)
+        else {},
+        passed_by_origin_benchmark_family=dict(payload.get("passed_by_origin_benchmark_family", {}))
+        if isinstance(payload.get("passed_by_origin_benchmark_family", {}), dict)
         else {},
         tolbert_shadow_episodes_by_benchmark_family=dict(payload.get("tolbert_shadow_episodes_by_benchmark_family", {}))
         if isinstance(payload.get("tolbert_shadow_episodes_by_benchmark_family", {}), dict)
@@ -209,11 +259,31 @@ def _metrics_from_summary(payload: object) -> object | None:
         proposal_metrics_by_benchmark_family=dict(payload.get("proposal_metrics_by_benchmark_family", {}))
         if isinstance(payload.get("proposal_metrics_by_benchmark_family", {}), dict)
         else {},
+        proposal_metrics_by_difficulty=dict(payload.get("proposal_metrics_by_difficulty", {}))
+        if isinstance(payload.get("proposal_metrics_by_difficulty", {}), dict)
+        else {},
         world_feedback_summary=dict(payload.get("world_feedback_summary", {}))
         if isinstance(payload.get("world_feedback_summary", {}), dict)
         else {},
         world_feedback_by_benchmark_family=dict(payload.get("world_feedback_by_benchmark_family", {}))
         if isinstance(payload.get("world_feedback_by_benchmark_family", {}), dict)
+        else {},
+        world_feedback_by_difficulty=dict(payload.get("world_feedback_by_difficulty", {}))
+        if isinstance(payload.get("world_feedback_by_difficulty", {}), dict)
+        else {},
+        long_horizon_persistence_summary=dict(payload.get("long_horizon_persistence_summary", {}))
+        if isinstance(payload.get("long_horizon_persistence_summary", {}), dict)
+        else {},
+        contract_clean_failure_recovery_summary=dict(payload.get("contract_clean_failure_recovery_summary", {}))
+        if isinstance(payload.get("contract_clean_failure_recovery_summary", {}), dict)
+        else {},
+        contract_clean_failure_recovery_by_origin_benchmark_family=dict(
+            payload.get("contract_clean_failure_recovery_by_origin_benchmark_family", {})
+        )
+        if isinstance(payload.get("contract_clean_failure_recovery_by_origin_benchmark_family", {}), dict)
+        else {},
+        transfer_alignment_summary=dict(payload.get("transfer_alignment_summary", {}))
+        if isinstance(payload.get("transfer_alignment_summary", {}), dict)
         else {},
     )
 
@@ -286,8 +356,8 @@ def _run_universal_decoder_eval(
     return payload
 
 
-def _write_report(report_path: Path, payload: dict[str, object]) -> None:
-    atomic_write_json(report_path, payload)
+def _write_report(report_path: Path, payload: dict[str, object], *, config: KernelConfig) -> None:
+    atomic_write_json(report_path, payload, config=config, govern_storage=False)
 
 
 def _metric_summary(metrics) -> dict[str, object]:
@@ -296,22 +366,51 @@ def _metric_summary(metrics) -> dict[str, object]:
         "passed": metrics.passed,
         "pass_rate": metrics.pass_rate,
         "average_steps": metrics.average_steps,
+        "average_success_steps": metrics.average_success_steps,
+        "unsafe_ambiguous_episodes": metrics.unsafe_ambiguous_episodes,
+        "hidden_side_effect_risk_episodes": metrics.hidden_side_effect_risk_episodes,
+        "success_hidden_side_effect_risk_episodes": metrics.success_hidden_side_effect_risk_episodes,
         "generated_total": metrics.generated_total,
         "generated_passed": metrics.generated_passed,
+        "generated_by_kind": dict(metrics.generated_by_kind),
+        "generated_passed_by_kind": dict(metrics.generated_passed_by_kind),
+        "generated_by_benchmark_family": dict(metrics.generated_by_benchmark_family),
+        "generated_passed_by_benchmark_family": dict(metrics.generated_passed_by_benchmark_family),
         "low_confidence_episodes": metrics.low_confidence_episodes,
+        "low_confidence_passed": metrics.low_confidence_passed,
+        "low_confidence_steps": metrics.low_confidence_steps,
+        "trusted_retrieval_steps": metrics.trusted_retrieval_steps,
+        "retrieval_guided_steps": metrics.retrieval_guided_steps,
+        "retrieval_selected_steps": metrics.retrieval_selected_steps,
+        "retrieval_influenced_steps": metrics.retrieval_influenced_steps,
+        "retrieval_ranked_skill_steps": metrics.retrieval_ranked_skill_steps,
         "proposal_selected_steps": metrics.proposal_selected_steps,
         "novel_command_steps": metrics.novel_command_steps,
         "novel_valid_command_steps": metrics.novel_valid_command_steps,
         "novel_valid_command_rate": metrics.novel_valid_command_rate,
+        "decision_source_counts": dict(metrics.decision_source_counts),
+        "tolbert_route_mode_counts": dict(metrics.tolbert_route_mode_counts),
         "tolbert_shadow_episodes": metrics.tolbert_shadow_episodes,
         "tolbert_primary_episodes": metrics.tolbert_primary_episodes,
+        "total_by_difficulty": dict(metrics.total_by_difficulty),
+        "passed_by_difficulty": dict(metrics.passed_by_difficulty),
         "total_by_benchmark_family": dict(metrics.total_by_benchmark_family),
         "passed_by_benchmark_family": dict(metrics.passed_by_benchmark_family),
+        "total_by_origin_benchmark_family": dict(metrics.total_by_origin_benchmark_family),
+        "passed_by_origin_benchmark_family": dict(metrics.passed_by_origin_benchmark_family),
         "tolbert_shadow_episodes_by_benchmark_family": dict(metrics.tolbert_shadow_episodes_by_benchmark_family),
         "tolbert_primary_episodes_by_benchmark_family": dict(metrics.tolbert_primary_episodes_by_benchmark_family),
         "proposal_metrics_by_benchmark_family": dict(metrics.proposal_metrics_by_benchmark_family),
+        "proposal_metrics_by_difficulty": dict(metrics.proposal_metrics_by_difficulty),
         "world_feedback_summary": dict(metrics.world_feedback_summary),
         "world_feedback_by_benchmark_family": dict(metrics.world_feedback_by_benchmark_family),
+        "world_feedback_by_difficulty": dict(metrics.world_feedback_by_difficulty),
+        "long_horizon_persistence_summary": dict(metrics.long_horizon_persistence_summary),
+        "contract_clean_failure_recovery_summary": dict(metrics.contract_clean_failure_recovery_summary),
+        "contract_clean_failure_recovery_by_origin_benchmark_family": dict(
+            metrics.contract_clean_failure_recovery_by_origin_benchmark_family
+        ),
+        "transfer_alignment_summary": dict(metrics.transfer_alignment_summary),
     }
 
 
@@ -361,6 +460,24 @@ def _world_feedback_calibration_delta_by_benchmark_family(
     return summary
 
 
+def _world_feedback_calibration_delta_by_difficulty(
+    baseline: dict[str, dict[str, object]],
+    candidate: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    if not isinstance(baseline, dict):
+        baseline = {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    difficulties = sorted(set(baseline) | set(candidate))
+    summary: dict[str, dict[str, object]] = {}
+    for difficulty in difficulties:
+        summary[difficulty] = _world_feedback_calibration_delta(
+            dict(baseline.get(difficulty, {})) if isinstance(baseline.get(difficulty, {}), dict) else {},
+            dict(candidate.get(difficulty, {})) if isinstance(candidate.get(difficulty, {}), dict) else {},
+        )
+    return summary
+
+
 def _proposal_metrics_delta_by_benchmark_family(
     baseline: dict[str, dict[str, object]],
     candidate: dict[str, dict[str, object]],
@@ -404,7 +521,152 @@ def _proposal_metrics_delta_by_benchmark_family(
     return summary
 
 
-def _apply_routing_to_artifact(artifact_path: Path, artifact: dict[str, object], report) -> None:
+def _proposal_metrics_delta_by_difficulty(
+    baseline: dict[str, dict[str, object]],
+    candidate: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    if not isinstance(baseline, dict):
+        baseline = {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    difficulties = sorted(set(baseline) | set(candidate))
+    summary: dict[str, dict[str, object]] = {}
+    for difficulty in difficulties:
+        baseline_row = baseline.get(difficulty, {})
+        candidate_row = candidate.get(difficulty, {})
+        if not isinstance(baseline_row, dict):
+            baseline_row = {}
+        if not isinstance(candidate_row, dict):
+            candidate_row = {}
+        baseline_task_count = int(baseline_row.get("task_count", 0) or 0)
+        candidate_task_count = int(candidate_row.get("task_count", 0) or 0)
+        if baseline_task_count == 0 and candidate_task_count == 0:
+            continue
+        baseline_proposal_steps = int(baseline_row.get("proposal_selected_steps", 0) or 0)
+        candidate_proposal_steps = int(candidate_row.get("proposal_selected_steps", 0) or 0)
+        baseline_valid_steps = int(baseline_row.get("novel_valid_command_steps", 0) or 0)
+        candidate_valid_steps = int(candidate_row.get("novel_valid_command_steps", 0) or 0)
+        baseline_valid_rate = float(baseline_row.get("novel_valid_command_rate", 0.0) or 0.0)
+        candidate_valid_rate = float(candidate_row.get("novel_valid_command_rate", 0.0) or 0.0)
+        summary[difficulty] = {
+            "baseline_task_count": baseline_task_count,
+            "candidate_task_count": candidate_task_count,
+            "baseline_proposal_selected_steps": baseline_proposal_steps,
+            "candidate_proposal_selected_steps": candidate_proposal_steps,
+            "proposal_selected_steps_delta": candidate_proposal_steps - baseline_proposal_steps,
+            "baseline_novel_valid_command_steps": baseline_valid_steps,
+            "candidate_novel_valid_command_steps": candidate_valid_steps,
+            "novel_valid_command_steps_delta": candidate_valid_steps - baseline_valid_steps,
+            "baseline_novel_valid_command_rate": round(baseline_valid_rate, 4),
+            "candidate_novel_valid_command_rate": round(candidate_valid_rate, 4),
+            "novel_valid_command_rate_delta": round(candidate_valid_rate - baseline_valid_rate, 4),
+        }
+    return summary
+
+
+def _long_horizon_comparison(baseline_metrics, candidate_metrics) -> dict[str, object]:
+    difficulty = "long_horizon"
+    baseline_total = int(baseline_metrics.total_by_difficulty.get(difficulty, 0) or 0)
+    candidate_total = int(candidate_metrics.total_by_difficulty.get(difficulty, 0) or 0)
+    baseline_rate = baseline_metrics.difficulty_pass_rate(difficulty)
+    candidate_rate = candidate_metrics.difficulty_pass_rate(difficulty)
+    proposal_by_difficulty = _proposal_metrics_delta_by_difficulty(
+        baseline_metrics.proposal_metrics_by_difficulty,
+        candidate_metrics.proposal_metrics_by_difficulty,
+    )
+    world_feedback_by_difficulty = _world_feedback_calibration_delta_by_difficulty(
+        baseline_metrics.world_feedback_by_difficulty,
+        candidate_metrics.world_feedback_by_difficulty,
+    )
+    baseline_persistence = (
+        dict(baseline_metrics.long_horizon_persistence_summary)
+        if isinstance(baseline_metrics.long_horizon_persistence_summary, dict)
+        else {}
+    )
+    candidate_persistence = (
+        dict(candidate_metrics.long_horizon_persistence_summary)
+        if isinstance(candidate_metrics.long_horizon_persistence_summary, dict)
+        else {}
+    )
+    return {
+        "difficulty": difficulty,
+        "baseline_task_count": baseline_total,
+        "candidate_task_count": candidate_total,
+        "baseline_pass_rate": round(baseline_rate, 4),
+        "candidate_pass_rate": round(candidate_rate, 4),
+        "pass_rate_delta": round(candidate_rate - baseline_rate, 4),
+        "proposal_metrics": dict(proposal_by_difficulty.get(difficulty, {}))
+        if isinstance(proposal_by_difficulty.get(difficulty, {}), dict)
+        else {},
+        "world_feedback": dict(world_feedback_by_difficulty.get(difficulty, {}))
+        if isinstance(world_feedback_by_difficulty.get(difficulty, {}), dict)
+        else {},
+        "persistence": {
+            "baseline": baseline_persistence,
+            "candidate": candidate_persistence,
+            "productive_long_horizon_step_rate_delta": round(
+                float(candidate_persistence.get("productive_long_horizon_step_rate", 0.0) or 0.0)
+                - float(baseline_persistence.get("productive_long_horizon_step_rate", 0.0) or 0.0),
+                4,
+            ),
+            "recovery_response_rate_delta": round(
+                float(candidate_persistence.get("recovery_response_rate", 0.0) or 0.0)
+                - float(baseline_persistence.get("recovery_response_rate", 0.0) or 0.0),
+                4,
+            ),
+            "horizon_drop_rate_delta": round(
+                float(candidate_persistence.get("horizon_drop_rate", 0.0) or 0.0)
+                - float(baseline_persistence.get("horizon_drop_rate", 0.0) or 0.0),
+                4,
+            ),
+        },
+    }
+
+
+def _transfer_alignment_comparison(baseline_metrics, candidate_metrics) -> dict[str, object]:
+    baseline = (
+        dict(baseline_metrics.transfer_alignment_summary)
+        if isinstance(baseline_metrics.transfer_alignment_summary, dict)
+        else {}
+    )
+    candidate = (
+        dict(candidate_metrics.transfer_alignment_summary)
+        if isinstance(candidate_metrics.transfer_alignment_summary, dict)
+        else {}
+    )
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "verified_transfer_step_rate_delta": round(
+            float(candidate.get("verified_transfer_step_rate", 0.0) or 0.0)
+            - float(baseline.get("verified_transfer_step_rate", 0.0) or 0.0),
+            4,
+        ),
+        "trusted_retrieval_alignment_mean_delta": round(
+            float(candidate.get("trusted_retrieval_alignment_mean", 0.0) or 0.0)
+            - float(baseline.get("trusted_retrieval_alignment_mean", 0.0) or 0.0),
+            4,
+        ),
+        "graph_environment_alignment_mean_delta": round(
+            float(candidate.get("graph_environment_alignment_mean", 0.0) or 0.0)
+            - float(baseline.get("graph_environment_alignment_mean", 0.0) or 0.0),
+            4,
+        ),
+        "safe_transfer_step_rate_delta": round(
+            float(candidate.get("safe_transfer_step_rate", 0.0) or 0.0)
+            - float(baseline.get("safe_transfer_step_rate", 0.0) or 0.0),
+            4,
+        ),
+    }
+
+
+def _apply_routing_to_artifact(
+    artifact_path: Path,
+    artifact: dict[str, object],
+    report,
+    *,
+    config: KernelConfig,
+) -> None:
     runtime_policy = artifact.get("runtime_policy", {})
     if not isinstance(runtime_policy, dict):
         runtime_policy = {}
@@ -428,7 +690,7 @@ def _apply_routing_to_artifact(artifact_path: Path, artifact: dict[str, object],
         hybrid_runtime["shadow_enabled"] = bool(runtime_policy.get("shadow_benchmark_families", []))
     artifact["runtime_policy"] = runtime_policy
     artifact["hybrid_runtime"] = hybrid_runtime
-    atomic_write_json(artifact_path, artifact)
+    atomic_write_json(artifact_path, artifact, config=config, govern_storage=False)
 
 
 def main() -> None:
@@ -454,9 +716,9 @@ def main() -> None:
     parser.add_argument("--baseline-task-limit", type=int, default=0)
     parser.add_argument("--candidate-task-limit", type=int, default=0)
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
-    parser.add_argument("--takeover-drift-step-budget", type=int, default=0)
-    parser.add_argument("--takeover-drift-wave-task-limit", type=int, default=0)
-    parser.add_argument("--takeover-drift-max-waves", type=int, default=0)
+    parser.add_argument("--takeover-drift-step-budget", type=int, default=None)
+    parser.add_argument("--takeover-drift-wave-task-limit", type=int, default=None)
+    parser.add_argument("--takeover-drift-max-waves", type=int, default=None)
     parser.add_argument("--child-heartbeat-seconds", type=float, default=120.0)
     parser.add_argument("--max-child-silence-seconds", type=float, default=1800.0)
     parser.add_argument("--max-child-runtime-seconds", type=float, default=14400.0)
@@ -535,7 +797,7 @@ def main() -> None:
         "candidate_artifact_path": str(candidate_artifact_path),
         "retained_artifact_path": str(config.tolbert_model_artifact_path),
     }
-    _write_report(report_path, base_report)
+    _write_report(report_path, base_report, config=config)
 
     campaign_report_path = (
         Path(str(resume_payload.get("campaign", {}).get("campaign_report_path", "")).strip())
@@ -551,11 +813,15 @@ def main() -> None:
     )
     baseline_metrics = _metrics_from_summary(resume_payload.get("baseline_metrics", {})) if isinstance(resume_payload, dict) else None
     candidate_metrics = _metrics_from_summary(resume_payload.get("candidate_metrics", {})) if isinstance(resume_payload, dict) else None
+    baseline_trust_ledger = _payload_dict(resume_payload, "baseline_trust")
+    candidate_trust_ledger = _payload_dict(resume_payload, "candidate_trust")
+    takeover_drift_report = _payload_dict(resume_payload, "takeover_drift")
+    universal_decoder_eval = _payload_dict(resume_payload, "universal_decoder_eval")
     try:
         if not campaign_completed and not args.skip_improvement and max(0, args.cycles) > 0:
             phase = "campaign"
             base_report["phase"] = phase
-            _write_report(report_path, base_report)
+            _write_report(report_path, base_report, config=config)
             _progress(
                 f"[liftoff] phase=campaign cycles={max(1, args.cycles)} task_limit={max(0, args.task_limit)} "
                 f"tolbert_device={config.tolbert_device}"
@@ -619,7 +885,7 @@ def main() -> None:
         if baseline_metrics is None:
             phase = "baseline_eval"
             base_report["phase"] = phase
-            _write_report(report_path, base_report)
+            _write_report(report_path, base_report, config=config)
             _progress(
                 f"[liftoff] phase=baseline_eval task_limit="
                 f"{max(0, args.baseline_task_limit) or max(0, args.task_limit) or 0}"
@@ -632,13 +898,15 @@ def main() -> None:
                 priority_benchmark_families=[
                     str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
                 ],
+                prefer_low_cost_tasks=True,
+                write_unattended_reports=True,
                 **_eval_kwargs(),
             )
             baseline_trust_ledger = build_unattended_trust_ledger(baseline_eval_config)
         phase = "candidate_build"
         base_report["phase"] = phase
         base_report["baseline_metrics"] = _metric_summary(baseline_metrics)
-        _write_report(report_path, base_report)
+        _write_report(report_path, base_report, config=config)
         _progress("[liftoff] phase=candidate_build")
         if not candidate_artifact:
             candidate_artifact = build_tolbert_model_candidate_artifact(
@@ -656,7 +924,7 @@ def main() -> None:
             base_report["phase"] = phase
             base_report["artifact_dataset_manifest"] = dict(candidate_artifact.get("dataset_manifest", {}))
             base_report["artifact_build_policy"] = dict(candidate_artifact.get("build_policy", {}))
-            _write_report(report_path, base_report)
+            _write_report(report_path, base_report, config=config)
             _progress(
                 f"[liftoff] phase=candidate_eval task_limit="
                 f"{max(0, args.candidate_task_limit) or max(0, args.task_limit) or 0}"
@@ -673,20 +941,32 @@ def main() -> None:
                 priority_benchmark_families=[
                     str(value).strip() for value in args.priority_benchmark_family if str(value).strip()
                 ],
+                prefer_low_cost_tasks=True,
+                write_unattended_reports=True,
                 **_eval_kwargs(),
             )
             candidate_trust_ledger = build_unattended_trust_ledger(candidate_eval_config)
         phase = "liftoff_gate"
         base_report["phase"] = phase
         base_report["candidate_metrics"] = _metric_summary(candidate_metrics)
-        _write_report(report_path, base_report)
+        _write_report(report_path, base_report, config=config)
         _progress("[liftoff] phase=liftoff_gate")
         gate = retained_tolbert_liftoff_gate(candidate_artifact)
-        drift_step_budget = max(0, args.takeover_drift_step_budget) or int(gate.get("takeover_drift_step_budget", 0))
-        drift_wave_task_limit = max(0, args.takeover_drift_wave_task_limit) or int(
-            gate.get("takeover_drift_wave_task_limit", 0)
+        drift_step_budget = (
+            max(0, int(args.takeover_drift_step_budget))
+            if args.takeover_drift_step_budget is not None
+            else int(gate.get("takeover_drift_step_budget", 0))
         )
-        drift_max_waves = max(0, args.takeover_drift_max_waves) or int(gate.get("takeover_drift_max_waves", 0))
+        drift_wave_task_limit = (
+            max(0, int(args.takeover_drift_wave_task_limit))
+            if args.takeover_drift_wave_task_limit is not None
+            else int(gate.get("takeover_drift_wave_task_limit", 0))
+        )
+        drift_max_waves = (
+            max(0, int(args.takeover_drift_max_waves))
+            if args.takeover_drift_max_waves is not None
+            else int(gate.get("takeover_drift_max_waves", 0))
+        )
         if bool(gate.get("require_takeover_drift_eval", True)) and drift_step_budget > 0:
             takeover_drift_report = run_takeover_drift_eval(
                 config=config,
@@ -706,7 +986,12 @@ def main() -> None:
         )
         _emit_liftoff_summary(liftoff_report)
         if args.apply_routing:
-            _apply_routing_to_artifact(candidate_artifact_path, candidate_artifact, liftoff_report)
+            _apply_routing_to_artifact(
+                candidate_artifact_path,
+                candidate_artifact,
+                liftoff_report,
+                config=config,
+            )
         if args.promote_on_retain and liftoff_report.state == "retain":
             config.tolbert_model_artifact_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
@@ -714,10 +999,12 @@ def main() -> None:
                 candidate_artifact_path.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-        universal_decoder_eval = _run_universal_decoder_eval(
+        refreshed_universal_decoder_eval = _run_universal_decoder_eval(
             config=config,
             candidate_artifact=candidate_artifact,
         )
+        if refreshed_universal_decoder_eval is not None:
+            universal_decoder_eval = refreshed_universal_decoder_eval
     except KeyboardInterrupt:
         base_report.update(
             {
@@ -745,7 +1032,7 @@ def main() -> None:
             base_report["takeover_drift"] = dict(takeover_drift_report)
         if universal_decoder_eval is not None:
             base_report["universal_decoder_eval"] = dict(universal_decoder_eval)
-        _write_report(report_path, base_report)
+        _write_report(report_path, base_report, config=config)
         print(report_path)
         raise SystemExit(130)
     finally:
@@ -796,8 +1083,20 @@ def main() -> None:
             "allow_kernel_rebuild": bool(build_policy.get("allow_kernel_rebuild", False)),
             "ready_total_examples": int(build_policy.get("ready_total_examples", 0) or 0),
             "ready_synthetic_examples": int(build_policy.get("ready_synthetic_examples", 0) or 0),
+            "ready_long_horizon_trajectory_examples": int(
+                build_policy.get("ready_long_horizon_trajectory_examples", 0) or 0
+            ),
+            "ready_long_horizon_policy_examples": int(
+                build_policy.get("ready_long_horizon_policy_examples", 0) or 0
+            ),
+            "ready_long_horizon_transition_examples": int(
+                build_policy.get("ready_long_horizon_transition_examples", 0) or 0
+            ),
             "min_total_examples": int(build_policy.get("min_total_examples", 0) or 0),
             "min_synthetic_examples": int(build_policy.get("min_synthetic_examples", 0) or 0),
+            "min_long_horizon_trajectory_examples": int(
+                build_policy.get("min_long_horizon_trajectory_examples", 0) or 0
+            ),
         },
         "training": {
             "job_records": list(candidate_artifact.get("job_records", []))
@@ -826,6 +1125,10 @@ def main() -> None:
                 baseline_metrics.proposal_metrics_by_benchmark_family,
                 candidate_metrics.proposal_metrics_by_benchmark_family,
             ),
+            "proposal_metrics_by_difficulty": _proposal_metrics_delta_by_difficulty(
+                baseline_metrics.proposal_metrics_by_difficulty,
+                candidate_metrics.proposal_metrics_by_difficulty,
+            ),
             "world_feedback_calibration": _world_feedback_calibration_delta(
                 baseline_metrics.world_feedback_summary,
                 candidate_metrics.world_feedback_summary,
@@ -833,6 +1136,18 @@ def main() -> None:
             "world_feedback_by_benchmark_family": _world_feedback_calibration_delta_by_benchmark_family(
                 baseline_metrics.world_feedback_by_benchmark_family,
                 candidate_metrics.world_feedback_by_benchmark_family,
+            ),
+            "world_feedback_by_difficulty": _world_feedback_calibration_delta_by_difficulty(
+                baseline_metrics.world_feedback_by_difficulty,
+                candidate_metrics.world_feedback_by_difficulty,
+            ),
+            "long_horizon": _long_horizon_comparison(
+                baseline_metrics,
+                candidate_metrics,
+            ),
+            "transfer_alignment": _transfer_alignment_comparison(
+                baseline_metrics,
+                candidate_metrics,
             ),
             "family_takeover_summary": _family_takeover_summary(liftoff_report),
             "proposal_gate_failure_reasons_by_benchmark_family": dict(
@@ -855,7 +1170,7 @@ def main() -> None:
         "artifact_dataset_manifest": dataset_manifest,
         "artifact_universal_dataset_manifest": dict(candidate_artifact.get("universal_dataset_manifest", {})),
     }
-    _write_report(report_path, report)
+    _write_report(report_path, report, config=config)
     print(report_path)
 
 

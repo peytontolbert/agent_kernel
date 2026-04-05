@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -10,9 +11,11 @@ import re
 from evals.harness import compare_abstraction_transfer_modes, run_eval, scoped_eval_config
 
 from .config import KernelConfig
+from .runtime_supervision import atomic_write_json
 from .improvement import (
     _generated_kind_pass_rate,
     _has_generated_kind,
+    artifact_sha256,
     effective_artifact_payload_for_retention,
     ImprovementCycleRecord,
     ImprovementPlanner,
@@ -33,6 +36,16 @@ from .subsystems import (
     config_with_subsystem_artifact_path,
 )
 from .tolbert_assets import materialize_retained_retrieval_asset_bundle
+
+
+def _candidate_matches_active_artifact(candidate_artifact_path: Path, active_artifact_path: Path) -> bool:
+    if candidate_artifact_path == active_artifact_path:
+        return False
+    if not candidate_artifact_path.exists() or not active_artifact_path.exists():
+        return False
+    candidate_sha256 = artifact_sha256(candidate_artifact_path)
+    active_sha256 = artifact_sha256(active_artifact_path)
+    return bool(candidate_sha256) and candidate_sha256 == active_sha256
 
 
 def comparison_flags(subsystem: str, *, config: KernelConfig | None = None) -> dict[str, bool]:
@@ -128,6 +141,48 @@ def evaluate_subsystem_metrics(
     return run_eval(config=config, progress_label=progress_label, **flags)
 
 
+def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
+    normalized = str(error_text).strip().lower()
+    if not normalized:
+        return False
+    return (
+        "tolbert service failed to become ready" in normalized
+        or "tolbert service exited before startup ready" in normalized
+    )
+
+
+def _evaluate_subsystem_metrics_with_tolbert_startup_retry(
+    *,
+    config: KernelConfig,
+    subsystem: str,
+    flags: dict[str, object],
+    progress_label: str | None,
+    phase_name: str,
+    progress: Callable[[str], None] | None,
+):
+    try:
+        return evaluate_subsystem_metrics(
+            config=config,
+            subsystem=subsystem,
+            flags=flags,
+            progress_label=progress_label,
+        )
+    except RuntimeError as exc:
+        if not bool(config.use_tolbert_context) or not _is_retryable_tolbert_startup_failure(str(exc)):
+            raise
+        if progress is not None:
+            progress(
+                f"finalize phase={phase_name}_retry subsystem={subsystem} "
+                "reason=tolbert_startup_failure use_tolbert_context=0"
+            )
+        return evaluate_subsystem_metrics(
+            config=replace(config, use_tolbert_context=False),
+            subsystem=subsystem,
+            flags=flags,
+            progress_label=progress_label,
+        )
+
+
 def _retention_eval_config(
     *,
     base_config: KernelConfig,
@@ -141,7 +196,111 @@ def _retention_eval_config(
         trajectories_root=base_config.trajectories_root,
         persist_episode_memory=False,
     )
+    preview_runtime_root = scoped.improvement_reports_dir / "preview_runtime"
+    scoped = replace(
+        scoped,
+        run_checkpoints_dir=preview_runtime_root / "checkpoints",
+        unattended_workspace_snapshot_root=preview_runtime_root / "workspace_snapshots",
+    )
+    scoped.run_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    scoped.unattended_workspace_snapshot_root.mkdir(parents=True, exist_ok=True)
     return comparison_config_for_subsystem_artifact(scoped, subsystem, artifact_path)
+
+
+def _comparison_task_limit_for_retention(
+    subsystem: str,
+    *,
+    task_limit: int | None,
+    payload: dict[str, object] | None = None,
+    capability_modules_path: Path | None = None,
+) -> int | None:
+    retrieval_bounded_compare_fallback = 24
+    if not isinstance(task_limit, int) or task_limit <= 0:
+        task_limit = None
+    if base_subsystem_for(subsystem, capability_modules_path) != "retrieval" or not isinstance(payload, dict):
+        return task_limit
+    preview_controls = payload.get("preview_controls", {})
+    if isinstance(preview_controls, dict):
+        comparison_task_limit_floor = preview_controls.get("comparison_task_limit_floor")
+        try:
+            comparison_task_limit_floor = int(comparison_task_limit_floor)
+        except (TypeError, ValueError):
+            comparison_task_limit_floor = 0
+        if comparison_task_limit_floor > 0:
+            if task_limit is None:
+                return comparison_task_limit_floor
+            return max(task_limit, comparison_task_limit_floor)
+    gate = retention_gate_for_payload(
+        subsystem,
+        payload,
+        capability_modules_path=capability_modules_path,
+    )
+    if bool(gate.get("require_trusted_carryover_repair_improvement", False)):
+        if task_limit is None:
+            return retrieval_bounded_compare_fallback
+        return max(task_limit, retrieval_bounded_compare_fallback)
+    return task_limit
+
+
+def _retrieval_preview_priority_overrides(
+    payload: dict[str, object] | None,
+) -> tuple[list[str], dict[str, float]]:
+    if not isinstance(payload, dict):
+        return [], {}
+    preview_controls = payload.get("preview_controls", {})
+    if not isinstance(preview_controls, dict):
+        return [], {}
+    families = [
+        str(family).strip()
+        for family in list(preview_controls.get("priority_benchmark_families", []))
+        if str(family).strip()
+    ]
+    weights_value = preview_controls.get("priority_benchmark_family_weights", {})
+    weights: dict[str, float] = {}
+    if isinstance(weights_value, dict):
+        for family, weight in weights_value.items():
+            normalized_family = str(family).strip()
+            if not normalized_family:
+                continue
+            try:
+                weights[normalized_family] = float(weight)
+            except (TypeError, ValueError):
+                continue
+    return families, weights
+
+
+def _merge_priority_families(
+    explicit_families: list[str] | None,
+    explicit_weights: dict[str, float] | None,
+    payload: dict[str, object] | None,
+) -> tuple[list[str], dict[str, float]]:
+    merged_families: list[str] = []
+    merged_weights: dict[str, float] = {}
+    for family in list(explicit_families or []):
+        normalized = str(family).strip()
+        if not normalized:
+            continue
+        if normalized not in merged_families:
+            merged_families.append(normalized)
+    for family, weight in dict(explicit_weights or {}).items():
+        normalized = str(family).strip()
+        if not normalized:
+            continue
+        try:
+            merged_weights[normalized] = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if normalized not in merged_families:
+            merged_families.append(normalized)
+    retrieval_families, retrieval_weights = _retrieval_preview_priority_overrides(payload)
+    for family in retrieval_families:
+        if family not in merged_families:
+            merged_families.append(family)
+    for family, weight in retrieval_weights.items():
+        merged_weights[family] = max(weight, float(merged_weights.get(family, 0.0) or 0.0))
+        if family not in merged_families:
+            merged_families.append(family)
+    return merged_families, merged_weights
 
 
 def confirmation_confidence_report(
@@ -981,9 +1140,24 @@ def compare_to_prior_retained(
             "reason": "prior retained artifact snapshot does not exist",
         }
 
+    comparison_task_limit = _comparison_task_limit_for_retention(
+        subsystem,
+        task_limit=task_limit,
+        payload=payload,
+        capability_modules_path=config.capability_modules_path,
+    )
+    merged_priority_families, merged_priority_family_weights = _merge_priority_families(
+        None,
+        None,
+        payload,
+    )
     scoped_flags = dict(flags)
-    if isinstance(task_limit, int) and task_limit > 0:
-        scoped_flags["task_limit"] = task_limit
+    if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
+        scoped_flags["task_limit"] = comparison_task_limit
+    if merged_priority_families:
+        scoped_flags["priority_benchmark_families"] = list(merged_priority_families)
+    if merged_priority_family_weights:
+        scoped_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
     baseline_config = _retention_eval_config(
         base_config=config,
         subsystem=subsystem,
@@ -1000,21 +1174,25 @@ def compare_to_prior_retained(
         f"finalize phase=preview_prior_retained_baseline_eval subsystem={subsystem} "
         f"baseline_cycle_id={baseline_cycle_id}"
     )
-    baseline_metrics = evaluate_subsystem_metrics(
+    baseline_metrics = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
         config=baseline_config,
         subsystem=subsystem,
         flags=scoped_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_baseline",
+        phase_name="preview_prior_retained_baseline",
+        progress=progress,
     )
     _emit(
         f"finalize phase=preview_prior_retained_candidate_eval subsystem={subsystem} "
         f"baseline_cycle_id={baseline_cycle_id}"
     )
-    current_metrics = evaluate_subsystem_metrics(
+    current_metrics = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
         config=current_config,
         subsystem=subsystem,
         flags=scoped_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_candidate",
+        phase_name="preview_prior_retained_candidate",
+        progress=progress,
     )
     _emit(
         f"finalize phase=preview_prior_retained_complete subsystem={subsystem} "
@@ -1097,6 +1275,26 @@ def preview_candidate_retention(
         if progress is not None:
             progress(message)
 
+    artifact_payload = None
+    if artifact_path.exists():
+        parsed = json.loads(artifact_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            artifact_payload = effective_artifact_payload_for_retention(
+                subsystem,
+                parsed,
+                capability_modules_path=config.capability_modules_path,
+            )
+    comparison_task_limit = _comparison_task_limit_for_retention(
+        subsystem,
+        task_limit=task_limit,
+        payload=artifact_payload,
+        capability_modules_path=config.capability_modules_path,
+    )
+    merged_priority_families, merged_priority_family_weights = _merge_priority_families(
+        priority_benchmark_families,
+        priority_benchmark_family_weights,
+        artifact_payload,
+    )
     managed_active_artifact_path = (
         active_artifact_path if active_artifact_path is not None else active_artifact_path_for_subsystem(config, subsystem)
     )
@@ -1127,12 +1325,12 @@ def preview_candidate_retention(
         }
     )
     baseline_flags = autonomous_runtime_eval_flags(baseline_config, baseline_flags)
-    if isinstance(task_limit, int) and task_limit > 0:
-        baseline_flags["task_limit"] = task_limit
-    if priority_benchmark_families:
-        baseline_flags["priority_benchmark_families"] = list(priority_benchmark_families)
-    if priority_benchmark_family_weights:
-        baseline_flags["priority_benchmark_family_weights"] = dict(priority_benchmark_family_weights)
+    if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
+        baseline_flags["task_limit"] = comparison_task_limit
+    if merged_priority_families:
+        baseline_flags["priority_benchmark_families"] = list(merged_priority_families)
+    if merged_priority_family_weights:
+        baseline_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
     candidate_flags.update(
         {
             "include_discovered_tasks": include_discovered_tasks or candidate_flags["include_discovered_tasks"],
@@ -1147,43 +1345,38 @@ def preview_candidate_retention(
         }
     )
     candidate_flags = autonomous_runtime_eval_flags(candidate_config, candidate_flags)
-    if isinstance(task_limit, int) and task_limit > 0:
-        candidate_flags["task_limit"] = task_limit
-    if priority_benchmark_families:
-        candidate_flags["priority_benchmark_families"] = list(priority_benchmark_families)
-    if priority_benchmark_family_weights:
-        candidate_flags["priority_benchmark_family_weights"] = dict(priority_benchmark_family_weights)
+    if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
+        candidate_flags["task_limit"] = comparison_task_limit
+    if merged_priority_families:
+        candidate_flags["priority_benchmark_families"] = list(merged_priority_families)
+    if merged_priority_family_weights:
+        candidate_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
     _emit(f"finalize phase=preview_baseline_eval subsystem={subsystem}")
-    baseline = evaluate_subsystem_metrics(
+    baseline = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
         config=baseline_config,
         subsystem=subsystem,
         flags=baseline_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_baseline",
+        phase_name="preview_baseline",
+        progress=progress,
     )
     _emit(
         f"finalize phase=preview_baseline_complete subsystem={subsystem} "
         f"baseline_pass_rate={baseline.pass_rate:.4f}"
     )
     _emit(f"finalize phase=preview_candidate_eval subsystem={subsystem}")
-    candidate = evaluate_subsystem_metrics(
+    candidate = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
         config=candidate_config,
         subsystem=subsystem,
         flags=candidate_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_candidate",
+        phase_name="preview_candidate",
+        progress=progress,
     )
     _emit(
         f"finalize phase=preview_candidate_complete subsystem={subsystem} "
         f"candidate_pass_rate={candidate.pass_rate:.4f}"
     )
-    artifact_payload = None
-    if artifact_path.exists():
-        parsed = json.loads(artifact_path.read_text(encoding="utf-8"))
-        if isinstance(parsed, dict):
-            artifact_payload = effective_artifact_payload_for_retention(
-                subsystem,
-                parsed,
-                capability_modules_path=config.capability_modules_path,
-            )
     evidence = retention_evidence(
         subsystem,
         baseline,
@@ -1194,14 +1387,24 @@ def preview_candidate_retention(
     compatibility = {}
     if isinstance(artifact_payload, dict):
         compatibility = dict(artifact_payload.get("compatibility", {}))
-    state, reason = evaluate_artifact_retention(
-        subsystem,
-        baseline,
-        candidate,
-        artifact_path=artifact_path,
-        payload=artifact_payload,
-        capability_modules_path=config.capability_modules_path,
-    )
+    candidate_matches_active = _candidate_matches_active_artifact(artifact_path, managed_active_artifact_path)
+    if candidate_matches_active:
+        state, reason = ("reject", "candidate artifact is identical to the active retained artifact")
+        evidence = {
+            **evidence,
+            "artifact_content_unchanged": True,
+            "candidate_artifact_path": str(artifact_path),
+            "active_artifact_path": str(managed_active_artifact_path),
+        }
+    else:
+        state, reason = evaluate_artifact_retention(
+            subsystem,
+            baseline,
+            candidate,
+            artifact_path=artifact_path,
+            payload=artifact_payload,
+            capability_modules_path=config.capability_modules_path,
+        )
     gate = retention_gate_for_payload(
         subsystem,
         artifact_payload,
@@ -1223,6 +1426,8 @@ def preview_candidate_retention(
         reason = first_failure or "candidate failed autonomous phase gates"
         state = "reject"
     prior_retained_comparison: dict[str, object] | None = None
+    prior_retained_guard_reason_value = ""
+    prior_retained_guard_reason_code = ""
     if state == "retain":
         planner = ImprovementPlanner(
             memory_root=config.trajectories_root,
@@ -1252,6 +1457,8 @@ def preview_candidate_retention(
             comparison=prior_retained_comparison,
             capability_modules_path=config.capability_modules_path,
         )
+        prior_retained_guard_reason_value = str(prior_guard_reason or "").strip()
+        prior_retained_guard_reason_code = _prior_retained_guard_reason_code(prior_retained_guard_reason_value)
         if prior_guard_reason:
             baseline_cycle_id = ""
             if isinstance(prior_retained_comparison, dict):
@@ -1264,9 +1471,17 @@ def preview_candidate_retention(
             else:
                 reason = f"candidate failed prior retained comparison: {prior_guard_reason}"
             state = "reject"
+    reason_code = _retention_reason_code(
+        subsystem=subsystem,
+        state=state,
+        reason=reason,
+        phase_gate_report=phase_gate_report,
+        prior_retained_guard_reason_code=prior_retained_guard_reason_code,
+    )
     return {
         "state": state,
         "reason": reason,
+        "reason_code": reason_code,
         "gate": gate,
         "phase_gate_report": phase_gate_report,
         "baseline": baseline,
@@ -1275,6 +1490,8 @@ def preview_candidate_retention(
         "compatibility": compatibility,
         "payload": artifact_payload,
         "prior_retained_comparison": prior_retained_comparison,
+        "prior_retained_guard_reason": prior_retained_guard_reason_value,
+        "prior_retained_guard_reason_code": prior_retained_guard_reason_code,
         "baseline_flags": baseline_flags,
         "candidate_flags": candidate_flags,
         "active_artifact_path": managed_active_artifact_path,
@@ -1491,6 +1708,69 @@ def prior_retained_guard_reason(
         gate.get("min_novel_valid_command_rate_delta", 0.0)
     ):
         return "candidate regressed verifier-valid novel-command rate against the prior retained baseline"
+    long_horizon_summary = evidence.get("long_horizon_summary", {})
+    if isinstance(long_horizon_summary, dict):
+        long_horizon_task_count = int(long_horizon_summary.get("baseline_task_count", 0) or 0) + int(
+            long_horizon_summary.get("candidate_task_count", 0) or 0
+        )
+        if bool(gate.get("require_long_horizon_non_regression", False)) and long_horizon_task_count > 0:
+            if float(long_horizon_summary.get("pass_rate_delta", 0.0) or 0.0) < 0.0:
+                return "candidate regressed long-horizon pass rate against the prior retained baseline"
+        if bool(gate.get("require_long_horizon_novel_command_non_regression", False)) and long_horizon_task_count > 0:
+            if float(long_horizon_summary.get("novel_valid_command_rate_delta", 0.0) or 0.0) < 0.0:
+                return "candidate regressed long-horizon verifier-valid novel-command rate against the prior retained baseline"
+        long_horizon_world_feedback = long_horizon_summary.get("world_feedback", {})
+        if not isinstance(long_horizon_world_feedback, dict):
+            long_horizon_world_feedback = {}
+        long_horizon_feedback_steps = int(long_horizon_summary.get("baseline_world_feedback_step_count", 0) or 0) + int(
+            long_horizon_summary.get("candidate_world_feedback_step_count", 0) or 0
+        )
+        if bool(gate.get("require_long_horizon_world_feedback_non_regression", False)) and long_horizon_feedback_steps > 0:
+            if float(long_horizon_world_feedback.get("progress_calibration_mae_gain", 0.0) or 0.0) < 0.0:
+                return "candidate regressed long-horizon world-feedback calibration against the prior retained baseline"
+    validation_family_summary = evidence.get("validation_family_summary", {})
+    if isinstance(validation_family_summary, dict):
+        validation_primary_task_count = int(validation_family_summary.get("baseline_primary_task_count", 0) or 0) + int(
+            validation_family_summary.get("candidate_primary_task_count", 0) or 0
+        )
+        if bool(gate.get("require_validation_family_non_regression", False)) and validation_primary_task_count > 0:
+            if float(validation_family_summary.get("primary_pass_rate_delta", 0.0) or 0.0) < 0.0:
+                return "candidate regressed validation-family pass rate against the prior retained baseline"
+        validation_generated_task_count = int(
+            validation_family_summary.get("baseline_generated_task_count", 0) or 0
+        ) + int(validation_family_summary.get("candidate_generated_task_count", 0) or 0)
+        if bool(gate.get("require_validation_family_generated_non_regression", False)) and validation_generated_task_count > 0:
+            if float(validation_family_summary.get("generated_pass_rate_delta", 0.0) or 0.0) < 0.0:
+                return "candidate regressed validation-family generated pass rate against the prior retained baseline"
+        validation_total_task_count = validation_primary_task_count + validation_generated_task_count
+        if bool(gate.get("require_validation_family_novel_command_non_regression", False)) and validation_total_task_count > 0:
+            if float(validation_family_summary.get("novel_valid_command_rate_delta", 0.0) or 0.0) < 0.0:
+                return "candidate regressed validation-family verifier-valid novel-command rate against the prior retained baseline"
+        validation_world_feedback = validation_family_summary.get("world_feedback", {})
+        if not isinstance(validation_world_feedback, dict):
+            validation_world_feedback = {}
+        validation_feedback_steps = int(
+            validation_family_summary.get("baseline_world_feedback_step_count", 0) or 0
+        ) + int(validation_family_summary.get("candidate_world_feedback_step_count", 0) or 0)
+        if bool(gate.get("require_validation_family_world_feedback_non_regression", False)) and validation_feedback_steps > 0:
+            if float(validation_world_feedback.get("progress_calibration_mae_gain", 0.0) or 0.0) < 0.0:
+                return "candidate regressed validation-family world-feedback calibration against the prior retained baseline"
+    shared_repo_bundle_summary = evidence.get("shared_repo_bundle_summary", {})
+    if (
+        base_subsystem_for(subsystem, capability_modules_path) == "tooling"
+        and bool(gate.get("require_shared_repo_bundle_coherence", False))
+        and isinstance(shared_repo_bundle_summary, dict)
+    ):
+        shared_repo_candidate_count = int(
+            shared_repo_bundle_summary.get("baseline_shared_repo_candidate_count", 0) or 0
+        ) + int(shared_repo_bundle_summary.get("candidate_shared_repo_candidate_count", 0) or 0)
+        if shared_repo_candidate_count > 0:
+            if int(shared_repo_bundle_summary.get("candidate_bundle_coherence_delta", 0) or 0) < 0:
+                return "candidate regressed shared-repo bundle coherence against the prior retained baseline"
+            if int(shared_repo_bundle_summary.get("shared_repo_incomplete_integrator_candidate_count_delta", 0) or 0) > 0:
+                return "candidate increased incomplete shared-repo integrator histories against the prior retained baseline"
+            if int(shared_repo_bundle_summary.get("shared_repo_complete_candidate_count_delta", 0) or 0) < 0:
+                return "candidate reduced complete shared-repo bundle evidence against the prior retained baseline"
     family_gate_failure = proposal_gate_failure_reason(
         gate,
         evidence,
@@ -1501,6 +1781,134 @@ def prior_retained_guard_reason(
     if current_pass_rate <= baseline_pass_rate and current_average_steps > baseline_average_steps:
         return "candidate did not beat the prior retained baseline on pass rate or steps"
     return None
+
+
+def _prior_retained_guard_reason_code(reason: str) -> str:
+    normalized = str(reason).strip()
+    if not normalized:
+        return ""
+    return {
+        "candidate regressed long-horizon pass rate against the prior retained baseline": "long_horizon_pass_rate_regressed",
+        "candidate regressed long-horizon verifier-valid novel-command rate against the prior retained baseline": "long_horizon_novel_command_rate_regressed",
+        "candidate regressed long-horizon world-feedback calibration against the prior retained baseline": "long_horizon_world_feedback_regressed",
+        "candidate regressed validation-family pass rate against the prior retained baseline": "validation_family_pass_rate_regressed",
+        "candidate regressed validation-family generated pass rate against the prior retained baseline": "validation_family_generated_pass_rate_regressed",
+        "candidate regressed validation-family verifier-valid novel-command rate against the prior retained baseline": "validation_family_novel_command_rate_regressed",
+        "candidate regressed validation-family world-feedback calibration against the prior retained baseline": "validation_family_world_feedback_regressed",
+        "candidate regressed shared-repo bundle coherence against the prior retained baseline": "shared_repo_bundle_coherence_regressed",
+        "candidate increased incomplete shared-repo integrator histories against the prior retained baseline": "shared_repo_incomplete_integrator_histories_increased",
+        "candidate reduced complete shared-repo bundle evidence against the prior retained baseline": "shared_repo_complete_bundle_evidence_regressed",
+    }.get(normalized, "")
+
+
+def _retention_reason_code_for_text(reason: str) -> str:
+    normalized = str(reason).strip()
+    if not normalized:
+        return ""
+    def _nested_reason_code(text: str) -> str:
+        parts = str(text).rsplit(": ", 1)
+        if len(parts) != 2:
+            return ""
+        return _retention_reason_code_for_text(parts[-1])
+    prior_retained_code = _prior_retained_guard_reason_code(normalized)
+    if prior_retained_code:
+        return prior_retained_code
+    if normalized.startswith("candidate failed prior retained comparison"):
+        nested_code = _nested_reason_code(normalized)
+        if nested_code:
+            return nested_code
+        return "prior_retained_comparison_failed"
+    if normalized.startswith("candidate failed confirmation run"):
+        nested_code = _nested_reason_code(normalized)
+        return nested_code or "confirmation_run_failed"
+    if normalized.startswith("candidate failed holdout run"):
+        nested_code = _nested_reason_code(normalized)
+        return nested_code or "holdout_run_failed"
+    if normalized.startswith("candidate failed autonomous phase gates"):
+        return "autonomous_phase_gates_failed"
+    return {
+        "candidate artifact is identical to the active retained artifact": "candidate_artifact_unchanged",
+        "retrieval candidate did not satisfy the retained retrieval gate": "retrieval_retained_gate_failed",
+        "retrieval candidate regressed one or more benchmark families": "retrieval_family_regressed",
+        "retrieval candidate regressed failure-recovery generation": "retrieval_failure_recovery_regressed",
+        "Tolbert model candidate did not produce a checkpoint": "tolbert_checkpoint_missing",
+        "Tolbert model candidate did not produce a retrieval cache": "tolbert_retrieval_cache_missing",
+        "Tolbert model candidate regressed base success": "tolbert_base_success_regressed",
+        "Qwen adapter candidate did not produce a training dataset": "qwen_training_dataset_missing",
+        "Qwen adapter candidate attempted to claim primary runtime authority": "qwen_runtime_authority_violation",
+        "Qwen adapter candidate did not declare a runtime target": "qwen_runtime_target_missing",
+        "Qwen adapter candidate disabled teacher-generation support": "qwen_teacher_generation_disabled",
+        "Qwen adapter candidate regressed base success": "qwen_base_success_regressed",
+        "candidate regressed pass rate against the prior retained baseline": "prior_retained_pass_rate_regressed",
+        "candidate increased average steps against the prior retained baseline": "prior_retained_average_steps_regressed",
+        "candidate regressed the generated-task lane against the prior retained baseline": "prior_retained_generated_lane_regressed",
+        "candidate regressed one or more benchmark families against the prior retained baseline": "prior_retained_family_regressed",
+        "candidate regressed one or more generated benchmark families against the prior retained baseline": "prior_retained_generated_family_regressed",
+        "candidate regressed failure-recovery performance against the prior retained baseline": "prior_retained_failure_recovery_regressed",
+        "candidate produced no proposal-selected commands against the prior retained baseline": "prior_retained_proposal_selected_commands_missing",
+        "candidate regressed proposal-selected command usage against the prior retained baseline": "prior_retained_proposal_selected_commands_regressed",
+        "candidate did not produce enough verifier-valid novel commands against the prior retained baseline": "prior_retained_novel_valid_commands_missing",
+        "candidate regressed verifier-valid novel-command rate against the prior retained baseline": "prior_retained_novel_valid_command_rate_regressed",
+        "candidate regressed long-horizon pass rate against the prior retained baseline": "long_horizon_pass_rate_regressed",
+        "candidate regressed long-horizon verifier-valid novel-command rate against the prior retained baseline": "long_horizon_novel_command_rate_regressed",
+        "candidate regressed long-horizon world-feedback calibration against the prior retained baseline": "long_horizon_world_feedback_regressed",
+        "candidate regressed validation-family pass rate against the prior retained baseline": "validation_family_pass_rate_regressed",
+        "candidate regressed validation-family generated pass rate against the prior retained baseline": "validation_family_generated_pass_rate_regressed",
+        "candidate regressed validation-family verifier-valid novel-command rate against the prior retained baseline": "validation_family_novel_command_rate_regressed",
+        "candidate regressed validation-family world-feedback calibration against the prior retained baseline": "validation_family_world_feedback_regressed",
+        "candidate regressed shared-repo bundle coherence against the prior retained baseline": "shared_repo_bundle_coherence_regressed",
+        "candidate increased incomplete shared-repo integrator histories against the prior retained baseline": "shared_repo_incomplete_integrator_histories_increased",
+        "candidate reduced complete shared-repo bundle evidence against the prior retained baseline": "shared_repo_complete_bundle_evidence_regressed",
+        "candidate did not beat the prior retained baseline on pass rate or steps": "prior_retained_baseline_not_beaten",
+        "generated-task lane was not included in autonomous cycle evaluation": "autonomous_generated_lane_missing",
+        "failure-recovery lane was not included in autonomous cycle evaluation": "autonomous_failure_recovery_lane_missing",
+        "generated-task lane produced no tasks during autonomous evaluation": "autonomous_generated_lane_empty",
+        "failure-recovery lane produced no generated tasks during autonomous evaluation": "autonomous_failure_recovery_lane_empty",
+        "retrieval candidate reduced trusted retrieval usage under autonomous phase gates": "autonomous_retrieval_trusted_usage_regressed",
+        "retrieval candidate increased low-confidence episodes under autonomous phase gates": "autonomous_retrieval_low_confidence_increased",
+        "retrieval candidate showed no retrieval influence during autonomous evaluation": "autonomous_retrieval_influence_missing",
+        "retrieval candidate showed no retrieval selection or skill ranking during autonomous evaluation": "autonomous_retrieval_selection_missing",
+        "failure-recovery lane regressed under autonomous phase gates": "autonomous_failure_recovery_regressed",
+    }.get(normalized, "")
+
+
+def _retention_reason_code(
+    *,
+    subsystem: str,
+    state: str,
+    reason: str,
+    phase_gate_report: dict[str, object] | None = None,
+    prior_retained_guard_reason_code: str = "",
+) -> str:
+    del subsystem
+    if str(state).strip() != "reject":
+        return ""
+    if str(prior_retained_guard_reason_code).strip():
+        return str(prior_retained_guard_reason_code).strip()
+    candidate_reasons = [reason]
+    if isinstance(phase_gate_report, dict) and not bool(phase_gate_report.get("passed", False)):
+        candidate_reasons.extend(
+            str(failure)
+            for failure in phase_gate_report.get("failures", [])
+            if str(failure).strip()
+        )
+    for candidate_reason in candidate_reasons:
+        code = _retention_reason_code_for_text(candidate_reason)
+        if code:
+            return code
+    return "retention_reject_unknown"
+
+
+def _promotion_block_reason_code(*, final_reason: str, prior_retained_guard_reason: str = "") -> str:
+    prior_code = _prior_retained_guard_reason_code(prior_retained_guard_reason)
+    if prior_code:
+        return prior_code
+    normalized = str(final_reason).strip()
+    if normalized.startswith("candidate failed prior retained comparison"):
+        parts = normalized.rsplit(": ", 1)
+        if parts:
+            return _prior_retained_guard_reason_code(parts[-1])
+    return ""
 
 
 def _is_runtime_managed_artifact_path(path: str) -> bool:
@@ -1548,6 +1956,57 @@ def _yield_summary_for(records: list[dict[str, object]]) -> dict[str, object]:
             return 0.0
         return sum(deltas) / len(deltas)
 
+    productive_depth_step_deltas: list[float] = []
+    depth_drift_step_deltas: list[float] = []
+    productive_depth_retained_cycles = 0
+    depth_drift_cycles = 0
+    long_horizon_retained_cycles = 0
+    for row in records:
+        metrics = row.get("metrics_summary", {})
+        if not isinstance(metrics, dict):
+            continue
+        try:
+            baseline_steps = float(metrics.get("baseline_average_steps", 0.0) or 0.0)
+            candidate_steps = float(metrics.get("candidate_average_steps", 0.0) or 0.0)
+            baseline_pass_rate = float(metrics.get("baseline_pass_rate", 0.0) or 0.0)
+            candidate_pass_rate = float(metrics.get("candidate_pass_rate", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        step_delta = candidate_steps - baseline_steps
+        pass_delta = candidate_pass_rate - baseline_pass_rate
+        long_horizon_summary = metrics.get("long_horizon_summary", {})
+        long_horizon_task_count = 0
+        long_horizon_negative = False
+        if isinstance(long_horizon_summary, dict):
+            long_horizon_task_count = int(long_horizon_summary.get("baseline_task_count", 0) or 0) + int(
+                long_horizon_summary.get("candidate_task_count", 0) or 0
+            )
+            long_horizon_negative = (
+                float(long_horizon_summary.get("pass_rate_delta", 0.0) or 0.0) < 0.0
+                or float(long_horizon_summary.get("novel_valid_command_rate_delta", 0.0) or 0.0) < 0.0
+            )
+            world_feedback = long_horizon_summary.get("world_feedback", {})
+            if isinstance(world_feedback, dict):
+                long_horizon_negative = long_horizon_negative or (
+                    float(world_feedback.get("progress_calibration_mae_gain", 0.0) or 0.0) < 0.0
+                )
+        if str(row.get("state", "")) == "retain" and long_horizon_task_count > 0:
+            long_horizon_retained_cycles += 1
+        if step_delta <= 0.0:
+            continue
+        productive_depth = (
+            str(row.get("state", "")) == "retain"
+            and bool(metrics.get("phase_gate_passed", True))
+            and pass_delta >= 0.0
+            and not long_horizon_negative
+        )
+        if productive_depth:
+            productive_depth_retained_cycles += 1
+            productive_depth_step_deltas.append(step_delta)
+            continue
+        depth_drift_cycles += 1
+        depth_drift_step_deltas.append(step_delta)
+
     return {
         "retained_cycles": len(retained),
         "rejected_cycles": len(rejected),
@@ -1574,6 +2033,19 @@ def _yield_summary_for(records: list[dict[str, object]]) -> dict[str, object]:
             baseline_key="baseline_average_steps",
             candidate_key="candidate_average_steps",
         ),
+        "productive_depth_retained_cycles": productive_depth_retained_cycles,
+        "average_productive_depth_step_delta": (
+            0.0
+            if not productive_depth_step_deltas
+            else sum(productive_depth_step_deltas) / len(productive_depth_step_deltas)
+        ),
+        "max_productive_depth_step_delta": max(productive_depth_step_deltas, default=0.0),
+        "depth_drift_cycles": depth_drift_cycles,
+        "average_depth_drift_step_delta": (
+            0.0 if not depth_drift_step_deltas else sum(depth_drift_step_deltas) / len(depth_drift_step_deltas)
+        ),
+        "max_depth_drift_step_delta": max(depth_drift_step_deltas, default=0.0),
+        "long_horizon_retained_cycles": long_horizon_retained_cycles,
     }
 
 
@@ -1610,6 +2082,10 @@ def _write_cycle_report(
     candidate,
     phase_gate_report: dict[str, object],
     prior_retained_comparison: dict[str, object] | None = None,
+    prior_retained_guard_reason: str = "",
+    prior_retained_guard_reason_code: str = "",
+    preview_reason_code: str = "",
+    decision_reason_code: str = "",
     protocol_match_id: str = "",
 ) -> Path:
     records = planner.load_cycle_records(config.improvement_cycles_path)
@@ -1618,6 +2094,10 @@ def _write_cycle_report(
     summary = planner.retained_gain_summary(config.improvement_cycles_path)
     safe_cycle_id = re.sub(r"[^A-Za-z0-9._-]+", "_", cycle_id).strip("._") or "cycle"
     report_path = config.improvement_reports_dir / f"cycle_report_{safe_cycle_id}.json"
+    promotion_block_reason_code = _promotion_block_reason_code(
+        final_reason=final_reason,
+        prior_retained_guard_reason=prior_retained_guard_reason,
+    )
     report = {
         "spec_version": "asi_v1",
         "report_kind": "improvement_cycle_report",
@@ -1630,6 +2110,12 @@ def _write_cycle_report(
         "artifact_kind": str(artifact_update.get("artifact_kind", "")),
         "final_state": final_state,
         "final_reason": final_reason,
+        "promotion_blocked": str(final_state).strip() != "retain",
+        "promotion_block_reason_code": promotion_block_reason_code,
+        "prior_retained_guard_reason": str(prior_retained_guard_reason).strip(),
+        "prior_retained_guard_reason_code": str(prior_retained_guard_reason_code).strip() or promotion_block_reason_code,
+        "preview_reason_code": str(preview_reason_code).strip(),
+        "decision_reason_code": str(decision_reason_code).strip(),
         "artifact_lifecycle_state": str(artifact_update.get("artifact_lifecycle_state", "")),
         "artifact_sha256": str(artifact_update.get("artifact_sha256", "")),
         "previous_artifact_sha256": str(artifact_update.get("previous_artifact_sha256", "")),
@@ -1691,7 +2177,7 @@ def _write_cycle_report(
         "production_yield_summary": _yield_summary_for(production_decisions),
         "current_cycle_records": cycle_records,
     }
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    atomic_write_json(report_path, report, config=config)
     planner.append_cycle_record(
         config.improvement_cycles_path,
         ImprovementCycleRecord(
@@ -1704,6 +2190,8 @@ def _write_cycle_report(
             reason="persisted single-cycle improvement evidence report",
             metrics_summary={
                 "final_state": final_state,
+                "preview_reason_code": preview_reason_code,
+                "decision_reason_code": decision_reason_code,
                 **_phase_gate_metrics_summary(phase_gate_report),
                 "production_total_decisions": report["production_yield_summary"]["total_decisions"],
                 "production_retained_cycles": report["production_yield_summary"]["retained_cycles"],
@@ -1772,11 +2260,19 @@ def finalize_cycle(
     gate = dict(preview["gate"])
     phase_gate_report = dict(preview.get("phase_gate_report", {}))
     prior_retained_comparison = preview["prior_retained_comparison"]
+    prior_retained_guard_reason = str(preview.get("prior_retained_guard_reason", "")).strip()
+    prior_retained_guard_reason_code = str(preview.get("prior_retained_guard_reason_code", "")).strip()
+    preview_reason_code = str(preview.get("reason_code", "")).strip()
     _emit(
         f"finalize phase=preview_complete subsystem={subsystem} "
         f"preview_state={state} baseline_pass_rate={baseline.pass_rate:.4f} "
         f"candidate_pass_rate={candidate.pass_rate:.4f}"
     )
+    if state == "reject" and preview_reason_code:
+        _emit(
+            f"finalize phase=preview_reject_reason subsystem={subsystem} "
+            f"reason_code={preview_reason_code} reason={reason}"
+        )
     planner = ImprovementPlanner(
         memory_root=config.trajectories_root,
         prompt_proposals_path=config.prompt_proposals_path,
@@ -1796,6 +2292,7 @@ def finalize_cycle(
         replay_verified_update = persist_replay_verified_tool_artifact(
             artifact_path,
             cycle_id=cycle_id,
+            runtime_config=config,
         )
         evaluate_record_kwargs = {
             "artifact_lifecycle_state": str(replay_verified_update["artifact_lifecycle_state"]),
@@ -1864,15 +2361,21 @@ def finalize_cycle(
                 )
                 return comparison.raw_skill_metrics, comparison.operator_metrics
             return (
-                run_eval(
+                _evaluate_subsystem_metrics_with_tolbert_startup_retry(
                     config=baseline_config,
+                    subsystem=subsystem,
+                    flags=baseline_flags,
                     progress_label=f"{cycle_id}_{subsystem}_confirmation_baseline",
-                    **baseline_flags,
+                    phase_name="confirmation_baseline",
+                    progress=_emit,
                 ),
-                run_eval(
+                _evaluate_subsystem_metrics_with_tolbert_startup_retry(
                     config=candidate_config,
+                    subsystem=subsystem,
+                    flags=candidate_flags,
                     progress_label=f"{cycle_id}_{subsystem}_confirmation_candidate",
-                    **candidate_flags,
+                    phase_name="confirmation_candidate",
+                    progress=_emit,
                 ),
             )
         for confirmation_index in range(2, required_confirmation_runs + 1):
@@ -1946,17 +2449,21 @@ def finalize_cycle(
         )
         holdout_baseline_flags = {key: value for key, value in baseline_flags.items() if key != "task_limit"}
         holdout_candidate_flags = {key: value for key, value in candidate_flags.items() if key != "task_limit"}
-        holdout_baseline = evaluate_subsystem_metrics(
+        holdout_baseline = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
             config=holdout_baseline_config,
             subsystem=subsystem,
             flags=holdout_baseline_flags,
             progress_label=f"{cycle_id}_{subsystem}_holdout_baseline",
+            phase_name="holdout_baseline",
+            progress=_emit,
         )
-        holdout_candidate = evaluate_subsystem_metrics(
+        holdout_candidate = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
             config=holdout_candidate_config,
             subsystem=subsystem,
             flags=holdout_candidate_flags,
             progress_label=f"{cycle_id}_{subsystem}_holdout_candidate",
+            phase_name="holdout_candidate",
+            progress=_emit,
         )
         holdout_evidence = retention_evidence(
             subsystem,
@@ -2026,6 +2533,8 @@ def finalize_cycle(
                 capability_modules_path=config.capability_modules_path,
             )
             if holdout_prior_guard_reason:
+                prior_retained_guard_reason = str(holdout_prior_guard_reason).strip()
+                prior_retained_guard_reason_code = _prior_retained_guard_reason_code(prior_retained_guard_reason)
                 holdout_state = "reject"
                 holdout_reason = holdout_prior_guard_reason
             prior_retained_comparison = holdout_prior_retained
@@ -2166,12 +2675,21 @@ def finalize_cycle(
                 metrics_summary={
                     **protocol_metrics,
                     **_prior_retained_metrics_summary(prior_retained_comparison),
+                    "prior_retained_guard_reason": prior_retained_guard_reason,
+                    "prior_retained_guard_reason_code": prior_retained_guard_reason_code,
                 },
                 candidate_artifact_path=str(artifact_path),
                 active_artifact_path=str(managed_active_artifact_path),
                 compatibility=compatibility,
             ),
         )
+    decision_reason_code = _retention_reason_code(
+        subsystem=subsystem,
+        state=state,
+        reason=reason,
+        phase_gate_report=phase_gate_report,
+        prior_retained_guard_reason_code=prior_retained_guard_reason_code,
+    )
     _emit(f"finalize phase=apply_decision subsystem={subsystem} state={state}")
     artifact_update = apply_artifact_retention_decision(
         artifact_path=artifact_path,
@@ -2223,18 +2741,16 @@ def finalize_cycle(
             baseline_metrics=baseline,
             artifact_payload=payload,
         )
-        config.tolbert_liftoff_report_path.write_text(
-            json.dumps(
-                {
-                    "spec_version": "asi_v1",
-                    "artifact_kind": "liftoff_gate_report",
-                    "cycle_id": cycle_id,
-                    "subsystem": subsystem,
-                    "report": liftoff_report.to_dict(),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        atomic_write_json(
+            config.tolbert_liftoff_report_path,
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "liftoff_gate_report",
+                "cycle_id": cycle_id,
+                "subsystem": subsystem,
+                "report": liftoff_report.to_dict(),
+            },
+            config=config,
         )
         if isinstance(payload, dict):
             runtime_policy = payload.get("runtime_policy", {})
@@ -2256,7 +2772,11 @@ def finalize_cycle(
                     }
                 )
             payload["runtime_policy"] = runtime_policy
-            managed_active_artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            atomic_write_json(
+                managed_active_artifact_path,
+                payload,
+                config=config,
+            )
         planner.append_cycle_record(
             config.improvement_cycles_path,
             ImprovementCycleRecord(
@@ -2289,6 +2809,14 @@ def finalize_cycle(
                 "candidate_pass_rate": candidate.pass_rate,
                 "baseline_average_steps": baseline.average_steps,
                 "candidate_average_steps": candidate.average_steps,
+                "preview_reason_code": preview_reason_code,
+                "decision_reason_code": decision_reason_code,
+                "promotion_block_reason_code": _promotion_block_reason_code(
+                    final_reason=reason,
+                    prior_retained_guard_reason=prior_retained_guard_reason,
+                ),
+                "prior_retained_guard_reason": prior_retained_guard_reason,
+                "prior_retained_guard_reason_code": prior_retained_guard_reason_code,
                 **protocol_metrics,
                 **_phase_gate_metrics_summary(phase_gate_report),
                 **evidence,
@@ -2318,6 +2846,14 @@ def finalize_cycle(
                 "baseline_pass_rate": baseline.pass_rate,
                 "candidate_pass_rate": candidate.pass_rate,
                 "decision_pass_rate_delta": candidate.pass_rate - baseline.pass_rate,
+                "preview_reason_code": preview_reason_code,
+                "decision_reason_code": decision_reason_code,
+                "promotion_block_reason_code": _promotion_block_reason_code(
+                    final_reason=reason,
+                    prior_retained_guard_reason=prior_retained_guard_reason,
+                ),
+                "prior_retained_guard_reason": prior_retained_guard_reason,
+                "prior_retained_guard_reason_code": prior_retained_guard_reason_code,
                 **protocol_metrics,
                 **_phase_gate_metrics_summary(phase_gate_report),
                 **evidence,
@@ -2347,7 +2883,16 @@ def finalize_cycle(
         candidate=candidate,
         phase_gate_report=phase_gate_report,
         prior_retained_comparison=prior_retained_comparison,
+        prior_retained_guard_reason=prior_retained_guard_reason,
+        prior_retained_guard_reason_code=prior_retained_guard_reason_code,
+        preview_reason_code=preview_reason_code,
+        decision_reason_code=decision_reason_code,
         protocol_match_id=protocol_match_id,
     )
+    if state == "reject" and decision_reason_code:
+        _emit(
+            f"finalize phase=decision_reject_reason subsystem={subsystem} "
+            f"reason_code={decision_reason_code} reason={reason}"
+        )
     _emit(f"finalize phase=done subsystem={subsystem} state={state}")
     return state, reason

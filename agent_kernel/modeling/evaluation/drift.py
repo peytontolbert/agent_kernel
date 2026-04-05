@@ -104,6 +104,7 @@ def run_takeover_drift_eval(
         _reset_dir(scoped.run_reports_dir)
         _reset_dir(scoped.unattended_workspace_snapshot_root)
     drift_kwargs = dict(eval_kwargs or {})
+    drift_kwargs.setdefault("write_unattended_reports", True)
     if normalized_wave_task_limit > 0:
         drift_kwargs["task_limit"] = normalized_wave_task_limit
     elif "task_limit" not in drift_kwargs:

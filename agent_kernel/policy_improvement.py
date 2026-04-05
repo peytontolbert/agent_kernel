@@ -7,6 +7,7 @@ from evals.metrics import EvalMetrics
 from .improvement_common import retained_mapping_section
 from .prompt_policy_shared import (
     build_prompt_proposal_artifact,
+    dedupe_prompt_adjustments,
     improvement_planner_controls,
     planner_mutation_controls,
     policy_behavior_controls,
@@ -59,6 +60,13 @@ def tolbert_runtime_policy_overrides(
         overrides["use_world_model_head"] = True
         overrides["use_stop_head"] = True
         overrides["use_transition_head"] = True
+    if focus == "long_horizon_success":
+        overrides["min_path_confidence"] = max(_float_value(overrides.get("min_path_confidence"), 0.75), 0.8)
+        overrides["primary_min_command_score"] = max(_int_value(overrides.get("primary_min_command_score"), 2), 3)
+        overrides["use_world_model_head"] = True
+        overrides["use_stop_head"] = True
+        overrides["use_transition_head"] = True
+        overrides["use_risk_head"] = True
     return overrides
 
 
@@ -83,11 +91,21 @@ def tolbert_decoder_policy_overrides(
         overrides["max_task_suggestions"] = max(_int_value(overrides.get("max_task_suggestions"), 3), 4)
     if focus == "retrieval_caution":
         overrides["max_task_suggestions"] = max(_int_value(overrides.get("max_task_suggestions"), 3), 4)
+        overrides["min_stop_completion_ratio"] = max(
+            _float_value(overrides.get("min_stop_completion_ratio"), 0.95),
+            0.98,
+        )
     if failure_counts.get("missing_expected_file", 0) > 0 or focus == "verifier_alignment":
         overrides["min_stop_completion_ratio"] = max(
             _float_value(overrides.get("min_stop_completion_ratio"), 0.95),
             0.98,
         )
+    if focus == "long_horizon_success":
+        overrides["min_stop_completion_ratio"] = max(
+            _float_value(overrides.get("min_stop_completion_ratio"), 0.95),
+            0.99,
+        )
+        overrides["max_task_suggestions"] = max(_int_value(overrides.get("max_task_suggestions"), 3), 4)
     return overrides
 
 
@@ -134,9 +152,58 @@ def tolbert_rollout_policy_overrides(
             2.0,
         )
     if focus == "retrieval_caution":
+        overrides["predicted_workflow_bonus_weight"] = max(
+            _float_value(overrides.get("predicted_workflow_bonus_weight"), 1.5),
+            2.0,
+        )
         overrides["latent_risk_penalty_weight"] = max(
             _float_value(overrides.get("latent_risk_penalty_weight"), 2.0),
             2.75,
+        )
+        overrides["stop_missing_expected_penalty_weight"] = max(
+            _float_value(overrides.get("stop_missing_expected_penalty_weight"), 6.0),
+            7.0,
+        )
+    if focus == "long_horizon_success":
+        overrides["predicted_preserved_bonus_weight"] = max(
+            _float_value(overrides.get("predicted_preserved_bonus_weight"), 1.0),
+            1.5,
+        )
+        overrides["predicted_workflow_bonus_weight"] = max(
+            _float_value(overrides.get("predicted_workflow_bonus_weight"), 1.5),
+            2.0,
+        )
+        overrides["latent_risk_penalty_weight"] = max(
+            _float_value(overrides.get("latent_risk_penalty_weight"), 2.0),
+            2.5,
+        )
+        overrides["stop_missing_expected_penalty_weight"] = max(
+            _float_value(overrides.get("stop_missing_expected_penalty_weight"), 6.0),
+            7.0,
+        )
+        overrides["stop_preserved_penalty_weight"] = max(
+            _float_value(overrides.get("stop_preserved_penalty_weight"), 4.0),
+            5.5,
+        )
+        overrides["stable_stop_bonus_weight"] = max(
+            _float_value(overrides.get("stable_stop_bonus_weight"), 1.5),
+            2.0,
+        )
+        overrides["long_horizon_progress_bonus_weight"] = max(
+            _float_value(overrides.get("long_horizon_progress_bonus_weight"), 0.0),
+            1.0,
+        )
+        overrides["long_horizon_preserved_bonus_weight"] = max(
+            _float_value(overrides.get("long_horizon_preserved_bonus_weight"), 0.0),
+            1.0,
+        )
+        overrides["long_horizon_risk_penalty_weight"] = max(
+            _float_value(overrides.get("long_horizon_risk_penalty_weight"), 0.0),
+            2.0,
+        )
+        overrides["long_horizon_stop_penalty_weight"] = max(
+            _float_value(overrides.get("long_horizon_stop_penalty_weight"), 0.0),
+            2.5,
         )
     return overrides
 
@@ -184,6 +251,9 @@ def tolbert_hybrid_scoring_policy_overrides(
     if focus == "retrieval_caution":
         overrides["decoder_logprob_weight"] = min(float(overrides["decoder_logprob_weight"]), 0.08)
         overrides["risk_penalty_weight"] = max(float(overrides["risk_penalty_weight"]), 1.2)
+        overrides["stop_weight"] = max(float(overrides["stop_weight"]), 1.1)
+        overrides["world_progress_weight"] = max(float(overrides["world_progress_weight"]), 0.25)
+        overrides["world_risk_penalty_weight"] = max(float(overrides["world_risk_penalty_weight"]), 0.25)
         overrides["transition_regression_penalty_weight"] = max(
             float(overrides["transition_regression_penalty_weight"]),
             0.28,
@@ -192,6 +262,24 @@ def tolbert_hybrid_scoring_policy_overrides(
         overrides["world_progress_weight"] = max(float(overrides["world_progress_weight"]), 0.28)
         overrides["transition_progress_weight"] = max(float(overrides["transition_progress_weight"]), 0.2)
         overrides["stop_weight"] = max(float(overrides["stop_weight"]), 1.15)
+    if focus == "long_horizon_success":
+        overrides["risk_penalty_weight"] = max(float(overrides["risk_penalty_weight"]), 1.15)
+        overrides["stop_weight"] = max(float(overrides["stop_weight"]), 1.15)
+        overrides["transition_progress_weight"] = max(float(overrides["transition_progress_weight"]), 0.22)
+        overrides["world_progress_weight"] = max(float(overrides["world_progress_weight"]), 0.3)
+        overrides["world_risk_penalty_weight"] = max(float(overrides["world_risk_penalty_weight"]), 0.25)
+        overrides["long_horizon_progress_bonus_weight"] = max(
+            float(overrides.get("long_horizon_progress_bonus_weight", 0.0) or 0.0),
+            0.35,
+        )
+        overrides["long_horizon_risk_penalty_weight"] = max(
+            float(overrides.get("long_horizon_risk_penalty_weight", 0.0) or 0.0),
+            0.3,
+        )
+        overrides["long_horizon_horizon_scale_weight"] = max(
+            float(overrides.get("long_horizon_horizon_scale_weight", 0.0) or 0.0),
+            0.15,
+        )
     return overrides
 
 

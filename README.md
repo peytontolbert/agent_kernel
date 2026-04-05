@@ -1,7 +1,17 @@
 # agent-kernel
 
 `agent-kernel` is a verifier-driven coding agent with a strict TOLBERT context layer in front of the LLM policy.
-It uses one LLM-backed policy, two actions (`respond` and `code_execute`), deterministic verification, and selfplay-oriented task generation to solve bounded local software tasks and accumulate reusable trajectories.
+It uses one LLM-backed policy, two actions (`respond` and `code_execute`), deterministic and semantic verification, and selfplay-oriented task generation to solve local software tasks ranging from boot-check file edits to multi-file repo workflows, test repair, and shared-repo coordination.
+
+The repository is organized around two core loops.
+
+Inner task loop:
+
+`observe -> estimate state -> retrieve memory -> update world model -> simulate likely transitions -> plan candidates -> choose via policy -> execute -> verify -> critique -> update memory/models -> repeat`
+
+Outer improvement loop:
+
+`run tasks -> collect outcomes -> compare against verifiers -> localize failure -> modify policy/planner/world-model/transition-model/prompts/tools -> retest -> retain only verified gains`
 
 ## Documentation
 
@@ -37,8 +47,11 @@ export AGENT_KERNEL_MODEL=Qwen/Qwen3.5-9B
 export AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000
 python scripts/build_agentkernel_tolbert_assets.py --output-dir var/tolbert/agentkernel
 ./scripts/run_native_agent.sh hello_task
+./scripts/run_native_agent.sh git_repo_test_repair_task
 python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --generate-only
 ```
+
+Treat `hello_task` as a liveness probe only. The main product target is reliable work on `repository`, `project`, `tooling`, `integration`, and `repo_sandbox` families such as `git_repo_test_repair_task`, `git_repo_status_review_task`, and the supervised coding lanes that bias toward repository and project tasks.
 
 `vllm` is the preferred live provider. The current code defaults still fall back to `ollama` unless `AGENT_KERNEL_PROVIDER`, `AGENT_KERNEL_MODEL`, and `AGENT_KERNEL_VLLM_HOST` are set in the shell or passed on the CLI.
 

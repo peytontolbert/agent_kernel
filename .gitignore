@@ -10,7 +10,13 @@ var/
 trajectories/
 workspace/
 *.json
+!datasets/curriculum_templates.json
+!datasets/improvement_catalog.json
+!datasets/kernel_metadata.json
 asi.md
 agi.md
 tolbert.md
 config/
+!datasets/task_bank/synthesis_rules.json
+tmp/
+datasets/

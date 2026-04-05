@@ -27,7 +27,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", default=None)
     parser.add_argument("--model", default=None)
-    parser.add_argument("--focus", choices=("balanced", "retrieval_caution", "verifier_alignment"), default="balanced")
+    parser.add_argument(
+        "--focus",
+        choices=("balanced", "retrieval_caution", "verifier_alignment", "long_horizon_success"),
+        default="balanced",
+    )
     parser.add_argument("--include-episode-memory", action="store_true")
     parser.add_argument("--include-skill-memory", action="store_true")
     parser.add_argument("--include-tool-memory", action="store_true")

@@ -289,6 +289,497 @@ def test_compare_retained_baseline_reports_family_proposal_gate_failure_reason(t
     assert "reason=current artifact produced no proposal-selected commands on project tasks" in output
 
 
+def test_compare_retained_baseline_reports_long_horizon_slice_delta(tmp_path, monkeypatch, capsys):
+    module = _load_compare_module()
+    artifact_path = tmp_path / "tolbert_model" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = tmp_path / "tolbert_model" / "checkpoints" / "candidate.pt"
+    cache_path = tmp_path / "tolbert_model" / "cache" / "candidate.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text("pt", encoding="utf-8")
+    cache_path.write_text("cache", encoding="utf-8")
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "runtime_paths": {
+                    "checkpoint_path": str(checkpoint_path),
+                    "cache_paths": [str(cache_path)],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / ".artifact_history" / "tolbert_model.cycle_tolbert_1.post_retain.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "runtime_paths": {
+                    "checkpoint_path": str(checkpoint_path),
+                    "cache_paths": [str(cache_path)],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:tolbert_model:1",
+            state="retain",
+            subsystem="tolbert_model",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="tolbert_model_bundle",
+            reason="retained prior Tolbert baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+
+    run_results = [
+        EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.4,
+            total_by_difficulty={"long_horizon": 4},
+            passed_by_difficulty={"long_horizon": 3},
+            proposal_metrics_by_difficulty={
+                "long_horizon": {
+                    "task_count": 4,
+                    "proposal_selected_steps": 2,
+                    "novel_valid_command_steps": 1,
+                    "novel_valid_command_rate": 0.5,
+                }
+            },
+            world_feedback_by_difficulty={
+                "long_horizon": {
+                    "step_count": 4,
+                    "progress_calibration_mae": 0.4,
+                    "risk_calibration_mae": 0.2,
+                }
+            },
+        ),
+        EvalMetrics(
+            total=10,
+            passed=9,
+            average_steps=1.1,
+            total_by_difficulty={"long_horizon": 4},
+            passed_by_difficulty={"long_horizon": 4},
+            proposal_metrics_by_difficulty={
+                "long_horizon": {
+                    "task_count": 4,
+                    "proposal_selected_steps": 3,
+                    "novel_valid_command_steps": 3,
+                    "novel_valid_command_rate": 1.0,
+                }
+            },
+            world_feedback_by_difficulty={
+                "long_horizon": {
+                    "step_count": 4,
+                    "progress_calibration_mae": 0.2,
+                    "risk_calibration_mae": 0.1,
+                }
+            },
+        ),
+    ]
+
+    def fake_run_eval(*, config, **kwargs):
+        del config, kwargs
+        return run_results.pop(0)
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            tolbert_model_artifact_path=artifact_path,
+            improvement_cycles_path=cycles_path,
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retained_baseline.py",
+            "--subsystem",
+            "tolbert_model",
+            "--cycles-path",
+            str(cycles_path),
+            "--artifact-path",
+            str(artifact_path),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+
+    assert "long_horizon_delta" in output
+    assert "pass_rate_delta=0.25" in output
+    assert "novel_valid_command_rate_delta=0.50" in output
+    assert "progress_calibration_mae_gain=0.20" in output
+
+
+def test_compare_retained_baseline_reports_shared_repo_bundle_delta(tmp_path, monkeypatch, capsys):
+    module = _load_compare_module()
+    artifact_path = tmp_path / "tooling" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tool_candidate_set",
+                "candidates": [
+                    {
+                        "tool_id": "tool:worker",
+                        "quality": 0.8,
+                        "procedure": {"commands": ["git checkout worker/api-status"]},
+                        "shared_repo_bundle": {
+                            "shared_repo_id": "repo_sandbox_parallel_merge",
+                            "worker_branch": "worker/api-status",
+                            "role": "worker",
+                            "bundle_complete": True,
+                        },
+                    },
+                    {
+                        "tool_id": "tool:integrator",
+                        "quality": 0.9,
+                        "procedure": {
+                            "commands": [
+                                "git merge --no-ff worker/api-status",
+                                "git merge --no-ff worker/docs-status",
+                            ]
+                        },
+                        "shared_repo_bundle": {
+                            "shared_repo_id": "repo_sandbox_parallel_merge",
+                            "role": "integrator",
+                            "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / ".artifact_history" / "tooling.cycle_tooling_1.post_retain.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tool_candidate_set",
+                "candidates": [
+                    {
+                        "tool_id": "tool:integrator_old",
+                        "quality": 0.7,
+                        "procedure": {"commands": ["git merge --no-ff worker/api-status"]},
+                        "shared_repo_bundle": {
+                            "shared_repo_id": "repo_sandbox_parallel_merge",
+                            "role": "integrator",
+                            "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:tooling:1",
+            state="retain",
+            subsystem="tooling",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="tool_candidate_set",
+            reason="retained prior tooling baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+
+    run_results = [
+        EvalMetrics(total=4, passed=3, average_steps=1.0),
+        EvalMetrics(total=4, passed=3, average_steps=1.0),
+    ]
+
+    def fake_run_eval(*, config, **kwargs):
+        del config, kwargs
+        return run_results.pop(0)
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            tool_candidates_path=artifact_path,
+            improvement_cycles_path=cycles_path,
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retained_baseline.py",
+            "--subsystem",
+            "tooling",
+            "--cycles-path",
+            str(cycles_path),
+            "--artifact-path",
+            str(artifact_path),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+
+    assert "shared_repo_bundle_delta" in output
+    assert "baseline_complete_candidate_count=0" in output
+    assert "current_complete_candidate_count=2" in output
+    assert "complete_integrator_candidate_delta=1" in output
+    assert "incomplete_integrator_candidate_delta=-1" in output
+    assert "bundle_coherence_delta=3" in output
+
+
+def test_compare_retained_baseline_reports_retrieval_reuse_delta(tmp_path, monkeypatch, capsys):
+    module = _load_compare_module()
+    artifact_path = tmp_path / "skills" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "skill_set",
+                "skills": [
+                    {
+                        "skill_id": "skill:retrieval",
+                        "source_task_id": "repo_chore_task",
+                        "quality": 0.92,
+                        "procedure": {"commands": ["printf 'release ready\\n' > status.txt"]},
+                        "retrieval_backed": True,
+                        "retrieval_selected_steps": 1,
+                        "retrieval_influenced_steps": 1,
+                        "trusted_retrieval_steps": 1,
+                        "selected_retrieval_span_ids": ["learning:seed:release_status"],
+                        "retrieval_backed_commands": ["printf 'release ready\\n' > status.txt"],
+                    },
+                    {
+                        "skill_id": "skill:plain",
+                        "source_task_id": "repo_chore_task",
+                        "quality": 0.8,
+                        "procedure": {"commands": ["git status --short"]},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / ".artifact_history" / "skills.cycle_skills_1.post_retain.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "skill_set",
+                "skills": [
+                    {
+                        "skill_id": "skill:plain_old",
+                        "source_task_id": "repo_chore_task",
+                        "quality": 0.78,
+                        "procedure": {"commands": ["git status --short"]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:skills:1",
+            state="retain",
+            subsystem="skills",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="skill_set",
+            reason="retained prior skills baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+
+    run_results = [
+        EvalMetrics(total=3, passed=2, average_steps=1.0),
+        EvalMetrics(total=3, passed=2, average_steps=1.0),
+    ]
+
+    def fake_run_eval(*, config, **kwargs):
+        del config, kwargs
+        return run_results.pop(0)
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            skills_path=artifact_path,
+            improvement_cycles_path=cycles_path,
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retained_baseline.py",
+            "--subsystem",
+            "skills",
+            "--cycles-path",
+            str(cycles_path),
+            "--artifact-path",
+            str(artifact_path),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+
+    assert "retrieval_reuse_delta" in output
+    assert "baseline_retrieval_backed_procedure_count=0" in output
+    assert "current_retrieval_backed_procedure_count=1" in output
+    assert "trusted_retrieval_procedure_delta=1" in output
+    assert "verified_retrieval_command_delta=1" in output
+    assert "selected_retrieval_span_delta=1" in output
+
+
+def test_compare_retained_baseline_reports_validation_family_delta(tmp_path, monkeypatch, capsys):
+    module = _load_compare_module()
+    artifact_path = tmp_path / "transition_model" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps({"artifact_kind": "transition_model_policy_set", "rules": ["candidate"]}),
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / ".artifact_history" / "transition_model.cycle_transition_model_1.post_retain.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps({"artifact_kind": "transition_model_policy_set", "rules": ["baseline"]}),
+        encoding="utf-8",
+    )
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:transition_model:1",
+            state="retain",
+            subsystem="transition_model",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="transition_model_policy_set",
+            reason="retained prior transition-model baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+
+    run_results = [
+        EvalMetrics(
+            total=6,
+            passed=4,
+            average_steps=1.2,
+            generated_total=2,
+            generated_passed=1,
+            generated_by_benchmark_family={"validation": 2},
+            generated_passed_by_benchmark_family={"validation": 1},
+            proposal_metrics_by_benchmark_family={
+                "validation": {
+                    "task_count": 2,
+                    "proposal_selected_steps": 1,
+                    "novel_valid_command_steps": 1,
+                    "novel_valid_command_rate": 1.0,
+                }
+            },
+            world_feedback_by_benchmark_family={
+                "validation": {
+                    "step_count": 2,
+                    "progress_calibration_mae": 0.12,
+                    "risk_calibration_mae": 0.08,
+                }
+            },
+        ),
+        EvalMetrics(
+            total=6,
+            passed=4,
+            average_steps=1.2,
+            generated_total=2,
+            generated_passed=0,
+            generated_by_benchmark_family={"validation": 2},
+            generated_passed_by_benchmark_family={"validation": 0},
+            proposal_metrics_by_benchmark_family={
+                "validation": {
+                    "task_count": 2,
+                    "proposal_selected_steps": 1,
+                    "novel_valid_command_steps": 0,
+                    "novel_valid_command_rate": 0.0,
+                }
+            },
+            world_feedback_by_benchmark_family={
+                "validation": {
+                    "step_count": 2,
+                    "progress_calibration_mae": 0.2,
+                    "risk_calibration_mae": 0.1,
+                }
+            },
+        ),
+    ]
+
+    def fake_run_eval(*, config, **kwargs):
+        del config, kwargs
+        return run_results.pop(0)
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            transition_model_proposals_path=artifact_path,
+            improvement_cycles_path=cycles_path,
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retained_baseline.py",
+            "--subsystem",
+            "transition_model",
+            "--cycles-path",
+            str(cycles_path),
+            "--artifact-path",
+            str(artifact_path),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+
+    assert "validation_family_delta" in output
+    assert "primary_pass_rate_delta=0.00" in output
+    assert "generated_pass_rate_delta=-0.50" in output
+    assert "novel_valid_command_rate_delta=-1.00" in output
+    assert "progress_calibration_mae_gain=-0.08" in output
+
+
 def test_compare_retained_baseline_supports_operator_artifact_path():
     module = _load_compare_module()
     config = KernelConfig(
@@ -309,6 +800,17 @@ def test_compare_retained_baseline_supports_retrieval_artifact_path():
     resolved = module._artifact_path_for_subsystem(config, "retrieval")
 
     assert resolved == config.retrieval_proposals_path
+
+
+def test_compare_retained_baseline_supports_qwen_adapter_artifact_path():
+    module = _load_compare_module()
+    config = KernelConfig(
+        qwen_adapter_artifact_path=Path("trajectories/qwen_adapter/qwen_adapter_artifact.json"),
+    )
+
+    resolved = module._artifact_path_for_subsystem(config, "qwen_adapter")
+
+    assert resolved == config.qwen_adapter_artifact_path
 
 
 def test_compare_retained_baseline_supports_world_model_artifact_path():

@@ -6,6 +6,9 @@ import time
 import numpy as np
 import pytest
 
+from agent_kernel.schemas import TaskSpec
+from agent_kernel.world_model import WorldModel
+
 try:
     import torch
 except Exception:  # pragma: no cover - reduced environments
@@ -123,6 +126,125 @@ def test_condition_causal_world_prior_uses_signature_alignment():
     assert prior.matched_state_index == 0
     assert prior.matched_state_probability > 0.5
     assert np.isclose(np.exp(prior.log_prior).sum(), 1.0)
+
+
+def test_condition_causal_world_prior_strengthens_long_horizon_bias():
+    sketch, _ = build_causal_state_signature(
+        ["repair missing report.txt", "report.txt status cleanup"],
+        sketch_dim=4,
+    )
+    repeated = np.concatenate([sketch, sketch]).astype(np.float32)
+    profile = CausalWorldProfile(
+        profile_path=Path("/tmp/profile.json"),
+        sidecar_path=Path("/tmp/profile_spectral_eigenbases.npz"),
+        num_states=2,
+        horizons=(1, 4),
+        sketch_dim=4,
+        log_probs=np.zeros((2,), dtype=np.float32),
+        state_masses=np.array([1.0, 1.0], dtype=np.float32),
+        centroids_sketch=np.stack([repeated, -repeated]).astype(np.float32),
+    )
+
+    base_prior = condition_causal_world_prior(
+        profile,
+        text_fragments=["repair missing report.txt", "report.txt status cleanup"],
+    )
+    long_horizon_prior = condition_causal_world_prior(
+        profile,
+        text_fragments=["repair missing report.txt", "report.txt status cleanup", "horizon:long_horizon"],
+        horizon_hint="long_horizon",
+    )
+
+    assert long_horizon_prior.horizon_hint == "long_horizon"
+    assert long_horizon_prior.applied_bias_strength > base_prior.applied_bias_strength
+    assert long_horizon_prior.matched_state_probability > base_prior.matched_state_probability
+
+
+def test_world_model_prioritized_long_horizon_hotspots_surface_pending_workflow_paths_early():
+    model = WorldModel()
+    task = TaskSpec(
+        task_id="long_horizon_hotspot_task",
+        prompt="Repair the release workflow and publish the missing report.",
+        workspace_subdir="long_horizon_hotspot_task",
+        metadata={
+            "difficulty": "long_horizon",
+            "semantic_verifier": {
+                "expected_changed_paths": ["src/release_state.txt"],
+                "generated_paths": ["generated/release.patch"],
+                "report_rules": [{"path": "reports/release_review.txt"}],
+            },
+        },
+    )
+    summary = model.summarize(task)
+    summary.update(
+        {
+            "updated_workflow_paths": [],
+            "updated_generated_paths": [],
+            "updated_report_paths": [],
+            "missing_expected_artifacts": [],
+            "unsatisfied_expected_contents": [],
+            "present_forbidden_artifacts": [],
+            "changed_preserved_artifacts": [],
+            "missing_preserved_artifacts": [],
+        }
+    )
+
+    hotspots = model.prioritized_long_horizon_hotspots(
+        task,
+        summary,
+        latest_transition={"no_progress": True, "regressions": []},
+        latent_state_summary={
+            "active_paths": [],
+            "learned_world_state": {
+                "progress_signal": 0.12,
+                "risk_signal": 0.41,
+            },
+        },
+    )
+
+    assert [entry["subgoal"] for entry in hotspots[:3]] == [
+        "update workflow path src/release_state.txt",
+        "regenerate generated artifact generated/release.patch",
+        "write workflow report reports/release_review.txt",
+    ]
+
+
+def test_world_model_prioritized_long_horizon_hotspots_prioritize_regressed_preserved_paths():
+    model = WorldModel()
+    task = TaskSpec(
+        task_id="long_horizon_preserved_hotspot_task",
+        prompt="Repair the task without regressing preserved artifacts.",
+        workspace_subdir="long_horizon_preserved_hotspot_task",
+        expected_files=["status.txt"],
+        metadata={"difficulty": "long_horizon"},
+    )
+    summary = model.summarize(task)
+    summary.update(
+        {
+            "missing_expected_artifacts": ["status.txt"],
+            "unsatisfied_expected_contents": [],
+            "present_forbidden_artifacts": [],
+            "changed_preserved_artifacts": ["docs/context.md"],
+            "missing_preserved_artifacts": [],
+            "workflow_preserved_paths": ["docs/context.md"],
+        }
+    )
+
+    hotspots = model.prioritized_long_horizon_hotspots(
+        task,
+        summary,
+        latest_transition={"no_progress": True, "regressions": ["docs/context.md"]},
+        latent_state_summary={
+            "active_paths": [],
+            "learned_world_state": {
+                "progress_signal": 0.1,
+                "risk_signal": 0.43,
+            },
+        },
+    )
+
+    assert hotspots[0]["subgoal"] == "preserve required artifact docs/context.md"
+    assert "state_regression" in hotspots[0]["signals"]
 
 
 @pytest.mark.skipif(not _TORCH_RUNTIME_READY, reason="full torch runtime is required")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import lru_cache
 import glob
 import json
 from pathlib import Path
@@ -9,8 +10,155 @@ import shlex
 
 from .config import KernelConfig
 from .episode_store import iter_episode_documents
+from .kernel_catalog import kernel_catalog_string_list, kernel_catalog_string_set
 from .schemas import TaskSpec
+from .task_budget import uplifted_task_max_steps
 from .verifier import synthesize_stricter_task
+
+
+_BUILTIN_TASK_MANIFEST_PATH = (
+    Path(__file__).resolve().parent.parent / "datasets" / "task_bank" / "default_tasks.json"
+)
+_TASK_BANK_SYNTHESIS_RULES_PATH = (
+    Path(__file__).resolve().parent.parent / "datasets" / "task_bank" / "synthesis_rules.json"
+)
+
+
+def _task_acceptance_contract_defined(task: TaskSpec) -> bool:
+    metadata = dict(task.metadata)
+    verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
+    return bool(
+        task.success_command
+        or task.expected_files
+        or task.expected_output_substrings
+        or task.forbidden_files
+        or task.forbidden_output_substrings
+        or task.expected_file_contents
+        or verifier
+    )
+
+
+def _task_light_supervision_candidate(task: TaskSpec) -> bool:
+    metadata = dict(task.metadata)
+    if not _task_acceptance_contract_defined(task):
+        return False
+    memory_source = str(metadata.get("memory_source", "none")).strip().lower() or "none"
+    if memory_source not in {"", "none"}:
+        return False
+    if bool(metadata.get("requires_retrieval", False)) and str(metadata.get("source_task", "")).strip():
+        return False
+    difficulty = str(metadata.get("difficulty", "")).strip().lower()
+    if difficulty == "retrieval":
+        return False
+    task_origin = str(metadata.get("task_origin", "")).strip().lower()
+    if task_origin in {
+        "episode_replay",
+        "skill_replay",
+        "skill_transfer",
+        "operator_replay",
+        "tool_replay",
+        "verifier_replay",
+        "discovered_task",
+        "transition_pressure",
+        "benchmark_candidate",
+        "verifier_candidate",
+    }:
+        return False
+    return True
+
+
+def _light_supervision_contract_kind(task: TaskSpec) -> str:
+    metadata = dict(task.metadata)
+    verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
+    if verifier:
+        return "semantic_verifier"
+    if (
+        task.expected_files
+        or task.expected_output_substrings
+        or task.forbidden_files
+        or task.forbidden_output_substrings
+        or task.expected_file_contents
+    ):
+        return "workspace_acceptance"
+    if task.success_command:
+        return "success_command"
+    return ""
+
+
+def _annotate_light_supervision_contract(task: TaskSpec) -> TaskSpec:
+    metadata = dict(task.metadata)
+    candidate = _task_light_supervision_candidate(task)
+    metadata["light_supervision_candidate"] = candidate
+    metadata["decision_yield_family"] = str(metadata.get("benchmark_family", "bounded")).strip() or "bounded"
+    metadata["decision_yield_contract_candidate"] = candidate
+    contract_kind = _light_supervision_contract_kind(task)
+    if contract_kind:
+        metadata["light_supervision_contract_kind"] = contract_kind
+    else:
+        metadata.pop("light_supervision_contract_kind", None)
+    task.metadata = metadata
+    return task
+
+
+def annotate_light_supervision_contract(task: TaskSpec) -> TaskSpec:
+    return _annotate_light_supervision_contract(task)
+
+
+@lru_cache(maxsize=1)
+def _task_bank_synthesis_rules() -> dict[str, object]:
+    if not _TASK_BANK_SYNTHESIS_RULES_PATH.exists() or not _TASK_BANK_SYNTHESIS_RULES_PATH.is_file():
+        raise RuntimeError(f"task-bank synthesis rules missing: {_TASK_BANK_SYNTHESIS_RULES_PATH}")
+    try:
+        parsed = json.loads(_TASK_BANK_SYNTHESIS_RULES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid task-bank synthesis rules: {_TASK_BANK_SYNTHESIS_RULES_PATH}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"task-bank synthesis rules must be an object: {_TASK_BANK_SYNTHESIS_RULES_PATH}")
+    return parsed
+
+
+def _task_bank_memory_task_rule(name: str) -> dict[str, object]:
+    rules = _task_bank_synthesis_rules().get("memory_task_rules", {})
+    if not isinstance(rules, dict):
+        raise RuntimeError(f"task-bank memory_task_rules must be an object: {_TASK_BANK_SYNTHESIS_RULES_PATH}")
+    rule = rules.get(name, {})
+    if not isinstance(rule, dict):
+        raise RuntimeError(f"task-bank memory task rule must be an object: {name}")
+    return rule
+
+
+def _memory_task_rule_text(rule_name: str, field: str, *, fallback: str = "") -> str:
+    return str(_task_bank_memory_task_rule(rule_name).get(field, fallback)).strip() or fallback
+
+
+def _memory_task_prompt(rule_name: str, *, prompt: str, **kwargs: object) -> str:
+    template = _memory_task_rule_text(rule_name, "prompt_template", fallback="{prompt}")
+    values = {"prompt": prompt}
+    values.update({key: str(value) for key, value in kwargs.items()})
+    try:
+        rendered = template.format(**values)
+    except KeyError as exc:
+        raise RuntimeError(f"invalid task-bank memory prompt template: {rule_name}") from exc
+    return str(rendered).strip() or prompt
+
+
+def _memory_task_metadata(
+    rule_name: str,
+    *,
+    source_task_id: str,
+    origin_benchmark_family: str,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    metadata = _task_bank_memory_task_rule(rule_name).get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"task-bank memory task metadata must be an object: {rule_name}")
+    payload = dict(metadata)
+    payload.setdefault("memory_source_task", source_task_id)
+    payload.setdefault("origin_benchmark_family", origin_benchmark_family)
+    payload.setdefault("source_task", source_task_id)
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 class TaskBank:
@@ -19,2148 +167,8 @@ class TaskBank:
         config: KernelConfig | None = None,
         external_task_manifests: tuple[str, ...] | None = None,
     ) -> None:
-        self._tasks = {
-            "hello_task": self._task(
-                task_id="hello_task",
-                prompt="Create hello.txt containing the string hello agent kernel.",
-                workspace_subdir="hello_task",
-                suggested_commands=[
-                    "printf 'hello agent kernel\n' > hello.txt",
-                    "cat hello.txt",
-                ],
-                success_command="test -f hello.txt && grep -q 'hello agent kernel' hello.txt",
-                expected_files=["hello.txt"],
-                expected_file_contents={"hello.txt": "hello agent kernel\n"},
-                capability="file_write",
-                difficulty="seed",
-            ),
-            "math_task": self._task(
-                task_id="math_task",
-                prompt="Create result.txt containing the number 42.",
-                workspace_subdir="math_task",
-                suggested_commands=[
-                    "printf '42\n' > result.txt",
-                    "cat result.txt",
-                ],
-                success_command="test -f result.txt && grep -q '^42$' result.txt",
-                expected_files=["result.txt"],
-                expected_file_contents={"result.txt": "42\n"},
-                capability="file_write",
-                difficulty="seed",
-            ),
-            "nested_file_task": self._task(
-                task_id="nested_file_task",
-                prompt="Create reports/status.txt containing the string ready.",
-                workspace_subdir="nested_file_task",
-                suggested_commands=[
-                    "mkdir -p reports && printf 'ready\n' > reports/status.txt",
-                    "cat reports/status.txt",
-                ],
-                success_command="test -f reports/status.txt && grep -q '^ready$' reports/status.txt",
-                expected_files=["reports/status.txt"],
-                expected_file_contents={"reports/status.txt": "ready\n"},
-                capability="nested_filesystem",
-                difficulty="bounded",
-            ),
-            "rename_task": self._task(
-                task_id="rename_task",
-                prompt="Rename draft.txt to final.txt and keep the existing contents.",
-                workspace_subdir="rename_task",
-                setup_commands=["printf 'renamed content\n' > draft.txt"],
-                suggested_commands=[
-                    "mv draft.txt final.txt",
-                    "cat final.txt",
-                ],
-                success_command="test -f final.txt && grep -q '^renamed content$' final.txt",
-                expected_files=["final.txt"],
-                forbidden_files=["draft.txt"],
-                expected_file_contents={"final.txt": "renamed content\n"},
-                capability="filesystem_mutation",
-                difficulty="bounded",
-            ),
-            "rewrite_task": self._task(
-                task_id="rewrite_task",
-                prompt="Overwrite note.txt so it contains only the string done.",
-                workspace_subdir="rewrite_task",
-                setup_commands=["printf 'todo\n' > note.txt"],
-                suggested_commands=[
-                    "printf 'done\n' > note.txt",
-                    "cat note.txt",
-                ],
-                success_command="test -f note.txt && grep -q '^done$' note.txt",
-                expected_files=["note.txt"],
-                expected_file_contents={"note.txt": "done\n"},
-                capability="file_edit",
-                difficulty="bounded",
-            ),
-            "cleanup_task": self._task(
-                task_id="cleanup_task",
-                prompt="Remove temp.txt and create status.txt containing cleaned.",
-                workspace_subdir="cleanup_task",
-                setup_commands=["printf 'temporary\n' > temp.txt"],
-                suggested_commands=[
-                    "rm -f temp.txt && printf 'cleaned\n' > status.txt",
-                    "cat status.txt",
-                ],
-                success_command="test ! -f temp.txt && test -f status.txt && grep -q '^cleaned$' status.txt",
-                expected_files=["status.txt"],
-                forbidden_files=["temp.txt"],
-                expected_file_contents={"status.txt": "cleaned\n"},
-                capability="cleanup",
-                difficulty="bounded",
-                metadata={"benchmark_family": "micro"},
-            ),
-            "release_bundle_task": self._task(
-                task_id="release_bundle_task",
-                prompt=(
-                    "Prepare a release bundle: remove incoming/draft.txt, create release/notes.txt "
-                    "containing shipped release, and create release/status.txt containing packaged."
-                ),
-                workspace_subdir="release_bundle_task",
-                setup_commands=[
-                    "mkdir -p incoming && printf 'draft release\\n' > incoming/draft.txt",
-                ],
-                suggested_commands=[
-                    "mkdir -p release && rm -f incoming/draft.txt && printf 'shipped release\n' > release/notes.txt && printf 'packaged\n' > release/status.txt",
-                    "cat release/notes.txt",
-                    "cat release/status.txt",
-                ],
-                success_command=(
-                    "test ! -f incoming/draft.txt && "
-                    "test -f release/notes.txt && grep -q '^shipped release$' release/notes.txt && "
-                    "test -f release/status.txt && grep -q '^packaged$' release/status.txt"
-                ),
-                expected_files=["release/notes.txt", "release/status.txt"],
-                forbidden_files=["incoming/draft.txt"],
-                expected_file_contents={
-                    "release/notes.txt": "shipped release\n",
-                    "release/status.txt": "packaged\n",
-                },
-                capability="workflow_environment",
-                difficulty="environment",
-                metadata={"benchmark_family": "workflow"},
-            ),
-            "config_sync_task": self._task(
-                task_id="config_sync_task",
-                prompt=(
-                    "Synchronize the config workspace: create config/app.env containing MODE=prod "
-                    "and PORT=8080, while preserving template.env."
-                ),
-                workspace_subdir="config_sync_task",
-                setup_commands=["printf 'MODE=dev\nPORT=3000\n' > template.env"],
-                suggested_commands=[
-                    "mkdir -p config && printf 'MODE=prod\nPORT=8080\n' > config/app.env",
-                    "cat config/app.env",
-                ],
-                success_command=(
-                    "test -f template.env && "
-                    "test -f config/app.env && grep -q '^MODE=prod$' config/app.env && "
-                    "grep -q '^PORT=8080$' config/app.env"
-                ),
-                expected_files=["template.env", "config/app.env"],
-                expected_file_contents={
-                    "template.env": "MODE=dev\nPORT=3000\n",
-                    "config/app.env": "MODE=prod\nPORT=8080\n",
-                },
-                capability="workflow_environment",
-                difficulty="environment",
-                metadata={"benchmark_family": "workflow"},
-            ),
-            "release_bundle_retrieval_task": self._task(
-                task_id="release_bundle_retrieval_task",
-                prompt=(
-                    "Reproduce the established release workflow used elsewhere in this repo: remove the draft input, "
-                    "write the shipped release notes, and mark the release as packaged."
-                ),
-                workspace_subdir="release_bundle_retrieval_task",
-                setup_commands=[
-                    "mkdir -p incoming && printf 'draft release\\n' > incoming/draft.txt",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test ! -f incoming/draft.txt && "
-                    "test -f release/notes.txt && grep -q '^shipped release$' release/notes.txt && "
-                    "test -f release/status.txt && grep -q '^packaged$' release/status.txt"
-                ),
-                expected_files=["release/notes.txt", "release/status.txt"],
-                forbidden_files=["incoming/draft.txt"],
-                expected_file_contents={
-                    "release/notes.txt": "shipped release\n",
-                    "release/status.txt": "packaged\n",
-                },
-                capability="workflow_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "workflow",
-                    "requires_retrieval": True,
-                    "source_task": "release_bundle_task",
-                },
-            ),
-            "config_sync_retrieval_task": self._task(
-                task_id="config_sync_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical config synchronization procedure from earlier repo tasks: preserve "
-                    "template.env and create the production config file under config/."
-                ),
-                workspace_subdir="config_sync_retrieval_task",
-                setup_commands=["printf 'MODE=dev\nPORT=3000\n' > template.env"],
-                suggested_commands=[],
-                success_command=(
-                    "test -f template.env && "
-                    "test -f config/app.env && grep -q '^MODE=prod$' config/app.env && "
-                    "grep -q '^PORT=8080$' config/app.env"
-                ),
-                expected_files=["template.env", "config/app.env"],
-                expected_file_contents={
-                    "template.env": "MODE=dev\nPORT=3000\n",
-                    "config/app.env": "MODE=prod\nPORT=8080\n",
-                },
-                capability="workflow_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "workflow",
-                    "requires_retrieval": True,
-                    "source_task": "config_sync_task",
-                },
-            ),
-            "deployment_manifest_task": self._task(
-                task_id="deployment_manifest_task",
-                prompt=(
-                    "Prepare the deployment workspace: remove staging/draft.txt, preserve config/base.env, "
-                    "create deploy/manifest.txt containing deployment manifest ready, and create "
-                    "deploy/checklist.txt containing deployment checklist complete."
-                ),
-                workspace_subdir="deployment_manifest_task",
-                setup_commands=[
-                    "mkdir -p staging config && printf 'draft deployment\\n' > staging/draft.txt && printf 'ENV=base\\n' > config/base.env",
-                ],
-                suggested_commands=[
-                    "mkdir -p deploy && rm -f staging/draft.txt && printf 'deployment manifest ready\n' > deploy/manifest.txt && printf 'deployment checklist complete\n' > deploy/checklist.txt",
-                    "cat deploy/manifest.txt",
-                    "cat deploy/checklist.txt",
-                ],
-                success_command=(
-                    "test ! -f staging/draft.txt && "
-                    "test -f config/base.env && grep -q '^ENV=base$' config/base.env && "
-                    "test -f deploy/manifest.txt && grep -q '^deployment manifest ready$' deploy/manifest.txt && "
-                    "test -f deploy/checklist.txt && grep -q '^deployment checklist complete$' deploy/checklist.txt"
-                ),
-                expected_files=["config/base.env", "deploy/manifest.txt", "deploy/checklist.txt"],
-                forbidden_files=["staging/draft.txt"],
-                expected_file_contents={
-                    "config/base.env": "ENV=base\n",
-                    "deploy/manifest.txt": "deployment manifest ready\n",
-                    "deploy/checklist.txt": "deployment checklist complete\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={"benchmark_family": "project"},
-            ),
-            "deployment_manifest_retrieval_task": self._task(
-                task_id="deployment_manifest_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical deployment manifest procedure used elsewhere in this repo: "
-                    "preserve the base config, remove the staging draft, and produce the manifest and checklist."
-                ),
-                workspace_subdir="deployment_manifest_retrieval_task",
-                setup_commands=[
-                    "mkdir -p staging config && printf 'draft deployment\\n' > staging/draft.txt && printf 'ENV=base\\n' > config/base.env",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test ! -f staging/draft.txt && "
-                    "test -f config/base.env && grep -q '^ENV=base$' config/base.env && "
-                    "test -f deploy/manifest.txt && grep -q '^deployment manifest ready$' deploy/manifest.txt && "
-                    "test -f deploy/checklist.txt && grep -q '^deployment checklist complete$' deploy/checklist.txt"
-                ),
-                expected_files=["config/base.env", "deploy/manifest.txt", "deploy/checklist.txt"],
-                forbidden_files=["staging/draft.txt"],
-                expected_file_contents={
-                    "config/base.env": "ENV=base\n",
-                    "deploy/manifest.txt": "deployment manifest ready\n",
-                    "deploy/checklist.txt": "deployment checklist complete\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={
-                    "benchmark_family": "project",
-                    "requires_retrieval": True,
-                    "source_task": "deployment_manifest_task",
-                },
-            ),
-            "report_rollup_task": self._task(
-                task_id="report_rollup_task",
-                prompt=(
-                    "Prepare the report rollup: preserve inbox/day1.log and inbox/day2.log, create "
-                    "reports/summary.txt containing rollup complete, and create reports/index.txt containing "
-                    "2 sources processed."
-                ),
-                workspace_subdir="report_rollup_task",
-                setup_commands=[
-                    "mkdir -p inbox && printf 'source day1\\n' > inbox/day1.log && printf 'source day2\\n' > inbox/day2.log",
-                ],
-                suggested_commands=[
-                    "mkdir -p reports && printf 'rollup complete\n' > reports/summary.txt && printf '2 sources processed\n' > reports/index.txt",
-                    "cat reports/summary.txt",
-                    "cat reports/index.txt",
-                ],
-                success_command=(
-                    "test -f inbox/day1.log && grep -q '^source day1$' inbox/day1.log && "
-                    "test -f inbox/day2.log && grep -q '^source day2$' inbox/day2.log && "
-                    "test -f reports/summary.txt && grep -q '^rollup complete$' reports/summary.txt && "
-                    "test -f reports/index.txt && grep -q '^2 sources processed$' reports/index.txt"
-                ),
-                expected_files=["inbox/day1.log", "inbox/day2.log", "reports/summary.txt", "reports/index.txt"],
-                expected_file_contents={
-                    "inbox/day1.log": "source day1\n",
-                    "inbox/day2.log": "source day2\n",
-                    "reports/summary.txt": "rollup complete\n",
-                    "reports/index.txt": "2 sources processed\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={"benchmark_family": "project"},
-            ),
-            "report_rollup_retrieval_task": self._task(
-                task_id="report_rollup_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical report rollup procedure from earlier repo tasks: preserve both inbox "
-                    "source logs and create the summary and index artifacts."
-                ),
-                workspace_subdir="report_rollup_retrieval_task",
-                setup_commands=[
-                    "mkdir -p inbox && printf 'source day1\\n' > inbox/day1.log && printf 'source day2\\n' > inbox/day2.log",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f inbox/day1.log && grep -q '^source day1$' inbox/day1.log && "
-                    "test -f inbox/day2.log && grep -q '^source day2$' inbox/day2.log && "
-                    "test -f reports/summary.txt && grep -q '^rollup complete$' reports/summary.txt && "
-                    "test -f reports/index.txt && grep -q '^2 sources processed$' reports/index.txt"
-                ),
-                expected_files=["inbox/day1.log", "inbox/day2.log", "reports/summary.txt", "reports/index.txt"],
-                expected_file_contents={
-                    "inbox/day1.log": "source day1\n",
-                    "inbox/day2.log": "source day2\n",
-                    "reports/summary.txt": "rollup complete\n",
-                    "reports/index.txt": "2 sources processed\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={
-                    "benchmark_family": "project",
-                    "requires_retrieval": True,
-                    "source_task": "report_rollup_task",
-                },
-            ),
-            "release_packet_task": self._task(
-                task_id="release_packet_task",
-                prompt=(
-                    "Prepare the project release packet: preserve notes/brief.txt, remove drafts/old.txt, create "
-                    "plan/timeline.txt containing milestone freeze ready, create plan/owners.txt containing owner "
-                    "delivery, and create reports/packet.txt containing release packet assembled."
-                ),
-                workspace_subdir="release_packet_task",
-                setup_commands=[
-                    "mkdir -p notes drafts && printf 'brief baseline\\n' > notes/brief.txt && printf 'outdated draft\\n' > drafts/old.txt",
-                ],
-                suggested_commands=[
-                    "mkdir -p plan reports && rm -f drafts/old.txt && printf 'milestone freeze ready\n' > plan/timeline.txt && printf 'owner delivery\n' > plan/owners.txt && printf 'release packet assembled\n' > reports/packet.txt",
-                    "cat plan/timeline.txt",
-                    "cat plan/owners.txt",
-                    "cat reports/packet.txt",
-                ],
-                success_command=(
-                    "test -f notes/brief.txt && grep -q '^brief baseline$' notes/brief.txt && "
-                    "test ! -f drafts/old.txt && "
-                    "test -f plan/timeline.txt && grep -q '^milestone freeze ready$' plan/timeline.txt && "
-                    "test -f plan/owners.txt && grep -q '^owner delivery$' plan/owners.txt && "
-                    "test -f reports/packet.txt && grep -q '^release packet assembled$' reports/packet.txt"
-                ),
-                expected_files=["notes/brief.txt", "plan/timeline.txt", "plan/owners.txt", "reports/packet.txt"],
-                forbidden_files=["drafts/old.txt"],
-                expected_file_contents={
-                    "notes/brief.txt": "brief baseline\n",
-                    "plan/timeline.txt": "milestone freeze ready\n",
-                    "plan/owners.txt": "owner delivery\n",
-                    "reports/packet.txt": "release packet assembled\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={"benchmark_family": "project"},
-            ),
-            "release_packet_retrieval_task": self._task(
-                task_id="release_packet_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical project release packet from earlier tasks: preserve the brief, remove "
-                    "the outdated draft, build the timeline and owner plan, and emit the packet report."
-                ),
-                workspace_subdir="release_packet_retrieval_task",
-                setup_commands=[
-                    "mkdir -p notes drafts && printf 'brief baseline\\n' > notes/brief.txt && printf 'outdated draft\\n' > drafts/old.txt",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f notes/brief.txt && grep -q '^brief baseline$' notes/brief.txt && "
-                    "test ! -f drafts/old.txt && "
-                    "test -f plan/timeline.txt && grep -q '^milestone freeze ready$' plan/timeline.txt && "
-                    "test -f plan/owners.txt && grep -q '^owner delivery$' plan/owners.txt && "
-                    "test -f reports/packet.txt && grep -q '^release packet assembled$' reports/packet.txt"
-                ),
-                expected_files=["notes/brief.txt", "plan/timeline.txt", "plan/owners.txt", "reports/packet.txt"],
-                forbidden_files=["drafts/old.txt"],
-                expected_file_contents={
-                    "notes/brief.txt": "brief baseline\n",
-                    "plan/timeline.txt": "milestone freeze ready\n",
-                    "plan/owners.txt": "owner delivery\n",
-                    "reports/packet.txt": "release packet assembled\n",
-                },
-                capability="project_environment",
-                difficulty="long_horizon",
-                metadata={
-                    "benchmark_family": "project",
-                    "requires_retrieval": True,
-                    "source_task": "release_packet_task",
-                    "distractor_tasks": ["deployment_manifest_task", "report_rollup_task"],
-                },
-            ),
-            "service_release_task": self._task(
-                task_id="service_release_task",
-                prompt=(
-                    "Prepare the service release repo slice: preserve docs/overview.md, create app/release.txt "
-                    "containing service release ready, create config/runtime.env containing MODE=release, "
-                    "and create tests/smoke.txt containing smoke ready."
-                ),
-                workspace_subdir="service_release_task",
-                setup_commands=[
-                    "mkdir -p docs && printf 'service overview\\n' > docs/overview.md",
-                ],
-                suggested_commands=[
-                    "mkdir -p app config tests && printf 'service release ready\n' > app/release.txt && printf 'MODE=release\n' > config/runtime.env && printf 'smoke ready\n' > tests/smoke.txt",
-                    "cat app/release.txt",
-                    "cat config/runtime.env",
-                    "cat tests/smoke.txt",
-                ],
-                success_command=(
-                    "test -f docs/overview.md && grep -q '^service overview$' docs/overview.md && "
-                    "test -f app/release.txt && grep -q '^service release ready$' app/release.txt && "
-                    "test -f config/runtime.env && grep -q '^MODE=release$' config/runtime.env && "
-                    "test -f tests/smoke.txt && grep -q '^smoke ready$' tests/smoke.txt"
-                ),
-                expected_files=["docs/overview.md", "app/release.txt", "config/runtime.env", "tests/smoke.txt"],
-                expected_file_contents={
-                    "docs/overview.md": "service overview\n",
-                    "app/release.txt": "service release ready\n",
-                    "config/runtime.env": "MODE=release\n",
-                    "tests/smoke.txt": "smoke ready\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={"benchmark_family": "repository"},
-            ),
-            "service_release_retrieval_task": self._task(
-                task_id="service_release_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical service release repo procedure from earlier tasks: preserve the "
-                    "overview doc, create the release artifact, set release mode, and add the smoke marker."
-                ),
-                workspace_subdir="service_release_retrieval_task",
-                setup_commands=[
-                    "mkdir -p docs && printf 'service overview\\n' > docs/overview.md",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f docs/overview.md && grep -q '^service overview$' docs/overview.md && "
-                    "test -f app/release.txt && grep -q '^service release ready$' app/release.txt && "
-                    "test -f config/runtime.env && grep -q '^MODE=release$' config/runtime.env && "
-                    "test -f tests/smoke.txt && grep -q '^smoke ready$' tests/smoke.txt"
-                ),
-                expected_files=["docs/overview.md", "app/release.txt", "config/runtime.env", "tests/smoke.txt"],
-                expected_file_contents={
-                    "docs/overview.md": "service overview\n",
-                    "app/release.txt": "service release ready\n",
-                    "config/runtime.env": "MODE=release\n",
-                    "tests/smoke.txt": "smoke ready\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={
-                    "benchmark_family": "repository",
-                    "requires_retrieval": True,
-                    "source_task": "service_release_task",
-                },
-            ),
-            "schema_alignment_task": self._task(
-                task_id="schema_alignment_task",
-                prompt=(
-                    "Align the schema repo slice: preserve specs/base.md, create src/schema.txt containing "
-                    "schema aligned, create fixtures/example.json containing {\"status\": \"aligned\"}, and "
-                    "create docs/changelog.txt containing schema update recorded."
-                ),
-                workspace_subdir="schema_alignment_task",
-                setup_commands=[
-                    "mkdir -p specs && printf 'base schema spec\\n' > specs/base.md",
-                ],
-                suggested_commands=[
-                    "mkdir -p src fixtures docs && printf 'schema aligned\n' > src/schema.txt && printf '{\"status\": \"aligned\"}\n' > fixtures/example.json && printf 'schema update recorded\n' > docs/changelog.txt",
-                    "cat src/schema.txt",
-                    "cat fixtures/example.json",
-                    "cat docs/changelog.txt",
-                ],
-                success_command=(
-                    "test -f specs/base.md && grep -q '^base schema spec$' specs/base.md && "
-                    "test -f src/schema.txt && grep -q '^schema aligned$' src/schema.txt && "
-                    "test -f fixtures/example.json && grep -q '^{\"status\": \"aligned\"}$' fixtures/example.json && "
-                    "test -f docs/changelog.txt && grep -q '^schema update recorded$' docs/changelog.txt"
-                ),
-                expected_files=["specs/base.md", "src/schema.txt", "fixtures/example.json", "docs/changelog.txt"],
-                expected_file_contents={
-                    "specs/base.md": "base schema spec\n",
-                    "src/schema.txt": "schema aligned\n",
-                    "fixtures/example.json": "{\"status\": \"aligned\"}\n",
-                    "docs/changelog.txt": "schema update recorded\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={"benchmark_family": "repository"},
-            ),
-            "schema_alignment_retrieval_task": self._task(
-                task_id="schema_alignment_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical schema alignment repo procedure from earlier tasks: preserve the "
-                    "base spec, align the schema artifact, update the fixture, and record the changelog."
-                ),
-                workspace_subdir="schema_alignment_retrieval_task",
-                setup_commands=[
-                    "mkdir -p specs && printf 'base schema spec\\n' > specs/base.md",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f specs/base.md && grep -q '^base schema spec$' specs/base.md && "
-                    "test -f src/schema.txt && grep -q '^schema aligned$' src/schema.txt && "
-                    "test -f fixtures/example.json && grep -q '^{\"status\": \"aligned\"}$' fixtures/example.json && "
-                    "test -f docs/changelog.txt && grep -q '^schema update recorded$' docs/changelog.txt"
-                ),
-                expected_files=["specs/base.md", "src/schema.txt", "fixtures/example.json", "docs/changelog.txt"],
-                expected_file_contents={
-                    "specs/base.md": "base schema spec\n",
-                    "src/schema.txt": "schema aligned\n",
-                    "fixtures/example.json": "{\"status\": \"aligned\"}\n",
-                    "docs/changelog.txt": "schema update recorded\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={
-                    "benchmark_family": "repository",
-                    "requires_retrieval": True,
-                    "source_task": "schema_alignment_task",
-                },
-            ),
-            "repo_sync_matrix_task": self._task(
-                task_id="repo_sync_matrix_task",
-                prompt=(
-                    "Prepare the repository sync matrix: preserve docs/module_map.md, create src/runtime.txt "
-                    "containing runtime synced, create tests/coverage.txt containing coverage expanded, create "
-                    "config/deploy.env containing DEPLOY_MODE=sync, and create reports/matrix.txt containing "
-                    "repository sync recorded."
-                ),
-                workspace_subdir="repo_sync_matrix_task",
-                setup_commands=[
-                    "mkdir -p docs && printf 'module map preserved\\n' > docs/module_map.md",
-                ],
-                suggested_commands=[
-                    "mkdir -p src tests config reports && printf 'runtime synced\n' > src/runtime.txt && printf 'coverage expanded\n' > tests/coverage.txt && printf 'DEPLOY_MODE=sync\n' > config/deploy.env && printf 'repository sync recorded\n' > reports/matrix.txt",
-                    "cat src/runtime.txt",
-                    "cat tests/coverage.txt",
-                    "cat config/deploy.env",
-                    "cat reports/matrix.txt",
-                ],
-                success_command=(
-                    "test -f docs/module_map.md && grep -q '^module map preserved$' docs/module_map.md && "
-                    "test -f src/runtime.txt && grep -q '^runtime synced$' src/runtime.txt && "
-                    "test -f tests/coverage.txt && grep -q '^coverage expanded$' tests/coverage.txt && "
-                    "test -f config/deploy.env && grep -q '^DEPLOY_MODE=sync$' config/deploy.env && "
-                    "test -f reports/matrix.txt && grep -q '^repository sync recorded$' reports/matrix.txt"
-                ),
-                expected_files=[
-                    "docs/module_map.md",
-                    "src/runtime.txt",
-                    "tests/coverage.txt",
-                    "config/deploy.env",
-                    "reports/matrix.txt",
-                ],
-                expected_file_contents={
-                    "docs/module_map.md": "module map preserved\n",
-                    "src/runtime.txt": "runtime synced\n",
-                    "tests/coverage.txt": "coverage expanded\n",
-                    "config/deploy.env": "DEPLOY_MODE=sync\n",
-                    "reports/matrix.txt": "repository sync recorded\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={"benchmark_family": "repository"},
-            ),
-            "repo_sync_matrix_retrieval_task": self._task(
-                task_id="repo_sync_matrix_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical repository sync matrix from earlier tasks: preserve the module map, "
-                    "sync the runtime and deploy config, expand the coverage artifact, and emit the matrix report."
-                ),
-                workspace_subdir="repo_sync_matrix_retrieval_task",
-                setup_commands=[
-                    "mkdir -p docs && printf 'module map preserved\\n' > docs/module_map.md",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f docs/module_map.md && grep -q '^module map preserved$' docs/module_map.md && "
-                    "test -f src/runtime.txt && grep -q '^runtime synced$' src/runtime.txt && "
-                    "test -f tests/coverage.txt && grep -q '^coverage expanded$' tests/coverage.txt && "
-                    "test -f config/deploy.env && grep -q '^DEPLOY_MODE=sync$' config/deploy.env && "
-                    "test -f reports/matrix.txt && grep -q '^repository sync recorded$' reports/matrix.txt"
-                ),
-                expected_files=[
-                    "docs/module_map.md",
-                    "src/runtime.txt",
-                    "tests/coverage.txt",
-                    "config/deploy.env",
-                    "reports/matrix.txt",
-                ],
-                expected_file_contents={
-                    "docs/module_map.md": "module map preserved\n",
-                    "src/runtime.txt": "runtime synced\n",
-                    "tests/coverage.txt": "coverage expanded\n",
-                    "config/deploy.env": "DEPLOY_MODE=sync\n",
-                    "reports/matrix.txt": "repository sync recorded\n",
-                },
-                capability="repo_environment",
-                difficulty="cross_component",
-                metadata={
-                    "benchmark_family": "repository",
-                    "requires_retrieval": True,
-                    "source_task": "repo_sync_matrix_task",
-                    "distractor_tasks": ["service_release_task", "schema_alignment_task"],
-                },
-            ),
-            "repo_patch_review_task": self._task(
-                task_id="repo_patch_review_task",
-                prompt=(
-                    "Prepare the repo patch review packet: preserve docs/context.md, update src/app.py to "
-                    "contain STATUS=ready, update tests/status_check.txt to contain status ready covered, "
-                    "create reports/diff_summary.txt containing src and tests updated, and create "
-                    "reports/verification.txt containing deterministic checks passed."
-                ),
-                workspace_subdir="repo_patch_review_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'repo context\\n' > docs/context.md && printf 'STATUS=pending\\n' > src/app.py && printf 'status pending\\n' > tests/status_check.txt",
-                ],
-                suggested_commands=[
-                    "mkdir -p reports && printf 'STATUS=ready\n' > src/app.py && printf 'status ready covered\n' > tests/status_check.txt && printf 'updated src/app.py and tests/status_check.txt\n' > reports/diff_summary.txt && printf 'deterministic checks passed for docs/context.md preservation\n' > reports/verification.txt",
-                    "cat src/app.py",
-                    "cat tests/status_check.txt",
-                    "cat reports/diff_summary.txt",
-                    "cat reports/verification.txt",
-                ],
-                success_command=(
-                    "test -f docs/context.md && grep -q '^repo context$' docs/context.md && "
-                    "test -f src/app.py && grep -q '^STATUS=ready$' src/app.py && "
-                    "test -f tests/status_check.txt && grep -q '^status ready covered$' tests/status_check.txt && "
-                    "test -f reports/diff_summary.txt && grep -q '^updated src/app.py and tests/status_check.txt$' reports/diff_summary.txt && "
-                    "test -f reports/verification.txt && grep -q '^deterministic checks passed for docs/context.md preservation$' reports/verification.txt"
-                ),
-                expected_files=[
-                    "docs/context.md",
-                    "src/app.py",
-                    "tests/status_check.txt",
-                    "reports/diff_summary.txt",
-                    "reports/verification.txt",
-                ],
-                expected_file_contents={
-                    "docs/context.md": "repo context\n",
-                    "src/app.py": "STATUS=ready\n",
-                    "tests/status_check.txt": "status ready covered\n",
-                    "reports/diff_summary.txt": "updated src/app.py and tests/status_check.txt\n",
-                    "reports/verification.txt": "deterministic checks passed for docs/context.md preservation\n",
-                },
-                capability="repo_environment",
-                difficulty="delegated_review",
-                metadata={
-                    "benchmark_family": "repo_chore",
-                    "semantic_verifier": {
-                        "kind": "repo_chore_review",
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["updated"],
-                                "covers": ["src/app.py", "tests/status_check.txt"],
-                            },
-                            {
-                                "path": "reports/verification.txt",
-                                "must_mention": ["checks", "passed", "preservation"],
-                                "covers": ["docs/context.md"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "repo_patch_review_retrieval_task": self._task(
-                task_id="repo_patch_review_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical repo patch review packet from earlier tasks: preserve the "
-                    "repo context, update the app status, update the status check, and emit the diff and "
-                    "verification reports."
-                ),
-                workspace_subdir="repo_patch_review_retrieval_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'repo context\\n' > docs/context.md && printf 'STATUS=pending\\n' > src/app.py && printf 'status pending\\n' > tests/status_check.txt",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f docs/context.md && grep -q '^repo context$' docs/context.md && "
-                    "test -f src/app.py && grep -q '^STATUS=ready$' src/app.py && "
-                    "test -f tests/status_check.txt && grep -q '^status ready covered$' tests/status_check.txt && "
-                    "test -f reports/diff_summary.txt && grep -q '^updated src/app.py and tests/status_check.txt$' reports/diff_summary.txt && "
-                    "test -f reports/verification.txt && grep -q '^deterministic checks passed for docs/context.md preservation$' reports/verification.txt"
-                ),
-                expected_files=[
-                    "docs/context.md",
-                    "src/app.py",
-                    "tests/status_check.txt",
-                    "reports/diff_summary.txt",
-                    "reports/verification.txt",
-                ],
-                expected_file_contents={
-                    "docs/context.md": "repo context\n",
-                    "src/app.py": "STATUS=ready\n",
-                    "tests/status_check.txt": "status ready covered\n",
-                    "reports/diff_summary.txt": "updated src/app.py and tests/status_check.txt\n",
-                    "reports/verification.txt": "deterministic checks passed for docs/context.md preservation\n",
-                },
-                capability="repo_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "repo_chore",
-                    "requires_retrieval": True,
-                    "source_task": "repo_patch_review_task",
-                    "semantic_verifier": {
-                        "kind": "repo_chore_review",
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["updated"],
-                                "covers": ["src/app.py", "tests/status_check.txt"],
-                            },
-                            {
-                                "path": "reports/verification.txt",
-                                "must_mention": ["checks", "passed", "preservation"],
-                                "covers": ["docs/context.md"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "repo_cleanup_review_task": self._task(
-                task_id="repo_cleanup_review_task",
-                prompt=(
-                    "Prepare the cleanup review packet: remove tmp/debug.log, preserve config/base.env, "
-                    "create src/service.py containing SERVICE_MODE=stable, create reports/branch.txt "
-                    "containing branch cleanup/stable-ready, and create reports/review.txt containing "
-                    "review packet complete."
-                ),
-                workspace_subdir="repo_cleanup_review_task",
-                setup_commands=[
-                    "mkdir -p tmp config && printf 'debug trace\\n' > tmp/debug.log && printf 'BASE_ENV=kept\\n' > config/base.env",
-                ],
-                suggested_commands=[
-                    "mkdir -p src reports && rm -f tmp/debug.log && printf 'SERVICE_MODE=stable\n' > src/service.py && printf 'branch cleanup/stable-ready removes tmp/debug.log\n' > reports/branch.txt && printf 'review packet complete with config/base.env preserved\n' > reports/review.txt",
-                    "cat src/service.py",
-                    "cat reports/branch.txt",
-                    "cat reports/review.txt",
-                ],
-                success_command=(
-                    "test ! -f tmp/debug.log && "
-                    "test -f config/base.env && grep -q '^BASE_ENV=kept$' config/base.env && "
-                    "test -f src/service.py && grep -q '^SERVICE_MODE=stable$' src/service.py && "
-                    "test -f reports/branch.txt && grep -q '^branch cleanup/stable-ready removes tmp/debug.log$' reports/branch.txt && "
-                    "test -f reports/review.txt && grep -q '^review packet complete with config/base.env preserved$' reports/review.txt"
-                ),
-                expected_files=[
-                    "config/base.env",
-                    "src/service.py",
-                    "reports/branch.txt",
-                    "reports/review.txt",
-                ],
-                forbidden_files=["tmp/debug.log"],
-                expected_file_contents={
-                    "config/base.env": "BASE_ENV=kept\n",
-                    "src/service.py": "SERVICE_MODE=stable\n",
-                    "reports/branch.txt": "branch cleanup/stable-ready removes tmp/debug.log\n",
-                    "reports/review.txt": "review packet complete with config/base.env preserved\n",
-                },
-                capability="repo_environment",
-                difficulty="delegated_review",
-                metadata={
-                    "benchmark_family": "repo_chore",
-                    "semantic_verifier": {
-                        "kind": "repo_chore_review",
-                        "report_rules": [
-                            {
-                                "path": "reports/branch.txt",
-                                "must_mention": ["branch", "cleanup", "stable"],
-                                "covers": ["tmp/debug.log"],
-                            },
-                            {
-                                "path": "reports/review.txt",
-                                "must_mention": ["review", "complete", "preserved"],
-                                "covers": ["config/base.env"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "repo_cleanup_review_retrieval_task": self._task(
-                task_id="repo_cleanup_review_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical cleanup review packet from earlier tasks: remove the debug log, "
-                    "preserve the base env, create the stable service artifact, and emit the branch and review reports."
-                ),
-                workspace_subdir="repo_cleanup_review_retrieval_task",
-                setup_commands=[
-                    "mkdir -p tmp config && printf 'debug trace\\n' > tmp/debug.log && printf 'BASE_ENV=kept\\n' > config/base.env",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test ! -f tmp/debug.log && "
-                    "test -f config/base.env && grep -q '^BASE_ENV=kept$' config/base.env && "
-                    "test -f src/service.py && grep -q '^SERVICE_MODE=stable$' src/service.py && "
-                    "test -f reports/branch.txt && grep -q '^branch cleanup/stable-ready removes tmp/debug.log$' reports/branch.txt && "
-                    "test -f reports/review.txt && grep -q '^review packet complete with config/base.env preserved$' reports/review.txt"
-                ),
-                expected_files=[
-                    "config/base.env",
-                    "src/service.py",
-                    "reports/branch.txt",
-                    "reports/review.txt",
-                ],
-                forbidden_files=["tmp/debug.log"],
-                expected_file_contents={
-                    "config/base.env": "BASE_ENV=kept\n",
-                    "src/service.py": "SERVICE_MODE=stable\n",
-                    "reports/branch.txt": "branch cleanup/stable-ready removes tmp/debug.log\n",
-                    "reports/review.txt": "review packet complete with config/base.env preserved\n",
-                },
-                capability="repo_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "repo_chore",
-                    "requires_retrieval": True,
-                    "source_task": "repo_cleanup_review_task",
-                    "distractor_tasks": ["repo_patch_review_task"],
-                    "semantic_verifier": {
-                        "kind": "repo_chore_review",
-                        "report_rules": [
-                            {
-                                "path": "reports/branch.txt",
-                                "must_mention": ["branch", "cleanup", "stable"],
-                                "covers": ["tmp/debug.log"],
-                            },
-                            {
-                                "path": "reports/review.txt",
-                                "must_mention": ["review", "complete", "preserved"],
-                                "covers": ["config/base.env"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_repo_status_review_task": self._task(
-                task_id="git_repo_status_review_task",
-                prompt=(
-                    "In this git repo sandbox, create branch review/status-ready, update src/app.py to contain "
-                    "STATUS=ready, update tests/status_check.txt to contain status ready covered, run the local "
-                    "status check script, create reports/diff_summary.txt describing the changed repo paths, and "
-                    "create reports/test_report.txt containing status check passed."
-                ),
-                workspace_subdir="git_repo_status_review_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'repo context\\n' > docs/context.md && printf 'STATUS=pending\\n' > src/app.py && printf 'status pending covered\\n' > tests/status_check.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^STATUS=ready$\" src/app.py\\ngrep -q \"^status ready covered$\" tests/status_check.txt\\n' > tests/check_status.sh && chmod +x tests/check_status.sh && git init && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/context.md src/app.py tests/status_check.txt tests/check_status.sh && git commit -m 'baseline repo sandbox'",
-                ],
-                suggested_commands=[
-                    "git checkout -b review/status-ready && mkdir -p reports && printf 'STATUS=ready\n' > src/app.py && printf 'status ready covered\n' > tests/status_check.txt && tests/check_status.sh && printf 'updated src/app.py, tests/status_check.txt, reports/diff_summary.txt, and reports/test_report.txt on branch review/status-ready\n' > reports/diff_summary.txt && printf 'status check passed\n' > reports/test_report.txt",
-                    "git branch --show-current",
-                    "git diff --name-only --relative",
-                    "cat reports/test_report.txt",
-                ],
-                success_command=(
-                    "git branch --show-current | grep -q '^review/status-ready$' && "
-                    "test -f reports/test_report.txt && grep -q '^status check passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/context.md",
-                    "src/app.py",
-                    "tests/status_check.txt",
-                    "tests/check_status.sh",
-                    "reports/diff_summary.txt",
-                    "reports/test_report.txt",
-                ],
-                expected_file_contents={
-                    "docs/context.md": "repo context\n",
-                    "src/app.py": "STATUS=ready\n",
-                    "tests/status_check.txt": "status ready covered\n",
-                    "reports/test_report.txt": "status check passed\n",
-                },
-                capability="repo_environment",
-                difficulty="git_workflow",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "workflow_guard": {
-                        "requires_git": True,
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "review/status-ready",
-                        "expected_changed_paths": [
-                            "reports/diff_summary.txt",
-                            "reports/test_report.txt",
-                            "src/app.py",
-                            "tests/status_check.txt",
-                        ],
-                        "preserved_paths": ["docs/context.md", "tests/check_status.sh"],
-                        "test_commands": [
-                            {
-                                "label": "status check script",
-                                "argv": ["tests/check_status.sh"],
-                            }
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["updated", "review/status-ready"],
-                                "covers": [
-                                    "src/app.py",
-                                    "tests/status_check.txt",
-                                    "reports/test_report.txt",
-                                ],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["status", "check", "passed"],
-                                "covers": ["tests/check_status.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_repo_status_review_retrieval_task": self._task(
-                task_id="git_repo_status_review_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical git repo sandbox review workflow from earlier tasks: create the "
-                    "review/status-ready branch, make the status-ready repo changes, run the local status check, "
-                    "and emit the diff and test reports."
-                ),
-                workspace_subdir="git_repo_status_review_retrieval_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'repo context\\n' > docs/context.md && printf 'STATUS=pending\\n' > src/app.py && printf 'status pending covered\\n' > tests/status_check.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^STATUS=ready$\" src/app.py\\ngrep -q \"^status ready covered$\" tests/status_check.txt\\n' > tests/check_status.sh && chmod +x tests/check_status.sh && git init && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/context.md src/app.py tests/status_check.txt tests/check_status.sh && git commit -m 'baseline repo sandbox'",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "git branch --show-current | grep -q '^review/status-ready$' && "
-                    "test -f reports/test_report.txt && grep -q '^status check passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/context.md",
-                    "src/app.py",
-                    "tests/status_check.txt",
-                    "tests/check_status.sh",
-                    "reports/diff_summary.txt",
-                    "reports/test_report.txt",
-                ],
-                expected_file_contents={
-                    "docs/context.md": "repo context\n",
-                    "src/app.py": "STATUS=ready\n",
-                    "tests/status_check.txt": "status ready covered\n",
-                    "reports/test_report.txt": "status check passed\n",
-                },
-                capability="repo_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "requires_retrieval": True,
-                    "source_task": "git_repo_status_review_task",
-                    "workflow_guard": {
-                        "requires_git": True,
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "review/status-ready",
-                        "expected_changed_paths": [
-                            "reports/diff_summary.txt",
-                            "reports/test_report.txt",
-                            "src/app.py",
-                            "tests/status_check.txt",
-                        ],
-                        "preserved_paths": ["docs/context.md", "tests/check_status.sh"],
-                        "test_commands": [
-                            {
-                                "label": "status check script",
-                                "argv": ["tests/check_status.sh"],
-                            }
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["updated", "review/status-ready"],
-                                "covers": [
-                                    "src/app.py",
-                                    "tests/status_check.txt",
-                                    "reports/test_report.txt",
-                                ],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["status", "check", "passed"],
-                                "covers": ["tests/check_status.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_repo_test_repair_task": self._task(
-                task_id="git_repo_test_repair_task",
-                prompt=(
-                    "In this git repo sandbox, create branch fix/release-ready, repair the failing deterministic "
-                    "release test by updating src/release_state.txt to RELEASE_STATUS=ready, run the local release "
-                    "test script, and create reports/diff_summary.txt and reports/test_report.txt describing the "
-                    "accepted repair."
-                ),
-                workspace_subdir="git_repo_test_repair_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'release notes preserved\\n' > docs/notes.md && printf 'RELEASE_STATUS=broken\\n' > src/release_state.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^RELEASE_STATUS=ready$\" src/release_state.txt\\n' > tests/test_release.sh && chmod +x tests/test_release.sh && git init && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/notes.md src/release_state.txt tests/test_release.sh && git commit -m 'baseline failing release test'",
-                ],
-                suggested_commands=[
-                    "git checkout -b fix/release-ready && mkdir -p reports && printf 'RELEASE_STATUS=ready\n' > src/release_state.txt && tests/test_release.sh && printf 'repaired failing deterministic release test by updating src/release_state.txt on branch fix/release-ready\n' > reports/diff_summary.txt && printf 'release test passed\n' > reports/test_report.txt",
-                    "git branch --show-current",
-                    "git diff --name-only --relative",
-                    "cat reports/test_report.txt",
-                ],
-                success_command=(
-                    "git branch --show-current | grep -q '^fix/release-ready$' && "
-                    "test -f reports/test_report.txt && grep -q '^release test passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/notes.md",
-                    "src/release_state.txt",
-                    "tests/test_release.sh",
-                    "reports/diff_summary.txt",
-                    "reports/test_report.txt",
-                ],
-                expected_file_contents={
-                    "docs/notes.md": "release notes preserved\n",
-                    "src/release_state.txt": "RELEASE_STATUS=ready\n",
-                    "reports/test_report.txt": "release test passed\n",
-                },
-                capability="repo_environment",
-                difficulty="git_test_repair",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "workflow_guard": {
-                        "requires_git": True,
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "fix/release-ready",
-                        "expected_changed_paths": [
-                            "reports/diff_summary.txt",
-                            "reports/test_report.txt",
-                            "src/release_state.txt",
-                        ],
-                        "preserved_paths": ["docs/notes.md", "tests/test_release.sh"],
-                        "test_commands": [
-                            {
-                                "label": "release test script",
-                                "argv": ["tests/test_release.sh"],
-                            }
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["repaired", "failing", "fix/release-ready"],
-                                "covers": ["src/release_state.txt", "reports/test_report.txt"],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["release", "test", "passed"],
-                                "covers": ["tests/test_release.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_repo_test_repair_retrieval_task": self._task(
-                task_id="git_repo_test_repair_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical git repo sandbox repair workflow from earlier tasks: create the "
-                    "fix/release-ready branch, repair the failing deterministic release test, run the local "
-                    "release test script, and emit the diff and test reports."
-                ),
-                workspace_subdir="git_repo_test_repair_retrieval_task",
-                setup_commands=[
-                    "mkdir -p docs src tests && printf 'release notes preserved\\n' > docs/notes.md && printf 'RELEASE_STATUS=broken\\n' > src/release_state.txt && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^RELEASE_STATUS=ready$\" src/release_state.txt\\n' > tests/test_release.sh && chmod +x tests/test_release.sh && git init && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/notes.md src/release_state.txt tests/test_release.sh && git commit -m 'baseline failing release test'",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "git branch --show-current | grep -q '^fix/release-ready$' && "
-                    "test -f reports/test_report.txt && grep -q '^release test passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/notes.md",
-                    "src/release_state.txt",
-                    "tests/test_release.sh",
-                    "reports/diff_summary.txt",
-                    "reports/test_report.txt",
-                ],
-                expected_file_contents={
-                    "docs/notes.md": "release notes preserved\n",
-                    "src/release_state.txt": "RELEASE_STATUS=ready\n",
-                    "reports/test_report.txt": "release test passed\n",
-                },
-                capability="repo_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "requires_retrieval": True,
-                    "source_task": "git_repo_test_repair_task",
-                    "workflow_guard": {
-                        "requires_git": True,
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "fix/release-ready",
-                        "expected_changed_paths": [
-                            "reports/diff_summary.txt",
-                            "reports/test_report.txt",
-                            "src/release_state.txt",
-                        ],
-                        "preserved_paths": ["docs/notes.md", "tests/test_release.sh"],
-                        "test_commands": [
-                            {
-                                "label": "release test script",
-                                "argv": ["tests/test_release.sh"],
-                            }
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/diff_summary.txt",
-                                "must_mention": ["repaired", "failing", "fix/release-ready"],
-                                "covers": ["src/release_state.txt", "reports/test_report.txt"],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["release", "test", "passed"],
-                                "covers": ["tests/test_release.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_parallel_worker_api_task": self._task(
-                task_id="git_parallel_worker_api_task",
-                prompt=(
-                    "In the shared repo sandbox on branch worker/api-status, update src/api_status.txt to "
-                    "API_STATUS=ready, run the api suite, and commit the branch without touching any other "
-                    "worker-owned paths."
-                ),
-                workspace_subdir="git_parallel_worker_api_task",
-                setup_commands=[],
-                suggested_commands=[
-                    "printf 'API_STATUS=ready\n' > src/api_status.txt && tests/test_api.sh && git add src/api_status.txt && git commit -m 'worker api status ready'",
-                    "git branch --show-current",
-                    "git diff --name-only --relative origin/main..HEAD",
-                ],
-                success_command="git branch --show-current",
-                expected_files=[
-                    "docs/status.md",
-                    "src/api_status.txt",
-                    "tests/test_api.sh",
-                    "tests/test_docs.sh",
-                ],
-                expected_file_contents={
-                    "docs/status.md": "status pending documented\n",
-                    "src/api_status.txt": "API_STATUS=ready\n",
-                },
-                capability="repo_environment",
-                difficulty="git_worker_branch",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "shared_repo_order": 0,
-                    "shared_repo_bootstrap_commands": [
-                        "mkdir -p docs src tests && printf 'API_STATUS=pending\\n' > src/api_status.txt && printf 'status pending documented\\n' > docs/status.md && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^API_STATUS=ready$\" src/api_status.txt\\n' > tests/test_api.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^status ready documented$\" docs/status.md\\n' > tests/test_docs.sh && chmod +x tests/test_api.sh tests/test_docs.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/status.md src/api_status.txt tests/test_api.sh tests/test_docs.sh && git commit -m 'baseline parallel sandbox' && git tag baseline",
-                    ],
-                    "shared_repo_bootstrap_managed_paths": [
-                        "docs/status.md",
-                        "src/api_status.txt",
-                        "tests/test_api.sh",
-                        "tests/test_docs.sh",
-                    ],
-                    "workflow_guard": {
-                        "requires_git": True,
-                        "shared_repo_id": "repo_sandbox_parallel_merge",
-                        "target_branch": "main",
-                        "worker_branch": "worker/api-status",
-                        "claimed_paths": ["src/api_status.txt"],
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "worker/api-status",
-                        "diff_base_ref": "origin/main",
-                        "expected_changed_paths": ["src/api_status.txt"],
-                        "preserved_paths": ["docs/status.md", "tests/test_api.sh", "tests/test_docs.sh"],
-                        "clean_worktree": True,
-                        "test_commands": [
-                            {
-                                "label": "api suite",
-                                "argv": ["tests/test_api.sh"],
-                            }
-                        ],
-                    },
-                },
-            ),
-            "git_parallel_worker_docs_task": self._task(
-                task_id="git_parallel_worker_docs_task",
-                prompt=(
-                    "In the shared repo sandbox on branch worker/docs-status, update docs/status.md to "
-                    "status ready documented, run the docs suite, and commit the branch without touching any "
-                    "other worker-owned paths."
-                ),
-                workspace_subdir="git_parallel_worker_docs_task",
-                setup_commands=[],
-                suggested_commands=[
-                    "printf 'status ready documented\n' > docs/status.md && tests/test_docs.sh && git add docs/status.md && git commit -m 'worker docs status ready'",
-                    "git branch --show-current",
-                    "git diff --name-only --relative origin/main..HEAD",
-                ],
-                success_command="git branch --show-current",
-                expected_files=[
-                    "docs/status.md",
-                    "src/api_status.txt",
-                    "tests/test_api.sh",
-                    "tests/test_docs.sh",
-                ],
-                expected_file_contents={
-                    "docs/status.md": "status ready documented\n",
-                    "src/api_status.txt": "API_STATUS=pending\n",
-                },
-                capability="repo_environment",
-                difficulty="git_worker_branch",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "shared_repo_order": 0,
-                    "shared_repo_bootstrap_commands": [
-                        "mkdir -p docs src tests && printf 'API_STATUS=pending\\n' > src/api_status.txt && printf 'status pending documented\\n' > docs/status.md && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^API_STATUS=ready$\" src/api_status.txt\\n' > tests/test_api.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^status ready documented$\" docs/status.md\\n' > tests/test_docs.sh && chmod +x tests/test_api.sh tests/test_docs.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/status.md src/api_status.txt tests/test_api.sh tests/test_docs.sh && git commit -m 'baseline parallel sandbox' && git tag baseline",
-                    ],
-                    "shared_repo_bootstrap_managed_paths": [
-                        "docs/status.md",
-                        "src/api_status.txt",
-                        "tests/test_api.sh",
-                        "tests/test_docs.sh",
-                    ],
-                    "workflow_guard": {
-                        "requires_git": True,
-                        "shared_repo_id": "repo_sandbox_parallel_merge",
-                        "target_branch": "main",
-                        "worker_branch": "worker/docs-status",
-                        "claimed_paths": ["docs/status.md"],
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "worker/docs-status",
-                        "diff_base_ref": "origin/main",
-                        "expected_changed_paths": ["docs/status.md"],
-                        "preserved_paths": ["src/api_status.txt", "tests/test_api.sh", "tests/test_docs.sh"],
-                        "clean_worktree": True,
-                        "test_commands": [
-                            {
-                                "label": "docs suite",
-                                "argv": ["tests/test_docs.sh"],
-                            }
-                        ],
-                    },
-                },
-            ),
-            "git_parallel_merge_acceptance_task": self._task(
-                task_id="git_parallel_merge_acceptance_task",
-                prompt=(
-                    "In this shared git repo sandbox, accept worker/api-status and worker/docs-status into main "
-                    "without collisions, run the api and docs suites, and record the accepted merge packet."
-                ),
-                workspace_subdir="git_parallel_merge_acceptance_task",
-                setup_commands=[],
-                suggested_commands=[
-                    "git merge --no-ff worker/api-status -m 'merge worker/api-status' && git merge --no-ff worker/docs-status -m 'merge worker/docs-status' && tests/test_api.sh && tests/test_docs.sh && mkdir -p reports && printf 'accepted worker/api-status for src/api_status.txt and worker/docs-status for docs/status.md into main without collisions\n' > reports/merge_report.txt && printf 'api suite passed; docs suite passed\n' > reports/test_report.txt && git add reports/merge_report.txt reports/test_report.txt && git commit -m 'record merge acceptance reports'",
-                    "git branch --show-current",
-                    "git diff --name-only --relative baseline..HEAD",
-                    "cat reports/test_report.txt",
-                ],
-                success_command=(
-                    "test -f reports/test_report.txt && "
-                    "grep -q '^api suite passed; docs suite passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/status.md",
-                    "src/api_status.txt",
-                    "tests/test_api.sh",
-                    "tests/test_docs.sh",
-                    "reports/merge_report.txt",
-                    "reports/test_report.txt",
-                ],
-                expected_file_contents={
-                    "docs/status.md": "status ready documented\n",
-                    "src/api_status.txt": "API_STATUS=ready\n",
-                    "reports/merge_report.txt": (
-                        "accepted worker/api-status for src/api_status.txt and worker/docs-status for "
-                        "docs/status.md into main without collisions\n"
-                    ),
-                    "reports/test_report.txt": "api suite passed; docs suite passed\n",
-                },
-                capability="repo_environment",
-                difficulty="git_parallel_merge",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "shared_repo_order": 1,
-                    "shared_repo_bootstrap_commands": [
-                        "mkdir -p docs src tests && printf 'API_STATUS=pending\\n' > src/api_status.txt && printf 'status pending documented\\n' > docs/status.md && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^API_STATUS=ready$\" src/api_status.txt\\n' > tests/test_api.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^status ready documented$\" docs/status.md\\n' > tests/test_docs.sh && chmod +x tests/test_api.sh tests/test_docs.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/status.md src/api_status.txt tests/test_api.sh tests/test_docs.sh && git commit -m 'baseline parallel sandbox' && git tag baseline",
-                    ],
-                    "shared_repo_bootstrap_managed_paths": [
-                        "docs/status.md",
-                        "src/api_status.txt",
-                        "tests/test_api.sh",
-                        "tests/test_docs.sh",
-                    ],
-                    "workflow_guard": {
-                        "requires_git": True,
-                        "shared_repo_id": "repo_sandbox_parallel_merge",
-                        "target_branch": "main",
-                        "claimed_paths": [
-                            "docs/status.md",
-                            "src/api_status.txt",
-                            "reports/merge_report.txt",
-                            "reports/test_report.txt",
-                        ],
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "main",
-                        "diff_base_ref": "baseline",
-                        "required_merged_branches": ["worker/api-status", "worker/docs-status"],
-                        "expected_changed_paths": [
-                            "docs/status.md",
-                            "reports/merge_report.txt",
-                            "reports/test_report.txt",
-                            "src/api_status.txt",
-                        ],
-                        "preserved_paths": ["tests/test_api.sh", "tests/test_docs.sh"],
-                        "clean_worktree": True,
-                        "test_commands": [
-                            {
-                                "label": "api suite",
-                                "argv": ["tests/test_api.sh"],
-                            },
-                            {
-                                "label": "docs suite",
-                                "argv": ["tests/test_docs.sh"],
-                            },
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/merge_report.txt",
-                                "must_mention": ["accepted", "without collisions", "main"],
-                                "covers": ["src/api_status.txt", "docs/status.md"],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["api", "docs", "passed"],
-                                "covers": ["tests/test_api.sh", "tests/test_docs.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "git_conflict_worker_status_task": self._task(
-                task_id="git_conflict_worker_status_task",
-                prompt=(
-                    "In the shared repo sandbox on branch worker/status-refresh, update src/shared_status.txt to "
-                    "SERVICE_STATUS=worker-ready, run the worker refresh suite, and commit the branch."
-                ),
-                workspace_subdir="git_conflict_worker_status_task",
-                setup_commands=[],
-                suggested_commands=[
-                    "printf 'SERVICE_STATUS=worker-ready\n' > src/shared_status.txt && tests/test_worker_refresh.sh && git add src/shared_status.txt && git commit -m 'worker status refresh'",
-                    "git branch --show-current",
-                    "git diff --name-only --relative origin/main..HEAD",
-                ],
-                success_command="git branch --show-current",
-                expected_files=[
-                    "docs/notes.md",
-                    "scripts/generate_bundle.sh",
-                    "src/shared_status.txt",
-                    "tests/test_worker_refresh.sh",
-                    "tests/test_service.sh",
-                    "tests/test_bundle.sh",
-                ],
-                expected_file_contents={
-                    "docs/notes.md": "notes pending\n",
-                    "src/shared_status.txt": "SERVICE_STATUS=worker-ready\n",
-                },
-                capability="repo_environment",
-                difficulty="git_worker_branch",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "shared_repo_order": 0,
-                    "shared_repo_bootstrap_commands": [
-                        "mkdir -p docs scripts src tests && printf 'SERVICE_STATUS=baseline\\n' > src/shared_status.txt && printf 'notes pending\\n' > docs/notes.md && printf '#!/bin/sh\\nset -eu\\nmkdir -p dist\\ncat src/shared_status.txt docs/notes.md > dist/status_bundle.txt\\n' > scripts/generate_bundle.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=worker-ready$\" src/shared_status.txt\\n' > tests/test_worker_refresh.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=resolved$\" src/shared_status.txt\\n' > tests/test_service.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=resolved$\" dist/status_bundle.txt\\ngrep -q \"^notes ready$\" dist/status_bundle.txt\\n' > tests/test_bundle.sh && chmod +x scripts/generate_bundle.sh tests/test_worker_refresh.sh tests/test_service.sh tests/test_bundle.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/notes.md scripts/generate_bundle.sh src/shared_status.txt tests/test_worker_refresh.sh tests/test_service.sh tests/test_bundle.sh && git commit -m 'baseline generated sandbox' && git tag baseline",
-                    ],
-                    "shared_repo_bootstrap_managed_paths": [
-                        "docs/notes.md",
-                        "scripts/generate_bundle.sh",
-                        "src/shared_status.txt",
-                        "tests/test_worker_refresh.sh",
-                        "tests/test_service.sh",
-                        "tests/test_bundle.sh",
-                    ],
-                    "workflow_guard": {
-                        "requires_git": True,
-                        "shared_repo_id": "repo_sandbox_generated_conflict",
-                        "target_branch": "main",
-                        "worker_branch": "worker/status-refresh",
-                        "claimed_paths": ["src/shared_status.txt"],
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "worker/status-refresh",
-                        "diff_base_ref": "origin/main",
-                        "expected_changed_paths": ["src/shared_status.txt"],
-                        "preserved_paths": [
-                            "docs/notes.md",
-                            "scripts/generate_bundle.sh",
-                            "tests/test_worker_refresh.sh",
-                            "tests/test_service.sh",
-                            "tests/test_bundle.sh",
-                        ],
-                        "clean_worktree": True,
-                        "test_commands": [
-                            {
-                                "label": "worker refresh suite",
-                                "argv": ["tests/test_worker_refresh.sh"],
-                            }
-                        ],
-                    },
-                },
-            ),
-            "git_generated_conflict_resolution_task": self._task(
-                task_id="git_generated_conflict_resolution_task",
-                prompt=(
-                    "In this shared git repo sandbox, update main so worker/status-refresh conflicts on "
-                    "src/shared_status.txt, resolve that conflict before acceptance, regenerate dist/status_bundle.txt, "
-                    "run the selected service and bundle suites, and record the accepted merge packet."
-                ),
-                workspace_subdir="git_generated_conflict_resolution_task",
-                setup_commands=[],
-                suggested_commands=[
-                    "printf 'SERVICE_STATUS=mainline-ready\n' > src/shared_status.txt && git add src/shared_status.txt && git commit -m 'mainline status change' && git merge -X theirs --no-ff worker/status-refresh -m 'merge worker/status-refresh' && printf 'SERVICE_STATUS=resolved\n' > src/shared_status.txt && printf 'notes ready\n' > docs/notes.md && scripts/generate_bundle.sh && tests/test_service.sh && tests/test_bundle.sh && mkdir -p reports && printf 'resolved worker/status-refresh merge conflict on src/shared_status.txt before acceptance into main\n' > reports/merge_report.txt && printf 'service suite passed; bundle suite passed\n' > reports/test_report.txt && git add docs/notes.md dist/status_bundle.txt reports/merge_report.txt reports/test_report.txt src/shared_status.txt && git commit -m 'resolve merge conflict and regenerate bundle'",
-                    "git branch --show-current",
-                    "git diff --name-only --relative baseline..HEAD",
-                    "cat reports/test_report.txt",
-                ],
-                success_command=(
-                    "test -f reports/test_report.txt && "
-                    "grep -q '^service suite passed; bundle suite passed$' reports/test_report.txt"
-                ),
-                expected_files=[
-                    "docs/notes.md",
-                    "dist/status_bundle.txt",
-                    "reports/merge_report.txt",
-                    "reports/test_report.txt",
-                    "scripts/generate_bundle.sh",
-                    "src/shared_status.txt",
-                    "tests/test_worker_refresh.sh",
-                    "tests/test_bundle.sh",
-                    "tests/test_service.sh",
-                ],
-                expected_file_contents={
-                    "docs/notes.md": "notes ready\n",
-                    "dist/status_bundle.txt": "SERVICE_STATUS=resolved\nnotes ready\n",
-                    "reports/merge_report.txt": (
-                        "resolved worker/status-refresh merge conflict on src/shared_status.txt before "
-                        "acceptance into main\n"
-                    ),
-                    "reports/test_report.txt": "service suite passed; bundle suite passed\n",
-                    "src/shared_status.txt": "SERVICE_STATUS=resolved\n",
-                },
-                capability="repo_environment",
-                difficulty="git_conflict_resolution",
-                metadata={
-                    "benchmark_family": "repo_sandbox",
-                    "requires_git": True,
-                    "shared_repo_order": 1,
-                    "shared_repo_bootstrap_commands": [
-                        "mkdir -p docs scripts src tests && printf 'SERVICE_STATUS=baseline\\n' > src/shared_status.txt && printf 'notes pending\\n' > docs/notes.md && printf '#!/bin/sh\\nset -eu\\nmkdir -p dist\\ncat src/shared_status.txt docs/notes.md > dist/status_bundle.txt\\n' > scripts/generate_bundle.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=worker-ready$\" src/shared_status.txt\\n' > tests/test_worker_refresh.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=resolved$\" src/shared_status.txt\\n' > tests/test_service.sh && printf '#!/bin/sh\\nset -eu\\ngrep -q \"^SERVICE_STATUS=resolved$\" dist/status_bundle.txt\\ngrep -q \"^notes ready$\" dist/status_bundle.txt\\n' > tests/test_bundle.sh && chmod +x scripts/generate_bundle.sh tests/test_worker_refresh.sh tests/test_service.sh tests/test_bundle.sh && git init && git checkout -b main && git config user.email agent@example.com && git config user.name 'Agent Kernel' && git add docs/notes.md scripts/generate_bundle.sh src/shared_status.txt tests/test_worker_refresh.sh tests/test_service.sh tests/test_bundle.sh && git commit -m 'baseline generated sandbox' && git tag baseline",
-                    ],
-                    "shared_repo_bootstrap_managed_paths": [
-                        "docs/notes.md",
-                        "scripts/generate_bundle.sh",
-                        "src/shared_status.txt",
-                        "tests/test_worker_refresh.sh",
-                        "tests/test_service.sh",
-                        "tests/test_bundle.sh",
-                    ],
-                    "workflow_guard": {
-                        "requires_git": True,
-                        "touches_generated_paths": True,
-                        "shared_repo_id": "repo_sandbox_generated_conflict",
-                        "target_branch": "main",
-                        "claimed_paths": [
-                            "docs/notes.md",
-                            "dist/status_bundle.txt",
-                            "reports/merge_report.txt",
-                            "reports/test_report.txt",
-                            "src/shared_status.txt",
-                        ],
-                    },
-                    "semantic_verifier": {
-                        "kind": "git_repo_review",
-                        "expected_branch": "main",
-                        "diff_base_ref": "baseline",
-                        "required_merged_branches": ["worker/status-refresh"],
-                        "expected_changed_paths": [
-                            "docs/notes.md",
-                            "dist/status_bundle.txt",
-                            "reports/merge_report.txt",
-                            "reports/test_report.txt",
-                            "src/shared_status.txt",
-                        ],
-                        "generated_paths": ["dist/status_bundle.txt"],
-                        "resolved_conflict_paths": ["src/shared_status.txt"],
-                        "preserved_paths": [
-                            "scripts/generate_bundle.sh",
-                            "tests/test_worker_refresh.sh",
-                            "tests/test_bundle.sh",
-                            "tests/test_service.sh",
-                        ],
-                        "clean_worktree": True,
-                        "test_commands": [
-                            {
-                                "label": "service suite",
-                                "argv": ["tests/test_service.sh"],
-                            },
-                            {
-                                "label": "bundle suite",
-                                "argv": ["tests/test_bundle.sh"],
-                            },
-                        ],
-                        "report_rules": [
-                            {
-                                "path": "reports/merge_report.txt",
-                                "must_mention": ["resolved", "merge conflict", "main"],
-                                "covers": ["src/shared_status.txt"],
-                            },
-                            {
-                                "path": "reports/test_report.txt",
-                                "must_mention": ["service", "bundle", "passed"],
-                                "covers": ["tests/test_service.sh", "tests/test_bundle.sh"],
-                            },
-                        ],
-                    },
-                },
-            ),
-            "api_contract_task": self._task(
-                task_id="api_contract_task",
-                prompt=(
-                    "Prepare the API contract bundle: preserve requests/template.http, create api/request.json "
-                    "containing {\"route\": \"/health\", \"method\": \"GET\"}, and create responses/expected.json "
-                    "containing {\"status\": \"ok\"}."
-                ),
-                workspace_subdir="api_contract_task",
-                setup_commands=[
-                    "mkdir -p requests && printf 'GET /template\\n' > requests/template.http",
-                ],
-                suggested_commands=[
-                    "mkdir -p api responses && printf '{\"route\": \"/health\", \"method\": \"GET\"}\n' > api/request.json && printf '{\"status\": \"ok\"}\n' > responses/expected.json",
-                    "cat api/request.json",
-                    "cat responses/expected.json",
-                ],
-                success_command=(
-                    "test -f requests/template.http && grep -q '^GET /template$' requests/template.http && "
-                    "test -f api/request.json && grep -q '^{\"route\": \"/health\", \"method\": \"GET\"}$' api/request.json && "
-                    "test -f responses/expected.json && grep -q '^{\"status\": \"ok\"}$' responses/expected.json"
-                ),
-                expected_files=["requests/template.http", "api/request.json", "responses/expected.json"],
-                expected_file_contents={
-                    "requests/template.http": "GET /template\n",
-                    "api/request.json": "{\"route\": \"/health\", \"method\": \"GET\"}\n",
-                    "responses/expected.json": "{\"status\": \"ok\"}\n",
-                },
-                capability="tool_environment",
-                difficulty="cross_tool",
-                metadata={"benchmark_family": "tooling"},
-            ),
-            "api_contract_retrieval_task": self._task(
-                task_id="api_contract_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical API contract procedure from earlier tasks: preserve the request template, "
-                    "write the health request payload, and create the expected ok response."
-                ),
-                workspace_subdir="api_contract_retrieval_task",
-                setup_commands=[
-                    "mkdir -p requests && printf 'GET /template\\n' > requests/template.http",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f requests/template.http && grep -q '^GET /template$' requests/template.http && "
-                    "test -f api/request.json && grep -q '^{\"route\": \"/health\", \"method\": \"GET\"}$' api/request.json && "
-                    "test -f responses/expected.json && grep -q '^{\"status\": \"ok\"}$' responses/expected.json"
-                ),
-                expected_files=["requests/template.http", "api/request.json", "responses/expected.json"],
-                expected_file_contents={
-                    "requests/template.http": "GET /template\n",
-                    "api/request.json": "{\"route\": \"/health\", \"method\": \"GET\"}\n",
-                    "responses/expected.json": "{\"status\": \"ok\"}\n",
-                },
-                capability="tool_environment",
-                difficulty="cross_tool",
-                metadata={
-                    "benchmark_family": "tooling",
-                    "requires_retrieval": True,
-                    "source_task": "api_contract_task",
-                },
-            ),
-            "cli_exchange_task": self._task(
-                task_id="cli_exchange_task",
-                prompt=(
-                    "Prepare the CLI exchange bundle: preserve prompts/base.txt, create commands/run.sh containing "
-                    "echo tool ready, and create outputs/result.txt containing tool output ready."
-                ),
-                workspace_subdir="cli_exchange_task",
-                setup_commands=[
-                    "mkdir -p prompts && printf 'base prompt\\n' > prompts/base.txt",
-                ],
-                suggested_commands=[
-                    "mkdir -p commands outputs && printf 'echo tool ready\n' > commands/run.sh && printf 'tool output ready\n' > outputs/result.txt",
-                    "cat commands/run.sh",
-                    "cat outputs/result.txt",
-                ],
-                success_command=(
-                    "test -f prompts/base.txt && grep -q '^base prompt$' prompts/base.txt && "
-                    "test -f commands/run.sh && grep -q '^echo tool ready$' commands/run.sh && "
-                    "test -f outputs/result.txt && grep -q '^tool output ready$' outputs/result.txt"
-                ),
-                expected_files=["prompts/base.txt", "commands/run.sh", "outputs/result.txt"],
-                expected_file_contents={
-                    "prompts/base.txt": "base prompt\n",
-                    "commands/run.sh": "echo tool ready\n",
-                    "outputs/result.txt": "tool output ready\n",
-                },
-                capability="tool_environment",
-                difficulty="cross_tool",
-                metadata={"benchmark_family": "tooling"},
-            ),
-            "cli_exchange_retrieval_task": self._task(
-                task_id="cli_exchange_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical CLI exchange procedure from earlier tasks: preserve the base prompt, "
-                    "write the run script, and create the ready output artifact."
-                ),
-                workspace_subdir="cli_exchange_retrieval_task",
-                setup_commands=[
-                    "mkdir -p prompts && printf 'base prompt\\n' > prompts/base.txt",
-                ],
-                suggested_commands=[],
-                success_command=(
-                    "test -f prompts/base.txt && grep -q '^base prompt$' prompts/base.txt && "
-                    "test -f commands/run.sh && grep -q '^echo tool ready$' commands/run.sh && "
-                    "test -f outputs/result.txt && grep -q '^tool output ready$' outputs/result.txt"
-                ),
-                expected_files=["prompts/base.txt", "commands/run.sh", "outputs/result.txt"],
-                expected_file_contents={
-                    "prompts/base.txt": "base prompt\n",
-                    "commands/run.sh": "echo tool ready\n",
-                    "outputs/result.txt": "tool output ready\n",
-                },
-                capability="tool_environment",
-                difficulty="cross_tool",
-                metadata={
-                    "benchmark_family": "tooling",
-                    "requires_retrieval": True,
-                    "source_task": "cli_exchange_task",
-                },
-            ),
-            "service_mesh_task": self._task(
-                task_id="service_mesh_task",
-                prompt=(
-                    "Prepare the integration workspace: create gateway/routes.txt containing routes synced, "
-                    "create services/api.env containing API_VERSION=v2 and QUEUE_ENABLED=yes, and create "
-                    "reports/health.txt containing integration green."
-                ),
-                workspace_subdir="service_mesh_task",
-                suggested_commands=[
-                    "mkdir -p gateway services reports && printf 'routes synced\n' > gateway/routes.txt && printf 'API_VERSION=v2\nQUEUE_ENABLED=yes\n' > services/api.env && printf 'integration green\n' > reports/health.txt",
-                    "cat gateway/routes.txt",
-                    "cat services/api.env",
-                    "cat reports/health.txt",
-                ],
-                success_command=(
-                    "test -f gateway/routes.txt && grep -q '^routes synced$' gateway/routes.txt && "
-                    "test -f services/api.env && grep -q '^API_VERSION=v2$' services/api.env && "
-                    "grep -q '^QUEUE_ENABLED=yes$' services/api.env && "
-                    "test -f reports/health.txt && grep -q '^integration green$' reports/health.txt"
-                ),
-                expected_files=["gateway/routes.txt", "services/api.env", "reports/health.txt"],
-                expected_file_contents={
-                    "gateway/routes.txt": "routes synced\n",
-                    "services/api.env": "API_VERSION=v2\nQUEUE_ENABLED=yes\n",
-                    "reports/health.txt": "integration green\n",
-                },
-                capability="integration_environment",
-                difficulty="multi_system",
-                metadata={"benchmark_family": "integration"},
-            ),
-            "incident_matrix_task": self._task(
-                task_id="incident_matrix_task",
-                prompt=(
-                    "Prepare the incident integration bundle: create alerts/open.txt containing incident triaged, "
-                    "create runbook/steps.txt containing rollback queued, and create summary/owner.txt containing "
-                    "owner platform."
-                ),
-                workspace_subdir="incident_matrix_task",
-                suggested_commands=[
-                    "mkdir -p alerts runbook summary && printf 'incident triaged\n' > alerts/open.txt && printf 'rollback queued\n' > runbook/steps.txt && printf 'owner platform\n' > summary/owner.txt",
-                    "cat alerts/open.txt",
-                    "cat runbook/steps.txt",
-                    "cat summary/owner.txt",
-                ],
-                success_command=(
-                    "test -f alerts/open.txt && grep -q '^incident triaged$' alerts/open.txt && "
-                    "test -f runbook/steps.txt && grep -q '^rollback queued$' runbook/steps.txt && "
-                    "test -f summary/owner.txt && grep -q '^owner platform$' summary/owner.txt"
-                ),
-                expected_files=["alerts/open.txt", "runbook/steps.txt", "summary/owner.txt"],
-                expected_file_contents={
-                    "alerts/open.txt": "incident triaged\n",
-                    "runbook/steps.txt": "rollback queued\n",
-                    "summary/owner.txt": "owner platform\n",
-                },
-                capability="integration_environment",
-                difficulty="multi_system",
-                metadata={"benchmark_family": "integration"},
-            ),
-            "service_mesh_retrieval_task": self._task(
-                task_id="service_mesh_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical integration mesh procedure from earlier tasks: sync the gateway routes, "
-                    "write the API integration env, and mark the health report green."
-                ),
-                workspace_subdir="service_mesh_retrieval_task",
-                suggested_commands=[],
-                success_command=(
-                    "test -f gateway/routes.txt && grep -q '^routes synced$' gateway/routes.txt && "
-                    "test -f services/api.env && grep -q '^API_VERSION=v2$' services/api.env && "
-                    "grep -q '^QUEUE_ENABLED=yes$' services/api.env && "
-                    "test -f reports/health.txt && grep -q '^integration green$' reports/health.txt"
-                ),
-                expected_files=["gateway/routes.txt", "services/api.env", "reports/health.txt"],
-                expected_file_contents={
-                    "gateway/routes.txt": "routes synced\n",
-                    "services/api.env": "API_VERSION=v2\nQUEUE_ENABLED=yes\n",
-                    "reports/health.txt": "integration green\n",
-                },
-                capability="integration_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "integration",
-                    "requires_retrieval": True,
-                    "source_task": "service_mesh_task",
-                    "distractor_tasks": ["incident_matrix_task"],
-                },
-            ),
-            "incident_matrix_retrieval_task": self._task(
-                task_id="incident_matrix_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical incident integration bundle from prior tasks: triage the alert, queue "
-                    "the rollback runbook, and assign the owner summary."
-                ),
-                workspace_subdir="incident_matrix_retrieval_task",
-                suggested_commands=[],
-                success_command=(
-                    "test -f alerts/open.txt && grep -q '^incident triaged$' alerts/open.txt && "
-                    "test -f runbook/steps.txt && grep -q '^rollback queued$' runbook/steps.txt && "
-                    "test -f summary/owner.txt && grep -q '^owner platform$' summary/owner.txt"
-                ),
-                expected_files=["alerts/open.txt", "runbook/steps.txt", "summary/owner.txt"],
-                expected_file_contents={
-                    "alerts/open.txt": "incident triaged\n",
-                    "runbook/steps.txt": "rollback queued\n",
-                    "summary/owner.txt": "owner platform\n",
-                },
-                capability="integration_environment",
-                difficulty="retrieval",
-                metadata={
-                    "benchmark_family": "integration",
-                    "requires_retrieval": True,
-                    "source_task": "incident_matrix_task",
-                    "distractor_tasks": ["service_mesh_task"],
-                },
-            ),
-            "queue_failover_task": self._task(
-                task_id="queue_failover_task",
-                prompt=(
-                    "Prepare the failover integration bundle: create queues/consumer.env containing QUEUE_MODE=failover "
-                    "and RETRIES=2, create orchestration/plan.txt containing failover staged, and create "
-                    "summary/state.txt containing recovery ready."
-                ),
-                workspace_subdir="queue_failover_task",
-                suggested_commands=[
-                    "mkdir -p queues orchestration summary && printf 'QUEUE_MODE=failover\nRETRIES=2\n' > queues/consumer.env && printf 'failover staged\n' > orchestration/plan.txt && printf 'recovery ready\n' > summary/state.txt",
-                    "cat queues/consumer.env",
-                    "cat orchestration/plan.txt",
-                    "cat summary/state.txt",
-                ],
-                success_command=(
-                    "test -f queues/consumer.env && grep -q '^QUEUE_MODE=failover$' queues/consumer.env && "
-                    "grep -q '^RETRIES=2$' queues/consumer.env && "
-                    "test -f orchestration/plan.txt && grep -q '^failover staged$' orchestration/plan.txt && "
-                    "test -f summary/state.txt && grep -q '^recovery ready$' summary/state.txt"
-                ),
-                expected_files=["queues/consumer.env", "orchestration/plan.txt", "summary/state.txt"],
-                expected_file_contents={
-                    "queues/consumer.env": "QUEUE_MODE=failover\nRETRIES=2\n",
-                    "orchestration/plan.txt": "failover staged\n",
-                    "summary/state.txt": "recovery ready\n",
-                },
-                capability="integration_environment",
-                difficulty="multi_system",
-                metadata={"benchmark_family": "integration"},
-            ),
-            "queue_failover_retrieval_task": self._task(
-                task_id="queue_failover_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical failover integration bundle from prior tasks: write the failover queue "
-                    "config, stage the orchestration plan, and mark the recovery summary ready."
-                ),
-                workspace_subdir="queue_failover_retrieval_task",
-                suggested_commands=[],
-                success_command=(
-                    "test -f queues/consumer.env && grep -q '^QUEUE_MODE=failover$' queues/consumer.env && "
-                    "grep -q '^RETRIES=2$' queues/consumer.env && "
-                    "test -f orchestration/plan.txt && grep -q '^failover staged$' orchestration/plan.txt && "
-                    "test -f summary/state.txt && grep -q '^recovery ready$' summary/state.txt"
-                ),
-                expected_files=["queues/consumer.env", "orchestration/plan.txt", "summary/state.txt"],
-                expected_file_contents={
-                    "queues/consumer.env": "QUEUE_MODE=failover\nRETRIES=2\n",
-                    "orchestration/plan.txt": "failover staged\n",
-                    "summary/state.txt": "recovery ready\n",
-                },
-                capability="integration_environment",
-                difficulty="multi_system",
-                metadata={
-                    "benchmark_family": "integration",
-                    "requires_retrieval": True,
-                    "source_task": "queue_failover_task",
-                    "distractor_tasks": ["service_mesh_task", "incident_matrix_task"],
-                },
-            ),
-            "handshake_seed_task": self._task(
-                task_id="handshake_seed_task",
-                prompt="Create handshake.txt containing the exact string kernel handshake ready.",
-                workspace_subdir="handshake_seed_task",
-                suggested_commands=[
-                    "printf 'kernel handshake ready\n' > handshake.txt",
-                    "cat handshake.txt",
-                ],
-                success_command="test -f handshake.txt && grep -q '^kernel handshake ready$' handshake.txt",
-                expected_files=["handshake.txt"],
-                expected_file_contents={"handshake.txt": "kernel handshake ready\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "handshake_retrieval_task": self._task(
-                task_id="handshake_retrieval_task",
-                prompt=(
-                    "Reproduce the canonical handshake artifact used elsewhere in this repo. "
-                    "Create the standard handshake file with the exact established phrase."
-                ),
-                workspace_subdir="handshake_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f handshake.txt && grep -q '^kernel handshake ready$' handshake.txt",
-                expected_files=["handshake.txt"],
-                expected_file_contents={"handshake.txt": "kernel handshake ready\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={"requires_retrieval": True, "source_task": "handshake_seed_task"},
-            ),
-            "status_phrase_seed_task": self._task(
-                task_id="status_phrase_seed_task",
-                prompt="Create phrase.txt containing the exact string diagnostics green stable.",
-                workspace_subdir="status_phrase_seed_task",
-                suggested_commands=[
-                    "printf 'diagnostics green stable\n' > phrase.txt",
-                    "cat phrase.txt",
-                ],
-                success_command="test -f phrase.txt && grep -q '^diagnostics green stable$' phrase.txt",
-                expected_files=["phrase.txt"],
-                expected_file_contents={"phrase.txt": "diagnostics green stable\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "status_phrase_fallback_seed_task": self._task(
-                task_id="status_phrase_fallback_seed_task",
-                prompt="Create phrase.txt containing the exact string diagnostics amber fallback.",
-                workspace_subdir="status_phrase_fallback_seed_task",
-                suggested_commands=[
-                    "printf 'diagnostics amber fallback\n' > phrase.txt",
-                    "cat phrase.txt",
-                ],
-                success_command="test -f phrase.txt && grep -q '^diagnostics amber fallback$' phrase.txt",
-                expected_files=["phrase.txt"],
-                expected_file_contents={"phrase.txt": "diagnostics amber fallback\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "status_phrase_retrieval_task": self._task(
-                task_id="status_phrase_retrieval_task",
-                prompt=(
-                    "Create the phrase artifact using the primary diagnostics wording previously established "
-                    "in this repo. There is also a fallback wording elsewhere; do not use the fallback."
-                ),
-                workspace_subdir="status_phrase_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f phrase.txt && grep -q '^diagnostics green stable$' phrase.txt",
-                expected_files=["phrase.txt"],
-                expected_file_contents={"phrase.txt": "diagnostics green stable\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "status_phrase_seed_task",
-                    "distractor_tasks": ["status_phrase_fallback_seed_task"],
-                },
-            ),
-            "status_phrase_fallback_retrieval_task": self._task(
-                task_id="status_phrase_fallback_retrieval_task",
-                prompt=(
-                    "Create the phrase artifact using the fallback diagnostics wording established elsewhere "
-                    "in this repo. Do not use the primary diagnostics wording."
-                ),
-                workspace_subdir="status_phrase_fallback_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f phrase.txt && grep -q '^diagnostics amber fallback$' phrase.txt",
-                expected_files=["phrase.txt"],
-                expected_file_contents={"phrase.txt": "diagnostics amber fallback\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "status_phrase_fallback_seed_task",
-                    "distractor_tasks": ["status_phrase_seed_task"],
-                },
-            ),
-            "archive_command_seed_task": self._task(
-                task_id="archive_command_seed_task",
-                prompt="Create archive/out.txt containing archived using a single command.",
-                workspace_subdir="archive_command_seed_task",
-                suggested_commands=[
-                    "mkdir -p archive && printf 'archived\n' > archive/out.txt",
-                    "cat archive/out.txt",
-                ],
-                success_command="test -f archive/out.txt && grep -q '^archived$' archive/out.txt",
-                expected_files=["archive/out.txt"],
-                expected_file_contents={"archive/out.txt": "archived\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "archive_retrieval_task": self._task(
-                task_id="archive_retrieval_task",
-                prompt=(
-                    "Reproduce the established archive command pattern from earlier repo tasks. "
-                    "Create archive/out.txt with the canonical archived content."
-                ),
-                workspace_subdir="archive_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f archive/out.txt && grep -q '^archived$' archive/out.txt",
-                expected_files=["archive/out.txt"],
-                expected_file_contents={"archive/out.txt": "archived\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={"requires_retrieval": True, "source_task": "archive_command_seed_task"},
-            ),
-            "avoidance_seed_task": self._task(
-                task_id="avoidance_seed_task",
-                prompt="Create safe.txt containing safe path only.",
-                workspace_subdir="avoidance_seed_task",
-                suggested_commands=[
-                    "printf 'safe path only\n' > safe.txt",
-                    "cat safe.txt",
-                ],
-                success_command="test -f safe.txt && grep -q '^safe path only$' safe.txt",
-                expected_files=["safe.txt"],
-                expected_file_contents={"safe.txt": "safe path only\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "avoidance_retrieval_task": self._task(
-                task_id="avoidance_retrieval_task",
-                prompt=(
-                    "Create the safe-path artifact using the prior successful pattern from this repo. "
-                    "Avoid repeating previously failing command shapes."
-                ),
-                workspace_subdir="avoidance_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f safe.txt && grep -q '^safe path only$' safe.txt",
-                expected_files=["safe.txt"],
-                expected_file_contents={"safe.txt": "safe path only\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={"requires_retrieval": True, "source_task": "avoidance_seed_task"},
-            ),
-            "bundle_primary_seed_task": self._task(
-                task_id="bundle_primary_seed_task",
-                prompt="Create bundle/report.txt containing the exact string bundle verified primary.",
-                workspace_subdir="bundle_primary_seed_task",
-                suggested_commands=[
-                    "mkdir -p bundle && printf 'bundle verified primary\n' > bundle/report.txt",
-                    "cat bundle/report.txt",
-                ],
-                success_command="test -f bundle/report.txt && grep -q '^bundle verified primary$' bundle/report.txt",
-                expected_files=["bundle/report.txt"],
-                expected_file_contents={"bundle/report.txt": "bundle verified primary\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "bundle_legacy_seed_task": self._task(
-                task_id="bundle_legacy_seed_task",
-                prompt="Create bundle/report.txt containing the exact string bundle verified legacy.",
-                workspace_subdir="bundle_legacy_seed_task",
-                suggested_commands=[
-                    "mkdir -p bundle && printf 'bundle verified legacy\n' > bundle/report.txt",
-                    "cat bundle/report.txt",
-                ],
-                success_command="test -f bundle/report.txt && grep -q '^bundle verified legacy$' bundle/report.txt",
-                expected_files=["bundle/report.txt"],
-                expected_file_contents={"bundle/report.txt": "bundle verified legacy\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "bundle_retrieval_task": self._task(
-                task_id="bundle_retrieval_task",
-                prompt=(
-                    "Recreate the canonical bundle report artifact used elsewhere in this repo. "
-                    "A legacy bundle wording also exists; do not use the legacy wording."
-                ),
-                workspace_subdir="bundle_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f bundle/report.txt && grep -q '^bundle verified primary$' bundle/report.txt",
-                expected_files=["bundle/report.txt"],
-                expected_file_contents={"bundle/report.txt": "bundle verified primary\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "bundle_primary_seed_task",
-                    "distractor_tasks": ["bundle_legacy_seed_task"],
-                },
-            ),
-            "bundle_legacy_retrieval_task": self._task(
-                task_id="bundle_legacy_retrieval_task",
-                prompt=(
-                    "Recreate the legacy bundle report artifact used elsewhere in this repo. "
-                    "Do not use the primary bundle wording."
-                ),
-                workspace_subdir="bundle_legacy_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f bundle/report.txt && grep -q '^bundle verified legacy$' bundle/report.txt",
-                expected_files=["bundle/report.txt"],
-                expected_file_contents={"bundle/report.txt": "bundle verified legacy\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "bundle_legacy_seed_task",
-                    "distractor_tasks": ["bundle_primary_seed_task"],
-                },
-            ),
-            "checkpoint_blue_seed_task": self._task(
-                task_id="checkpoint_blue_seed_task",
-                prompt="Create checkpoint.txt containing the exact string checkpoint blue stable.",
-                workspace_subdir="checkpoint_blue_seed_task",
-                suggested_commands=[
-                    "printf 'checkpoint blue stable\n' > checkpoint.txt",
-                    "cat checkpoint.txt",
-                ],
-                success_command="test -f checkpoint.txt && grep -q '^checkpoint blue stable$' checkpoint.txt",
-                expected_files=["checkpoint.txt"],
-                expected_file_contents={"checkpoint.txt": "checkpoint blue stable\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "checkpoint_green_seed_task": self._task(
-                task_id="checkpoint_green_seed_task",
-                prompt="Create checkpoint.txt containing the exact string checkpoint green stable.",
-                workspace_subdir="checkpoint_green_seed_task",
-                suggested_commands=[
-                    "printf 'checkpoint green stable\n' > checkpoint.txt",
-                    "cat checkpoint.txt",
-                ],
-                success_command="test -f checkpoint.txt && grep -q '^checkpoint green stable$' checkpoint.txt",
-                expected_files=["checkpoint.txt"],
-                expected_file_contents={"checkpoint.txt": "checkpoint green stable\n"},
-                capability="retrieval_bootstrap",
-                difficulty="bounded",
-            ),
-            "checkpoint_blue_retrieval_task": self._task(
-                task_id="checkpoint_blue_retrieval_task",
-                prompt=(
-                    "Create the checkpoint artifact using the established blue stable wording. "
-                    "A green checkpoint wording also exists elsewhere; do not use it."
-                ),
-                workspace_subdir="checkpoint_blue_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f checkpoint.txt && grep -q '^checkpoint blue stable$' checkpoint.txt",
-                expected_files=["checkpoint.txt"],
-                expected_file_contents={"checkpoint.txt": "checkpoint blue stable\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "checkpoint_blue_seed_task",
-                    "distractor_tasks": ["checkpoint_green_seed_task"],
-                },
-            ),
-            "checkpoint_green_retrieval_task": self._task(
-                task_id="checkpoint_green_retrieval_task",
-                prompt=(
-                    "Create the checkpoint artifact using the established green stable wording. "
-                    "Do not use the blue checkpoint wording."
-                ),
-                workspace_subdir="checkpoint_green_retrieval_task",
-                suggested_commands=[],
-                success_command="test -f checkpoint.txt && grep -q '^checkpoint green stable$' checkpoint.txt",
-                expected_files=["checkpoint.txt"],
-                expected_file_contents={"checkpoint.txt": "checkpoint green stable\n"},
-                capability="retrieval_dependent",
-                difficulty="retrieval",
-                metadata={
-                    "requires_retrieval": True,
-                    "source_task": "checkpoint_green_seed_task",
-                    "distractor_tasks": ["checkpoint_blue_seed_task"],
-                },
-            ),
-        }
+        self._tasks: dict[str, TaskSpec] = {}
+        self._merge_bundled_tasks(_BUILTIN_TASK_MANIFEST_PATH)
         self._merge_external_tasks(
             external_task_manifests
             if external_task_manifests is not None
@@ -2171,13 +179,41 @@ class TaskBank:
             )
         )
 
+    def _merge_bundled_tasks(self, manifest_path: Path) -> None:
+        if not manifest_path.exists() or not manifest_path.is_file():
+            raise RuntimeError(f"bundled task manifest missing: {manifest_path}")
+        loaded = 0
+        for payload in self._iter_manifest_task_payloads(manifest_path):
+            try:
+                task = TaskSpec.from_dict(payload)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"invalid bundled task payload in {manifest_path}") from exc
+            task.max_steps = uplifted_task_max_steps(
+                task.max_steps,
+                metadata=task.metadata,
+                suggested_commands=task.suggested_commands,
+            )
+            task = _annotate_light_supervision_contract(task)
+            if task.task_id in self._tasks:
+                raise RuntimeError(f"duplicate bundled task id: {task.task_id}")
+            self._tasks[task.task_id] = task
+            loaded += 1
+        if loaded == 0:
+            raise RuntimeError(f"bundled task manifest is empty: {manifest_path}")
+
     @staticmethod
     def _task(*, capability: str, difficulty: str, **kwargs) -> TaskSpec:
         metadata = dict(kwargs.pop("metadata", {}))
         metadata.setdefault("capability", capability)
         metadata.setdefault("difficulty", difficulty)
         metadata.setdefault("benchmark_family", "bounded")
-        return TaskSpec(metadata=metadata, **kwargs)
+        task = TaskSpec(metadata=metadata, **kwargs)
+        task.max_steps = uplifted_task_max_steps(
+            task.max_steps,
+            metadata=task.metadata,
+            suggested_commands=task.suggested_commands,
+        )
+        return _annotate_light_supervision_contract(task)
 
     def get(self, task_id: str) -> TaskSpec:
         try:
@@ -2205,6 +241,12 @@ class TaskBank:
                 metadata.setdefault("task_origin", "external_manifest")
                 metadata.setdefault("external_manifest_path", str(manifest_path))
                 task.metadata = metadata
+                task.max_steps = uplifted_task_max_steps(
+                    task.max_steps,
+                    metadata=task.metadata,
+                    suggested_commands=task.suggested_commands,
+                )
+                task = _annotate_light_supervision_contract(task)
                 self._tasks[task.task_id] = task
 
     @staticmethod
@@ -2345,6 +387,12 @@ class TaskBank:
             for command in metadata.get("shared_repo_bootstrap_commands", [])
             if str(command).strip()
         ]
+        bootstrap_fixture_dir = str(metadata.get("shared_repo_bootstrap_fixture_dir", "")).strip()
+        bootstrap_executable_paths = [
+            str(path).strip()
+            for path in metadata.get("shared_repo_bootstrap_executable_paths", [])
+            if str(path).strip()
+        ]
         bootstrap_managed_paths = [
             str(path).strip()
             for path in metadata.get("shared_repo_bootstrap_managed_paths", [])
@@ -2434,6 +482,8 @@ class TaskBank:
                     "synthetic_worker": True,
                     "source_integrator_task_id": task.task_id,
                     "shared_repo_bootstrap_commands": bootstrap_commands,
+                    "shared_repo_bootstrap_fixture_dir": bootstrap_fixture_dir,
+                    "shared_repo_bootstrap_executable_paths": bootstrap_executable_paths,
                     "shared_repo_bootstrap_managed_paths": bootstrap_managed_paths,
                     "synthetic_edit_plan": edit_plan,
                     "synthetic_edit_candidates": edit_candidates,
@@ -2559,30 +609,18 @@ class TaskBank:
         return worker_specs
 
 
-_SYNTHETIC_LINEAGE_TASK_SUFFIXES = (
-    "_episode_replay",
-    "_verifier_replay",
-    "_discovered",
-    "_transition_pressure",
-    "_skill_replay",
-    "_skill_transfer",
-    "_tool_replay",
-    "_benchmark_candidate",
-    "_verifier_candidate",
+_SYNTHETIC_LINEAGE_TASK_SUFFIXES = tuple(
+    kernel_catalog_string_list("task_bank", "synthetic_lineage_task_suffixes")
 )
 
-_SYNTHETIC_LINEAGE_BENCHMARK_FAMILIES = {
-    "episode_memory",
-    "verifier_memory",
-    "discovered_task",
-    "transition_pressure",
-    "skill_memory",
-    "skill_transfer",
-    "tool_memory",
-    "operator_memory",
-    "benchmark_candidate",
-    "verifier_candidate",
-}
+_SYNTHETIC_LINEAGE_BENCHMARK_FAMILIES = kernel_catalog_string_set(
+    "task_bank",
+    "synthetic_lineage_benchmark_families",
+)
+_SYNTHETIC_LINEAGE_MEMORY_SOURCES = kernel_catalog_string_set(
+    "task_bank",
+    "synthetic_lineage_memory_sources",
+)
 
 
 def _synthetic_lineage_seed_skipped(document: dict[str, object]) -> bool:
@@ -2596,16 +634,7 @@ def _synthetic_lineage_seed_skipped(document: dict[str, object]) -> bool:
     if benchmark_family in _SYNTHETIC_LINEAGE_BENCHMARK_FAMILIES:
         return True
     memory_source = str(task_metadata.get("memory_source", "")).strip()
-    return memory_source in {
-        "episode",
-        "verifier",
-        "discovered_task",
-        "transition_pressure",
-        "skill",
-        "skill_transfer",
-        "tool",
-        "operator",
-    }
+    return memory_source in _SYNTHETIC_LINEAGE_MEMORY_SOURCES
 
 
 def load_episode_replay_tasks(episodes_root: Path, *, limit: int | None = None) -> list[TaskSpec]:
@@ -2625,24 +654,22 @@ def load_episode_replay_tasks(episodes_root: Path, *, limit: int | None = None) 
         executed_commands = list(data.get("summary", {}).get("executed_commands", []))
         metadata = dict(contract.metadata)
         metadata.update(
-            {
-                "benchmark_family": "episode_memory",
-                "memory_source": "episode",
-                "memory_source_task": task_id,
-                "origin_benchmark_family": str(contract.metadata.get("benchmark_family", "bounded")),
-                "requires_retrieval": True,
-                "source_task": task_id,
-                "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
-                "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
-            }
+            _memory_task_metadata(
+                "episode_replay",
+                source_task_id=task_id,
+                origin_benchmark_family=str(contract.metadata.get("benchmark_family", "bounded")),
+                extra={
+                    "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
+                    "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
+                },
+            )
         )
         replay_task = TaskSpec(
-            task_id=f"{task_id}_episode_replay",
-            prompt=(
-                "Reproduce a previously successful task from episodic memory. "
-                f"{contract.prompt}"
+            task_id=f"{task_id}{_memory_task_rule_text('episode_replay', 'task_id_suffix', fallback='_episode_replay')}",
+            prompt=_memory_task_prompt("episode_replay", prompt=contract.prompt),
+            workspace_subdir=(
+                f"{task_id}{_memory_task_rule_text('episode_replay', 'workspace_suffix', fallback='_episode_replay')}"
             ),
-            workspace_subdir=f"{task_id}_episode_replay",
             setup_commands=list(contract.setup_commands),
             success_command=contract.success_command,
             suggested_commands=executed_commands or list(contract.suggested_commands),
@@ -2654,7 +681,7 @@ def load_episode_replay_tasks(episodes_root: Path, *, limit: int | None = None) 
             max_steps=max(contract.max_steps, max(1, len(executed_commands) + 1)),
             metadata=metadata,
         )
-        tasks.append(replay_task)
+        tasks.append(_annotate_light_supervision_contract(replay_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -2683,26 +710,27 @@ def load_discovered_tasks(episodes_root: Path, *, limit: int | None = None) -> l
             continue
         strict_task = synthesize_stricter_task(
             contract,
-            task_id=f"{task_id}_discovered",
-            extra_metadata={
-                "benchmark_family": "discovered_task",
-                "memory_source": "discovered_task",
-                "memory_source_task": task_id,
-                "origin_benchmark_family": str(contract.metadata.get("benchmark_family", "bounded")),
-                "source_task": task_id,
-                "discovery_failure_types": failure_types,
-                "discovery_transition_failures": transition_failures,
-                "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
-                "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
-            },
+            task_id=(
+                f"{task_id}{_memory_task_rule_text('discovered_task', 'task_id_suffix', fallback='_discovered')}"
+            ),
+            extra_metadata=_memory_task_metadata(
+                "discovered_task",
+                source_task_id=task_id,
+                origin_benchmark_family=str(contract.metadata.get("benchmark_family", "bounded")),
+                extra={
+                    "discovery_failure_types": failure_types,
+                    "discovery_transition_failures": transition_failures,
+                    "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
+                    "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
+                },
+            ),
         )
-        strict_task.prompt = (
-            "Solve a discovered robustness task derived from prior failures or bad state transitions. "
-            f"{strict_task.prompt}"
+        strict_task.prompt = _memory_task_prompt("discovered_task", prompt=strict_task.prompt)
+        strict_task.workspace_subdir = (
+            f"{contract.workspace_subdir}{_memory_task_rule_text('discovered_task', 'workspace_suffix', fallback='_discovered')}"
         )
-        strict_task.workspace_subdir = f"{contract.workspace_subdir}_discovered"
         strict_task.max_steps = max(strict_task.max_steps, len(strict_task.suggested_commands) + 1)
-        tasks.append(strict_task)
+        tasks.append(_annotate_light_supervision_contract(strict_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -2730,26 +758,30 @@ def load_transition_pressure_tasks(episodes_root: Path, *, limit: int | None = N
             continue
         pressure_task = synthesize_stricter_task(
             contract,
-            task_id=f"{task_id}_transition_pressure",
-            extra_metadata={
-                "benchmark_family": "transition_pressure",
-                "memory_source": "transition_pressure",
-                "memory_source_task": task_id,
-                "origin_benchmark_family": str(contract.metadata.get("benchmark_family", "bounded")),
-                "source_task": task_id,
-                "discovery_transition_failures": transition_failures,
-                "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
-                "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
-            },
+            task_id=(
+                f"{task_id}{_memory_task_rule_text('transition_pressure', 'task_id_suffix', fallback='_transition_pressure')}"
+            ),
+            extra_metadata=_memory_task_metadata(
+                "transition_pressure",
+                source_task_id=task_id,
+                origin_benchmark_family=str(contract.metadata.get("benchmark_family", "bounded")),
+                extra={
+                    "discovery_transition_failures": transition_failures,
+                    "episode_phase": str(data.get("episode_storage", {}).get("phase", "")).strip(),
+                    "episode_relative_path": str(data.get("episode_storage", {}).get("relative_path", "")).strip(),
+                },
+            ),
         )
-        pressure_task.prompt = (
-            "Solve a transition-pressure task derived from prior bad state transitions. "
-            f"Avoid repeating these failure modes: {', '.join(transition_failures)}. "
-            f"{pressure_task.prompt}"
+        pressure_task.prompt = _memory_task_prompt(
+            "transition_pressure",
+            prompt=pressure_task.prompt,
+            failure_modes=", ".join(transition_failures),
         )
-        pressure_task.workspace_subdir = f"{contract.workspace_subdir}_transition_pressure"
+        pressure_task.workspace_subdir = (
+            f"{contract.workspace_subdir}{_memory_task_rule_text('transition_pressure', 'workspace_suffix', fallback='_transition_pressure')}"
+        )
         pressure_task.max_steps = max(pressure_task.max_steps, len(pressure_task.suggested_commands) + 1)
-        tasks.append(pressure_task)
+        tasks.append(_annotate_light_supervision_contract(pressure_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -2920,10 +952,13 @@ def _select_worker_test_commands(
 
 def _worker_prompt(branch: str, assigned_paths: list[str]) -> str:
     owned = ", ".join(assigned_paths)
-    return (
-        f"On branch {branch}, update only these worker-owned paths: {owned}. "
-        "Keep unrelated paths unchanged, run any assigned tests, and commit the branch."
+    template = str(
+        _task_bank_synthesis_rules().get(
+            "worker_prompt_template",
+            "On branch {branch}, update only these worker-owned paths: {owned}. Keep unrelated paths unchanged, run any assigned tests, and commit the branch.",
+        )
     )
+    return template.format(branch=branch, owned=owned)
 
 
 def _synthesized_worker_commands(
@@ -2963,6 +998,24 @@ def _synthesized_worker_commands(
             if not isinstance(replacement, dict):
                 return []
             command = _render_block_replace_command(path, replacement)
+            if not command:
+                return []
+            write_commands.append(command)
+            continue
+        if edit_kind == "line_insert":
+            insertion = step.get("insertion", {})
+            if not isinstance(insertion, dict):
+                return []
+            command = _render_line_insert_command(path, insertion)
+            if not command:
+                return []
+            write_commands.append(command)
+            continue
+        if edit_kind == "line_delete":
+            deletion = step.get("deletion", {})
+            if not isinstance(deletion, dict):
+                return []
+            command = _render_line_delete_command(path, deletion)
             if not command:
                 return []
             write_commands.append(command)
@@ -3080,6 +1133,22 @@ def _derive_worker_edit_candidates(
         )
         if token_edit is not None:
             candidates.append(token_edit)
+        insert_edit = _derive_line_insert_step(
+            path=path,
+            baseline_content=baseline_content,
+            target_content=target_content,
+            intent_source=intent_source,
+        )
+        if insert_edit is not None:
+            candidates.append(insert_edit)
+        delete_edit = _derive_line_delete_step(
+            path=path,
+            baseline_content=baseline_content,
+            target_content=target_content,
+            intent_source=intent_source,
+        )
+        if delete_edit is not None:
+            candidates.append(delete_edit)
         block_edit = _derive_block_replace_step(
             path=path,
             baseline_content=baseline_content,
@@ -3142,8 +1211,6 @@ def _derive_line_replace_step(
     for line_number, (before_line, after_line) in enumerate(zip(baseline_lines, target_lines), start=1):
         if before_line == after_line:
             continue
-        if baseline_lines.count(before_line) != 1:
-            return None
         replacements.append(
             {
                 "line_number": line_number,
@@ -3185,7 +1252,7 @@ def _derive_token_replace_step(
         if fragment is None:
             return None
         before_fragment, after_fragment = fragment
-        if baseline_content.count(before_fragment) != 1:
+        if before_line.count(before_fragment) != 1:
             return None
         replacements.append(
             {
@@ -3268,6 +1335,56 @@ def _derive_block_replace_step(
     }
 
 
+def _derive_line_insert_step(
+    *,
+    path: str,
+    baseline_content: str,
+    target_content: str,
+    intent_source: str,
+) -> dict[str, object] | None:
+    if not baseline_content or baseline_content == target_content:
+        return None
+    baseline_lines = baseline_content.splitlines()
+    target_lines = target_content.splitlines()
+    prefix_length = 0
+    while (
+        prefix_length < len(baseline_lines)
+        and prefix_length < len(target_lines)
+        and baseline_lines[prefix_length] == target_lines[prefix_length]
+    ):
+        prefix_length += 1
+    suffix_length = 0
+    while (
+        suffix_length < (len(baseline_lines) - prefix_length)
+        and suffix_length < (len(target_lines) - prefix_length)
+        and baseline_lines[len(baseline_lines) - 1 - suffix_length] == target_lines[len(target_lines) - 1 - suffix_length]
+    ):
+        suffix_length += 1
+    baseline_start = prefix_length
+    baseline_end = len(baseline_lines) - suffix_length
+    target_start = prefix_length
+    target_end = len(target_lines) - suffix_length
+    baseline_block = baseline_lines[baseline_start:baseline_end]
+    target_block = target_lines[target_start:target_end]
+    if baseline_block or not target_block:
+        return None
+    baseline_lines = baseline_content.splitlines()
+    insertion = {
+        "line_number": baseline_start + 1,
+        "mode": "append" if baseline_start >= len(baseline_lines) else "before",
+        "after_lines": target_block,
+    }
+    return {
+        "path": path,
+        "baseline_content": baseline_content,
+        "target_content": target_content,
+        "edit_kind": "line_insert",
+        "intent_source": intent_source,
+        "insertion": insertion,
+        "edit_score": _edit_candidate_score("line_insert", insertion=insertion),
+    }
+
+
 def _rewrite_edit_step(
     *,
     path: str,
@@ -3282,6 +1399,54 @@ def _rewrite_edit_step(
         "edit_kind": "rewrite",
         "intent_source": intent_source,
         "edit_score": _edit_candidate_score("rewrite", target_content=target_content),
+    }
+
+
+def _derive_line_delete_step(
+    *,
+    path: str,
+    baseline_content: str,
+    target_content: str,
+    intent_source: str,
+) -> dict[str, object] | None:
+    if not baseline_content or baseline_content == target_content:
+        return None
+    baseline_lines = baseline_content.splitlines()
+    target_lines = target_content.splitlines()
+    prefix_length = 0
+    while (
+        prefix_length < len(baseline_lines)
+        and prefix_length < len(target_lines)
+        and baseline_lines[prefix_length] == target_lines[prefix_length]
+    ):
+        prefix_length += 1
+    suffix_length = 0
+    while (
+        suffix_length < (len(baseline_lines) - prefix_length)
+        and suffix_length < (len(target_lines) - prefix_length)
+        and baseline_lines[len(baseline_lines) - 1 - suffix_length] == target_lines[len(target_lines) - 1 - suffix_length]
+    ):
+        suffix_length += 1
+    baseline_start = prefix_length
+    baseline_end = len(baseline_lines) - suffix_length
+    target_end = len(target_lines) - suffix_length
+    baseline_block = baseline_lines[baseline_start:baseline_end]
+    target_block = target_lines[prefix_length:target_end]
+    if not baseline_block or target_block:
+        return None
+    deletion = {
+        "start_line": baseline_start + 1,
+        "end_line": max(baseline_start + 1, baseline_end),
+        "before_lines": baseline_block,
+    }
+    return {
+        "path": path,
+        "baseline_content": baseline_content,
+        "target_content": target_content,
+        "edit_kind": "line_delete",
+        "intent_source": intent_source,
+        "deletion": deletion,
+        "edit_score": _edit_candidate_score("line_delete", deletion=deletion),
     }
 
 
@@ -3308,34 +1473,51 @@ def _edit_candidate_score(
     *,
     replacements: list[dict[str, object]] | None = None,
     replacement: dict[str, object] | None = None,
+    insertion: dict[str, object] | None = None,
+    deletion: dict[str, object] | None = None,
     target_content: str = "",
 ) -> int:
     normalized_kind = str(edit_kind).strip() or "rewrite"
+    score_rules = dict(_task_bank_synthesis_rules().get("edit_scores", {}))
+    kind_rules = dict(score_rules.get(normalized_kind, {})) if isinstance(score_rules.get(normalized_kind, {}), dict) else {}
+    base = int(kind_rules.get("base", 120 if normalized_kind == "rewrite" else 0) or 0)
+    char_weight = int(kind_rules.get("char_weight", 1) or 1)
     if normalized_kind == "token_replace":
         ops = replacements or []
         fragment_chars = sum(len(str(item.get("before_fragment", ""))) + len(str(item.get("after_fragment", ""))) for item in ops)
-        return 10 + len(ops) * 5 + fragment_chars
+        return base + len(ops) * int(kind_rules.get("per_replacement", 0) or 0) + fragment_chars * char_weight
     if normalized_kind == "line_replace":
         ops = replacements or []
         changed_chars = sum(len(str(item.get("before_line", ""))) + len(str(item.get("after_line", ""))) for item in ops)
-        return 30 + len(ops) * 12 + changed_chars
+        return base + len(ops) * int(kind_rules.get("per_replacement", 0) or 0) + changed_chars * char_weight
+    if normalized_kind == "line_insert":
+        inserted = insertion or {}
+        raw_after_lines = inserted.get("after_lines", inserted.get("inserted_lines", []))
+        after_lines = [str(line) for line in raw_after_lines]
+        changed_chars = sum(len(line) for line in after_lines)
+        return base + len(after_lines) * int(kind_rules.get("per_line", 0) or 0) + changed_chars * char_weight
+    if normalized_kind == "line_delete":
+        removed = deletion or {}
+        before_lines = [str(line) for line in removed.get("before_lines", [])]
+        changed_chars = sum(len(line) for line in before_lines)
+        return base + len(before_lines) * int(kind_rules.get("per_line", 0) or 0) + changed_chars * char_weight
     if normalized_kind == "block_replace":
         block = replacement or {}
         before_lines = [str(line) for line in block.get("before_lines", [])]
         after_lines = [str(line) for line in block.get("after_lines", [])]
         changed_chars = sum(len(line) for line in before_lines) + sum(len(line) for line in after_lines)
         changed_lines = max(len(before_lines), len(after_lines))
-        return 60 + changed_lines * 20 + changed_chars
-    return 120 + len(str(target_content))
+        return base + changed_lines * int(kind_rules.get("per_line", 0) or 0) + changed_chars * char_weight
+    return base + len(str(target_content)) * char_weight
 
 
 def _edit_kind_rank(edit_kind: str) -> int:
-    order = {
-        "token_replace": 0,
-        "line_replace": 1,
-        "block_replace": 2,
-        "rewrite": 3,
-    }
+    ordered_kinds = [
+        str(value).strip()
+        for value in _task_bank_synthesis_rules().get("edit_kind_order", [])
+        if str(value).strip()
+    ]
+    order = {kind: index for index, kind in enumerate(ordered_kinds)}
     return order.get(str(edit_kind).strip() or "rewrite", 99)
 
 
@@ -3369,6 +1551,20 @@ def _token_replacement_fragment(before_line: str, after_line: str) -> tuple[str,
 
 def _bootstrap_file_contents(task: TaskSpec) -> dict[str, str]:
     metadata = dict(task.metadata)
+    fixture_dir = str(metadata.get("shared_repo_bootstrap_fixture_dir", "")).strip()
+    managed_paths = [
+        str(path).strip()
+        for path in metadata.get("shared_repo_bootstrap_managed_paths", [])
+        if str(path).strip()
+    ]
+    if fixture_dir:
+        contents: dict[str, str] = {}
+        fixture_root = (_BUILTIN_TASK_MANIFEST_PATH.parent / "shared_repo_fixtures" / fixture_dir).resolve()
+        for relative_path in managed_paths:
+            source = fixture_root / relative_path
+            if source.exists() and source.is_file():
+                contents[relative_path] = source.read_text(encoding="utf-8")
+        return contents
     commands = [
         str(command).strip()
         for command in metadata.get("shared_repo_bootstrap_commands", [])
@@ -3478,11 +1674,18 @@ def _merge_target_into_baseline_line(baseline_line: str, target_line: str) -> st
 def _render_line_replace_commands(path: str, replacements: list[dict[str, object]]) -> list[str]:
     commands: list[str] = []
     for replacement in replacements:
+        try:
+            line_number = int(replacement.get("line_number", 0))
+        except (TypeError, ValueError):
+            continue
         before_line = str(replacement.get("before_line", ""))
         after_line = str(replacement.get("after_line", ""))
-        if before_line == after_line:
+        if line_number <= 0 or before_line == after_line:
             continue
-        script = f"s#^{_sed_regex_escape(before_line)}$#{_sed_replacement_escape(after_line)}#"
+        script = (
+            f"{line_number}s#^{_sed_regex_escape(before_line)}$#"
+            f"{_sed_replacement_escape(after_line)}#"
+        )
         commands.append(f"sed -i {shlex.quote(script)} {shlex.quote(path)}")
     return commands
 
@@ -3504,14 +1707,51 @@ def _render_block_replace_command(path: str, replacement: dict[str, object]) -> 
     return f"sed -i {shlex.quote(script)} {shlex.quote(path)}"
 
 
+def _render_line_insert_command(path: str, insertion: dict[str, object]) -> str:
+    try:
+        line_number = int(insertion.get("line_number", 0))
+    except (TypeError, ValueError):
+        return ""
+    raw_after_lines = insertion.get("after_lines", insertion.get("inserted_lines", []))
+    after_lines = [str(line) for line in raw_after_lines]
+    mode = str(insertion.get("mode", "before")).strip() or "before"
+    if line_number <= 0 or not after_lines:
+        return ""
+    replacement_body = "\\\n".join(_sed_block_text_escape(line) for line in after_lines)
+    if mode == "append":
+        script = f"$a\\\n{replacement_body}"
+    else:
+        script = f"{line_number}i\\\n{replacement_body}"
+    return f"sed -i {shlex.quote(script)} {shlex.quote(path)}"
+
+
+def _render_line_delete_command(path: str, deletion: dict[str, object]) -> str:
+    try:
+        start_line = int(deletion.get("start_line", 0))
+        end_line = int(deletion.get("end_line", 0))
+    except (TypeError, ValueError):
+        return ""
+    if start_line <= 0 or end_line < start_line:
+        return ""
+    script = f"{start_line},{end_line}d"
+    return f"sed -i '{script}' {shlex.quote(path)}"
+
+
 def _render_token_replace_commands(path: str, replacements: list[dict[str, object]]) -> list[str]:
     commands: list[str] = []
     for replacement in replacements:
+        try:
+            line_number = int(replacement.get("line_number", 0))
+        except (TypeError, ValueError):
+            continue
         before_fragment = str(replacement.get("before_fragment", ""))
         after_fragment = str(replacement.get("after_fragment", ""))
-        if not before_fragment or before_fragment == after_fragment:
+        if line_number <= 0 or not before_fragment or before_fragment == after_fragment:
             continue
-        script = f"s#{_sed_regex_escape(before_fragment)}#{_sed_replacement_escape(after_fragment)}#"
+        script = (
+            f"{line_number}s#{_sed_regex_escape(before_fragment)}#"
+            f"{_sed_replacement_escape(after_fragment)}#"
+        )
         commands.append(f"sed -i {shlex.quote(script)} {shlex.quote(path)}")
     return commands
 
@@ -3586,16 +1826,22 @@ def _target_content_from_branch_intent(
         return None
     candidate = baseline_content
     changed = False
-    replacements = {
-        "pending": preferred_state,
-        "broken": preferred_state,
-        "todo": "done" if preferred_state == "ready" else preferred_state,
-        "draft": "final" if preferred_state == "ready" else preferred_state,
-        "stale": preferred_state,
-        "wip": preferred_state,
-    }
+    branch_rules = dict(_task_bank_synthesis_rules().get("branch_intent", {}))
+    direct_replacements = [
+        str(value).strip()
+        for value in branch_rules.get("direct_replacements", [])
+        if str(value).strip()
+    ]
+    replacements = {source: preferred_state for source in direct_replacements}
+    replacements["todo"] = str(
+        branch_rules.get("todo_replacement", "done" if preferred_state == "ready" else preferred_state)
+    )
+    replacements["draft"] = str(
+        branch_rules.get("draft_replacement", "final" if preferred_state == "ready" else preferred_state)
+    )
     for source, target in replacements.items():
-        candidate, count = re.subn(rf"\b{re.escape(source)}\b", target, candidate, flags=re.IGNORECASE)
+        normalized_target = preferred_state if target == "{preferred_state}" else target
+        candidate, count = re.subn(rf"\b{re.escape(source)}\b", normalized_target, candidate, flags=re.IGNORECASE)
         if count:
             changed = True
     if not changed and "=" in candidate and preferred_state not in candidate:
@@ -3614,9 +1860,16 @@ def _target_content_from_branch_intent(
 
 
 def _preferred_branch_state(branch: str, path: str) -> str:
+    branch_rules = dict(_task_bank_synthesis_rules().get("branch_intent", {}))
+    preferred_states = (
+        dict(branch_rules.get("preferred_states", {}))
+        if isinstance(branch_rules.get("preferred_states", {}), dict)
+        else {}
+    )
     for token in [*_path_tokens(branch), *_path_tokens(path)]:
-        if token in {"ready", "done", "fixed", "complete", "final", "enabled"}:
-            return "ready" if token == "fixed" else token
+        normalized = str(preferred_states.get(token, "")).strip()
+        if normalized:
+            return normalized
     return ""
 
 
@@ -3635,8 +1888,13 @@ def _derive_worker_report_rules(
 ) -> list[dict[str, object]]:
     if not changed_paths:
         return []
-    report_path = f"reports/{_safe_worker_name(branch)}_report.txt"
-    must_mention = ["updated", branch]
+    report_rules = dict(_task_bank_synthesis_rules().get("worker_report", {}))
+    report_template = str(report_rules.get("path_template", "reports/{worker_name}_report.txt"))
+    report_path = report_template.format(worker_name=_safe_worker_name(branch), branch=branch)
+    must_mention = [
+        *[str(value).strip() for value in report_rules.get("base_must_mention", []) if str(value).strip()],
+        branch,
+    ]
     test_cover_paths: list[str] = []
     for command in test_commands:
         label = str(command.get("label", "")).strip()
@@ -3698,22 +1956,18 @@ def load_skill_replay_tasks(skills_path: Path, *, limit: int | None = None) -> l
         procedure = list(skill.get("procedure", {}).get("commands", []))
         metadata = dict(contract.metadata)
         metadata.update(
-            {
-                "benchmark_family": "skill_memory",
-                "memory_source": "skill",
-                "memory_source_task": source_task_id,
-                "origin_benchmark_family": str(contract.metadata.get("benchmark_family", "bounded")),
-                "source_task": source_task_id,
-                "requires_skill_memory": True,
-            }
+            _memory_task_metadata(
+                "skill_replay",
+                source_task_id=source_task_id,
+                origin_benchmark_family=str(contract.metadata.get("benchmark_family", "bounded")),
+            )
         )
         replay_task = TaskSpec(
-            task_id=f"{source_task_id}_skill_replay",
-            prompt=(
-                "Use the promoted reusable procedure from prior successful work to solve an equivalent task. "
-                f"{contract.prompt}"
+            task_id=f"{source_task_id}{_memory_task_rule_text('skill_replay', 'task_id_suffix', fallback='_skill_replay')}",
+            prompt=_memory_task_prompt("skill_replay", prompt=contract.prompt),
+            workspace_subdir=(
+                f"{source_task_id}{_memory_task_rule_text('skill_replay', 'workspace_suffix', fallback='_skill_replay')}"
             ),
-            workspace_subdir=f"{source_task_id}_skill_replay",
             setup_commands=list(contract.setup_commands),
             success_command=contract.success_command,
             suggested_commands=procedure or list(contract.suggested_commands),
@@ -3725,7 +1979,7 @@ def load_skill_replay_tasks(skills_path: Path, *, limit: int | None = None) -> l
             max_steps=max(contract.max_steps, max(1, len(procedure) + 1)),
             metadata=metadata,
         )
-        tasks.append(replay_task)
+        tasks.append(_annotate_light_supervision_contract(replay_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -3741,42 +1995,54 @@ def load_verifier_replay_tasks(
     for task in load_episode_replay_tasks(episodes_root, limit=limit):
         strict_task = synthesize_stricter_task(
             task,
-            task_id=f"{task.task_id}_verifier_replay",
-            extra_metadata={
-                "benchmark_family": "verifier_memory",
-                "memory_source": "verifier",
-                "verifier_source": "episode",
-                "memory_source_task": str(task.metadata.get("memory_source_task", task.task_id)),
-                "source_task": str(task.metadata.get("source_task", task.task_id)),
-                "origin_benchmark_family": str(
+            task_id=(
+                f"{task.task_id}{_memory_task_rule_text('verifier_replay', 'task_id_suffix', fallback='_verifier_replay')}"
+            ),
+            extra_metadata=_memory_task_metadata(
+                "verifier_replay",
+                source_task_id=str(task.metadata.get("memory_source_task", task.task_id)),
+                origin_benchmark_family=str(
                     task.metadata.get("origin_benchmark_family", task.metadata.get("benchmark_family", "bounded"))
                 ),
-            },
+                extra={
+                    "verifier_source": "episode",
+                    "memory_source_task": str(task.metadata.get("memory_source_task", task.task_id)),
+                    "source_task": str(task.metadata.get("source_task", task.task_id)),
+                },
+            ),
         )
-        strict_task.workspace_subdir = f"{task.workspace_subdir}_verifier_replay"
+        strict_task.workspace_subdir = (
+            f"{task.workspace_subdir}{_memory_task_rule_text('verifier_replay', 'workspace_suffix', fallback='_verifier_replay')}"
+        )
         strict_task.max_steps = max(strict_task.max_steps, len(strict_task.suggested_commands) + 1)
-        tasks.append(strict_task)
+        tasks.append(_annotate_light_supervision_contract(strict_task))
         if limit is not None and len(tasks) >= limit:
             return tasks
     remaining = None if limit is None else max(0, limit - len(tasks))
     for task in load_skill_replay_tasks(skills_path, limit=remaining):
         strict_task = synthesize_stricter_task(
             task,
-            task_id=f"{task.task_id}_verifier_replay",
-            extra_metadata={
-                "benchmark_family": "verifier_memory",
-                "memory_source": "verifier",
-                "verifier_source": "skill",
-                "memory_source_task": str(task.metadata.get("memory_source_task", task.task_id)),
-                "source_task": str(task.metadata.get("source_task", task.task_id)),
-                "origin_benchmark_family": str(
+            task_id=(
+                f"{task.task_id}{_memory_task_rule_text('verifier_replay', 'task_id_suffix', fallback='_verifier_replay')}"
+            ),
+            extra_metadata=_memory_task_metadata(
+                "verifier_replay",
+                source_task_id=str(task.metadata.get("memory_source_task", task.task_id)),
+                origin_benchmark_family=str(
                     task.metadata.get("origin_benchmark_family", task.metadata.get("benchmark_family", "bounded"))
                 ),
-            },
+                extra={
+                    "verifier_source": "skill",
+                    "memory_source_task": str(task.metadata.get("memory_source_task", task.task_id)),
+                    "source_task": str(task.metadata.get("source_task", task.task_id)),
+                },
+            ),
         )
-        strict_task.workspace_subdir = f"{task.workspace_subdir}_verifier_replay"
+        strict_task.workspace_subdir = (
+            f"{task.workspace_subdir}{_memory_task_rule_text('verifier_replay', 'workspace_suffix', fallback='_verifier_replay')}"
+        )
         strict_task.max_steps = max(strict_task.max_steps, len(strict_task.suggested_commands) + 1)
-        tasks.append(strict_task)
+        tasks.append(_annotate_light_supervision_contract(strict_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -3818,23 +2084,23 @@ def load_skill_transfer_tasks(
             continue
         metadata = dict(target_task.metadata)
         metadata.update(
-            {
-                "benchmark_family": "skill_transfer",
-                "memory_source": "skill_transfer",
-                "memory_source_task": source_task_id,
-                "origin_benchmark_family": str(target_task.metadata.get("benchmark_family", "bounded")),
-                "source_task": source_task_id,
-                "transfer_target_task": target_task.task_id,
-            }
+            _memory_task_metadata(
+                "skill_transfer",
+                source_task_id=source_task_id,
+                origin_benchmark_family=str(target_task.metadata.get("benchmark_family", "bounded")),
+                extra={"transfer_target_task": target_task.task_id},
+            )
         )
         tasks.append(
-            TaskSpec(
-                task_id=f"{source_task_id}_to_{target_task.task_id}_skill_transfer",
-                prompt=(
-                    "Attempt cross-task transfer with the raw remembered procedure from a different task. "
-                    f"{target_task.prompt}"
+            _annotate_light_supervision_contract(TaskSpec(
+                task_id=(
+                    f"{source_task_id}_to_{target_task.task_id}"
+                    f"{_memory_task_rule_text('skill_transfer', 'task_id_suffix', fallback='_skill_transfer')}"
                 ),
-                workspace_subdir=f"{target_task.workspace_subdir}_skill_transfer",
+                prompt=_memory_task_prompt("skill_transfer", prompt=target_task.prompt),
+                workspace_subdir=(
+                    f"{target_task.workspace_subdir}{_memory_task_rule_text('skill_transfer', 'workspace_suffix', fallback='_skill_transfer')}"
+                ),
                 setup_commands=list(target_task.setup_commands),
                 success_command=target_task.success_command,
                 suggested_commands=procedure or list(target_task.suggested_commands),
@@ -3845,7 +2111,7 @@ def load_skill_transfer_tasks(
                 expected_file_contents=dict(target_task.expected_file_contents),
                 max_steps=max(target_task.max_steps, len(procedure) + 1),
                 metadata=metadata,
-            )
+            ))
         )
         if limit is not None and len(tasks) >= limit:
             break
@@ -3885,24 +2151,27 @@ def load_operator_replay_tasks(
         commands = instantiate_operator_commands(operator, target_task)
         metadata = dict(target_task.metadata)
         metadata.update(
-            {
-                "benchmark_family": "operator_memory",
-                "memory_source": "operator",
-                "memory_source_task": ",".join(source_task_ids),
-                "origin_benchmark_family": str(target_task.metadata.get("benchmark_family", "bounded")),
-                "source_task": source_task_ids[0] if source_task_ids else "",
-                "transfer_target_task": target_task.task_id,
-                "operator_id": str(operator.get("operator_id", "")),
-            }
+            _memory_task_metadata(
+                "operator_replay",
+                source_task_id=",".join(source_task_ids),
+                origin_benchmark_family=str(target_task.metadata.get("benchmark_family", "bounded")),
+                extra={
+                    "source_task": source_task_ids[0] if source_task_ids else "",
+                    "transfer_target_task": target_task.task_id,
+                    "operator_id": str(operator.get("operator_id", "")),
+                },
+            )
         )
         tasks.append(
-            TaskSpec(
-                task_id=f"{str(operator.get('operator_id', 'operator')).replace(':', '_')}_{target_task.task_id}_operator_replay",
-                prompt=(
-                    "Use the induced operator class distilled from multiple successful procedures to solve a related task. "
-                    f"{target_task.prompt}"
+            _annotate_light_supervision_contract(TaskSpec(
+                task_id=(
+                    f"{str(operator.get('operator_id', 'operator')).replace(':', '_')}_{target_task.task_id}"
+                    f"{_memory_task_rule_text('operator_replay', 'task_id_suffix', fallback='_operator_replay')}"
                 ),
-                workspace_subdir=f"{target_task.workspace_subdir}_operator_replay",
+                prompt=_memory_task_prompt("operator_replay", prompt=target_task.prompt),
+                workspace_subdir=(
+                    f"{target_task.workspace_subdir}{_memory_task_rule_text('operator_replay', 'workspace_suffix', fallback='_operator_replay')}"
+                ),
                 setup_commands=list(target_task.setup_commands),
                 success_command=target_task.success_command,
                 suggested_commands=commands or list(target_task.suggested_commands),
@@ -3913,7 +2182,7 @@ def load_operator_replay_tasks(
                 expected_file_contents=dict(target_task.expected_file_contents),
                 max_steps=max(target_task.max_steps, len(commands) + 1),
                 metadata=metadata,
-            )
+            ))
         )
         if limit is not None and len(tasks) >= limit:
             break
@@ -3944,20 +2213,22 @@ def load_benchmark_candidate_tasks(
             continue
         metadata = dict(source_task.metadata)
         metadata.update(
-            {
-                "benchmark_family": "benchmark_candidate",
-                "memory_source": "benchmark_candidate",
-                "memory_source_task": source_task_id,
-                "candidate_kind": str(proposal.get("kind", "")),
-                "origin_benchmark_family": str(proposal.get("benchmark_family", metadata.get("benchmark_family", "bounded"))),
-                "source_task": source_task_id,
-            }
+            _memory_task_metadata(
+                "benchmark_candidate",
+                source_task_id=source_task_id,
+                origin_benchmark_family=str(proposal.get("benchmark_family", metadata.get("benchmark_family", "bounded"))),
+                extra={"candidate_kind": str(proposal.get("kind", ""))},
+            )
         )
         tasks.append(
-            TaskSpec(
-                task_id=f"{source_task_id}_benchmark_candidate",
+            _annotate_light_supervision_contract(TaskSpec(
+                task_id=(
+                    f"{source_task_id}{_memory_task_rule_text('benchmark_candidate', 'task_id_suffix', fallback='_benchmark_candidate')}"
+                ),
                 prompt=prompt,
-                workspace_subdir=f"{source_task.workspace_subdir}_benchmark_candidate",
+                workspace_subdir=(
+                    f"{source_task.workspace_subdir}{_memory_task_rule_text('benchmark_candidate', 'workspace_suffix', fallback='_benchmark_candidate')}"
+                ),
                 setup_commands=list(source_task.setup_commands),
                 success_command=source_task.success_command,
                 suggested_commands=list(source_task.suggested_commands),
@@ -3968,7 +2239,7 @@ def load_benchmark_candidate_tasks(
                 expected_file_contents=dict(source_task.expected_file_contents),
                 max_steps=source_task.max_steps,
                 metadata=metadata,
-            )
+            ))
         )
         if limit is not None and len(tasks) >= limit:
             break
@@ -3999,19 +2270,21 @@ def load_verifier_candidate_tasks(
             continue
         metadata = dict(source_task.metadata)
         metadata.update(
-            {
-                "benchmark_family": "verifier_candidate",
-                "memory_source": "verifier_candidate",
-                "memory_source_task": source_task_id,
-                "origin_benchmark_family": str(proposal.get("benchmark_family", metadata.get("benchmark_family", "bounded"))),
-                "source_task": source_task_id,
-            }
+            _memory_task_metadata(
+                "verifier_candidate",
+                source_task_id=source_task_id,
+                origin_benchmark_family=str(proposal.get("benchmark_family", metadata.get("benchmark_family", "bounded"))),
+            )
         )
         tasks.append(
-            TaskSpec(
-                task_id=f"{source_task_id}_verifier_candidate",
+            _annotate_light_supervision_contract(TaskSpec(
+                task_id=(
+                    f"{source_task_id}{_memory_task_rule_text('verifier_candidate', 'task_id_suffix', fallback='_verifier_candidate')}"
+                ),
                 prompt=source_task.prompt,
-                workspace_subdir=f"{source_task.workspace_subdir}_verifier_candidate",
+                workspace_subdir=(
+                    f"{source_task.workspace_subdir}{_memory_task_rule_text('verifier_candidate', 'workspace_suffix', fallback='_verifier_candidate')}"
+                ),
                 setup_commands=list(source_task.setup_commands),
                 success_command=source_task.success_command,
                 suggested_commands=list(source_task.suggested_commands),
@@ -4024,7 +2297,7 @@ def load_verifier_candidate_tasks(
                 expected_file_contents=dict(contract.get("expected_file_contents", source_task.expected_file_contents)),
                 max_steps=source_task.max_steps,
                 metadata=metadata,
-            )
+            ))
         )
         if limit is not None and len(tasks) >= limit:
             break
@@ -4058,24 +2331,22 @@ def load_tool_replay_tasks(tool_candidates_path: Path, *, limit: int | None = No
         if contract is None:
             continue
         procedure = list(record.get("procedure", {}).get("commands", []))
+        if _tool_candidate_has_incomplete_shared_repo_integrator_bundle(record, contract=contract, procedure=procedure):
+            continue
         metadata = dict(contract.metadata)
         metadata.update(
-            {
-                "benchmark_family": "tool_memory",
-                "memory_source": "tool",
-                "memory_source_task": source_task_id,
-                "origin_benchmark_family": str(contract.metadata.get("benchmark_family", "bounded")),
-                "source_task": source_task_id,
-                "requires_tool_memory": True,
-            }
+            _memory_task_metadata(
+                "tool_replay",
+                source_task_id=source_task_id,
+                origin_benchmark_family=str(contract.metadata.get("benchmark_family", "bounded")),
+            )
         )
         replay_task = TaskSpec(
-            task_id=f"{source_task_id}_tool_replay",
-            prompt=(
-                "Use the promoted local shell procedure from prior successful work to solve an equivalent task. "
-                f"{contract.prompt}"
+            task_id=f"{source_task_id}{_memory_task_rule_text('tool_replay', 'task_id_suffix', fallback='_tool_replay')}",
+            prompt=_memory_task_prompt("tool_replay", prompt=contract.prompt),
+            workspace_subdir=(
+                f"{source_task_id}{_memory_task_rule_text('tool_replay', 'workspace_suffix', fallback='_tool_replay')}"
             ),
-            workspace_subdir=f"{source_task_id}_tool_replay",
             setup_commands=list(contract.setup_commands),
             success_command=contract.success_command,
             suggested_commands=procedure or list(contract.suggested_commands),
@@ -4087,7 +2358,7 @@ def load_tool_replay_tasks(tool_candidates_path: Path, *, limit: int | None = No
             max_steps=max(contract.max_steps, max(1, len(procedure) + 1)),
             metadata=metadata,
         )
-        tasks.append(replay_task)
+        tasks.append(_annotate_light_supervision_contract(replay_task))
         if limit is not None and len(tasks) >= limit:
             break
     return tasks
@@ -4408,12 +2679,15 @@ def _task_contract_from_memory(
     if not isinstance(task_metadata, dict):
         task_metadata = {}
     if isinstance(contract, dict) and contract:
-        metadata = dict(contract.get("metadata", {}))
         try:
             fallback = bank.get(task_id)
             fallback_metadata = dict(fallback.metadata)
         except KeyError:
             fallback_metadata = {}
+            fallback = None
+        metadata = dict(fallback_metadata)
+        if isinstance(contract.get("metadata", {}), dict):
+            metadata.update(dict(contract.get("metadata", {})))
 
         capability = str(metadata.get("capability", "")).strip() or str(
             task_metadata.get("capability", "")
@@ -4428,22 +2702,62 @@ def _task_contract_from_memory(
         metadata["capability"] = capability
         metadata["difficulty"] = difficulty
         metadata["benchmark_family"] = benchmark_family
-        return TaskSpec(
+        task = TaskSpec(
             task_id=task_id,
-            prompt=str(contract.get("prompt", payload.get("prompt", ""))),
-            workspace_subdir=str(contract.get("workspace_subdir", task_id)),
-            setup_commands=list(contract.get("setup_commands", [])),
-            success_command=str(contract.get("success_command", "")),
-            suggested_commands=list(contract.get("suggested_commands", [])),
-            expected_files=list(contract.get("expected_files", [])),
-            expected_output_substrings=list(contract.get("expected_output_substrings", [])),
-            forbidden_files=list(contract.get("forbidden_files", [])),
-            forbidden_output_substrings=list(contract.get("forbidden_output_substrings", [])),
-            expected_file_contents=dict(contract.get("expected_file_contents", {})),
-            max_steps=int(contract.get("max_steps", 5) or 5),
+            prompt=str(contract.get("prompt", payload.get("prompt", getattr(fallback, "prompt", "")))),
+            workspace_subdir=str(contract.get("workspace_subdir", getattr(fallback, "workspace_subdir", task_id))),
+            setup_commands=list(contract.get("setup_commands", getattr(fallback, "setup_commands", []))),
+            success_command=str(contract.get("success_command", getattr(fallback, "success_command", ""))),
+            suggested_commands=list(contract.get("suggested_commands", getattr(fallback, "suggested_commands", []))),
+            expected_files=list(contract.get("expected_files", getattr(fallback, "expected_files", []))),
+            expected_output_substrings=list(
+                contract.get("expected_output_substrings", getattr(fallback, "expected_output_substrings", []))
+            ),
+            forbidden_files=list(contract.get("forbidden_files", getattr(fallback, "forbidden_files", []))),
+            forbidden_output_substrings=list(
+                contract.get("forbidden_output_substrings", getattr(fallback, "forbidden_output_substrings", []))
+            ),
+            expected_file_contents=dict(
+                contract.get("expected_file_contents", getattr(fallback, "expected_file_contents", {}))
+            ),
+            max_steps=int(contract.get("max_steps", getattr(fallback, "max_steps", 5)) or 5),
             metadata=metadata,
         )
+        task.max_steps = uplifted_task_max_steps(
+            task.max_steps,
+            metadata=task.metadata,
+            suggested_commands=task.suggested_commands,
+        )
+        return _annotate_light_supervision_contract(task)
     try:
         return bank.get(task_id)
     except KeyError:
         return None
+
+
+def _tool_candidate_has_incomplete_shared_repo_integrator_bundle(
+    record: dict[str, object],
+    *,
+    contract: TaskSpec,
+    procedure: list[str],
+) -> bool:
+    bundle = record.get("shared_repo_bundle", {})
+    if isinstance(bundle, dict) and str(bundle.get("role", "")).strip() == "integrator":
+        return not bool(bundle.get("bundle_complete", False))
+    metadata = dict(contract.metadata)
+    try:
+        shared_repo_order = int(metadata.get("shared_repo_order", 0) or 0)
+    except (TypeError, ValueError):
+        shared_repo_order = 0
+    verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
+    required_merged_branches = [
+        str(value).strip()
+        for value in verifier.get("required_merged_branches", [])
+        if str(value).strip()
+    ]
+    if shared_repo_order <= 0 or not required_merged_branches:
+        return False
+    observed_merged_branches = {
+        branch for branch in required_merged_branches if any(branch in str(command) for command in procedure)
+    }
+    return len(observed_merged_branches) < len(required_merged_branches)

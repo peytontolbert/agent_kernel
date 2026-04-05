@@ -58,6 +58,7 @@ def main() -> None:
         focus=None if args.focus == "balanced" else args.focus,
         family=args.family,
         current_payload=_current_payload(config.curriculum_proposals_path),
+        cycles_path=config.improvement_cycles_path,
     )
     config.curriculum_proposals_path.write_text(json.dumps(proposals, indent=2), encoding="utf-8")
     print(config.curriculum_proposals_path)

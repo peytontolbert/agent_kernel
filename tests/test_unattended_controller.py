@@ -1,6 +1,7 @@
 from agent_kernel.unattended_controller import (
     action_key_for_policy,
     build_round_observation,
+    controller_state_summary,
     default_controller_state,
     observation_reward,
     plan_next_policy,
@@ -267,6 +268,92 @@ def test_build_round_observation_tracks_priority_family_yield_feedback():
     )
 
     assert observation_reward(productive_observation) > observation_reward(stalled_observation)
+
+
+def test_build_round_observation_tracks_generalization_pressure():
+    broad = build_round_observation(
+        campaign_signal={
+            "priority_families": ["repository", "workflow", "integration"],
+            "priority_families_with_retained_gain": ["repository", "workflow"],
+            "priority_families_with_signal_but_no_retained_gain": ["integration"],
+        }
+    )
+    narrow = build_round_observation(
+        campaign_signal={
+            "priority_families": ["repository", "workflow", "integration"],
+            "priority_families_with_retained_gain": ["repository"],
+            "priority_families_with_signal_but_no_retained_gain": ["workflow"],
+            "priority_families_without_signal": ["integration"],
+        }
+    )
+
+    assert broad["features"]["generalization_gain"] > narrow["features"]["generalization_gain"]
+    assert broad["features"]["generalization_gap"] < narrow["features"]["generalization_gap"]
+    assert observation_reward(broad) > observation_reward(narrow)
+
+
+def test_build_round_observation_tracks_no_retained_gain_pressure():
+    pressured = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 0,
+            "rejected_cycles": 2,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository", "integration"],
+        }
+    )
+    recovered = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_with_retained_gain": ["project"],
+        }
+    )
+
+    assert pressured["features"]["no_retained_gain_pressure"] == 1.0
+    assert pressured["features"]["priority_family_yield_gap"] == 1.0
+    assert observation_reward(recovered) > observation_reward(pressured)
+
+
+def test_build_round_observation_tracks_frontier_motif_and_repo_setting_pressure():
+    pressured = build_round_observation(
+        campaign_signal={
+            "priority_families_with_retained_gain": ["project"],
+        },
+        planner_pressure_signal={
+            "frontier_failure_motif_families": ["workflow", "integration"],
+            "frontier_repo_setting_families": ["integration"],
+        },
+    )
+    productive = build_round_observation(
+        campaign_signal={
+            "priority_families_with_retained_gain": ["project", "workflow", "integration"],
+        },
+        planner_pressure_signal={
+            "frontier_failure_motif_families": ["workflow", "integration"],
+            "frontier_repo_setting_families": ["integration"],
+        },
+    )
+
+    assert pressured["features"]["frontier_failure_motif_pressure"] == 2.0 / 3.0
+    assert pressured["features"]["frontier_repo_setting_pressure"] == 1.0 / 3.0
+    assert productive["features"]["frontier_failure_motif_gain"] == 2.0 / 3.0
+    assert productive["features"]["frontier_repo_setting_gain"] == 1.0 / 3.0
+    assert observation_reward(productive) > observation_reward(pressured)
+
+
+def test_observation_reward_penalizes_subsystem_reject_pressure():
+    reject_only = build_round_observation(
+        campaign_signal={"retained_cycles": 0, "rejected_cycles": 1},
+        subsystem_signal={"rejected_by_subsystem": {"retrieval": 4}, "retained_by_subsystem": {}},
+    )
+    mixed = build_round_observation(
+        campaign_signal={"retained_cycles": 1, "rejected_cycles": 0},
+        subsystem_signal={"rejected_by_subsystem": {"retrieval": 1}, "retained_by_subsystem": {"repository": 2}},
+    )
+
+    assert reject_only["features"]["subsystem_reject_pressure"] == 4.0
+    assert mixed["features"]["subsystem_retain_pressure"] == 2.0
+    assert observation_reward(mixed) > observation_reward(reject_only)
 
 
 def test_plan_next_policy_generalizes_to_unseen_related_action():
@@ -576,3 +663,410 @@ def test_plan_next_policy_uses_state_repeat_and_novelty_terms_beyond_action_memo
     assert repeated_diag["state_repeat_penalty"] > novel_diag["state_repeat_penalty"]
     assert novel_diag["state_novelty_bonus"] > repeated_diag["state_novelty_bonus"]
     assert novel_diag["score"] > repeated_diag["score"]
+
+
+def test_plan_next_policy_penalizes_thin_evidence_exploitation():
+    thin_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "task_limit": 128,
+    }
+    proven_policy = {
+        "focus": "balanced",
+        "adaptive_search": False,
+        "cycles": 1,
+        "campaign_width": 1,
+        "variant_width": 1,
+        "task_limit": 64,
+    }
+    thin_key = action_key_for_policy(thin_policy)
+    proven_key = action_key_for_policy(proven_policy)
+    state = default_controller_state(
+        exploration_bonus=0.0,
+        uncertainty_penalty=0.0,
+        min_action_support=3,
+        thin_evidence_penalty=2.0,
+        rollout_depth=1,
+    )
+    state["action_models"] = {
+        thin_key: {
+            "count": 1,
+            "reward_mean": 8.0,
+            "reward_m2": 0.0,
+            "transition_mean": {"retained_cycles": 2.0, "pass_rate_delta": 0.2},
+            "transition_error_ema": {},
+            "policy_template": dict(thin_policy),
+            "last_reward": 8.0,
+        },
+        proven_key: {
+            "count": 4,
+            "reward_mean": 6.0,
+            "reward_m2": 0.0,
+            "transition_mean": {"retained_cycles": 0.5, "pass_rate_delta": 0.05},
+            "transition_error_ema": {},
+            "policy_template": dict(proven_policy),
+            "last_reward": 6.0,
+        },
+    }
+    neutral = build_round_observation(campaign_signal={})
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=neutral,
+        candidate_policies=[thin_policy, proven_policy],
+    )
+
+    assert selected["focus"] == "balanced"
+    thin_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == thin_key)
+    proven_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == proven_key)
+    assert (1.0 / 3.0) < thin_diag["support_confidence"] < 1.0
+    assert thin_diag["support_penalty"] > 0.0
+    assert thin_diag["supported_reward_lcb"] < thin_diag["reward_lcb"]
+    assert proven_diag["support_confidence"] == 1.0
+    assert proven_diag["support_penalty"] == 0.0
+    assert proven_diag["score"] > thin_diag["score"]
+
+
+def test_controller_state_summary_reports_support_controls():
+    summary = controller_state_summary(
+        default_controller_state(
+            min_action_support=4,
+            thin_evidence_penalty=1.25,
+            support_confidence_power=0.6,
+        )
+    )
+
+    assert summary["min_action_support"] == 4
+    assert summary["thin_evidence_penalty"] == 1.25
+    assert summary["support_confidence_power"] == 0.6
+
+
+def test_plan_next_policy_graduates_nearly_supported_actions_faster():
+    nearly_supported_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "task_limit": 128,
+    }
+    proven_policy = {
+        "focus": "balanced",
+        "adaptive_search": False,
+        "cycles": 1,
+        "campaign_width": 1,
+        "variant_width": 1,
+        "task_limit": 64,
+    }
+    nearly_supported_key = action_key_for_policy(nearly_supported_policy)
+    proven_key = action_key_for_policy(proven_policy)
+    state = default_controller_state(
+        exploration_bonus=0.0,
+        uncertainty_penalty=0.0,
+        min_action_support=3,
+        thin_evidence_penalty=2.0,
+        support_confidence_power=0.5,
+        rollout_depth=1,
+    )
+    state["action_models"] = {
+        nearly_supported_key: {
+            "count": 2,
+            "reward_mean": 8.5,
+            "reward_m2": 0.0,
+            "transition_mean": {"retained_cycles": 1.5, "pass_rate_delta": 0.15},
+            "transition_error_ema": {},
+            "policy_template": dict(nearly_supported_policy),
+            "last_reward": 8.5,
+        },
+        proven_key: {
+            "count": 4,
+            "reward_mean": 6.0,
+            "reward_m2": 0.0,
+            "transition_mean": {"retained_cycles": 0.5, "pass_rate_delta": 0.05},
+            "transition_error_ema": {},
+            "policy_template": dict(proven_policy),
+            "last_reward": 6.0,
+        },
+    }
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=build_round_observation(campaign_signal={}),
+        candidate_policies=[nearly_supported_policy, proven_policy],
+    )
+
+    assert selected["focus"] == "discovered_task_adaptation"
+    nearly_supported_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == nearly_supported_key)
+    proven_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == proven_key)
+    assert nearly_supported_diag["count"] == 2
+    assert nearly_supported_diag["support_confidence"] > (2.0 / 3.0)
+    assert nearly_supported_diag["support_penalty"] > 0.0
+    assert nearly_supported_diag["score"] > proven_diag["score"]
+
+
+def test_observation_reward_prefers_productive_depth_over_depth_drift():
+    productive = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.05,
+            "average_retained_step_delta": 3.0,
+            "productive_depth_retained_cycles": 1,
+            "average_productive_depth_step_delta": 3.0,
+            "long_horizon_retained_cycles": 1,
+        }
+    )
+    drifting = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.01,
+            "average_retained_step_delta": 3.0,
+            "depth_drift_cycles": 1,
+            "average_depth_drift_step_delta": 3.0,
+        }
+    )
+
+    assert productive["features"]["productive_depth_gain"] > 0.0
+    assert productive["features"]["depth_drift_pressure"] == 0.0
+    assert observation_reward(productive) > observation_reward(drifting)
+
+
+def test_plan_next_policy_can_learn_task_step_floor_as_policy_dimension():
+    state = default_controller_state(exploration_bonus=0.0)
+    deeper_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "task_limit": 128,
+        "task_step_floor": 120,
+    }
+    shallow_policy = {
+        **deeper_policy,
+        "task_step_floor": 40,
+    }
+    neutral = build_round_observation(campaign_signal={})
+    productive_depth_end = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.06,
+            "average_retained_step_delta": 4.0,
+            "productive_depth_retained_cycles": 1,
+            "average_productive_depth_step_delta": 4.0,
+            "long_horizon_retained_cycles": 1,
+        }
+    )
+    for _ in range(3):
+        state, _ = update_controller_state(
+            state,
+            start_observation=neutral,
+            action_policy=deeper_policy,
+            end_observation=productive_depth_end,
+        )
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=neutral,
+        candidate_policies=[shallow_policy, deeper_policy],
+    )
+
+    assert selected["task_step_floor"] == 120
+    deep_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(deeper_policy))
+    shallow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(shallow_policy))
+    assert deep_diag["policy_prior"] > shallow_diag["policy_prior"]
+
+
+def test_plan_next_policy_prefers_broader_generalization_yield():
+    state = default_controller_state(exploration_bonus=0.0, uncertainty_penalty=0.0)
+    broad_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 3,
+        "variant_width": 2,
+        "task_limit": 256,
+    }
+    narrow_policy = {
+        "focus": "balanced",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 3,
+        "variant_width": 2,
+        "task_limit": 256,
+    }
+    neutral = build_round_observation(campaign_signal={})
+    broad_end = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.05,
+            "priority_families": ["repository", "workflow", "integration"],
+            "priority_families_with_retained_gain": ["repository", "workflow"],
+            "priority_families_with_signal_but_no_retained_gain": ["integration"],
+        }
+    )
+    narrow_end = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.05,
+            "priority_families": ["repository", "workflow", "integration"],
+            "priority_families_with_retained_gain": ["repository"],
+            "priority_families_with_signal_but_no_retained_gain": ["workflow"],
+            "priority_families_without_signal": ["integration"],
+        }
+    )
+    for _ in range(3):
+        state, _ = update_controller_state(
+            state,
+            start_observation=neutral,
+            action_policy=broad_policy,
+            end_observation=broad_end,
+        )
+        state, _ = update_controller_state(
+            state,
+            start_observation=neutral,
+            action_policy=narrow_policy,
+            end_observation=narrow_end,
+        )
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=neutral,
+        candidate_policies=[narrow_policy, broad_policy],
+    )
+
+    assert selected["focus"] == "discovered_task_adaptation"
+    broad_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(broad_policy))
+    narrow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(narrow_policy))
+    assert broad_diag["score"] > narrow_diag["score"]
+
+
+def test_plan_next_policy_prefers_broader_policy_under_subsystem_reject_pressure():
+    state = default_controller_state(
+        exploration_bonus=0.0,
+        uncertainty_penalty=0.0,
+        repeat_action_penalty=0.0,
+    )
+    narrow_policy = {
+        "focus": "balanced",
+        "adaptive_search": False,
+        "cycles": 2,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "task_limit": 64,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project"],
+    }
+    broad_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 3,
+        "campaign_width": 4,
+        "variant_width": 3,
+        "task_limit": 256,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+    }
+    pressured = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 0,
+            "rejected_cycles": 2,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository"],
+            "priority_families_with_signal_but_no_retained_gain": ["integration"],
+            "max_low_confidence_episode_delta": 2,
+            "min_trusted_retrieval_step_delta": -1,
+        },
+        subsystem_signal={
+            "rejected_by_subsystem": {"retrieval": 4},
+            "retained_by_subsystem": {},
+        },
+        planner_pressure_signal={
+            "campaign_breadth_pressure_cycles": 2,
+            "variant_breadth_pressure_cycles": 1,
+        },
+    )
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=pressured,
+        candidate_policies=[narrow_policy, broad_policy],
+    )
+
+    assert selected["focus"] == "discovered_task_adaptation"
+    broad_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(broad_policy))
+    narrow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(narrow_policy))
+    assert broad_diag["pressure_alignment_bonus"] > narrow_diag["pressure_alignment_bonus"]
+    assert broad_diag["score"] > narrow_diag["score"]
+
+
+def test_plan_next_policy_prefers_broader_policy_when_no_retained_gain_pressure_is_present():
+    state = default_controller_state(
+        exploration_bonus=0.0,
+        uncertainty_penalty=0.0,
+        repeat_action_penalty=0.0,
+    )
+    narrow_policy = {
+        "focus": "balanced",
+        "adaptive_search": False,
+        "cycles": 1,
+        "campaign_width": 1,
+        "variant_width": 1,
+        "task_limit": 64,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project"],
+    }
+    broad_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 3,
+        "campaign_width": 4,
+        "variant_width": 3,
+        "task_limit": 256,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+    }
+    narrow_key = action_key_for_policy(narrow_policy)
+    broad_key = action_key_for_policy(broad_policy)
+    state["action_models"] = {
+        narrow_key: {
+            "count": 6,
+            "reward_mean": 7.5,
+            "reward_m2": 0.0,
+            "transition_mean": {},
+            "transition_error_ema": {},
+            "policy_template": dict(narrow_policy),
+            "last_reward": 7.5,
+        },
+        broad_key: {
+            "count": 6,
+            "reward_mean": 4.5,
+            "reward_m2": 0.0,
+            "transition_mean": {},
+            "transition_error_ema": {},
+            "policy_template": dict(broad_policy),
+            "last_reward": 4.5,
+        },
+    }
+    pressured = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 0,
+            "rejected_cycles": 2,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository", "integration"],
+        }
+    )
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=pressured,
+        candidate_policies=[narrow_policy, broad_policy],
+    )
+
+    assert selected["focus"] == "discovered_task_adaptation"
+    broad_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == broad_key)
+    narrow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == narrow_key)
+    assert broad_diag["pressure_alignment_bonus"] > narrow_diag["pressure_alignment_bonus"]
+    assert broad_diag["score"] > narrow_diag["score"]

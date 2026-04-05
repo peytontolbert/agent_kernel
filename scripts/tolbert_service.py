@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import torch
@@ -652,6 +653,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    startup_started_at = time.monotonic()
     args = parse_args()
     requested_device = args.device
     if requested_device == "cuda" and not torch.cuda.is_available():
@@ -660,7 +662,10 @@ def main() -> None:
                 {
                     "startup_error": (
                         "Requested CUDA for TOLBERT service, but torch.cuda.is_available() is false."
-                    )
+                    ),
+                    "device": requested_device,
+                    "pid": os.getpid(),
+                    "startup_elapsed_seconds": round(time.monotonic() - startup_started_at, 4),
                 }
             ),
             file=sys.stderr,
@@ -683,6 +688,9 @@ def main() -> None:
                 "event": "startup_ready",
                 "backend": "tolbert_brain_service",
                 "device": requested_device,
+                "pid": os.getpid(),
+                "cache_shard_count": len(runtime.shard_names),
+                "startup_elapsed_seconds": round(time.monotonic() - startup_started_at, 4),
             }
         ),
         file=sys.stderr,

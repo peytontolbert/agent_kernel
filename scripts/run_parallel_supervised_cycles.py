@@ -285,6 +285,7 @@ def _child_command(
     progress_label: str,
     requested_subsystem: str,
     requested_variant_id: str,
+    requested_variant_strategy_family: str,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -307,6 +308,8 @@ def _child_command(
         cmd.extend(["--subsystem", requested_subsystem])
     if requested_variant_id:
         cmd.extend(["--variant-id", requested_variant_id])
+    if requested_variant_strategy_family:
+        cmd.extend(["--variant-strategy-family", requested_variant_strategy_family])
     notes = str(args.notes).strip()
     if notes:
         cmd.extend(["--notes", f"{notes} [{scope_id}]"])
@@ -368,18 +371,52 @@ def _scoped_run_summary(base_config: KernelConfig, *, scope_id: str) -> dict[str
     candidate_artifact_path = str(
         generate_record.get("candidate_artifact_path") or generate_record.get("artifact_path") or ""
     ).strip()
+    observation_timed_out = bool(observe_metrics.get("observation_timed_out", False))
+    observation_budget_exceeded = bool(observe_metrics.get("observation_budget_exceeded", False))
+    observation_returncode = int(observe_metrics.get("observation_returncode", 0) or 0)
+    generated_total = int(observe_metrics.get("generated_total", 0) or 0)
+    generated_passed = int(observe_metrics.get("generated_passed", 0) or 0)
+    followups = observe_metrics.get("observation_curriculum_followups", [])
+    generated_failure_total = 0
+    generated_failure_passed = 0
+    if isinstance(followups, list):
+        for item in followups:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("kind", "")).strip() == "generated_failure":
+                generated_failure_total = int(item.get("generated_total", 0) or 0)
+                generated_failure_passed = int(item.get("generated_passed", 0) or 0)
+                break
+    run_completed = bool(observe_record)
+    process_succeeded = bool(run_completed and observation_returncode == 0 and not observation_timed_out)
+    healthy_run = bool(process_succeeded and not str(observe_metrics.get("observation_warning", "")).strip())
     return {
         "scope_id": scope_id,
         "workspace_root": str(scoped_config.workspace_root),
         "cycles_path": str(scoped_config.improvement_cycles_path),
         "candidate_artifacts_root": str(scoped_config.candidate_artifacts_root),
         "cycle_id": str(cycle_records[-1].get("cycle_id", "")).strip() if cycle_records else "",
+        "status": "healthy" if healthy_run else ("completed_with_warnings" if process_succeeded else ("failed" if run_completed else "missing")),
+        "run_completed": run_completed,
+        "run_succeeded": process_succeeded,
+        "process_succeeded": process_succeeded,
+        "healthy_run": healthy_run,
         "selected_subsystem": str(select_record.get("subsystem", "")).strip(),
         "selected_variant_id": str(select_metrics.get("selected_variant_id", "")).strip()
         or str((select_metrics.get("selected_variant", {}) or {}).get("variant_id", "")).strip(),
         "candidate_artifact_path": candidate_artifact_path,
         "generated_candidate": bool(generate_record),
-        "observation_timed_out": bool(observe_metrics.get("observation_timed_out", False)),
+        "primary_total": int(observe_metrics.get("total", 0) or 0),
+        "primary_passed": int(observe_metrics.get("passed", 0) or 0),
+        "primary_pass_rate": float(observe_metrics.get("pass_rate", 0.0) or 0.0),
+        "generated_success_total": generated_total,
+        "generated_success_passed": generated_passed,
+        "generated_success_pass_rate": float(observe_metrics.get("generated_pass_rate", 0.0) or 0.0),
+        "generated_failure_total": generated_failure_total,
+        "generated_failure_passed": generated_failure_passed,
+        "observation_returncode": observation_returncode,
+        "observation_timed_out": observation_timed_out,
+        "observation_budget_exceeded": observation_budget_exceeded,
         "observation_warning": str(observe_metrics.get("observation_warning", "")).strip(),
         "observation_elapsed_seconds": float(observe_metrics.get("observation_elapsed_seconds", 0.0) or 0.0),
         "records_written": len(cycle_records),
@@ -397,6 +434,7 @@ def _run_single_worker(
     progress_prefix: str,
     requested_subsystem: str,
     requested_variant_id: str,
+    requested_variant_strategy_family: str,
 ) -> dict[str, object]:
     scope_id = _child_scope_id(scope_prefix, worker_index)
     progress_label = _child_progress_label(progress_prefix, worker_index)
@@ -408,6 +446,7 @@ def _run_single_worker(
         progress_label=progress_label,
         requested_subsystem=requested_subsystem,
         requested_variant_id=requested_variant_id,
+        requested_variant_strategy_family=requested_variant_strategy_family,
     )
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -425,6 +464,7 @@ def _run_single_worker(
         "progress_label": progress_label,
         "requested_subsystem": requested_subsystem,
         "requested_variant_id": requested_variant_id,
+        "requested_variant_strategy_family": requested_variant_strategy_family,
         "command": cmd,
         "returncode": int(completed.returncode),
         "stdout": str(completed.stdout).strip(),
@@ -436,7 +476,14 @@ def _run_single_worker(
 def _batch_report_summary(runs: list[dict[str, object]]) -> dict[str, object]:
     generated_runs = sum(1 for run in runs if bool(run.get("generated_candidate", False)))
     timed_out_runs = sum(1 for run in runs if bool(run.get("observation_timed_out", False)))
-    failed_runs = sum(1 for run in runs if int(run.get("returncode", 0) or 0) != 0)
+    budget_exceeded_runs = sum(1 for run in runs if bool(run.get("observation_budget_exceeded", False)))
+    failed_runs = sum(1 for run in runs if not bool(run.get("process_succeeded", False)))
+    healthy_runs = sum(1 for run in runs if bool(run.get("healthy_run", False)))
+    warning_runs = sum(
+        1 for run in runs if bool(run.get("process_succeeded", False)) and not bool(run.get("healthy_run", False))
+    )
+    generated_success_runs = sum(1 for run in runs if int(run.get("generated_success_passed", 0) or 0) > 0)
+    generated_failure_runs = sum(1 for run in runs if int(run.get("generated_failure_passed", 0) or 0) > 0)
     selected_subsystems = sorted(
         {
             str(run.get("selected_subsystem", "")).strip()
@@ -458,14 +505,27 @@ def _batch_report_summary(runs: list[dict[str, object]]) -> dict[str, object]:
             if str(run.get("requested_variant_id", "")).strip()
         }
     )
+    requested_variant_strategy_families = sorted(
+        {
+            str(run.get("requested_variant_strategy_family", "")).strip()
+            for run in runs
+            if str(run.get("requested_variant_strategy_family", "")).strip()
+        }
+    )
     return {
         "completed_runs": len(runs),
         "generated_runs": generated_runs,
+        "generated_success_runs": generated_success_runs,
+        "generated_failure_runs": generated_failure_runs,
         "timed_out_runs": timed_out_runs,
+        "budget_exceeded_runs": budget_exceeded_runs,
         "failed_runs": failed_runs,
+        "healthy_runs": healthy_runs,
+        "warning_runs": warning_runs,
         "selected_subsystems": selected_subsystems,
         "requested_subsystems": requested_subsystems,
         "requested_variant_ids": requested_variant_ids,
+        "requested_variant_strategy_families": requested_variant_strategy_families,
     }
 
 
@@ -490,6 +550,7 @@ def _batch_history_record(
                 "scope_id": str(run.get("scope_id", "")).strip(),
                 "requested_subsystem": str(run.get("requested_subsystem", "")).strip(),
                 "requested_variant_id": str(run.get("requested_variant_id", "")).strip(),
+                "requested_variant_strategy_family": str(run.get("requested_variant_strategy_family", "")).strip(),
                 "selected_subsystem": str(run.get("selected_subsystem", "")).strip(),
                 "selected_variant_id": str(run.get("selected_variant_id", "")).strip(),
                 "generated_candidate": bool(run.get("generated_candidate", False)),
@@ -520,6 +581,7 @@ def main() -> None:
     parser.add_argument("--notes", default="")
     parser.add_argument("--subsystem", action="append", default=[])
     parser.add_argument("--variant-id", action="append", default=[])
+    parser.add_argument("--variant-strategy-family", action="append", default=[])
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
     parser.add_argument("--priority-benchmark-family-weight", action="append", default=[])
     parser.add_argument("--auto-diversify-subsystems", dest="auto_diversify_subsystems", action="store_true")
@@ -542,6 +604,7 @@ def main() -> None:
 
     args.subsystem = _normalized_optional_values(args.subsystem)
     args.variant_id = _normalized_optional_values(args.variant_id)
+    args.variant_strategy_family = _normalized_optional_values(args.variant_strategy_family)
     if max(1, int(args.workers)) != int(args.workers):
         raise SystemExit("--workers must be at least 1")
 
@@ -593,6 +656,21 @@ def main() -> None:
     if len(requested_variant_ids) < int(args.workers):
         requested_variant_ids.extend([""] * (int(args.workers) - len(requested_variant_ids)))
 
+    if args.variant_strategy_family:
+        requested_variant_strategy_families = [
+            _value_for_worker(
+                args.variant_strategy_family,
+                worker_index=index,
+                field_name="--variant-strategy-family",
+                worker_count=args.workers,
+            )
+            for index in range(int(args.workers))
+        ]
+    else:
+        requested_variant_strategy_families = [""] * int(args.workers)
+    if len(requested_variant_strategy_families) < int(args.workers):
+        requested_variant_strategy_families.extend([""] * (int(args.workers) - len(requested_variant_strategy_families)))
+
     started_at = datetime.now(timezone.utc)
     runs: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=int(args.workers)) as executor:
@@ -607,6 +685,7 @@ def main() -> None:
                 progress_prefix=progress_prefix,
                 requested_subsystem=requested_subsystems[worker_index],
                 requested_variant_id=requested_variant_ids[worker_index],
+                requested_variant_strategy_family=requested_variant_strategy_families[worker_index],
             )
             for worker_index in range(int(args.workers))
         ]

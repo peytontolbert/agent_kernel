@@ -52,11 +52,21 @@ _DEFAULT_TOLBERT_ROLLOUT_POLICY: dict[str, object] = {
     "predicted_workflow_bonus_weight": 1.5,
     "latent_progress_bonus_weight": 1.0,
     "latent_risk_penalty_weight": 2.0,
+    "learned_world_progress_bonus_weight": 1.25,
+    "learned_world_recovery_bonus_weight": 1.5,
+    "learned_world_continue_penalty_weight": 1.25,
     "recover_from_stall_bonus_weight": 1.5,
+    "long_horizon_progress_bonus_weight": 0.0,
+    "long_horizon_preserved_bonus_weight": 0.0,
+    "long_horizon_risk_penalty_weight": 0.0,
+    "long_horizon_stop_penalty_weight": 0.0,
     "stop_completion_weight": 8.0,
     "stop_missing_expected_penalty_weight": 6.0,
     "stop_forbidden_penalty_weight": 6.0,
     "stop_preserved_penalty_weight": 4.0,
+    "stop_learned_progress_weight": 1.5,
+    "stop_learned_risk_penalty_weight": 4.0,
+    "long_horizon_stop_risk_gap_penalty_weight": 3.0,
     "stable_stop_bonus_weight": 1.5,
 }
 
@@ -117,6 +127,9 @@ _DEFAULT_TOLBERT_HYBRID_SCORING_POLICY: dict[str, object] = {
     "respond_world_risk_penalty_weight": 0.20,
     "respond_latent_bias_weight": 0.0,
     "respond_decoder_logprob_weight": 0.05,
+    "long_horizon_progress_bonus_weight": 0.0,
+    "long_horizon_risk_penalty_weight": 0.0,
+    "long_horizon_horizon_scale_weight": 0.0,
 }
 
 _DEFAULT_TOLBERT_LIFTOFF_GATE: dict[str, object] = {
@@ -128,6 +141,11 @@ _DEFAULT_TOLBERT_LIFTOFF_GATE: dict[str, object] = {
     "require_unsafe_ambiguous_non_regression": True,
     "require_hidden_side_effect_non_regression": True,
     "require_success_hidden_side_effect_non_regression": True,
+    "require_long_horizon_non_regression": True,
+    "require_long_horizon_novel_command_non_regression": True,
+    "require_long_horizon_world_feedback_non_regression": True,
+    "require_long_horizon_persistence_non_regression": True,
+    "require_transfer_alignment_non_regression": True,
     "require_trust_gate_pass": True,
     "require_trust_success_non_regression": True,
     "require_trust_unsafe_non_regression": True,
@@ -152,12 +170,31 @@ _DEFAULT_TOLBERT_BUILD_POLICY: dict[str, object] = {
     "allow_kernel_rebuild": False,
     "require_synthetic_dataset": True,
     "require_head_targets": True,
+    "require_long_horizon_head_targets": True,
     "min_total_examples": 512,
     "min_synthetic_examples": 64,
     "min_policy_examples": 256,
     "min_transition_examples": 256,
     "min_value_examples": 256,
     "min_stop_examples": 128,
+    "min_long_horizon_trajectory_examples": 4,
+    "min_long_horizon_policy_examples": 4,
+    "min_long_horizon_transition_examples": 4,
+    "min_long_horizon_value_examples": 4,
+    "min_long_horizon_stop_examples": 1,
+}
+_DEFAULT_QWEN_ADAPTER_RUNTIME_POLICY: dict[str, object] = {
+    "allow_primary_routing": False,
+    "allow_shadow_routing": True,
+    "allow_teacher_generation": True,
+    "allow_post_liftoff_fallback": True,
+    "require_retained_promotion_for_runtime_use": True,
+}
+_DEFAULT_QWEN_ADAPTER_RETENTION_GATE: dict[str, object] = {
+    "require_improvement_cycle_promotion": True,
+    "require_non_regression": True,
+    "require_base_model_match": True,
+    "disallow_liftoff_authority": True,
 }
 
 
@@ -316,6 +353,36 @@ def retained_tolbert_liftoff_gate(payload: object) -> dict[str, object]:
         normalized.get(
             "require_success_hidden_side_effect_non_regression",
             _DEFAULT_TOLBERT_LIFTOFF_GATE["require_success_hidden_side_effect_non_regression"],
+        )
+    )
+    normalized["require_long_horizon_non_regression"] = bool(
+        normalized.get(
+            "require_long_horizon_non_regression",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_long_horizon_non_regression"],
+        )
+    )
+    normalized["require_long_horizon_novel_command_non_regression"] = bool(
+        normalized.get(
+            "require_long_horizon_novel_command_non_regression",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_long_horizon_novel_command_non_regression"],
+        )
+    )
+    normalized["require_long_horizon_world_feedback_non_regression"] = bool(
+        normalized.get(
+            "require_long_horizon_world_feedback_non_regression",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_long_horizon_world_feedback_non_regression"],
+        )
+    )
+    normalized["require_long_horizon_persistence_non_regression"] = bool(
+        normalized.get(
+            "require_long_horizon_persistence_non_regression",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_long_horizon_persistence_non_regression"],
+        )
+    )
+    normalized["require_transfer_alignment_non_regression"] = bool(
+        normalized.get(
+            "require_transfer_alignment_non_regression",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_transfer_alignment_non_regression"],
         )
     )
     normalized["require_trust_gate_pass"] = bool(
@@ -535,6 +602,12 @@ def retained_tolbert_build_policy(payload: object) -> dict[str, object]:
     normalized["require_head_targets"] = bool(
         normalized.get("require_head_targets", _DEFAULT_TOLBERT_BUILD_POLICY["require_head_targets"])
     )
+    normalized["require_long_horizon_head_targets"] = bool(
+        normalized.get(
+            "require_long_horizon_head_targets",
+            _DEFAULT_TOLBERT_BUILD_POLICY["require_long_horizon_head_targets"],
+        )
+    )
     normalized["min_total_examples"] = max(
         0,
         _int_value(
@@ -554,12 +627,22 @@ def retained_tolbert_build_policy(payload: object) -> dict[str, object]:
         "min_transition_examples",
         "min_value_examples",
         "min_stop_examples",
+        "min_long_horizon_trajectory_examples",
+        "min_long_horizon_policy_examples",
+        "min_long_horizon_transition_examples",
+        "min_long_horizon_value_examples",
+        "min_long_horizon_stop_examples",
         "ready_total_examples",
         "ready_synthetic_examples",
         "ready_policy_examples",
         "ready_transition_examples",
         "ready_value_examples",
         "ready_stop_examples",
+        "ready_long_horizon_trajectory_examples",
+        "ready_long_horizon_policy_examples",
+        "ready_long_horizon_transition_examples",
+        "ready_long_horizon_value_examples",
+        "ready_long_horizon_stop_examples",
     ):
         normalized[key] = max(
             0,
@@ -614,6 +697,22 @@ def tolbert_kernel_autobuild_ready(payload: object) -> tuple[bool, str]:
                     False,
                     f"head target threshold not met: {dataset_key}={observed} < {key}={required}",
                 )
+    long_horizon_trajectory_examples = _int_value(dataset.get("long_horizon_trajectory_examples"), 0)
+    if bool(policy.get("require_long_horizon_head_targets", True)) and long_horizon_trajectory_examples > 0:
+        for key, dataset_key in (
+            ("min_long_horizon_trajectory_examples", "long_horizon_trajectory_examples"),
+            ("min_long_horizon_policy_examples", "long_horizon_policy_examples"),
+            ("min_long_horizon_transition_examples", "long_horizon_transition_examples"),
+            ("min_long_horizon_value_examples", "long_horizon_value_examples"),
+            ("min_long_horizon_stop_examples", "long_horizon_stop_examples"),
+        ):
+            observed = _int_value(dataset.get(dataset_key), 0)
+            required = int(policy.get(key, 0))
+            if observed < required:
+                return (
+                    False,
+                    f"long-horizon threshold not met: {dataset_key}={observed} < {key}={required}",
+                )
     return True, ""
 
 
@@ -628,6 +727,34 @@ def retained_tolbert_rollout_policy(payload: object) -> dict[str, object]:
         normalized.update(policy)
     for key, default in _DEFAULT_TOLBERT_ROLLOUT_POLICY.items():
         normalized[key] = _float_value(normalized.get(key), float(default))
+    return normalized
+
+
+def retained_qwen_adapter_runtime_policy(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return dict(_DEFAULT_QWEN_ADAPTER_RUNTIME_POLICY)
+    if str(payload.get("artifact_kind", "")).strip() != "qwen_adapter_bundle":
+        return dict(_DEFAULT_QWEN_ADAPTER_RUNTIME_POLICY)
+    policy = payload.get("runtime_policy", {})
+    normalized = dict(_DEFAULT_QWEN_ADAPTER_RUNTIME_POLICY)
+    if isinstance(policy, dict):
+        normalized.update(policy)
+    for key, default in _DEFAULT_QWEN_ADAPTER_RUNTIME_POLICY.items():
+        normalized[key] = bool(normalized.get(key, default))
+    return normalized
+
+
+def retained_qwen_adapter_retention_gate(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return dict(_DEFAULT_QWEN_ADAPTER_RETENTION_GATE)
+    if str(payload.get("artifact_kind", "")).strip() != "qwen_adapter_bundle":
+        return dict(_DEFAULT_QWEN_ADAPTER_RETENTION_GATE)
+    gate = payload.get("retention_gate", {})
+    normalized = dict(_DEFAULT_QWEN_ADAPTER_RETENTION_GATE)
+    if isinstance(gate, dict):
+        normalized.update(gate)
+    for key, default in _DEFAULT_QWEN_ADAPTER_RETENTION_GATE.items():
+        normalized[key] = bool(normalized.get(key, default))
     return normalized
 
 

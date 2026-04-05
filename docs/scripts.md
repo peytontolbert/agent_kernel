@@ -228,6 +228,12 @@ Important flags:
 - summarizes unattended task outcomes, hidden-side-effect and false-pass rates, and acceptance-packet activity
 - prints required-family coverage, missing-family gaps, and per-required-family trust posture from the unattended trust ledger
 
+[`scripts/report_long_horizon_persistence.py`](/data/agentkernel/scripts/report_long_horizon_persistence.py)
+
+- runs the eval harness and summarizes whether long-horizon tasks actually stay in long-horizon mode across their inner steps
+- reports long-horizon step share, productive-step rate, recovery-response rate after pressure, subgoal refresh frequency, active-subgoal coverage, and per-task longest long-horizon streak
+- uses `task_trajectories` from the eval harness, so it measures persisted horizon and recovery quality rather than only final pass/fail
+
 Compatibility and protocol-comparison utilities still exist in `scripts/run_human_guided_improvement_cycle.py`,
 `scripts/compare_improvement_protocols.py`, and `scripts/run_protocol_head_to_head.py`, but the recommended
 operator entrypoint is `scripts/run_supervised_improvement_cycle.py` and none of those scripts are part of the

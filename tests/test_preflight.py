@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import agent_kernel.preflight as preflight
+import agent_kernel.syntax_motor as syntax_motor
 from agent_kernel.config import KernelConfig
 from agent_kernel.preflight import (
     PreflightCheck,
@@ -39,6 +41,7 @@ def test_run_unattended_preflight_passes_for_mock_with_verifier_contract(tmp_pat
         "paper_research_assets",
         "verifier_inputs",
         "workspace_readiness",
+        "syntax_preflight",
         "execution_containment",
         "operator_policy",
         "trust_posture",
@@ -521,6 +524,314 @@ def test_unattended_task_report_includes_edit_synthesis():
     assert report["acceptance_packet"]["verifier_result"]["passed"] is True
 
 
+def test_run_unattended_preflight_includes_python_syntax_preflight(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "syntax_worker"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "service.py").write_text(
+        "import os\n\n\ndef apply_status(value):\n    return normalize(value)\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="syntax_worker",
+        prompt="update service.py",
+        workspace_subdir="syntax_worker",
+        expected_files=["service.py"],
+        metadata={
+            "benchmark_family": "repository",
+            "synthetic_edit_plan": [
+                {
+                    "path": "service.py",
+                    "edit_kind": "line_replace",
+                    "replacements": [
+                        {
+                            "line_number": 4,
+                            "before_line": "def apply_status(value):",
+                            "after_line": "def apply_status(value, *, strict=False):",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    report = run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+    syntax_check = next(check for check in report.checks if check.name == "syntax_preflight")
+    assert syntax_check.passed is True
+    assert syntax_check.severity == "required"
+    assert "targeted_symbols=1" in syntax_check.detail
+
+
+def test_unattended_task_report_includes_syntax_motor_summary_for_python_edits(tmp_path):
+    workspace = tmp_path / "workspace" / "syntax_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "service.py").write_text(
+        "import os\n\n\ndef apply_status(value):\n    return normalize(value)\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="syntax_task",
+        prompt="update service.py",
+        workspace_subdir="syntax_task",
+        expected_files=["service.py"],
+        expected_file_contents={
+            "service.py": "import os\n\n\ndef apply_status(value, *, strict=False):\n    persist(value)\n    return normalize(value)\n",
+        },
+        metadata={
+            "benchmark_family": "repository",
+            "synthetic_edit_plan": [
+                {
+                    "path": "service.py",
+                    "edit_kind": "line_replace",
+                    "baseline_content": "import os\n\n\ndef apply_status(value):\n    return normalize(value)\n",
+                    "target_content": "import os\n\n\ndef apply_status(value, *, strict=False):\n    persist(value)\n    return normalize(value)\n",
+                    "replacements": [
+                        {
+                            "line_number": 4,
+                            "before_line": "def apply_status(value):",
+                            "after_line": "def apply_status(value, *, strict=False):",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        steps=[],
+        task_metadata=dict(task.metadata),
+        task_contract={
+            "prompt": task.prompt,
+            "workspace_subdir": task.workspace_subdir,
+            "setup_commands": [],
+            "success_command": "",
+            "suggested_commands": [],
+            "expected_files": ["service.py"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": dict(task.expected_file_contents),
+            "max_steps": 5,
+            "metadata": dict(task.metadata),
+            "synthetic_edit_plan": list(task.metadata["synthetic_edit_plan"]),
+            "synthetic_edit_candidates": [],
+        },
+    )
+    config = KernelConfig(provider="mock", use_tolbert_context=False)
+
+    report = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+    )
+
+    syntax_motor = report["syntax_motor"]
+    assert syntax_motor["parser"] in {"python_ast", "repository_library_python_ast"}
+    assert syntax_motor["syntax_preflight_passed"] is True
+    assert syntax_motor["targeted_symbol_count"] == 1
+    file_summary = syntax_motor["files"][0]
+    assert file_summary["path"] == "service.py"
+    assert file_summary["edited_region"] == {"start_line": 4, "end_line": 4}
+    assert file_summary["baseline_target_symbol"]["name"] == "apply_status"
+    assert file_summary["baseline_target_symbol"]["signature"] == "apply_status(value)"
+    assert file_summary["target_target_symbol"]["signature"] == "apply_status(value, *, strict)"
+    assert file_summary["edited_symbol_fqn"].endswith("apply_status")
+    assert file_summary["call_targets_before"] == ["normalize"]
+    assert file_summary["call_targets_after"] == ["persist", "normalize"]
+    assert file_summary["signature_changed"] is True
+    assert file_summary["signature_change_risk"] is True
+    assert file_summary["imports_before"] == ["os"]
+    assert file_summary["imports_added"] == []
+    assert file_summary["imports_removed"] == []
+    assert file_summary["module_symbols_before"][0]["name"] == "apply_status"
+    assert file_summary["module_symbols_after"][0]["name"] == "apply_status"
+
+
+def test_unattended_task_report_tracks_import_delta_in_syntax_motor_summary(tmp_path):
+    workspace = tmp_path / "workspace" / "syntax_imports"
+    workspace.mkdir(parents=True, exist_ok=True)
+    baseline = "import os\n\n\ndef load_env(value):\n    return value.strip()\n"
+    target = "import os\nimport json\n\n\ndef load_env(value):\n    return json.dumps(value.strip())\n"
+    (workspace / "service.py").write_text(baseline, encoding="utf-8")
+    task = TaskSpec(
+        task_id="syntax_imports",
+        prompt="update service imports",
+        workspace_subdir="syntax_imports",
+        expected_files=["service.py"],
+        expected_file_contents={"service.py": target},
+        metadata={
+            "benchmark_family": "repository",
+            "synthetic_edit_plan": [
+                {
+                    "path": "service.py",
+                    "edit_kind": "rewrite",
+                    "baseline_content": baseline,
+                    "target_content": target,
+                }
+            ],
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        steps=[],
+        task_metadata=dict(task.metadata),
+        task_contract={
+            "prompt": task.prompt,
+            "workspace_subdir": task.workspace_subdir,
+            "setup_commands": [],
+            "success_command": "",
+            "suggested_commands": [],
+            "expected_files": ["service.py"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": dict(task.expected_file_contents),
+            "max_steps": 5,
+            "metadata": dict(task.metadata),
+            "synthetic_edit_plan": list(task.metadata["synthetic_edit_plan"]),
+            "synthetic_edit_candidates": [],
+        },
+    )
+    config = KernelConfig(provider="mock", use_tolbert_context=False)
+
+    report = build_unattended_task_report(task=task, config=config, episode=episode, preflight=None)
+
+    file_summary = report["syntax_motor"]["files"][0]
+    assert file_summary["imports_before"] == ["os"]
+    assert file_summary["imports_after"] == ["os", "json"]
+    assert file_summary["imports_added"] == ["json"]
+    assert file_summary["imports_removed"] == []
+    assert file_summary["module_symbols_after"][0]["name"] == "load_env"
+
+
+def test_syntax_motor_prefers_repository_library_style_visitor(monkeypatch):
+    class DonorSymbol:
+        def __init__(self, name: str, qualname: str, signature: str, line: int, end_line: int) -> None:
+            self.kind = "function"
+            self.name = name
+            self.qualname = qualname
+            self.signature = signature
+            self.returns = "str"
+            self.line = line
+            self.end_line = end_line
+
+    class DonorVisitor:
+        def __init__(self, module: str, path: str) -> None:
+            del module, path
+            self.imports = {"json": "json"}
+            self.import_modules = ["json"]
+            self.star_imports = ["pkg.shared"]
+            self.exports = ["load_env"]
+            self.symbols = []
+
+        def visit(self, tree) -> None:
+            del tree
+            self.symbols = [DonorSymbol("load_env", "load_env", "(value:str)", 4, 5)]
+
+    monkeypatch.setattr(
+        syntax_motor,
+        "_repository_library_module_visitor_class",
+        lambda: (DonorVisitor, "repository_library_python_ast"),
+    )
+
+    parsed = syntax_motor._parse_python_source(
+        "import json\n\n\ndef load_env(value):\n    return value\n",
+        label="service.py",
+    )
+
+    assert parsed["parser"] == "repository_library_python_ast"
+    assert parsed["imports"] == ["json"]
+    assert parsed["star_imports"] == ["pkg.shared"]
+    assert parsed["exports"] == ["load_env"]
+    assert parsed["provider"] == "repository_library"
+    assert parsed["symbols"][0]["name"] == "load_env"
+    assert parsed["symbols"][0]["signature"] == "load_env(value:str)"
+    assert parsed["symbols"][0]["returns"] == "str"
+
+
+def test_syntax_motor_step_summary_tracks_edited_symbol_fqn_and_calls():
+    summary = syntax_motor.summarize_python_edit_step(
+        {
+            "path": "service.py",
+            "edit_kind": "line_replace",
+            "baseline_content": "def apply_status(value):\n    return normalize(value)\n",
+            "target_content": "def apply_status(value, *, strict=False):\n    persist(value)\n    return normalize(value)\n",
+            "replacements": [
+                {
+                    "line_number": 1,
+                    "before_line": "def apply_status(value):",
+                    "after_line": "def apply_status(value, *, strict=False):",
+                }
+            ],
+        }
+    )
+
+    assert summary is not None
+    assert summary["edited_symbol_fqn"].endswith("apply_status")
+    assert summary["call_targets_before"] == ["normalize"]
+    assert summary["call_targets_after"] == ["persist", "normalize"]
+    assert summary["syntax_ok"] is True
+
+
+def test_syntax_motor_step_summary_includes_repository_context(monkeypatch, tmp_path):
+    class FakeCodeGraph:
+        def owners_of(self, symbol: str) -> list[str]:
+            assert symbol == "apply_status"
+            return ["service.py"]
+
+        def who_calls(self, fqn: str) -> list[str]:
+            assert fqn.endswith("apply_status")
+            return ["client.sync_status"]
+
+        def calls_of(self, fqn: str) -> list[str]:
+            assert fqn.endswith("apply_status")
+            return ["persist", "normalize"]
+
+    monkeypatch.setattr(
+        syntax_motor,
+        "_repository_library_code_graph_for_root",
+        lambda workspace: FakeCodeGraph(),
+    )
+
+    summary = syntax_motor.summarize_python_edit_step(
+        {
+            "path": "service.py",
+            "edit_kind": "line_replace",
+            "baseline_content": "def apply_status(value):\n    return normalize(value)\n",
+            "target_content": "def apply_status(value, *, strict=False):\n    persist(value)\n    return normalize(value)\n",
+            "replacements": [
+                {
+                    "line_number": 1,
+                    "before_line": "def apply_status(value):",
+                    "after_line": "def apply_status(value, *, strict=False):",
+                }
+            ],
+        },
+        workspace=tmp_path,
+    )
+
+    assert summary is not None
+    repository_context = summary["repository_context"]
+    assert repository_context["provider"] == "repository_library_code_graph"
+    assert repository_context["owner_files"] == ["service.py"]
+    assert repository_context["owner_matches_path"] is True
+    assert repository_context["repo_callers"] == ["client.sync_status"]
+    assert repository_context["repo_callees"] == ["persist", "normalize"]
+
+
 def test_unattended_task_report_includes_acceptance_packet_for_integrator():
     task = TaskSpec(
         task_id="git_parallel_merge_acceptance_task",
@@ -800,6 +1111,57 @@ def test_run_unattended_preflight_bootstraps_trust_gate_for_repo_family(tmp_path
     assert "bootstrap mode" in trust_check.detail
 
 
+def test_run_unattended_preflight_surfaces_repository_task_root_breadth_detail(tmp_path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True)
+    reports_dir.joinpath("repository_clean.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "generated_at": "2026-04-03T00:00:00+00:00",
+                "task_id": "repository_adjacent_task",
+                "benchmark_family": "repository",
+                "outcome": "success",
+                "success": True,
+                "trust_scope": "gated",
+                "task_metadata": {"source_task": "repo_sync_matrix_task"},
+                "summary": {"unexpected_change_files": 0, "command_steps": 1},
+                "commands": [{}],
+                "side_effects": {"hidden_side_effect_risk": False},
+                "recovery": {"rollback_performed": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        run_reports_dir=reports_dir,
+        unattended_trust_enforce=True,
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("repository",),
+        unattended_trust_min_distinct_families=1,
+    )
+    task = TaskSpec(
+        task_id="repo_patch_review_task",
+        prompt="prepare repo review packet",
+        workspace_subdir="repo_patch_review_task",
+        expected_files=["reports/diff_summary.txt"],
+        metadata={"benchmark_family": "repository"},
+    )
+
+    report = run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+    trust_check = next(check for check in report.checks if check.name == "trust_posture")
+    assert report.passed is True
+    assert trust_check.passed is True
+    assert "repository clean task-root breadth: observed=1/2 remaining=1" in trust_check.detail
+    assert "roots=[repo_sync_matrix_task]" in trust_check.detail
+
+
 def test_run_unattended_preflight_fails_when_recent_trust_is_restricted(tmp_path):
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
@@ -813,6 +1175,13 @@ def test_run_unattended_preflight_fails_when_recent_trust_is_restricted(tmp_path
                     "benchmark_family": "repo_chore",
                     "outcome": "unsafe_ambiguous",
                     "success": False,
+                    "supervision": {
+                        "mode": "unattended",
+                        "operator_turns": 0,
+                        "independent_execution": True,
+                    },
+                    "summary": {"command_steps": 1},
+                    "commands": [{}],
                     "side_effects": {"hidden_side_effect_risk": True},
                     "recovery": {"rollback_performed": True},
                 }
@@ -969,6 +1338,66 @@ def test_write_unattended_task_report_persists_outcome_and_workspace_listing(tmp
     assert payload["uncertainties"] == []
 
 
+def test_write_unattended_task_report_skips_storage_governance(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace" / "hello_task"
+    workspace.mkdir(parents=True)
+    (workspace / "hello.txt").write_text("hello\n", encoding="utf-8")
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        run_reports_dir=tmp_path / "reports",
+    )
+    task = TaskSpec(
+        task_id="hello_task",
+        prompt="create hello.txt",
+        workspace_subdir="hello_task",
+        expected_files=["hello.txt"],
+    )
+    episode = EpisodeRecord(
+        task_id="hello_task",
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        steps=[
+            StepRecord(
+                index=1,
+                thought="write file",
+                action="code_execute",
+                content="printf 'hello\\n' > hello.txt",
+                selected_skill_id=None,
+                command_result={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+                verification={"passed": True, "reasons": ["verification passed"]},
+            )
+        ],
+        termination_reason="success",
+    )
+
+    seen: dict[str, object] = {}
+
+    def capture(path, payload, **kwargs):
+        seen["path"] = path
+        seen["payload"] = payload
+        seen["kwargs"] = kwargs
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(preflight, "atomic_write_json", capture)
+
+    report_path = write_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+    )
+
+    assert report_path.exists()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["report_kind"] == "unattended_task_report"
+    assert seen["path"] == report_path
+    assert seen["kwargs"] == {"config": config, "govern_storage": False}
+
+
 def test_build_unattended_task_report_uses_preflight_failure_without_episode(tmp_path):
     config = KernelConfig(
         provider="mock",
@@ -995,6 +1424,99 @@ def test_build_unattended_task_report_uses_preflight_failure_without_episode(tmp
     assert payload["commands"] == []
 
 
+def test_build_unattended_task_report_surfaces_light_supervision_summary(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "repo_sandbox_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "reports").mkdir()
+    (workspace / "reports" / "status.txt").write_text("ready\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="repo_sandbox_task",
+        prompt="materialize repo sandbox report",
+        workspace_subdir="repo_sandbox_task",
+        expected_files=["reports/status.txt"],
+        metadata={
+            "benchmark_family": "repo_sandbox",
+            "supervision_mode": "light_supervision",
+            "operator_turns": 1,
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=0,
+                thought="write report",
+                action="code_execute",
+                content="printf 'ready\\n' > reports/status.txt",
+                selected_skill_id=None,
+                command_result={"command": "printf 'ready\\n' > reports/status.txt", "exit_code": 0},
+                verification={"passed": True, "reasons": ["ok"]},
+            )
+        ],
+        task_metadata=dict(task.metadata),
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["supervision"] == {
+        "mode": "light_supervision",
+        "operator_turns": 1,
+        "verifier_defined": True,
+        "independent_execution": True,
+        "preflight_passed": True,
+        "command_steps": 1,
+        "changed_files": 1,
+        "hidden_side_effect_risk": False,
+        "light_supervision_candidate": True,
+        "light_supervision_success": True,
+        "light_supervision_clean_success": True,
+        "contract_clean_failure_recovery_origin": False,
+        "contract_clean_failure_recovery_step_floor": 0,
+        "contract_clean_failure_recovery_candidate": False,
+        "contract_clean_failure_recovery_success": False,
+        "contract_clean_failure_recovery_clean_success": False,
+    }
+
+
+def test_build_unattended_task_report_infers_guided_mode_from_operator_turns(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    task = TaskSpec(
+        task_id="guided_task",
+        prompt="refine guided patch",
+        workspace_subdir="guided_task",
+        expected_files=["patch.txt"],
+        metadata={"operator_turns": 3},
+    )
+
+    payload = build_unattended_task_report(task=task, config=config, episode=None, preflight=None)
+
+    assert payload["supervision"]["mode"] == "guided"
+    assert payload["supervision"]["operator_turns"] == 3
+    assert payload["supervision"]["light_supervision_candidate"] is False
+    assert payload["supervision"]["independent_execution"] is False
+
+
 def test_capture_workspace_snapshot_and_side_effect_summary_detect_changes(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1017,6 +1539,60 @@ def test_capture_workspace_snapshot_and_side_effect_summary_detect_changes(tmp_p
     assert side_effects["deleted_files"] == ["delete.txt"]
     assert side_effects["changed_files_total"] == 3
     assert side_effects["workspace_reset_detected"] is False
+
+
+def test_summarize_workspace_side_effects_ignores_git_internal_changes_for_git_tasks():
+    task = TaskSpec(
+        task_id="git_task",
+        prompt="update repo state",
+        workspace_subdir="repo",
+        expected_files=["src/status.txt"],
+        metadata={"requires_git": True},
+    )
+    side_effects = summarize_workspace_side_effects(
+        before_snapshot={},
+        after_snapshot={
+            ".git/HEAD": WorkspaceFileSnapshot(relative_path=".git/HEAD", size_bytes=20, sha256="git-head"),
+            "src/status.txt": WorkspaceFileSnapshot(
+                relative_path="src/status.txt",
+                size_bytes=6,
+                sha256="status",
+            ),
+        },
+        clean_workspace=True,
+        task=task,
+    )
+
+    assert side_effects["created_files"] == [".git/HEAD", "src/status.txt"]
+    assert side_effects["unexpected_change_files"] == []
+    assert side_effects["hidden_side_effect_risk"] is False
+
+
+def test_summarize_workspace_side_effects_keeps_non_git_unexpected_changes_for_git_tasks():
+    task = TaskSpec(
+        task_id="git_task",
+        prompt="update repo state",
+        workspace_subdir="repo",
+        expected_files=["src/status.txt"],
+        metadata={"requires_git": True},
+    )
+    side_effects = summarize_workspace_side_effects(
+        before_snapshot={},
+        after_snapshot={
+            ".git/HEAD": WorkspaceFileSnapshot(relative_path=".git/HEAD", size_bytes=20, sha256="git-head"),
+            "notes.txt": WorkspaceFileSnapshot(relative_path="notes.txt", size_bytes=5, sha256="notes"),
+            "src/status.txt": WorkspaceFileSnapshot(
+                relative_path="src/status.txt",
+                size_bytes=6,
+                sha256="status",
+            ),
+        },
+        clean_workspace=True,
+        task=task,
+    )
+
+    assert side_effects["unexpected_change_files"] == ["notes.txt"]
+    assert side_effects["hidden_side_effect_risk"] is True
 
 
 def test_build_unattended_task_report_records_side_effect_deletions_and_uncertainty(tmp_path):
@@ -1081,3 +1657,261 @@ def test_build_unattended_task_report_records_side_effect_deletions_and_uncertai
     assert "inspect side effects manually" in payload["uncertainties"][0]
     assert any("workspace deletions were observed" in note for note in payload["uncertainties"])
     assert any("unexpected workspace changes" in note for note in payload["uncertainties"])
+
+
+def test_build_unattended_task_report_serializes_command_route_metadata(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "shadow_report_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "deploy.txt").write_text("ready\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="shadow_report_task",
+        prompt="write deploy.txt",
+        workspace_subdir="shadow_report_task",
+        expected_files=["deploy.txt"],
+        expected_file_contents={"deploy.txt": "ready\n"},
+        metadata={"benchmark_family": "project"},
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=0,
+                thought="fallback",
+                action="code_execute",
+                content="printf 'ready\\n' > deploy.txt",
+                selected_skill_id=None,
+                command_result={"command": "printf 'ready\\n' > deploy.txt", "exit_code": 0},
+                verification={"passed": True, "reasons": ["ok"]},
+                decision_source="deterministic_fallback",
+                tolbert_route_mode="shadow",
+            )
+        ],
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["commands"][0]["decision_source"] == "deterministic_fallback"
+    assert payload["commands"][0]["tolbert_route_mode"] == "shadow"
+
+
+def test_build_unattended_task_report_marks_nonacting_retrieval_companion_as_coverage_only(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "repo_sync_matrix_retrieval_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    task = TaskSpec(
+        task_id="repo_sync_matrix_retrieval_task",
+        prompt="inspect repository context",
+        workspace_subdir="repo_sync_matrix_retrieval_task",
+        metadata={
+            "benchmark_family": "repository",
+            "requires_retrieval": True,
+            "source_task": "repo_sync_matrix_task",
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=False,
+        termination_reason="policy_terminated",
+        steps=[],
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["outcome"] == "safe_stop"
+    assert payload["trust_scope"] == "coverage_only"
+
+
+def test_build_unattended_task_report_marks_nonexecuting_safe_stop_with_accounted_setup_changes_as_coverage_only(
+    tmp_path,
+):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "integration_failover_drill_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "docs").mkdir()
+    (workspace / "docs" / "runbook.md").write_text("seed\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="integration_failover_drill_task",
+        prompt="prepare the integration drill workspace",
+        workspace_subdir="integration_failover_drill_task",
+        expected_files=["docs/runbook.md"],
+        metadata={"benchmark_family": "integration"},
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=False,
+        termination_reason="policy_terminated",
+        steps=[],
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["outcome"] == "safe_stop"
+    assert payload["side_effects"]["changed_files_total"] == 1
+    assert payload["side_effects"]["unexpected_change_files"] == []
+    assert payload["trust_scope"] == "coverage_only"
+
+
+def test_build_unattended_task_report_surfaces_repository_trust_breadth_summary(tmp_path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True)
+    reports_dir.joinpath("repository_clean.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "generated_at": "2026-04-03T00:00:00+00:00",
+                "task_id": "repository_adjacent_task",
+                "benchmark_family": "repository",
+                "outcome": "success",
+                "success": True,
+                "trust_scope": "gated",
+                "task_metadata": {"source_task": "repo_sync_matrix_task"},
+                "summary": {"unexpected_change_files": 0, "command_steps": 1},
+                "commands": [{}],
+                "side_effects": {"hidden_side_effect_risk": False},
+                "recovery": {"rollback_performed": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        run_reports_dir=reports_dir,
+        unattended_trust_enforce=True,
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("repository",),
+        unattended_trust_min_distinct_families=1,
+    )
+    task = TaskSpec(
+        task_id="repo_patch_review_task",
+        prompt="prepare repo review packet",
+        workspace_subdir="repo_patch_review_task",
+        expected_files=["reports/diff_summary.txt"],
+        metadata={"benchmark_family": "repository"},
+    )
+
+    payload = build_unattended_task_report(task=task, config=config, episode=None, preflight=None)
+
+    assert payload["trust"]["status"] == "bootstrap"
+    assert payload["trust_breadth_summary"] == {
+        "benchmark_family": "repository",
+        "required": True,
+        "status": "bootstrap",
+        "reports": 1,
+        "bootstrap_min_reports": 1,
+        "breadth_min_reports": 1,
+        "min_distinct_task_roots": 2,
+        "distinct_clean_success_task_roots": 1,
+        "clean_success_task_roots": ["repo_sync_matrix_task"],
+        "remaining_distinct_task_roots": 1,
+        "required_family_clean_task_root_count": 1,
+        "light_supervision_reports": 0,
+        "light_supervision_successes": 0,
+        "light_supervision_clean_successes": 0,
+        "contract_clean_failure_recovery_reports": 0,
+        "contract_clean_failure_recovery_successes": 0,
+        "contract_clean_failure_recovery_clean_successes": 0,
+    }
+
+
+def test_build_unattended_task_report_surfaces_contract_clean_failure_recovery_summary(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "repository_failure_recovery_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "reports").mkdir()
+    (workspace / "reports" / "status.txt").write_text("recovered\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="repository_failure_recovery_task",
+        prompt="repair repository report",
+        workspace_subdir="repository_failure_recovery_task",
+        expected_files=["reports/status.txt"],
+        metadata={
+            "benchmark_family": "repository",
+            "curriculum_kind": "failure_recovery",
+            "contract_clean_failure_recovery_origin": True,
+            "contract_clean_failure_recovery_step_floor": 12,
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=True,
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=0,
+                thought="repair report",
+                action="code_execute",
+                content="printf 'recovered\\n' > reports/status.txt",
+                selected_skill_id=None,
+                command_result={"command": "printf 'recovered\\n' > reports/status.txt", "exit_code": 0},
+                verification={"passed": True, "reasons": ["ok"]},
+            )
+        ],
+        task_metadata=dict(task.metadata),
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["supervision"]["contract_clean_failure_recovery_origin"] is True
+    assert payload["supervision"]["contract_clean_failure_recovery_step_floor"] == 12
+    assert payload["supervision"]["contract_clean_failure_recovery_candidate"] is True
+    assert payload["supervision"]["contract_clean_failure_recovery_success"] is True
+    assert payload["supervision"]["contract_clean_failure_recovery_clean_success"] is True

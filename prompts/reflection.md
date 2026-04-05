@@ -1,1 +1,1 @@
-Summarize what worked, what failed, and which commands should be retained as reusable skill fragments.
+Summarize what worked, what failed, which edits or validations changed the workspace meaningfully, and which commands or debugging patterns should be retained as reusable skill fragments for future repository tasks.
