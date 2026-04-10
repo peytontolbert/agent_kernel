@@ -5,14 +5,14 @@
 This is the compact map from the current unattended evidence to the highest-value remaining gaps on
 the path to compounding coding agency.
 
-It is anchored to the live unattended safe-stop on `2026-04-05T00:46:40Z` from
-[`unattended_campaign.status.json`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/reports/unattended_campaign.status.json)
+It is anchored to the latest integrated unattended completion on `2026-04-09` from
+[`unattended_campaign.status.json`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.status.json)
 and the paired campaign report
-[`campaign_report_20260405T002026515795Z.json`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/improvement_reports/campaign_report_20260405T002026515795Z.json).
+[`unattended_campaign.json`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.json).
 
 ## Current Read
 
-The current kernel is already beyond a toy seed-task loop. It has:
+The current kernel is already beyond a toy seed-task loop. It now has:
 
 - a verifier-driven task runtime in [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py)
 - an unattended outer loop in [`scripts/run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py)
@@ -23,40 +23,43 @@ The current kernel is already beyond a toy seed-task loop. It has:
   and [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py)
 
 The blocker is not "the runtime cannot do coding at all." The blocker is that the system still does
-not convert enough unattended work into broad, runtime-managed, repeatable coding gains.
+not convert unattended work into broad, child-native, repeatable coding gains with counted external
+evidence.
 
 ## Evidence Snapshot
 
-- live unattended parent reached `safe_stop` because `campaign report showed no runtime-managed decisions`
-- round 2 stayed inside `retrieval`, finished cleanly, and still ended in `state=reject`
-- the live campaign report shows `runtime_managed_decisions=0`
-- the same report shows `priority_families_without_signal=["project","repository","integration"]`
-- required-family coverage is still missing `integration` and `repo_chore`
-- required-family clean task-root breadth is still zero for `integration`, `project`, `repo_chore`,
-  `repo_sandbox`, and `repository`
-- the event and stdout logs show repeated retrieval proposals with
-  `reason=low-confidence retrieval remains common relative to trusted retrieval usage`
-  and `final_reason=retrieval candidate did not satisfy the retained retrieval gate`
+- the latest unattended parent finished with `status=completed` and `reason=requested unattended rounds completed`
+- the integrated report now shows `runtime_managed_decisions=1` and `retained_gain_runs=1`
+- the credited retain is still described as
+  `mid-round controller intervention closed as a runtime-managed retain after productive work was already demonstrated`
+  rather than a clean child-native closeout stream
+- sampled families from progress now include
+  `["integration","project","repository","bounded","transition_pressure","discovered_task"]`
+- the trust breadth summary still shows `required_families_with_reports=[]`,
+  `distinct_external_benchmark_families=0`, and no counted external report breadth
+- campaign validation still accepted a productive partial timeout rather than a completed child
+  report path: `accepted productive partial child timeout: generated_success_completed_without_report_path`
 
 Primary artifacts:
 
-- [`unattended_campaign.status.json`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/reports/unattended_campaign.status.json)
-- [`unattended_campaign.events.jsonl`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/reports/unattended_campaign.events.jsonl)
-- [`unattended_campaign.stdout.log`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/reports/unattended_campaign.stdout.log)
-- [`campaign_report_20260405T002026515795Z.json`](/data/agentkernel/var/unattended_repro_autonomyfull_20260404T1901Z_adaptive/improvement_reports/campaign_report_20260405T002026515795Z.json)
+- [`unattended_campaign.status.json`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.status.json)
+- [`unattended_campaign.events.jsonl`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.events.jsonl)
+- [`unattended_campaign.stdout.log`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.stdout.log)
+- [`unattended_campaign.json`](/data/agentkernel/var/unattended_run_20260409T1620Z_authority_bundle_final_rerun/reports/unattended_campaign.json)
 
 ## Priority Gaps
 
 ### 1. Runtime-managed conversion gap
 
-The kernel can complete unattended rounds and produce productive compare activity, but it still
-fails to turn those rounds into runtime-managed retained or rejected decisions at a useful rate.
+The kernel can complete unattended rounds and now produce at least one runtime-managed retain, but
+it still fails to turn those rounds into a child-native retained or rejected decision stream at a
+useful rate.
 
 Why this is AGI-critical:
 
 - compounding coding agency requires machine-owned decisions, not only machine activity
-- a loop that generates artifacts but rarely crosses the runtime-managed decision boundary will keep
-  spending compute without closing control
+- controller-closed productive partial timeouts are better than pure churn, but they still do not
+  prove that the child loop can carry decisions to a clean unattended closeout boundary
 
 Primary surfaces:
 
@@ -67,9 +70,10 @@ Primary surfaces:
 
 What the live evidence says:
 
-- the current safe-stop reason is directly tied to `runtime_managed_decisions=0`
-- the system is willing to keep exploring retrieval variants, but the compare/finalize path still
-  does not yield a runtime-managed result stream that the unattended parent considers meaningful
+- the current integrated run did clear `runtime_managed_decisions=1`, so the zero-decision failure
+  is no longer the immediate blocker
+- the credited retain still came from a productive partial timeout that the controller accepted
+  mid-round, which means decision ownership is improved but not yet robustly child-native
 
 Next attack:
 
@@ -97,9 +101,9 @@ Primary surfaces:
 
 What the live evidence says:
 
-- required-family coverage is still missing `integration` and `repo_chore`
-- `priority_families_without_signal` still includes every currently requested family
-- the campaign sampled priority families, but sampled work did not turn into counted decision signal
+- the campaign now samples `integration`, `project`, and `repository` in the live progress stream
+- the trust ledger still does not show counted external reports for those required families
+- sampled family breadth is improving faster than counted trusted breadth
 
 Next attack:
 
@@ -127,10 +131,9 @@ Primary surfaces:
 
 What the live evidence says:
 
-- repeated unattended rounds kept emitting retrieval proposals with the same low-confidence reason
-- retrieval candidates kept failing the retained retrieval gate
-- the retrieval subsystem is acting more like a churn attractor than a compounding memory amplifier
-  in the current unattended slice
+- retrieval pressure is no longer the only visible family signal in the integrated run
+- the remaining retrieval gap is carryover proof: the reports still do not broadly demonstrate that
+  improved retrieval changed later repair or verification behavior in counted evidence
 
 Next attack:
 

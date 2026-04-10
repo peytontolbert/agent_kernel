@@ -201,6 +201,86 @@ def test_build_liftoff_gate_report_demotes_family_without_novel_command_evidence
     )
 
 
+def test_build_liftoff_gate_report_accepts_primary_routing_signal_without_novel_commands():
+    report = build_liftoff_gate_report(
+        candidate_metrics=EvalMetrics(
+            total=10,
+            passed=9,
+            average_steps=1.1,
+            total_by_benchmark_family={"repository": 10},
+            passed_by_benchmark_family={"repository": 9},
+            generated_total=2,
+            generated_passed=2,
+            generated_by_kind={"failure_recovery": 1},
+            generated_passed_by_kind={"failure_recovery": 1},
+            tolbert_shadow_episodes_by_benchmark_family={"repository": 3},
+            tolbert_primary_episodes_by_benchmark_family={"repository": 2},
+            proposal_metrics_by_benchmark_family={
+                "repository": {
+                    "task_count": 10,
+                    "proposal_selected_steps": 0,
+                    "novel_valid_command_steps": 0,
+                    "novel_valid_command_rate": 0.0,
+                }
+            },
+        ),
+        baseline_metrics=EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.2,
+            total_by_benchmark_family={"repository": 10},
+            passed_by_benchmark_family={"repository": 8},
+            generated_total=2,
+            generated_passed=2,
+            generated_by_kind={"failure_recovery": 1},
+            generated_passed_by_kind={"failure_recovery": 1},
+            proposal_metrics_by_benchmark_family={
+                "repository": {
+                    "task_count": 10,
+                    "proposal_selected_steps": 0,
+                    "novel_valid_command_steps": 0,
+                    "novel_valid_command_rate": 0.0,
+                }
+            },
+        ),
+        artifact_payload={
+            "artifact_kind": "tolbert_model_bundle",
+            "runtime_policy": {
+                "shadow_benchmark_families": ["repository"],
+                "primary_benchmark_families": ["repository"],
+            },
+            "liftoff_gate": {
+                "require_family_novel_command_evidence": True,
+                "require_shadow_signal": True,
+                "min_shadow_episodes_per_promoted_family": 1,
+                "proposal_gate_by_benchmark_family": {
+                    "repository": {
+                        "require_novel_command_signal": True,
+                        "min_proposal_selected_steps_delta": 0,
+                        "min_novel_valid_command_steps": 0,
+                        "min_novel_valid_command_rate_delta": 0.0,
+                        "allow_primary_routing_signal": True,
+                        "min_primary_episodes": 1,
+                    }
+                },
+            },
+        },
+        takeover_drift_report={
+            "budget_reached": True,
+            "worst_pass_rate_delta": 0.0,
+            "worst_unsafe_ambiguous_rate_delta": 0.0,
+            "worst_hidden_side_effect_rate_delta": 0.0,
+            "worst_trust_success_rate_delta": 0.0,
+            "worst_trust_unsafe_ambiguous_rate_delta": 0.0,
+        },
+    )
+
+    assert report.state == "retain"
+    assert "repository" in report.primary_takeover_families
+    assert report.family_takeover_evidence["repository"]["decision"] == "promoted"
+    assert report.family_takeover_evidence["repository"]["failure_reason"] == ""
+
+
 def test_build_liftoff_gate_report_rejects_safety_regression():
     report = build_liftoff_gate_report(
         candidate_metrics=EvalMetrics(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import KernelConfig
 from .episode_store import iter_episode_documents, load_episode_document
+from .episode_store import episode_storage_metadata
 from .extractors import render_episode_document
 from .learning_compiler import load_learning_candidates
 from .schemas import EpisodeRecord
@@ -28,13 +29,14 @@ class EpisodeMemory:
         path = self.root / f"{episode.task_id}.json"
         document = render_episode_document(episode)
         if self.config is not None and self.config.uses_sqlite_storage():
-            storage = {
-                "relative_path": path.relative_to(self.root).as_posix(),
-                "phase": "primary",
-                "source_group": "",
-                "depth": 0,
-                "is_generated": False,
-            }
+            storage_root = self.root
+            try:
+                trajectories_root = self.config.trajectories_root.resolve()
+                if path.resolve().is_relative_to(trajectories_root):
+                    storage_root = trajectories_root
+            except (AttributeError, OSError, ValueError):
+                storage_root = self.root
+            storage = _episode_storage_metadata_for_sqlite(storage_root, episode, fallback_path=path)
             self.config.sqlite_store().upsert_episode_document(payload=document, storage=storage)
             if self.config.storage_write_episode_exports:
                 path.write_text(json.dumps(document, indent=2), encoding="utf-8")
@@ -88,7 +90,17 @@ class EpisodeMemory:
                 source_tasks.add(source_id)
             summary = document.get("summary", {})
             if isinstance(summary, dict):
-                for failure_type in summary.get("failure_types", []):
+                summary_failure_types = [
+                    str(failure_type).strip()
+                    for failure_type in summary.get("failure_types", [])
+                    if str(failure_type).strip()
+                ]
+                if not summary_failure_types:
+                    has_episode_steps = isinstance(document.get("steps", []), list) and bool(document.get("steps", []))
+                    has_executed_commands = bool(summary.get("executed_commands", []))
+                    if has_episode_steps or has_executed_commands:
+                        summary_failure_types = ["other"]
+                for failure_type in summary_failure_types:
                     key = str(failure_type).strip()
                     if key:
                         failure_types[key] = failure_types.get(key, 0) + 1
@@ -164,6 +176,41 @@ class EpisodeMemory:
             "related_tasks": neighbors,
             "neighbors": neighbors,
         }
+
+
+def _episode_storage_metadata_for_sqlite(
+    root: Path,
+    episode: EpisodeRecord,
+    *,
+    fallback_path: Path,
+) -> dict[str, object]:
+    task_metadata = dict(episode.task_metadata) if isinstance(episode.task_metadata, dict) else {}
+    phase = str(task_metadata.get("episode_phase", "")).strip()
+    source_group = str(task_metadata.get("episode_source_group", "")).strip()
+    relative_path = str(task_metadata.get("episode_relative_path", "")).strip()
+    if not phase:
+        workspace = str(episode.workspace).strip()
+        workspace_parts = PurePosixPath(workspace).parts
+        if workspace_parts[:2] and workspace_parts[0] == "workspace":
+            if len(workspace_parts) > 2 and workspace_parts[1].startswith("generated_"):
+                phase = str(workspace_parts[1]).strip()
+                source_group = source_group or phase
+                relative_path = relative_path or f"{phase}/{episode.task_id}.json"
+            elif len(workspace_parts) >= 2:
+                phase = "primary"
+                relative_path = relative_path or f"{episode.task_id}.json"
+    if not phase:
+        return episode_storage_metadata(root, fallback_path)
+    normalized_relative_path = PurePosixPath(relative_path) if relative_path else PurePosixPath(f"{episode.task_id}.json")
+    if not source_group and len(normalized_relative_path.parts) > 1:
+        source_group = PurePosixPath(*normalized_relative_path.parts[:-1]).as_posix()
+    return {
+        "relative_path": normalized_relative_path.as_posix(),
+        "phase": phase,
+        "source_group": source_group,
+        "depth": max(0, len(normalized_relative_path.parts) - 1),
+        "is_generated": phase.startswith("generated_"),
+    }
 
 
 def _document_retrieval_summary(document: dict[str, object]) -> dict[str, object]:
@@ -423,6 +470,12 @@ def _synthetic_document_from_learning_candidate(candidate: dict[str, object]) ->
         "step_count": len(commands),
         "executed_command_count": len(commands),
         "executed_commands": commands,
+        "execution_source_summary": {
+            "llm_generated": 0,
+            "synthetic_plan": 0,
+            "deterministic_or_other": len(commands),
+            "total_executed_commands": len(commands),
+        },
         "failure_types": failure_types,
         "failure_signals": failure_signals,
         "transition_failures": transition_failures,

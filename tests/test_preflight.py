@@ -3,6 +3,7 @@ from pathlib import Path
 
 import agent_kernel.preflight as preflight
 import agent_kernel.syntax_motor as syntax_motor
+import pytest
 from agent_kernel.config import KernelConfig
 from agent_kernel.preflight import (
     PreflightCheck,
@@ -46,6 +47,65 @@ def test_run_unattended_preflight_passes_for_mock_with_verifier_contract(tmp_pat
         "operator_policy",
         "trust_posture",
     }
+
+
+def test_run_unattended_preflight_rejects_tolbert_provider_alias(tmp_path):
+    config = KernelConfig(
+        provider="tolbert",
+        use_tolbert_context=True,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    task = TaskSpec(
+        task_id="hello_task",
+        prompt="create hello.txt",
+        workspace_subdir="hello_task",
+        expected_files=["hello.txt"],
+    )
+
+    with pytest.raises(ValueError, match="unsupported provider"):
+        run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+
+def test_run_unattended_preflight_fails_when_tolbert_runtime_modules_are_missing(monkeypatch, tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        tolbert_python_bin="/bin/sh",
+        tolbert_config_path=str(tmp_path / "tolbert" / "config.json"),
+        tolbert_checkpoint_path=str(tmp_path / "tolbert" / "checkpoint.pt"),
+        tolbert_nodes_path=str(tmp_path / "tolbert" / "nodes.jsonl"),
+        tolbert_label_map_path=str(tmp_path / "tolbert" / "label_map.json"),
+        tolbert_source_spans_paths=(str(tmp_path / "tolbert" / "source_spans.jsonl"),),
+        tolbert_cache_paths=(str(tmp_path / "tolbert" / "cache.pt"),),
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    for path in (
+        Path(config.tolbert_config_path),
+        Path(config.tolbert_checkpoint_path),
+        Path(config.tolbert_nodes_path),
+        Path(config.tolbert_label_map_path),
+        Path(config.tolbert_source_spans_paths[0]),
+        Path(config.tolbert_cache_paths[0]),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    task = TaskSpec(
+        task_id="hello_task",
+        prompt="create hello.txt",
+        workspace_subdir="hello_task",
+        expected_files=["hello.txt"],
+    )
+
+    monkeypatch.setattr(preflight, "_tolbert_runtime_import_check", lambda repo_root: PreflightCheck("tolbert_assets", False, "missing tolbert runtime modules: tolbert_brain.brain"))
+    monkeypatch.setattr(preflight, "_paper_research_assets_check", lambda config, repo_root: PreflightCheck("paper_research_assets", True, "ok", severity="optional"))
+
+    report = run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+    tolbert_check = next(check for check in report.checks if check.name == "tolbert_assets")
+    assert tolbert_check.passed is False
+    assert "runtime modules" in tolbert_check.detail
 
 
 def test_run_unattended_preflight_marks_missing_execution_containment_optional(monkeypatch, tmp_path):

@@ -37,7 +37,7 @@ def test_kernel_solves_seed_task(tmp_path):
     assert episode.steps[0].world_model_horizon == "bounded"
 
 
-def test_kernel_supports_providerless_tolbert_runtime(tmp_path):
+def test_kernel_rejects_tolbert_as_provider_name(tmp_path):
     config = KernelConfig(
         provider="tolbert",
         use_tolbert_context=False,
@@ -45,10 +45,8 @@ def test_kernel_supports_providerless_tolbert_runtime(tmp_path):
         trajectories_root=tmp_path / "trajectories",
     )
 
-    episode = AgentKernel(config=config).run_task(TaskBank().get("hello_task"))
-
-    assert episode.success is True
-    assert episode.steps[0].decision_source in {"tolbert_primary", "llm", "deterministic"}
+    with pytest.raises(ValueError, match="unsupported provider"):
+        AgentKernel(config=config)
 
 
 def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_path, monkeypatch):
@@ -4029,6 +4027,125 @@ def test_kernel_records_tolbert_compile_failure_as_retrieval_failure(tmp_path):
     assert episode.steps[0].failure_origin == "retrieval_failure"
     assert episode.steps[0].failure_signals == ["retrieval_failure"]
     assert "context packet compilation failed" in episode.steps[0].content
+
+
+def test_kernel_uses_deterministic_fallback_after_retryable_tolbert_compile_failure(tmp_path):
+    class RetryableTolbertContextProvider:
+        def compile(self, state):
+            del state
+            raise RuntimeError(
+                "context packet compilation failed: "
+                "TOLBERT service exited before startup ready with code 1."
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=5,
+    )
+    task = TaskSpec(
+        task_id="tolbert_failure_fallback",
+        prompt="complete a task",
+        workspace_subdir="tolbert_failure_fallback",
+        suggested_commands=["printf 'done\\n' > done.txt"],
+        expected_files=["done.txt"],
+        expected_file_contents={"done.txt": "done\n"},
+        max_steps=5,
+    )
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        context_provider=RetryableTolbertContextProvider(),
+        config=config,
+    )
+
+    episode = AgentKernel(config=config, policy=policy).run_task(task)
+
+    assert episode.success is True
+    assert episode.termination_reason == "success"
+    assert episode.steps[0].failure_origin == "retrieval_failure"
+    assert episode.steps[0].failure_signals == ["retrieval_failure"]
+    assert episode.steps[0].decision_source == "deterministic_fallback"
+    assert episode.steps[0].proposal_metadata["fallback_failure_origin"] == "retrieval_failure"
+    assert (config.workspace_root / "tolbert_failure_fallback" / "done.txt").read_text(encoding="utf-8") == "done\n"
+
+
+def test_kernel_uses_progressive_deterministic_fallback_for_long_horizon_retryable_tolbert_failure(tmp_path):
+    class RetryableTolbertContextProvider:
+        def compile(self, state):
+            del state
+            raise RuntimeError(
+                "context packet compilation failed: "
+                "TOLBERT service exited before startup ready with code 1."
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=20,
+    )
+    task = TaskSpec(
+        task_id="tolbert_failure_long_horizon_fallback",
+        prompt="complete a long-horizon task",
+        workspace_subdir="tolbert_failure_long_horizon_fallback",
+        suggested_commands=[
+            "mkdir -p reports audit",
+            "rm -f drafts/obsolete.txt",
+            "printf 'freeze locked\\nowner handoff\\nvalidation queued\\n' > plan/timeline.txt",
+            "printf 'smoke checklist complete\\nrollback checklist complete\\n' > plan/checklist.txt",
+            "printf 'cutover packet assembled\\n' > reports/packet.txt",
+            "printf 'signoff captured\\n' > reports/signoff.txt",
+            "printf 'project cutover recorded\\n' > audit/summary.txt",
+        ],
+        expected_files=[
+            "notes/brief.txt",
+            "docs/charter.md",
+            "plan/timeline.txt",
+            "plan/checklist.txt",
+            "reports/packet.txt",
+            "reports/signoff.txt",
+            "audit/summary.txt",
+        ],
+        forbidden_files=["drafts/obsolete.txt"],
+        expected_file_contents={
+            "notes/brief.txt": "project brief\n",
+            "docs/charter.md": "project charter\n",
+            "plan/timeline.txt": "freeze locked\nowner handoff\nvalidation queued\n",
+            "plan/checklist.txt": "smoke checklist complete\nrollback checklist complete\n",
+            "reports/packet.txt": "cutover packet assembled\n",
+            "reports/signoff.txt": "signoff captured\n",
+            "audit/summary.txt": "project cutover recorded\n",
+        },
+        max_steps=20,
+    )
+    workspace = config.workspace_root / task.workspace_subdir
+    (workspace / "notes").mkdir(parents=True, exist_ok=True)
+    (workspace / "docs").mkdir(parents=True, exist_ok=True)
+    (workspace / "plan").mkdir(parents=True, exist_ok=True)
+    (workspace / "drafts").mkdir(parents=True, exist_ok=True)
+    (workspace / "notes" / "brief.txt").write_text("project brief\n", encoding="utf-8")
+    (workspace / "docs" / "charter.md").write_text("project charter\n", encoding="utf-8")
+    (workspace / "drafts" / "obsolete.txt").write_text("stale\n", encoding="utf-8")
+
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        context_provider=RetryableTolbertContextProvider(),
+        config=config,
+    )
+
+    episode = AgentKernel(config=config, policy=policy).run_task(task, clean_workspace=False)
+
+    assert episode.success is True
+    assert episode.steps[0].decision_source == "deterministic_fallback"
+    assert episode.steps[0].action == "code_execute"
+    assert episode.steps[0].content != "false"
+    assert episode.steps[0].proposal_metadata["fallback_failure_origin"] == "retrieval_failure"
+    assert (workspace / "reports" / "packet.txt").read_text(encoding="utf-8") == "cutover packet assembled\n"
+    assert (workspace / "audit" / "summary.txt").read_text(encoding="utf-8") == "project cutover recorded\n"
+    assert not (workspace / "drafts" / "obsolete.txt").exists()
 
 
 def test_kernel_skips_learning_persistence_for_adjacent_success_followup(tmp_path, monkeypatch):

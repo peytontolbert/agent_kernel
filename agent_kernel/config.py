@@ -45,6 +45,12 @@ def current_storage_governance_config() -> "KernelConfig":
         improvement_reports_dir=Path(
             os.getenv("AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR", str(base.improvement_reports_dir))
         ),
+        strategy_memory_nodes_path=Path(
+            os.getenv("AGENT_KERNEL_STRATEGY_MEMORY_NODES_PATH", str(base.strategy_memory_nodes_path))
+        ),
+        strategy_memory_snapshots_path=Path(
+            os.getenv("AGENT_KERNEL_STRATEGY_MEMORY_SNAPSHOTS_PATH", str(base.strategy_memory_snapshots_path))
+        ),
         run_reports_dir=Path(
             os.getenv("AGENT_KERNEL_RUN_REPORTS_DIR", str(base.run_reports_dir))
         ),
@@ -303,6 +309,9 @@ class KernelConfig:
     llm_retry_backoff_seconds: float = float(
         os.getenv("AGENT_KERNEL_LLM_RETRY_BACKOFF_SECONDS", "0.5")
     )
+    observe_feature_probe_max_tasks: int = int(
+        os.getenv("AGENT_KERNEL_OBSERVE_FEATURE_PROBE_MAX_TASKS", "8")
+    )
     compare_feature_max_tasks: int = int(
         os.getenv("AGENT_KERNEL_COMPARE_FEATURE_MAX_TASKS", "40")
     )
@@ -395,6 +404,15 @@ class KernelConfig:
     )
     improvement_reports_dir: Path = Path(
         os.getenv("AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR", "trajectories/improvement/reports")
+    )
+    strategy_memory_nodes_path: Path = Path(
+        os.getenv("AGENT_KERNEL_STRATEGY_MEMORY_NODES_PATH", "trajectories/improvement/strategy_memory/nodes.jsonl")
+    )
+    strategy_memory_snapshots_path: Path = Path(
+        os.getenv("AGENT_KERNEL_STRATEGY_MEMORY_SNAPSHOTS_PATH", "trajectories/improvement/strategy_memory/snapshots.json")
+    )
+    semantic_hub_root: Path = Path(
+        os.getenv("AGENT_KERNEL_SEMANTIC_HUB_ROOT", "trajectories/semantic_hub")
     )
     run_reports_dir: Path = Path(
         os.getenv("AGENT_KERNEL_RUN_REPORTS_DIR", "trajectories/reports")
@@ -572,9 +590,12 @@ class KernelConfig:
     )
     min_skill_quality: float = float(os.getenv("AGENT_KERNEL_MIN_SKILL_QUALITY", "0.75"))
 
+    def normalized_provider(self) -> str:
+        return self.provider.strip().lower()
+
     def validate(self) -> None:
-        provider = self.provider.strip().lower()
-        if provider not in {"mock", "ollama", "tolbert", "vllm"}:
+        provider = self.normalized_provider()
+        if provider not in {"mock", "ollama", "vllm"}:
             raise ValueError(f"unsupported provider: {self.provider}")
         if provider == "ollama" and not self.ollama_host.strip():
             raise ValueError("ollama_host must be non-empty when provider='ollama'")
@@ -691,6 +712,9 @@ class KernelConfig:
         self.improvement_cycles_path.parent.mkdir(parents=True, exist_ok=True)
         self.candidate_artifacts_root.mkdir(parents=True, exist_ok=True)
         self.improvement_reports_dir.mkdir(parents=True, exist_ok=True)
+        self.strategy_memory_nodes_path.parent.mkdir(parents=True, exist_ok=True)
+        self.strategy_memory_snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+        self.semantic_hub_root.mkdir(parents=True, exist_ok=True)
         self.run_reports_dir.mkdir(parents=True, exist_ok=True)
         self.learning_artifacts_path.parent.mkdir(parents=True, exist_ok=True)
         self.capability_modules_path.parent.mkdir(parents=True, exist_ok=True)

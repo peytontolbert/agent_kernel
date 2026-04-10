@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
+import inspect
 import json
 import math
 import re
@@ -12,6 +13,7 @@ from evals.harness import compare_abstraction_transfer_modes, run_eval, scoped_e
 
 from .config import KernelConfig
 from .runtime_supervision import atomic_write_json
+from .strategy_memory import finalize_strategy_node
 from .improvement import (
     _generated_kind_pass_rate,
     _has_generated_kind,
@@ -38,11 +40,181 @@ from .subsystems import (
 from .tolbert_assets import materialize_retained_retrieval_asset_bundle
 
 
+def semantic_progress_phase_family(phase: str) -> str:
+    normalized = str(phase).strip()
+    if not normalized:
+        return "unknown"
+    if normalized == "holdout_eval":
+        return "holdout"
+    if normalized.startswith("preview"):
+        return "preview"
+    if normalized in {
+        "apply_decision",
+        "materialize_retrieval_bundle",
+        "decision_reject_reason",
+        "decision_retain_reason",
+        "done",
+    }:
+        return "apply"
+    if normalized in {"observe"} or normalized.startswith("observe_"):
+        return "observe"
+    if normalized in {"generated_success"} or normalized.startswith("generated_success"):
+        return "finalize"
+    if normalized in {"variant_search", "variant_generate"}:
+        return "preview"
+    if normalized in {"confirmation_eval", "confidence_aggregate", "finalize"}:
+        return "finalize"
+    if normalized in {"generated_failure", "recovery"} or normalized.startswith("generated_failure"):
+        return "recovery"
+    return "active"
+
+
+def semantic_progress_state(
+    *,
+    phase: str,
+    now: float,
+    started_at: float,
+    last_progress_at: float,
+    max_progress_stall_seconds: float,
+    max_runtime_seconds: float = 0.0,
+    current_task: Mapping[str, object] | None = None,
+    observe_summary: Mapping[str, object] | None = None,
+    pending_decision_state: str = "",
+    preview_state: str = "",
+    current_task_verification_passed: bool | None = None,
+) -> dict[str, object]:
+    normalized_phase = str(phase).strip()
+    phase_family = semantic_progress_phase_family(normalized_phase)
+    if not normalized_phase:
+        return {
+            "phase": "",
+            "phase_family": phase_family,
+            "status": "sampling",
+            "progress_class": "unknown",
+            "decision_distance": "unknown",
+            "detail": "waiting for progress events",
+        }
+    task = current_task if isinstance(current_task, Mapping) else {}
+    observe = observe_summary if isinstance(observe_summary, Mapping) else {}
+    progress_silence_seconds = max(0.0, float(now) - float(last_progress_at or now))
+    runtime_elapsed_seconds = max(0.0, float(now) - float(started_at or now))
+    stall_threshold = max(0.0, float(max_progress_stall_seconds or 0.0))
+    runtime_pressure = 0.0
+    if float(max_runtime_seconds or 0.0) > 0.0:
+        runtime_pressure = min(1.0, runtime_elapsed_seconds / max(1.0, float(max_runtime_seconds)))
+    pending_state = str(pending_decision_state).strip()
+    preview_decision = str(preview_state).strip()
+    task_index = int(task.get("index", 0) or 0)
+    task_total = int(task.get("total", 0) or 0)
+    task_started = task_index > 0
+    task_complete = task_started and task_total > 0 and task_index >= task_total
+    task_verification_failed = current_task_verification_passed is False
+    observe_total = int(observe.get("total", 0) or 0)
+    observe_complete = observe_total > 0
+    observe_degraded_threshold = 45.0
+    observe_stuck_threshold = 120.0
+    if stall_threshold > 0.0:
+        observe_stuck_threshold = min(observe_stuck_threshold, stall_threshold)
+        observe_degraded_threshold = min(observe_degraded_threshold, max(15.0, observe_stuck_threshold / 2.0))
+
+    status = "active"
+    progress_class = "healthy"
+    decision_distance = "far"
+    detail = f"{phase_family} work is progressing"
+    if normalized_phase == "done":
+        status = "complete"
+        progress_class = "complete"
+        decision_distance = "complete"
+        detail = "finalize completed"
+    elif pending_state in {"retain", "reject"} or preview_decision in {"retain", "reject"}:
+        status = "decision_emitted"
+        progress_class = "complete" if phase_family == "apply" else "healthy"
+        decision_distance = "decision_emitted"
+        detail = "decision has been emitted and is awaiting durable completion"
+    else:
+        if phase_family in {"preview", "apply", "finalize", "holdout"}:
+            decision_distance = "near"
+        elif phase_family in {"observe", "recovery"}:
+            decision_distance = "far"
+        else:
+            decision_distance = "active"
+        if (
+            phase_family == "observe"
+            and not observe_complete
+            and task_started
+            and progress_silence_seconds >= observe_stuck_threshold
+        ):
+            status = "stalled"
+            progress_class = "stuck"
+            detail = "observe throughput stalled before decision evidence"
+        elif (
+            phase_family == "observe"
+            and not observe_complete
+            and task_started
+            and progress_silence_seconds >= observe_degraded_threshold
+        ):
+            status = "active"
+            progress_class = "degraded"
+            detail = "observe throughput is advancing too slowly to support timely intervention"
+        elif stall_threshold > 0.0 and progress_silence_seconds >= stall_threshold:
+            status = "stalled"
+            progress_class = "stuck"
+            detail = f"{phase_family} work has stopped making forward progress"
+        elif phase_family in {"preview", "apply", "finalize"} and runtime_pressure >= 0.6:
+            status = "active"
+            progress_class = "degraded"
+            detail = f"{phase_family} work is advancing slowly relative to the runtime budget"
+        elif phase_family == "observe" and observe_complete:
+            status = "complete"
+            progress_class = "complete"
+            decision_distance = "near"
+            detail = "observe phase completed and is ready to hand off"
+        elif task_verification_failed:
+            status = "active"
+            progress_class = "degraded"
+            detail = (
+                f"{phase_family} task {task_index}/{max(task_total, task_index)} failed verification and is awaiting recovery"
+                if task_started
+                else f"{phase_family} verification failed and is awaiting recovery"
+            )
+        elif task_complete:
+            detail = (
+                f"{phase_family} task {task_index}/{max(task_total, task_index)} reached the execution boundary "
+                "and is awaiting verification"
+            )
+        elif task_started:
+            detail = f"{phase_family} task {task_index}/{max(task_total, task_index)} is progressing"
+        elif phase_family == "recovery":
+            detail = "recovery work is active"
+    return {
+        "phase": normalized_phase,
+        "phase_family": phase_family,
+        "status": status,
+        "progress_class": progress_class,
+        "decision_distance": decision_distance,
+        "progress_silence_seconds": progress_silence_seconds,
+        "runtime_elapsed_seconds": runtime_elapsed_seconds,
+        "detail": detail,
+    }
+
+
 def _candidate_matches_active_artifact(candidate_artifact_path: Path, active_artifact_path: Path) -> bool:
     if candidate_artifact_path == active_artifact_path:
         return False
     if not candidate_artifact_path.exists() or not active_artifact_path.exists():
         return False
+    try:
+        candidate_payload = json.loads(candidate_artifact_path.read_text(encoding="utf-8"))
+        active_payload = json.loads(active_artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        candidate_payload = None
+        active_payload = None
+    if isinstance(candidate_payload, dict) and isinstance(active_payload, dict):
+        low_signal_keys = {"artifact_kind", "spec_version", "lifecycle_state"}
+        candidate_identity_keys = {str(key).strip() for key in candidate_payload if str(key).strip()} - low_signal_keys
+        active_identity_keys = {str(key).strip() for key in active_payload if str(key).strip()} - low_signal_keys
+        if not candidate_identity_keys or not active_identity_keys:
+            return False
     candidate_sha256 = artifact_sha256(candidate_artifact_path)
     active_sha256 = artifact_sha256(active_artifact_path)
     return bool(candidate_sha256) and candidate_sha256 == active_sha256
@@ -151,6 +323,105 @@ def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
     )
 
 
+def _new_tolbert_runtime_summary(*, use_tolbert_context: bool) -> dict[str, object]:
+    return {
+        "configured_to_use_tolbert": bool(use_tolbert_context),
+        "stages_attempted": [],
+        "successful_tolbert_stages": [],
+        "startup_failure_stages": [],
+        "recovered_without_tolbert_stages": [],
+        "bypassed_stages": [],
+        "startup_failure_count": 0,
+        "outcome": "pending" if bool(use_tolbert_context) else "bypassed",
+    }
+
+
+def _ordered_unique_stage_names(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = str(value).strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
+
+def _normalize_tolbert_runtime_summary(
+    summary: Mapping[str, object] | None,
+    *,
+    use_tolbert_context: bool | None = None,
+) -> dict[str, object]:
+    payload = dict(summary) if isinstance(summary, Mapping) else {}
+    configured = (
+        bool(payload.get("configured_to_use_tolbert", False))
+        if use_tolbert_context is None
+        else bool(use_tolbert_context)
+    )
+    normalized = _new_tolbert_runtime_summary(use_tolbert_context=configured)
+    for key in (
+        "stages_attempted",
+        "successful_tolbert_stages",
+        "startup_failure_stages",
+        "recovered_without_tolbert_stages",
+        "bypassed_stages",
+    ):
+        normalized[key] = _ordered_unique_stage_names(payload.get(key, []))
+    normalized["startup_failure_count"] = len(normalized["startup_failure_stages"])
+    if payload.get("outcome"):
+        normalized["outcome"] = str(payload.get("outcome", "")).strip()
+    return _finalize_tolbert_runtime_summary(normalized)
+
+
+def _mark_tolbert_stage(summary: dict[str, object] | None, key: str, stage_name: str) -> None:
+    if not isinstance(summary, dict):
+        return
+    token = str(stage_name).strip()
+    if not token:
+        return
+    values = summary.setdefault(key, [])
+    if not isinstance(values, list):
+        values = []
+        summary[key] = values
+    if token not in values:
+        values.append(token)
+
+
+def _finalize_tolbert_runtime_summary(summary: Mapping[str, object] | None) -> dict[str, object]:
+    normalized = _new_tolbert_runtime_summary(
+        use_tolbert_context=bool(dict(summary or {}).get("configured_to_use_tolbert", False))
+    )
+    normalized.update(dict(summary or {}))
+    for key in (
+        "stages_attempted",
+        "successful_tolbert_stages",
+        "startup_failure_stages",
+        "recovered_without_tolbert_stages",
+        "bypassed_stages",
+    ):
+        normalized[key] = _ordered_unique_stage_names(normalized.get(key, []))
+    normalized["startup_failure_count"] = len(normalized["startup_failure_stages"])
+    configured = bool(normalized.get("configured_to_use_tolbert", False))
+    if normalized["startup_failure_stages"]:
+        outcome = "failed_recovered"
+    elif normalized["successful_tolbert_stages"]:
+        outcome = "succeeded"
+    elif normalized["bypassed_stages"] or not configured:
+        outcome = "bypassed"
+    elif normalized["stages_attempted"]:
+        outcome = "pending"
+    else:
+        outcome = "not_exercised"
+    normalized["outcome"] = outcome
+    normalized["used_tolbert_successfully"] = bool(normalized["successful_tolbert_stages"])
+    normalized["recovered_without_tolbert"] = bool(normalized["recovered_without_tolbert_stages"])
+    normalized["bypassed"] = outcome == "bypassed"
+    return normalized
+
+
 def _evaluate_subsystem_metrics_with_tolbert_startup_retry(
     *,
     config: KernelConfig,
@@ -159,28 +430,65 @@ def _evaluate_subsystem_metrics_with_tolbert_startup_retry(
     progress_label: str | None,
     phase_name: str,
     progress: Callable[[str], None] | None,
+    tolbert_runtime_summary: dict[str, object] | None = None,
 ):
+    if isinstance(tolbert_runtime_summary, dict):
+        tolbert_runtime_summary["configured_to_use_tolbert"] = bool(config.use_tolbert_context)
+        _mark_tolbert_stage(tolbert_runtime_summary, "stages_attempted", phase_name)
     try:
-        return evaluate_subsystem_metrics(
+        result = evaluate_subsystem_metrics(
             config=config,
             subsystem=subsystem,
             flags=flags,
             progress_label=progress_label,
         )
+        if bool(config.use_tolbert_context):
+            _mark_tolbert_stage(tolbert_runtime_summary, "successful_tolbert_stages", phase_name)
+        else:
+            _mark_tolbert_stage(tolbert_runtime_summary, "bypassed_stages", phase_name)
+        return result
     except RuntimeError as exc:
         if not bool(config.use_tolbert_context) or not _is_retryable_tolbert_startup_failure(str(exc)):
             raise
+        _mark_tolbert_stage(tolbert_runtime_summary, "startup_failure_stages", phase_name)
         if progress is not None:
             progress(
                 f"finalize phase={phase_name}_retry subsystem={subsystem} "
                 "reason=tolbert_startup_failure use_tolbert_context=0"
             )
+        _mark_tolbert_stage(tolbert_runtime_summary, "recovered_without_tolbert_stages", phase_name)
+        _mark_tolbert_stage(tolbert_runtime_summary, "bypassed_stages", phase_name)
         return evaluate_subsystem_metrics(
             config=replace(config, use_tolbert_context=False),
             subsystem=subsystem,
             flags=flags,
             progress_label=progress_label,
         )
+
+
+def _call_tolbert_preview_eval(
+    *,
+    config: KernelConfig,
+    subsystem: str,
+    flags: dict[str, object],
+    progress_label: str | None,
+    phase_name: str,
+    progress: Callable[[str], None] | None,
+    tolbert_runtime_summary: dict[str, object] | None = None,
+):
+    retry_evaluator = _evaluate_subsystem_metrics_with_tolbert_startup_retry
+    parameters = inspect.signature(retry_evaluator).parameters
+    kwargs = {
+        "config": config,
+        "subsystem": subsystem,
+        "flags": flags,
+        "progress_label": progress_label,
+        "phase_name": phase_name,
+        "progress": progress,
+    }
+    if "tolbert_runtime_summary" in parameters:
+        kwargs["tolbert_runtime_summary"] = tolbert_runtime_summary
+    return retry_evaluator(**kwargs)
 
 
 def _retention_eval_config(
@@ -214,11 +522,17 @@ def _comparison_task_limit_for_retention(
     payload: dict[str, object] | None = None,
     capability_modules_path: Path | None = None,
 ) -> int | None:
-    retrieval_bounded_compare_fallback = 24
+    preview_comparison_task_limit_cap = 16
+    retrieval_preview_comparison_task_limit_cap = 8
+    retrieval_bounded_compare_fallback = 8
     if not isinstance(task_limit, int) or task_limit <= 0:
         task_limit = None
     if base_subsystem_for(subsystem, capability_modules_path) != "retrieval" or not isinstance(payload, dict):
-        return task_limit
+        if task_limit is None:
+            return None
+        # Retention preview already follows breadth-aware observe plus holdout gates.
+        # Cap non-retrieval preview slices so autonomous cycles can reach decisions in bounded time.
+        return min(task_limit, preview_comparison_task_limit_cap)
     preview_controls = payload.get("preview_controls", {})
     if isinstance(preview_controls, dict):
         comparison_task_limit_floor = preview_controls.get("comparison_task_limit_floor")
@@ -227,19 +541,52 @@ def _comparison_task_limit_for_retention(
         except (TypeError, ValueError):
             comparison_task_limit_floor = 0
         if comparison_task_limit_floor > 0:
+            bounded_floor = max(retrieval_preview_comparison_task_limit_cap, comparison_task_limit_floor)
             if task_limit is None:
-                return comparison_task_limit_floor
-            return max(task_limit, comparison_task_limit_floor)
+                return bounded_floor
+            return max(task_limit, bounded_floor)
     gate = retention_gate_for_payload(
         subsystem,
         payload,
         capability_modules_path=capability_modules_path,
     )
     if bool(gate.get("require_trusted_carryover_repair_improvement", False)):
+        bounded_limit = max(retrieval_preview_comparison_task_limit_cap, retrieval_bounded_compare_fallback)
         if task_limit is None:
-            return retrieval_bounded_compare_fallback
-        return max(task_limit, retrieval_bounded_compare_fallback)
-    return task_limit
+            return bounded_limit
+        return max(task_limit, bounded_limit)
+    if task_limit is None:
+        return retrieval_preview_comparison_task_limit_cap
+    return min(task_limit, retrieval_preview_comparison_task_limit_cap)
+
+
+def _holdout_task_limit_for_retention(
+    subsystem: str,
+    *,
+    comparison_task_limit: int | None,
+    capability_modules_path: Path | None = None,
+) -> int | None:
+    if not isinstance(comparison_task_limit, int) or comparison_task_limit <= 0:
+        return None
+    if base_subsystem_for(subsystem, capability_modules_path) != "retrieval":
+        return None
+    return max(4, comparison_task_limit)
+
+
+def _holdout_generated_schedule_limit_for_retention(
+    subsystem: str,
+    *,
+    comparison_task_limit: int | None,
+    capability_modules_path: Path | None = None,
+) -> int:
+    holdout_task_limit = _holdout_task_limit_for_retention(
+        subsystem,
+        comparison_task_limit=comparison_task_limit,
+        capability_modules_path=capability_modules_path,
+    )
+    if not isinstance(holdout_task_limit, int) or holdout_task_limit <= 0:
+        return 0
+    return holdout_task_limit
 
 
 def _retrieval_preview_priority_overrides(
@@ -269,10 +616,46 @@ def _retrieval_preview_priority_overrides(
     return families, weights
 
 
+def _retrieval_bounded_preview_required(
+    subsystem: str,
+    *,
+    payload: dict[str, object] | None,
+    capability_modules_path: Path | None = None,
+) -> bool:
+    if base_subsystem_for(subsystem, capability_modules_path) != "retrieval" or not isinstance(payload, dict):
+        return False
+    preview_controls = payload.get("preview_controls", {})
+    if not isinstance(preview_controls, dict):
+        return False
+    return bool(preview_controls.get("bounded_comparison_required", False))
+
+
+def _apply_retrieval_bounded_preview_filters(
+    subsystem: str,
+    *,
+    flags: dict[str, object],
+    payload: dict[str, object] | None,
+    capability_modules_path: Path | None = None,
+) -> dict[str, object]:
+    scoped_flags = dict(flags)
+    if not _retrieval_bounded_preview_required(
+        subsystem,
+        payload=payload,
+        capability_modules_path=capability_modules_path,
+    ):
+        return scoped_flags
+    # Bounded retrieval previews need discriminative non-replay slices rather than replay-family drift.
+    scoped_flags["include_episode_memory"] = False
+    scoped_flags["include_verifier_memory"] = False
+    return scoped_flags
+
+
 def _merge_priority_families(
     explicit_families: list[str] | None,
     explicit_weights: dict[str, float] | None,
     payload: dict[str, object] | None,
+    *,
+    allow_payload_overrides: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     merged_families: list[str] = []
     merged_weights: dict[str, float] = {}
@@ -292,14 +675,15 @@ def _merge_priority_families(
             continue
         if normalized not in merged_families:
             merged_families.append(normalized)
-    retrieval_families, retrieval_weights = _retrieval_preview_priority_overrides(payload)
-    for family in retrieval_families:
-        if family not in merged_families:
-            merged_families.append(family)
-    for family, weight in retrieval_weights.items():
-        merged_weights[family] = max(weight, float(merged_weights.get(family, 0.0) or 0.0))
-        if family not in merged_families:
-            merged_families.append(family)
+    if allow_payload_overrides:
+        retrieval_families, retrieval_weights = _retrieval_preview_priority_overrides(payload)
+        for family in retrieval_families:
+            if family not in merged_families:
+                merged_families.append(family)
+        for family, weight in retrieval_weights.items():
+            merged_weights[family] = max(weight, float(merged_weights.get(family, 0.0) or 0.0))
+            if family not in merged_families:
+                merged_families.append(family)
     return merged_families, merged_weights
 
 
@@ -1146,18 +1530,54 @@ def compare_to_prior_retained(
         payload=payload,
         capability_modules_path=config.capability_modules_path,
     )
-    merged_priority_families, merged_priority_family_weights = _merge_priority_families(
-        None,
-        None,
-        payload,
+    scoped_flags = _apply_retrieval_bounded_preview_filters(
+        subsystem,
+        flags=flags,
+        payload=payload,
+        capability_modules_path=config.capability_modules_path,
     )
-    scoped_flags = dict(flags)
+    explicit_priority_families = [
+        str(family).strip()
+        for family in list(scoped_flags.get("priority_benchmark_families", []) or [])
+        if str(family).strip()
+    ]
+    explicit_priority_weights: dict[str, float] = {}
+    for family, weight in dict(scoped_flags.get("priority_benchmark_family_weights", {}) or {}).items():
+        normalized_family = str(family).strip()
+        if not normalized_family:
+            continue
+        try:
+            explicit_priority_weights[normalized_family] = float(weight)
+        except (TypeError, ValueError):
+            continue
+    restrict_to_priority_families = bool(scoped_flags.get("restrict_to_priority_benchmark_families", False)) and bool(
+        explicit_priority_families
+    )
+    merged_priority_families, merged_priority_family_weights = _merge_priority_families(
+        explicit_priority_families,
+        explicit_priority_weights,
+        payload,
+        allow_payload_overrides=not restrict_to_priority_families,
+    )
     if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
         scoped_flags["task_limit"] = comparison_task_limit
+    holdout_generated_schedule_limit = _holdout_generated_schedule_limit_for_retention(
+        subsystem,
+        comparison_task_limit=comparison_task_limit,
+        capability_modules_path=config.capability_modules_path,
+    )
+    if holdout_generated_schedule_limit > 0:
+        scoped_flags["max_generated_success_schedule_tasks"] = holdout_generated_schedule_limit
+        scoped_flags["max_generated_failure_schedule_tasks"] = holdout_generated_schedule_limit
     if merged_priority_families:
         scoped_flags["priority_benchmark_families"] = list(merged_priority_families)
     if merged_priority_family_weights:
         scoped_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
+    if restrict_to_priority_families and merged_priority_families:
+        scoped_flags["restrict_to_priority_benchmark_families"] = True
+        scoped_flags["prefer_low_cost_tasks"] = True
+        scoped_flags["include_generated"] = False
+        scoped_flags["include_failure_generated"] = False
     baseline_config = _retention_eval_config(
         base_config=config,
         subsystem=subsystem,
@@ -1174,7 +1594,7 @@ def compare_to_prior_retained(
         f"finalize phase=preview_prior_retained_baseline_eval subsystem={subsystem} "
         f"baseline_cycle_id={baseline_cycle_id}"
     )
-    baseline_metrics = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
+    baseline_metrics = _call_tolbert_preview_eval(
         config=baseline_config,
         subsystem=subsystem,
         flags=scoped_flags,
@@ -1186,7 +1606,7 @@ def compare_to_prior_retained(
         f"finalize phase=preview_prior_retained_candidate_eval subsystem={subsystem} "
         f"baseline_cycle_id={baseline_cycle_id}"
     )
-    current_metrics = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
+    current_metrics = _call_tolbert_preview_eval(
         config=current_config,
         subsystem=subsystem,
         flags=scoped_flags,
@@ -1268,6 +1688,7 @@ def preview_candidate_retention(
     task_limit: int | None = None,
     priority_benchmark_families: list[str] | None = None,
     priority_benchmark_family_weights: dict[str, float] | None = None,
+    restrict_to_priority_benchmark_families: bool = False,
     progress_label_prefix: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
@@ -1275,6 +1696,7 @@ def preview_candidate_retention(
         if progress is not None:
             progress(message)
 
+    tolbert_runtime_summary = _new_tolbert_runtime_summary(use_tolbert_context=bool(config.use_tolbert_context))
     artifact_payload = None
     if artifact_path.exists():
         parsed = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -1294,6 +1716,9 @@ def preview_candidate_retention(
         priority_benchmark_families,
         priority_benchmark_family_weights,
         artifact_payload,
+        allow_payload_overrides=not (
+            restrict_to_priority_benchmark_families and bool(priority_benchmark_families)
+        ),
     )
     managed_active_artifact_path = (
         active_artifact_path if active_artifact_path is not None else active_artifact_path_for_subsystem(config, subsystem)
@@ -1325,12 +1750,23 @@ def preview_candidate_retention(
         }
     )
     baseline_flags = autonomous_runtime_eval_flags(baseline_config, baseline_flags)
+    baseline_flags = _apply_retrieval_bounded_preview_filters(
+        subsystem,
+        flags=baseline_flags,
+        payload=artifact_payload,
+        capability_modules_path=config.capability_modules_path,
+    )
     if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
         baseline_flags["task_limit"] = comparison_task_limit
     if merged_priority_families:
         baseline_flags["priority_benchmark_families"] = list(merged_priority_families)
     if merged_priority_family_weights:
         baseline_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
+    if restrict_to_priority_benchmark_families and merged_priority_families:
+        baseline_flags["restrict_to_priority_benchmark_families"] = True
+        baseline_flags["prefer_low_cost_tasks"] = True
+        baseline_flags["include_generated"] = False
+        baseline_flags["include_failure_generated"] = False
     candidate_flags.update(
         {
             "include_discovered_tasks": include_discovered_tasks or candidate_flags["include_discovered_tasks"],
@@ -1345,33 +1781,46 @@ def preview_candidate_retention(
         }
     )
     candidate_flags = autonomous_runtime_eval_flags(candidate_config, candidate_flags)
+    candidate_flags = _apply_retrieval_bounded_preview_filters(
+        subsystem,
+        flags=candidate_flags,
+        payload=artifact_payload,
+        capability_modules_path=config.capability_modules_path,
+    )
     if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
         candidate_flags["task_limit"] = comparison_task_limit
     if merged_priority_families:
         candidate_flags["priority_benchmark_families"] = list(merged_priority_families)
     if merged_priority_family_weights:
         candidate_flags["priority_benchmark_family_weights"] = dict(merged_priority_family_weights)
+    if restrict_to_priority_benchmark_families and merged_priority_families:
+        candidate_flags["restrict_to_priority_benchmark_families"] = True
+        candidate_flags["prefer_low_cost_tasks"] = True
+        candidate_flags["include_generated"] = False
+        candidate_flags["include_failure_generated"] = False
     _emit(f"finalize phase=preview_baseline_eval subsystem={subsystem}")
-    baseline = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
+    baseline = _call_tolbert_preview_eval(
         config=baseline_config,
         subsystem=subsystem,
         flags=baseline_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_baseline",
         phase_name="preview_baseline",
         progress=progress,
+        tolbert_runtime_summary=tolbert_runtime_summary,
     )
     _emit(
         f"finalize phase=preview_baseline_complete subsystem={subsystem} "
         f"baseline_pass_rate={baseline.pass_rate:.4f}"
     )
     _emit(f"finalize phase=preview_candidate_eval subsystem={subsystem}")
-    candidate = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
+    candidate = _call_tolbert_preview_eval(
         config=candidate_config,
         subsystem=subsystem,
         flags=candidate_flags,
         progress_label=None if not progress_label_prefix else f"{progress_label_prefix}_candidate",
         phase_name="preview_candidate",
         progress=progress,
+        tolbert_runtime_summary=tolbert_runtime_summary,
     )
     _emit(
         f"finalize phase=preview_candidate_complete subsystem={subsystem} "
@@ -1387,7 +1836,10 @@ def preview_candidate_retention(
     compatibility = {}
     if isinstance(artifact_payload, dict):
         compatibility = dict(artifact_payload.get("compatibility", {}))
-    candidate_matches_active = _candidate_matches_active_artifact(artifact_path, managed_active_artifact_path)
+    candidate_matches_active = (
+        base_subsystem_for(subsystem, config.capability_modules_path) == "retrieval"
+        and _candidate_matches_active_artifact(artifact_path, managed_active_artifact_path)
+    )
     if candidate_matches_active:
         state, reason = ("reject", "candidate artifact is identical to the active retained artifact")
         evidence = {
@@ -1495,6 +1947,7 @@ def preview_candidate_retention(
         "baseline_flags": baseline_flags,
         "candidate_flags": candidate_flags,
         "active_artifact_path": managed_active_artifact_path,
+        "tolbert_runtime_summary": _finalize_tolbert_runtime_summary(tolbert_runtime_summary),
     }
 
 
@@ -1603,17 +2056,34 @@ def autonomous_phase_gate_report(
     capability_modules_path: Path | None = None,
 ) -> dict[str, object]:
     failures: list[str] = []
+    base_subsystem = base_subsystem_for(subsystem, capability_modules_path)
     generated_lane_included = bool(candidate_flags.get("include_generated", False))
     failure_recovery_lane_included = bool(candidate_flags.get("include_failure_generated", False))
+    require_generated_lane_output = bool(
+        gate.get(
+            "require_autonomous_generated_lane_output",
+            base_subsystem not in {"retrieval", "tolbert_model"},
+        )
+    )
+    require_failure_recovery_output = bool(
+        gate.get(
+            "require_autonomous_failure_recovery_output",
+            base_subsystem not in {"retrieval", "tolbert_model"},
+        )
+    )
     if not generated_lane_included:
         failures.append("generated-task lane was not included in autonomous cycle evaluation")
     if not failure_recovery_lane_included:
         failures.append("failure-recovery lane was not included in autonomous cycle evaluation")
-    if generated_lane_included and int(candidate_metrics.generated_total) <= 0:
+    if generated_lane_included and require_generated_lane_output and int(candidate_metrics.generated_total) <= 0:
         failures.append("generated-task lane produced no tasks during autonomous evaluation")
-    if failure_recovery_lane_included and int(candidate_metrics.generated_by_kind.get("failure_recovery", 0)) <= 0:
+    if (
+        failure_recovery_lane_included
+        and require_failure_recovery_output
+        and int(candidate_metrics.generated_by_kind.get("failure_recovery", 0)) <= 0
+    ):
         failures.append("failure-recovery lane produced no generated tasks during autonomous evaluation")
-    if base_subsystem_for(subsystem, capability_modules_path) in {"retrieval", "tolbert_model"}:
+    if base_subsystem in {"retrieval", "tolbert_model"}:
         if candidate_metrics.trusted_retrieval_steps < baseline_metrics.trusted_retrieval_steps:
             failures.append("retrieval candidate reduced trusted retrieval usage under autonomous phase gates")
         if candidate_metrics.low_confidence_episodes > baseline_metrics.low_confidence_episodes:
@@ -1694,10 +2164,15 @@ def prior_retained_guard_reason(
     if bool(gate.get("require_failure_recovery_non_regression", False)) and isinstance(evidence, dict):
         if float(evidence.get("failure_recovery_pass_rate_delta", 0.0)) < 0.0:
             return "candidate regressed failure-recovery performance against the prior retained baseline"
+    if bool(gate.get("require_primary_routing_signal", False)) and int(
+        current_metrics.get("tolbert_primary_episodes", 0) or 0
+    ) < int(gate.get("min_primary_episodes", 0) or 0):
+        return "candidate never entered retained Tolbert primary routing against the prior retained baseline"
     if bool(gate.get("require_novel_command_signal", False)) and int(
         current_metrics.get("proposal_selected_steps", 0) or 0
     ) <= 0:
-        return "candidate produced no proposal-selected commands against the prior retained baseline"
+        if not _tolbert_prior_retained_selection_signal_fallback_satisfied(gate, comparison):
+            return "candidate produced no proposal-selected commands against the prior retained baseline"
     if int(evidence.get("proposal_selected_steps_delta", 0)) < int(gate.get("min_proposal_selected_steps_delta", 0)):
         return "candidate regressed proposal-selected command usage against the prior retained baseline"
     if int(current_metrics.get("novel_valid_command_steps", 0) or 0) < int(
@@ -1783,6 +2258,26 @@ def prior_retained_guard_reason(
     return None
 
 
+def _tolbert_prior_retained_selection_signal_fallback_satisfied(
+    gate: dict[str, object],
+    comparison: dict[str, object],
+) -> bool:
+    if not bool(gate.get("allow_selection_signal_fallback", False)):
+        return False
+    baseline_metrics = comparison.get("baseline_metrics", {})
+    current_metrics = comparison.get("current_metrics", {})
+    evidence = comparison.get("evidence", {})
+    if not isinstance(baseline_metrics, dict) or not isinstance(current_metrics, dict) or not isinstance(evidence, dict):
+        return False
+    if float(current_metrics.get("pass_rate", 0.0) or 0.0) < float(baseline_metrics.get("pass_rate", 0.0) or 0.0):
+        return False
+    selection_deltas = (
+        int(evidence.get("trusted_retrieval_delta", 0) or 0),
+        int(evidence.get("tolbert_primary_episodes_delta", 0) or 0),
+    )
+    return any(delta > 0 for delta in selection_deltas)
+
+
 def _prior_retained_guard_reason_code(reason: str) -> str:
     normalized = str(reason).strip()
     if not normalized:
@@ -1829,6 +2324,7 @@ def _retention_reason_code_for_text(reason: str) -> str:
     return {
         "candidate artifact is identical to the active retained artifact": "candidate_artifact_unchanged",
         "retrieval candidate did not satisfy the retained retrieval gate": "retrieval_retained_gate_failed",
+        "retrieval candidate produced no material change from the retained artifact": "retrieval_no_material_change",
         "retrieval candidate regressed one or more benchmark families": "retrieval_family_regressed",
         "retrieval candidate regressed failure-recovery generation": "retrieval_failure_recovery_regressed",
         "Tolbert model candidate did not produce a checkpoint": "tolbert_checkpoint_missing",
@@ -2067,6 +2563,34 @@ def _phase_gate_metrics_summary(report: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _decision_state_for_cycle_report(
+    *,
+    final_state: str,
+    final_reason: str,
+    preview_reason_code: str = "",
+    decision_reason_code: str = "",
+) -> dict[str, object]:
+    retention_state = str(final_state).strip()
+    if retention_state not in {"retain", "reject", "incomplete"}:
+        retention_state = "undecided"
+    retention_basis = (
+        str(decision_reason_code).strip()
+        or str(preview_reason_code).strip()
+        or str(final_reason).strip()
+        or retention_state
+    )
+    return {
+        "decision_owner": "child_native",
+        "decision_credit": "child_native",
+        "decision_conversion_state": "runtime_managed" if retention_state in {"retain", "reject"} else "incomplete",
+        "retention_state": retention_state,
+        "retention_basis": retention_basis,
+        "closeout_mode": "natural",
+        "controller_intervention_reason_code": "",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _write_cycle_report(
     *,
     config: KernelConfig,
@@ -2087,6 +2611,8 @@ def _write_cycle_report(
     preview_reason_code: str = "",
     decision_reason_code: str = "",
     protocol_match_id: str = "",
+    strategy_candidate: dict[str, object] | None = None,
+    tolbert_runtime_summary: dict[str, object] | None = None,
 ) -> Path:
     records = planner.load_cycle_records(config.improvement_cycles_path)
     cycle_records = [record for record in records if str(record.get("cycle_id", "")) == cycle_id]
@@ -2102,14 +2628,24 @@ def _write_cycle_report(
         "spec_version": "asi_v1",
         "report_kind": "improvement_cycle_report",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "report_path": str(report_path),
         "cycle_id": cycle_id,
         "subsystem": subsystem,
+        "strategy_candidate": dict(strategy_candidate or {}),
+        "strategy_candidate_id": str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+        "strategy_candidate_kind": str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
         "artifact_path": str(artifact_path),
         "candidate_artifact_path": str(artifact_update.get("candidate_artifact_path", "")),
         "active_artifact_path": str(artifact_update.get("active_artifact_path", "")),
         "artifact_kind": str(artifact_update.get("artifact_kind", "")),
         "final_state": final_state,
         "final_reason": final_reason,
+        "decision_state": _decision_state_for_cycle_report(
+            final_state=final_state,
+            final_reason=final_reason,
+            preview_reason_code=preview_reason_code,
+            decision_reason_code=decision_reason_code,
+        ),
         "promotion_blocked": str(final_state).strip() != "retain",
         "promotion_block_reason_code": promotion_block_reason_code,
         "prior_retained_guard_reason": str(prior_retained_guard_reason).strip(),
@@ -2162,6 +2698,7 @@ def _write_cycle_report(
             "failure_recovery_lane_included": bool(phase_gate_report.get("failure_recovery_lane_included", False)),
         },
         "prior_retained_comparison": dict(prior_retained_comparison or {}),
+        "tolbert_runtime_summary": _finalize_tolbert_runtime_summary(tolbert_runtime_summary),
         "evidence": evidence,
         "yield_summary": {
             "retained_cycles": summary.retained_cycles,
@@ -2176,6 +2713,16 @@ def _write_cycle_report(
         },
         "production_yield_summary": _yield_summary_for(production_decisions),
         "current_cycle_records": cycle_records,
+    }
+    strategy_node = finalize_strategy_node(config, report)
+    report["strategy_memory"] = {
+        "strategy_node_id": strategy_node.strategy_node_id,
+        "parent_strategy_node_ids": list(strategy_node.parent_strategy_node_ids),
+        "retention_state": strategy_node.retention_state,
+        "retained_gain": float(strategy_node.retained_gain),
+        "analysis_lesson": strategy_node.analysis_lesson,
+        "reuse_conditions": list(strategy_node.reuse_conditions),
+        "avoid_conditions": list(strategy_node.avoid_conditions),
     }
     atomic_write_json(report_path, report, config=config)
     planner.append_cycle_record(
@@ -2198,7 +2745,11 @@ def _write_cycle_report(
                 "production_rejected_cycles": report["production_yield_summary"]["rejected_cycles"],
                 "protocol": "autonomous",
                 "protocol_match_id": str(protocol_match_id).strip(),
+                "strategy_candidate_id": str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                "strategy_candidate_kind": str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
             },
+            strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+            strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
         ),
     )
     return report_path
@@ -2221,8 +2772,13 @@ def finalize_cycle(
     include_curriculum: bool = False,
     include_failure_curriculum: bool = False,
     comparison_task_limit: int | None = None,
+    priority_benchmark_families: list[str] | None = None,
+    priority_benchmark_family_weights: dict[str, float] | None = None,
+    restrict_to_priority_benchmark_families: bool = False,
+    preview: dict[str, object] | None = None,
     progress: Callable[[str], None] | None = None,
     protocol_match_id: str = "",
+    strategy_candidate: dict[str, object] | None = None,
 ) -> tuple[str, str]:
     def _emit(message: str) -> None:
         if progress is not None:
@@ -2230,39 +2786,50 @@ def finalize_cycle(
 
     repo_root = Path(__file__).resolve().parents[1]
     _emit(f"finalize phase=preview subsystem={subsystem}")
-    preview = preview_candidate_retention(
-        config=config,
-        subsystem=subsystem,
-        artifact_path=artifact_path,
-        cycle_id=cycle_id,
-        active_artifact_path=active_artifact_path,
-        include_discovered_tasks=include_discovered_tasks,
-        include_episode_memory=include_episode_memory,
-        include_skill_memory=include_skill_memory,
-        include_skill_transfer=include_skill_transfer,
-        include_operator_memory=include_operator_memory,
-        include_tool_memory=include_tool_memory,
-        include_verifier_memory=include_verifier_memory,
-        include_curriculum=include_curriculum,
-        include_failure_curriculum=include_failure_curriculum,
-        task_limit=comparison_task_limit,
-        progress_label_prefix=f"{cycle_id}_{subsystem}_preview",
-        progress=_emit,
+    preview_result = preview
+    if preview_result is None:
+        preview_result = preview_candidate_retention(
+            config=config,
+            subsystem=subsystem,
+            artifact_path=artifact_path,
+            cycle_id=cycle_id,
+            active_artifact_path=active_artifact_path,
+            include_discovered_tasks=include_discovered_tasks,
+            include_episode_memory=include_episode_memory,
+            include_skill_memory=include_skill_memory,
+            include_skill_transfer=include_skill_transfer,
+            include_operator_memory=include_operator_memory,
+            include_tool_memory=include_tool_memory,
+            include_verifier_memory=include_verifier_memory,
+            include_curriculum=include_curriculum,
+            include_failure_curriculum=include_failure_curriculum,
+            task_limit=comparison_task_limit,
+            priority_benchmark_families=priority_benchmark_families,
+            priority_benchmark_family_weights=priority_benchmark_family_weights,
+            restrict_to_priority_benchmark_families=restrict_to_priority_benchmark_families,
+            progress_label_prefix=f"{cycle_id}_{subsystem}_preview",
+            progress=_emit,
+        )
+    else:
+        _emit(f"finalize phase=preview_reused subsystem={subsystem}")
+    managed_active_artifact_path = Path(preview_result["active_artifact_path"])
+    baseline = preview_result["baseline"]
+    candidate = preview_result["candidate"]
+    evidence = dict(preview_result["evidence"])
+    compatibility = dict(preview_result["compatibility"])
+    artifact_payload = preview_result["payload"]
+    state = str(preview_result["state"])
+    reason = str(preview_result["reason"])
+    gate = dict(preview_result["gate"])
+    phase_gate_report = dict(preview_result.get("phase_gate_report", {}))
+    prior_retained_comparison = preview_result["prior_retained_comparison"]
+    prior_retained_guard_reason = str(preview_result.get("prior_retained_guard_reason", "")).strip()
+    prior_retained_guard_reason_code = str(preview_result.get("prior_retained_guard_reason_code", "")).strip()
+    preview_reason_code = str(preview_result.get("reason_code", "")).strip()
+    tolbert_runtime_summary = _normalize_tolbert_runtime_summary(
+        preview_result.get("tolbert_runtime_summary"),
+        use_tolbert_context=bool(config.use_tolbert_context),
     )
-    managed_active_artifact_path = Path(preview["active_artifact_path"])
-    baseline = preview["baseline"]
-    candidate = preview["candidate"]
-    evidence = dict(preview["evidence"])
-    compatibility = dict(preview["compatibility"])
-    artifact_payload = preview["payload"]
-    state = str(preview["state"])
-    reason = str(preview["reason"])
-    gate = dict(preview["gate"])
-    phase_gate_report = dict(preview.get("phase_gate_report", {}))
-    prior_retained_comparison = preview["prior_retained_comparison"]
-    prior_retained_guard_reason = str(preview.get("prior_retained_guard_reason", "")).strip()
-    prior_retained_guard_reason_code = str(preview.get("prior_retained_guard_reason_code", "")).strip()
-    preview_reason_code = str(preview.get("reason_code", "")).strip()
     _emit(
         f"finalize phase=preview_complete subsystem={subsystem} "
         f"preview_state={state} baseline_pass_rate={baseline.pass_rate:.4f} "
@@ -2280,8 +2847,8 @@ def finalize_cycle(
         capability_modules_path=config.capability_modules_path,
         trust_ledger_path=config.unattended_trust_ledger_path,
     )
-    baseline_flags = dict(preview["baseline_flags"])
-    candidate_flags = dict(preview["candidate_flags"])
+    baseline_flags = dict(preview_result["baseline_flags"])
+    candidate_flags = dict(preview_result["candidate_flags"])
     protocol_metrics = {
         "protocol": "autonomous",
         "protocol_match_id": str(protocol_match_id).strip(),
@@ -2323,6 +2890,8 @@ def finalize_cycle(
                 **_phase_gate_metrics_summary(phase_gate_report),
                 **evidence,
             },
+            strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+            strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
             candidate_artifact_path=str(artifact_path),
             active_artifact_path=str(managed_active_artifact_path),
             compatibility=compatibility,
@@ -2368,6 +2937,7 @@ def finalize_cycle(
                     progress_label=f"{cycle_id}_{subsystem}_confirmation_baseline",
                     phase_name="confirmation_baseline",
                     progress=_emit,
+                    tolbert_runtime_summary=tolbert_runtime_summary,
                 ),
                 _evaluate_subsystem_metrics_with_tolbert_startup_retry(
                     config=candidate_config,
@@ -2376,6 +2946,7 @@ def finalize_cycle(
                     progress_label=f"{cycle_id}_{subsystem}_confirmation_candidate",
                     phase_name="confirmation_candidate",
                     progress=_emit,
+                    tolbert_runtime_summary=tolbert_runtime_summary,
                 ),
             )
         for confirmation_index in range(2, required_confirmation_runs + 1):
@@ -2413,6 +2984,8 @@ def finalize_cycle(
                         **protocol_metrics,
                         **confirmation_evidence,
                     },
+                    strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                    strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
                     candidate_artifact_path=str(artifact_path),
                     active_artifact_path=str(managed_active_artifact_path),
                     compatibility=compatibility,
@@ -2449,6 +3022,24 @@ def finalize_cycle(
         )
         holdout_baseline_flags = {key: value for key, value in baseline_flags.items() if key != "task_limit"}
         holdout_candidate_flags = {key: value for key, value in candidate_flags.items() if key != "task_limit"}
+        holdout_task_limit = _holdout_task_limit_for_retention(
+            subsystem,
+            comparison_task_limit=comparison_task_limit,
+            capability_modules_path=config.capability_modules_path,
+        )
+        holdout_generated_schedule_limit = _holdout_generated_schedule_limit_for_retention(
+            subsystem,
+            comparison_task_limit=comparison_task_limit,
+            capability_modules_path=config.capability_modules_path,
+        )
+        if isinstance(holdout_task_limit, int) and holdout_task_limit > 0:
+            holdout_baseline_flags["task_limit"] = holdout_task_limit
+            holdout_candidate_flags["task_limit"] = holdout_task_limit
+        if holdout_generated_schedule_limit > 0:
+            holdout_baseline_flags["max_generated_success_schedule_tasks"] = holdout_generated_schedule_limit
+            holdout_baseline_flags["max_generated_failure_schedule_tasks"] = holdout_generated_schedule_limit
+            holdout_candidate_flags["max_generated_success_schedule_tasks"] = holdout_generated_schedule_limit
+            holdout_candidate_flags["max_generated_failure_schedule_tasks"] = holdout_generated_schedule_limit
         holdout_baseline = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
             config=holdout_baseline_config,
             subsystem=subsystem,
@@ -2456,6 +3047,7 @@ def finalize_cycle(
             progress_label=f"{cycle_id}_{subsystem}_holdout_baseline",
             phase_name="holdout_baseline",
             progress=_emit,
+            tolbert_runtime_summary=tolbert_runtime_summary,
         )
         holdout_candidate = _evaluate_subsystem_metrics_with_tolbert_startup_retry(
             config=holdout_candidate_config,
@@ -2464,6 +3056,7 @@ def finalize_cycle(
             progress_label=f"{cycle_id}_{subsystem}_holdout_candidate",
             phase_name="holdout_candidate",
             progress=_emit,
+            tolbert_runtime_summary=tolbert_runtime_summary,
         )
         holdout_evidence = retention_evidence(
             subsystem,
@@ -2499,6 +3092,8 @@ def finalize_cycle(
                     **_phase_gate_metrics_summary(holdout_phase_gate_report),
                     **holdout_evidence,
                 },
+                strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
                 candidate_artifact_path=str(artifact_path),
                 active_artifact_path=str(managed_active_artifact_path),
                 compatibility=compatibility,
@@ -2522,7 +3117,7 @@ def finalize_cycle(
                 before_cycle_id=cycle_id,
                 flags=dict(holdout_candidate_flags),
                 payload=artifact_payload,
-                task_limit=None,
+                task_limit=holdout_task_limit,
                 progress_label_prefix=f"{cycle_id}_{subsystem}_holdout_prior_retained",
                 progress=progress,
             )
@@ -2646,6 +3241,8 @@ def finalize_cycle(
                     **protocol_metrics,
                     **dict(confirmation_report),
                 },
+                strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
                 candidate_artifact_path=str(artifact_path),
                 active_artifact_path=str(managed_active_artifact_path),
                 compatibility=compatibility,
@@ -2678,6 +3275,8 @@ def finalize_cycle(
                     "prior_retained_guard_reason": prior_retained_guard_reason,
                     "prior_retained_guard_reason_code": prior_retained_guard_reason_code,
                 },
+                strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
                 candidate_artifact_path=str(artifact_path),
                 active_artifact_path=str(managed_active_artifact_path),
                 compatibility=compatibility,
@@ -2689,6 +3288,12 @@ def finalize_cycle(
         reason=reason,
         phase_gate_report=phase_gate_report,
         prior_retained_guard_reason_code=prior_retained_guard_reason_code,
+    )
+    tolbert_runtime_summary = _finalize_tolbert_runtime_summary(tolbert_runtime_summary)
+    evidence["tolbert_runtime_summary"] = dict(tolbert_runtime_summary)
+    evidence["tolbert_runtime_outcome"] = str(tolbert_runtime_summary.get("outcome", "")).strip()
+    evidence["tolbert_runtime_startup_failure_count"] = int(
+        tolbert_runtime_summary.get("startup_failure_count", 0) or 0
     )
     _emit(f"finalize phase=apply_decision subsystem={subsystem} state={state}")
     artifact_update = apply_artifact_retention_decision(
@@ -2726,6 +3331,8 @@ def finalize_cycle(
                     "decision_pass_rate_delta": candidate.pass_rate - baseline.pass_rate,
                     **protocol_metrics,
                 },
+                strategy_candidate_id=str(dict(strategy_candidate or {}).get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(dict(strategy_candidate or {}).get("strategy_candidate_kind", "")).strip(),
                 active_artifact_path=str(managed_active_artifact_path),
             ),
         )
@@ -2888,6 +3495,8 @@ def finalize_cycle(
         preview_reason_code=preview_reason_code,
         decision_reason_code=decision_reason_code,
         protocol_match_id=protocol_match_id,
+        strategy_candidate=strategy_candidate,
+        tolbert_runtime_summary=tolbert_runtime_summary,
     )
     if state == "reject" and decision_reason_code:
         _emit(

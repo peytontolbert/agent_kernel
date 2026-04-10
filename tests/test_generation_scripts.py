@@ -5132,6 +5132,107 @@ def test_supervisor_loop_prefers_runtime_managed_campaign_signal_over_clean_gap(
     assert decisions["trust_breadth_reserved_subsystem_slots"] == ["trust", "trust"]
 
 
+def test_supervisor_loop_prioritizes_sampled_but_uncredited_family_yield(tmp_path, monkeypatch):
+    module = _load_script_module("run_supervisor_loop.py")
+    meta_policy_path = tmp_path / "config" / "supervisor_meta_policy.json"
+    meta_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_policy_path.write_text(json.dumps({}), encoding="utf-8")
+    policy = module.SupervisorPolicy(
+        autonomy_mode="dry_run",
+        max_discovery_workers=2,
+        discovery_task_limit=5,
+        discovery_observation_budget_seconds=60.0,
+        max_promotion_candidates=2,
+        command_timeout_seconds=120,
+        lane_failure_threshold=2,
+        sleep_seconds=30.0,
+        include_curriculum=False,
+        include_failure_curriculum=False,
+        generated_curriculum_budget_seconds=0.0,
+        failure_curriculum_budget_seconds=0.0,
+        bootstrap_finalize_policy="operator_review",
+        provider="mock",
+        model_name="test-model",
+        rollout_stage="compare_only",
+        max_meta_promotions_per_round=1,
+        meta_trust_clean_success_streak=2,
+        meta_policy_path=str(meta_policy_path),
+    )
+    monkeypatch.setattr(module, "_planner_ranked_subsystems", lambda config, worker_count: ["world_model", "policy"])
+
+    decisions = module._build_round_actions(
+        config=KernelConfig(),
+        repo_root=Path(__file__).resolve().parents[1],
+        policy=policy,
+        queue_state={"active_leases": []},
+        frontier_state={"frontier_candidates": []},
+        promotion_pass_state={"results": []},
+        trust_ledger={
+            "overall_assessment": {"passed": True, "status": "bootstrap"},
+            "overall_summary": {"clean_success_streak": 1},
+            "coverage_summary": {
+                "family_breadth_min_distinct_task_roots": 2,
+                "required_family_clean_task_root_counts": {
+                    "integration": 0,
+                    "project": 0,
+                    "repo_chore": 0,
+                    "repository": 0,
+                },
+                "required_families_missing_clean_task_root_breadth": [
+                    "integration",
+                    "project",
+                    "repo_chore",
+                    "repository",
+                ],
+                "required_family_sampled_progress_counts": {
+                    "integration": 3,
+                    "project": 2,
+                    "repo_chore": 1,
+                    "repository": 4,
+                },
+                "required_family_runtime_managed_signal_counts": {
+                    "integration": 1,
+                    "project": 1,
+                    "repo_chore": 0,
+                    "repository": 1,
+                },
+                "required_family_runtime_managed_decision_yield_counts": {
+                    "integration": 0,
+                    "project": 0,
+                    "repo_chore": 0,
+                    "repository": 0,
+                },
+                "required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield": [
+                    "integration",
+                    "project",
+                    "repo_chore",
+                    "repository",
+                ],
+                "required_families_missing_runtime_managed_decision_yield": [
+                    "integration",
+                    "project",
+                    "repo_chore",
+                    "repository",
+                ],
+                "required_families_missing_runtime_managed_signal": ["repo_chore"],
+            },
+        },
+        recent_outcomes=[],
+    )
+
+    assert decisions["current_trust_breadth_focus"]["detail_mode"] == "credited_family_yield"
+    assert decisions["current_trust_breadth_focus"]["missing_required_family_credited_yield"] == [
+        "integration",
+        "project",
+        "repo_chore",
+        "repository",
+    ]
+    assert decisions["current_trust_breadth_focus"]["details"][:2] == [
+        {"family": "repository", "observed": 0, "sampled_progress": 4, "threshold": 1, "remaining": 1},
+        {"family": "integration", "observed": 0, "sampled_progress": 3, "threshold": 1, "remaining": 1},
+    ]
+
+
 def test_supervisor_loop_pauses_discovery_for_bootstrap_review_pending_subsystem(tmp_path, monkeypatch):
     module = _load_script_module("run_supervisor_loop.py")
     meta_policy_path = tmp_path / "config" / "supervisor_meta_policy.json"

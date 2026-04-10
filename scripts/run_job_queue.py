@@ -25,6 +25,7 @@ from agent_kernel.preflight import run_unattended_preflight
 from agent_kernel.shared_repo import prepare_runtime_task
 from agent_kernel.task_bank import TaskBank
 from agent_kernel.trust import build_unattended_trust_ledger
+from agent_kernel.unattended_controller import discover_structural_classes, structural_class_family_aliases
 
 
 def _load_report_payload(report_path: str) -> dict[str, object]:
@@ -89,6 +90,25 @@ def _family_trust_summary(config: KernelConfig, *, family: str) -> dict[str, obj
     }
 
 
+def _job_structural_summary(metadata: dict[str, object]) -> dict[str, object]:
+    classes = discover_structural_classes(metadata)
+    aliases = structural_class_family_aliases(classes)
+    return {
+        "discovered_structural_classes": classes,
+        "discovered_structural_class_ids": [
+            str(entry.get("class_id", "")).strip()
+            for entry in classes
+            if str(entry.get("class_id", "")).strip()
+        ],
+        "discovered_structural_class_kinds": [
+            str(entry.get("class_kind", "")).strip()
+            for entry in classes
+            if str(entry.get("class_kind", "")).strip()
+        ],
+        "discovered_structural_family_aliases": aliases,
+    }
+
+
 def _job_readiness(
     queue: DelegatedJobQueue,
     job: object,
@@ -111,6 +131,7 @@ def _job_readiness(
         if isinstance(metadata.get("semantic_verifier", {}), dict)
         else {}
     )
+    structural_summary = _job_structural_summary(metadata)
     worker_job = bool(str(workflow_guard.get("worker_branch", "")).strip())
     integrator_job = bool(
         [
@@ -161,6 +182,7 @@ def _job_readiness(
             blocker_details.append(str(getattr(job, "last_error", "")).strip())
     return {
         "benchmark_family": str(metadata.get("benchmark_family", "bounded")).strip() or "bounded",
+        **structural_summary,
         "acceptance": acceptance,
         "acceptance_ready": acceptance_ready,
         "promoted": promoted,
@@ -231,6 +253,27 @@ def _readiness_payload(readiness: dict[str, object]) -> dict[str, object]:
         ]
         if isinstance(readiness.get("blocker_details", []), list)
         else [],
+        "discovered_structural_class_ids": [
+            str(value).strip()
+            for value in readiness.get("discovered_structural_class_ids", [])
+            if str(value).strip()
+        ]
+        if isinstance(readiness.get("discovered_structural_class_ids", []), list)
+        else [],
+        "discovered_structural_class_kinds": [
+            str(value).strip()
+            for value in readiness.get("discovered_structural_class_kinds", [])
+            if str(value).strip()
+        ]
+        if isinstance(readiness.get("discovered_structural_class_kinds", []), list)
+        else [],
+        "discovered_structural_family_aliases": [
+            str(value).strip()
+            for value in readiness.get("discovered_structural_family_aliases", [])
+            if str(value).strip()
+        ]
+        if isinstance(readiness.get("discovered_structural_family_aliases", []), list)
+        else [],
     }
 
 
@@ -239,6 +282,13 @@ def _job_payload(job: object, readiness: dict[str, object]) -> dict[str, object]
     return {
         "job": job.to_dict() if hasattr(job, "to_dict") else {},
         "benchmark_family": str(readiness.get("benchmark_family", "")).strip(),
+        "discovered_structural_classes": [
+            dict(entry)
+            for entry in readiness.get("discovered_structural_classes", [])
+            if isinstance(entry, dict)
+        ]
+        if isinstance(readiness.get("discovered_structural_classes", []), list)
+        else [],
         "acceptance": dict(acceptance) if isinstance(acceptance, dict) else {},
         "readiness": _readiness_payload(readiness),
         "latest_scheduler_decision": _latest_scheduler_decision(job),
@@ -314,6 +364,70 @@ def _queue_family_rollups(jobs_with_readiness: list[tuple[object, dict[str, obje
             ),
         }
         for family, rollup in sorted(families.items())
+    }
+
+
+def _queue_structural_class_rollups(
+    jobs_with_readiness: list[tuple[object, dict[str, object]]],
+) -> dict[str, dict[str, object]]:
+    rollups: dict[str, dict[str, object]] = {}
+    for job, readiness in jobs_with_readiness:
+        classes = readiness.get("discovered_structural_classes", [])
+        if not isinstance(classes, list):
+            continue
+        for entry in classes:
+            if not isinstance(entry, dict):
+                continue
+            class_id = str(entry.get("class_id", "")).strip()
+            if not class_id:
+                continue
+            rollup = rollups.setdefault(
+                class_id,
+                {
+                    "class_kind": str(entry.get("class_kind", "")).strip(),
+                    "total_jobs": 0,
+                    "runnable_jobs": 0,
+                    "blocked_jobs": 0,
+                    "promotable_jobs": 0,
+                    "benchmark_families": set(),
+                    "family_aliases": set(),
+                },
+            )
+            rollup["total_jobs"] = int(rollup["total_jobs"]) + 1
+            if bool(readiness.get("runnable", False)):
+                rollup["runnable_jobs"] = int(rollup["runnable_jobs"]) + 1
+            if bool(readiness.get("blocked", False)):
+                rollup["blocked_jobs"] = int(rollup["blocked_jobs"]) + 1
+            if bool(readiness.get("promotable", False)):
+                rollup["promotable_jobs"] = int(rollup["promotable_jobs"]) + 1
+            benchmark_families = rollup.get("benchmark_families", set())
+            family_aliases = rollup.get("family_aliases", set())
+            if isinstance(benchmark_families, set):
+                benchmark_families.add(str(readiness.get("benchmark_family", "")).strip() or "bounded")
+            if isinstance(family_aliases, set):
+                for alias in readiness.get("discovered_structural_family_aliases", []):
+                    token = str(alias).strip()
+                    if token:
+                        family_aliases.add(token)
+    return {
+        class_id: {
+            "class_kind": str(rollup["class_kind"]).strip(),
+            "total_jobs": int(rollup["total_jobs"]),
+            "runnable_jobs": int(rollup["runnable_jobs"]),
+            "blocked_jobs": int(rollup["blocked_jobs"]),
+            "promotable_jobs": int(rollup["promotable_jobs"]),
+            "benchmark_families": sorted(
+                str(value).strip()
+                for value in rollup.get("benchmark_families", set())
+                if str(value).strip()
+            ),
+            "family_aliases": sorted(
+                str(value).strip()
+                for value in rollup.get("family_aliases", set())
+                if str(value).strip()
+            ),
+        }
+        for class_id, rollup in sorted(rollups.items())
     }
 
 
@@ -827,6 +941,12 @@ def main() -> None:
                 f"blocker_details={';'.join(str(value) for value in readiness.get('blocker_details', [])) or '-'}"
             )
             print(
+                "structural_classes "
+                f"class_ids={','.join(readiness.get('discovered_structural_class_ids', [])) or '-'} "
+                f"class_kinds={','.join(readiness.get('discovered_structural_class_kinds', [])) or '-'} "
+                f"family_aliases={','.join(readiness.get('discovered_structural_family_aliases', [])) or '-'}"
+            )
+            print(
                 "trust_family "
                 f"family={trust['family']} status={trust['status']} reports={trust['reports']} "
                 f"success_rate={trust['success_rate']:.3f} "
@@ -1171,6 +1291,7 @@ def main() -> None:
             None,
         )
         family_rollups = _queue_family_rollups(jobs_with_readiness)
+        structural_class_rollups = _queue_structural_class_rollups(jobs_with_readiness)
         active_lease_roles = _active_lease_role_rollup(jobs_with_readiness, leases if isinstance(leases, list) else [])
         if json_mode:
             payload = {
@@ -1208,6 +1329,7 @@ def main() -> None:
                     "state_counts": _queue_state_counts(jobs_with_readiness),
                     "blocker_counts": _queue_blocker_counts(jobs_with_readiness),
                     "benchmark_families": family_rollups,
+                    "discovered_structural_classes": structural_class_rollups,
                     "decision_counts": dict(sorted(decision_counts.items())),
                     "fairness": {
                         "blocked_open_jobs": blocked_open_jobs,
@@ -1272,6 +1394,18 @@ def main() -> None:
                 f"worker_jobs={rollup['worker_jobs']} "
                 f"integrator_jobs={rollup['integrator_jobs']} "
                 f"budget_groups={','.join(rollup['budget_groups']) or '-'}"
+            )
+        for class_id, rollup in structural_class_rollups.items():
+            print(
+                "queue_structural_class "
+                f"class_id={class_id} "
+                f"class_kind={rollup['class_kind'] or '-'} "
+                f"total_jobs={rollup['total_jobs']} "
+                f"runnable_jobs={rollup['runnable_jobs']} "
+                f"blocked_jobs={rollup['blocked_jobs']} "
+                f"promotable_jobs={rollup['promotable_jobs']} "
+                f"benchmark_families={','.join(rollup['benchmark_families']) or '-'} "
+                f"family_aliases={','.join(rollup['family_aliases']) or '-'}"
             )
         print(
             "queue_fairness "

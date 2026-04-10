@@ -96,8 +96,145 @@ def _annotate_light_supervision_contract(task: TaskSpec) -> TaskSpec:
         metadata["light_supervision_contract_kind"] = contract_kind
     else:
         metadata.pop("light_supervision_contract_kind", None)
+    metadata.update(_infer_repo_semantic_metadata(task))
     task.metadata = metadata
     return task
+
+
+def _normalized_repo_semantic_list(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    for value in values:
+        label = str(value).strip().lower()
+        if label and label not in normalized:
+            normalized.append(label)
+    return normalized
+
+
+def _infer_repo_semantic_metadata(task: TaskSpec) -> dict[str, object]:
+    metadata = dict(task.metadata)
+    existing_repo_semantics = _normalized_repo_semantic_list(metadata.get("repo_semantics", []))
+    existing_artifact_kinds = _normalized_repo_semantic_list(metadata.get("artifact_kinds", []))
+    expected_paths = [
+        str(path).strip()
+        for path in [*task.expected_files, *task.forbidden_files, *task.expected_file_contents.keys()]
+        if str(path).strip()
+    ]
+    all_commands = [
+        str(command).strip()
+        for command in [*task.setup_commands, *task.suggested_commands, task.success_command]
+        if str(command).strip()
+    ]
+    normalized_paths = [path.lower() for path in expected_paths]
+    normalized_commands = [command.lower() for command in all_commands]
+    verifier = metadata.get("semantic_verifier", {})
+    verifier = dict(verifier) if isinstance(verifier, dict) else {}
+    workflow_guard = metadata.get("workflow_guard", {})
+    workflow_guard = dict(workflow_guard) if isinstance(workflow_guard, dict) else {}
+    benchmark_family = str(metadata.get("benchmark_family", "bounded")).strip().lower() or "bounded"
+    task_origin = str(metadata.get("task_origin", "")).strip().lower()
+
+    repo_semantics = list(existing_repo_semantics)
+
+    def _add_semantic(label: str, *, active: bool) -> None:
+        if active and label not in repo_semantics:
+            repo_semantics.append(label)
+
+    def _has_path_fragment(*fragments: str) -> bool:
+        lowered = [fragment.lower() for fragment in fragments if fragment]
+        return any(any(fragment in path for fragment in lowered) for path in normalized_paths)
+
+    def _has_command_fragment(*fragments: str) -> bool:
+        lowered = [fragment.lower() for fragment in fragments if fragment]
+        return any(any(fragment in command for fragment in lowered) for command in normalized_commands)
+
+    _add_semantic("project", active=benchmark_family == "project" or _has_path_fragment("project/"))
+    _add_semantic(
+        "repository",
+        active=benchmark_family in {"repository", "repo_sandbox"} or _has_path_fragment("repo/", "repository", "mirrors/"),
+    )
+    _add_semantic(
+        "integration",
+        active=benchmark_family == "integration"
+        or _has_path_fragment("integration/", "handoff", "merge", "conflict")
+        or bool(verifier.get("required_merged_branches")),
+    )
+    _add_semantic(
+        "tooling",
+        active=benchmark_family == "tooling" or _has_path_fragment("tool/", "tooling/", "scripts/") or _has_command_fragment("python -m", "pytest"),
+    )
+    _add_semantic(
+        "workflow",
+        active=benchmark_family == "workflow" or _has_command_fragment("git ", "make ", "npm ", "cargo "),
+    )
+    _add_semantic(
+        "cleanup",
+        active=benchmark_family == "repo_chore"
+        or _has_path_fragment("cleanup", "upkeep/")
+        or _has_command_fragment("rm ", "cleanup"),
+    )
+    _add_semantic(
+        "validation",
+        active=_has_path_fragment("validation/", "verify", "checklist", "matrix")
+        or _has_command_fragment("pytest", "verify", "check"),
+    )
+    _add_semantic(
+        "shared_repo",
+        active=bool(workflow_guard.get("shared_repo_id")) or _has_path_fragment("shared_repo/"),
+    )
+    _add_semantic(
+        "recovery",
+        active=task_origin in {"discovered_task", "transition_pressure"}
+        or _has_path_fragment("recovery/")
+        or _has_command_fragment("rollback", "recover"),
+    )
+
+    artifact_kinds = list(existing_artifact_kinds)
+
+    def _add_artifact(label: str, *, active: bool) -> None:
+        if active and label not in artifact_kinds:
+            artifact_kinds.append(label)
+
+    _add_artifact("report", active=_has_path_fragment(".md", ".txt", "report", "summary", "packet"))
+    _add_artifact("config", active=_has_path_fragment(".json", ".yaml", ".yml", ".toml", ".ini"))
+    _add_artifact("source", active=_has_path_fragment(".py", ".ts", ".tsx", ".js", ".java", ".go", ".rs", ".c", ".cpp"))
+    _add_artifact("test", active=_has_path_fragment("test", "spec", "verify", "validation"))
+    _add_artifact("workspace_contract", active=_task_acceptance_contract_defined(task))
+
+    workflow_shape = str(metadata.get("workflow_shape", "")).strip().lower()
+    if not workflow_shape:
+        if bool(workflow_guard.get("shared_repo_id")):
+            workflow_shape = "shared_repo_parallel"
+        elif bool(verifier.get("required_merged_branches")):
+            workflow_shape = "multi_branch_validation"
+        elif task_origin in {"episode_replay", "discovered_task", "transition_pressure"}:
+            workflow_shape = "memory_derived"
+        elif len(expected_paths) > 3:
+            workflow_shape = "multi_artifact_workspace"
+        elif task.success_command:
+            workflow_shape = "command_driven"
+        else:
+            workflow_shape = "single_workspace"
+
+    contract_shape = str(metadata.get("contract_shape", "")).strip().lower()
+    if not contract_shape:
+        contract_kind = _light_supervision_contract_kind(task)
+        if contract_kind == "semantic_verifier":
+            contract_shape = "semantic_verifier"
+        elif contract_kind == "workspace_acceptance":
+            contract_shape = "workspace_acceptance"
+        elif contract_kind == "success_command":
+            contract_shape = "command_acceptance"
+        else:
+            contract_shape = "open_ended"
+
+    return {
+        "repo_semantics": repo_semantics,
+        "artifact_kinds": artifact_kinds,
+        "workflow_shape": workflow_shape,
+        "contract_shape": contract_shape,
+    }
 
 
 def annotate_light_supervision_contract(task: TaskSpec) -> TaskSpec:
@@ -1220,6 +1357,11 @@ def _derive_line_replace_step(
         )
     if not replacements:
         return None
+    replacement_lines = [int(replacement.get("line_number", 0)) for replacement in replacements]
+    if len(replacement_lines) > 1 and replacement_lines == list(
+        range(replacement_lines[0], replacement_lines[-1] + 1)
+    ):
+        return None
     return {
         "path": path,
         "baseline_content": baseline_content,
@@ -1954,6 +2096,13 @@ def load_skill_replay_tasks(skills_path: Path, *, limit: int | None = None) -> l
         if contract is None:
             continue
         procedure = list(skill.get("procedure", {}).get("commands", []))
+        if not _memory_replay_matches_source_task(
+            bank=bank,
+            source_task_id=source_task_id,
+            contract=contract,
+            procedure=procedure,
+        ):
+            continue
         metadata = dict(contract.metadata)
         metadata.update(
             _memory_task_metadata(
@@ -2331,6 +2480,13 @@ def load_tool_replay_tasks(tool_candidates_path: Path, *, limit: int | None = No
         if contract is None:
             continue
         procedure = list(record.get("procedure", {}).get("commands", []))
+        if not _memory_replay_matches_source_task(
+            bank=bank,
+            source_task_id=source_task_id,
+            contract=contract,
+            procedure=procedure,
+        ):
+            continue
         if _tool_candidate_has_incomplete_shared_repo_integrator_bundle(record, contract=contract, procedure=procedure):
             continue
         metadata = dict(contract.metadata)
@@ -2733,6 +2889,27 @@ def _task_contract_from_memory(
         return bank.get(task_id)
     except KeyError:
         return None
+
+
+def _memory_replay_matches_source_task(
+    *,
+    bank: TaskBank,
+    source_task_id: str,
+    contract: TaskSpec,
+    procedure: list[object],
+) -> bool:
+    try:
+        source_task = bank.get(source_task_id)
+    except KeyError:
+        return True
+    expected_files = {str(path) for path in source_task.expected_files if str(path).strip()}
+    contract_expected_files = {str(path) for path in contract.expected_files if str(path).strip()}
+    if expected_files and contract_expected_files != expected_files:
+        return False
+    normalized_commands = " ".join(str(command) for command in procedure if str(command).strip())
+    if expected_files and normalized_commands and not any(path in normalized_commands for path in expected_files):
+        return False
+    return True
 
 
 def _tool_candidate_has_incomplete_shared_repo_integrator_bundle(

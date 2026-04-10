@@ -23,7 +23,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-model-len 8192 \
   --reasoning-parser qwen3 \
   --language-model-only \
-  --gpu-memory-utilization 0.6
+  --gpu-memory-utilization 0.5
 ```
 
 Recommended runtime env:

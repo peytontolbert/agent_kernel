@@ -67,6 +67,7 @@ def _write_campaign_report(
     required_families_with_reports: list[str],
     sampled_families_from_progress: list[str],
     family_observed_decisions: dict[str, int] | None = None,
+    required_family_clean_task_root_counts: dict[str, int] | None = None,
 ) -> None:
     normalized_decisions = {
         str(family).strip(): max(0, int(count))
@@ -101,6 +102,7 @@ def _write_campaign_report(
                         "repository",
                     ],
                     "required_families_with_reports": required_families_with_reports,
+                    "required_family_clean_task_root_counts": dict(required_family_clean_task_root_counts or {}),
                 },
                 "priority_family_yield_summary": {
                     "priority_families": priority_families,
@@ -206,6 +208,59 @@ def test_build_unattended_trust_ledger_summarizes_recent_reports(tmp_path: Path)
     assert ledger["coverage_summary"]["distinct_family_gap"] == 0
 
 
+def test_build_unattended_trust_ledger_surfaces_repo_semantic_clusters(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _write_report(
+        reports_dir,
+        "project_validation_success.json",
+        generated_at="2026-03-25T00:00:01+00:00",
+        benchmark_family="project",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_metadata={"repo_semantics": ["project", "validation"]},
+    )
+    _write_report(
+        reports_dir,
+        "repository_integration_success.json",
+        generated_at="2026-03-25T00:00:02+00:00",
+        benchmark_family="repository",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_metadata={"repo_semantics": ["repository", "integration", "shared_repo"]},
+    )
+    config = KernelConfig(
+        run_reports_dir=reports_dir,
+        use_trust_proposals=False,
+        unattended_trust_recent_report_limit=10,
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("project", "repository"),
+        unattended_trust_min_distinct_families=2,
+    )
+
+    ledger = build_unattended_trust_ledger(config)
+
+    assert ledger["overall_summary"]["distinct_repo_semantic_clusters"] == 5
+    assert ledger["overall_summary"]["repo_semantic_clusters"] == [
+        "integration",
+        "project",
+        "repository",
+        "shared_repo",
+        "validation",
+    ]
+    assert ledger["coverage_summary"]["distinct_repo_semantic_clusters"] == 5
+    assert ledger["coverage_summary"]["observed_repo_semantic_clusters"] == [
+        "integration",
+        "project",
+        "repository",
+        "shared_repo",
+        "validation",
+    ]
+
+
 def test_build_unattended_trust_ledger_uses_campaign_runtime_managed_signals(tmp_path: Path):
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()
@@ -287,14 +342,21 @@ def test_build_unattended_trust_ledger_uses_campaign_runtime_managed_signals(tmp
         "repo_chore",
         "repo_sandbox",
     ]
+    assert ledger["coverage_summary"]["required_families_with_reports"] == []
+    assert ledger["coverage_summary"]["required_families_with_gated_reports"] == []
     assert ledger["coverage_summary"]["missing_required_families"] == [
+        "integration",
+        "project",
         "repo_chore",
         "repo_sandbox",
+        "repository",
     ]
     assert ledger["coverage_summary"]["missing_required_gated_families"] == [
         "integration",
+        "project",
         "repo_chore",
         "repo_sandbox",
+        "repository",
     ]
 
 
@@ -365,12 +427,36 @@ def test_build_unattended_trust_ledger_does_not_promote_sampled_families_without
         "repo_chore",
         "repository",
     ]
+    assert ledger["coverage_summary"]["required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield"] == [
+        "integration",
+        "project",
+        "repo_chore",
+        "repository",
+    ]
+    assert ledger["coverage_summary"]["required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts"] == {
+        "integration": 1,
+        "project": 1,
+        "repo_chore": 1,
+        "repository": 1,
+    }
     assert ledger["coverage_summary"]["required_families_missing_runtime_managed_signal"] == [
         "integration",
         "repo_chore",
         "repository",
     ]
-    assert ledger["coverage_summary"]["missing_required_families"] == []
+    assert ledger["coverage_summary"]["required_family_report_counts"] == {
+        "integration": 0,
+        "project": 0,
+        "repo_chore": 0,
+        "repository": 0,
+    }
+    assert ledger["coverage_summary"]["required_families_with_reports"] == []
+    assert ledger["coverage_summary"]["missing_required_families"] == [
+        "integration",
+        "project",
+        "repo_chore",
+        "repository",
+    ]
     assert ledger["coverage_summary"]["required_families_missing_runtime_managed_decision_yield"] == [
         "integration",
         "project",
@@ -379,7 +465,7 @@ def test_build_unattended_trust_ledger_does_not_promote_sampled_families_without
     ]
 
 
-def test_build_unattended_trust_ledger_grants_family_coverage_credit_from_sampled_progress(tmp_path: Path):
+def test_build_unattended_trust_ledger_does_not_grant_report_credit_from_sampled_progress(tmp_path: Path):
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()
     _write_campaign_report(
@@ -407,12 +493,13 @@ def test_build_unattended_trust_ledger_grants_family_coverage_credit_from_sample
         "project",
         "repository",
     ]
-    assert ledger["coverage_summary"]["required_families_with_reports"] == [
+    assert ledger["coverage_summary"]["required_families_with_reports"] == []
+    assert ledger["coverage_summary"]["missing_required_families"] == [
         "integration",
         "project",
+        "repo_chore",
         "repository",
     ]
-    assert ledger["coverage_summary"]["missing_required_families"] == ["repo_chore"]
     assert ledger["coverage_summary"]["required_families_with_gated_reports"] == []
     assert ledger["coverage_summary"]["missing_required_gated_families"] == [
         "integration",
@@ -420,6 +507,33 @@ def test_build_unattended_trust_ledger_grants_family_coverage_credit_from_sample
         "repo_chore",
         "repository",
     ]
+
+
+def test_build_unattended_trust_ledger_merges_campaign_clean_task_root_counts(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _write_campaign_report(
+        reports_dir,
+        "campaign_report.json",
+        generated_at="2026-04-05T00:00:01+00:00",
+        required_families_with_reports=["project", "repository"],
+        sampled_families_from_progress=["project", "repository"],
+        family_observed_decisions={"project": 1},
+        required_family_clean_task_root_counts={"project": 2, "repository": 1},
+    )
+    config = KernelConfig(
+        run_reports_dir=reports_dir,
+        unattended_trust_required_benchmark_families=("project", "repository", "integration", "repo_chore"),
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_min_distinct_families=1,
+    )
+
+    ledger = build_unattended_trust_ledger(config)
+
+    assert ledger["campaign_summary"]["required_family_clean_task_root_counts"]["project"] == 2
+    assert ledger["coverage_summary"]["required_family_clean_task_root_counts"]["project"] == 2
+    assert ledger["coverage_summary"]["required_family_clean_task_root_counts"]["repository"] == 1
 
 
 
@@ -461,6 +575,7 @@ def test_build_unattended_trust_ledger_tracks_family_decision_yield(tmp_path: Pa
     ledger = build_unattended_trust_ledger(config)
 
     assert ledger["campaign_summary"]["runtime_managed_decision_yield_families"] == ["project"]
+    assert ledger["campaign_summary"]["required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield"] == []
     assert ledger["coverage_summary"]["required_family_runtime_managed_decision_yield_counts"] == {
         "integration": 0,
         "project": 1,
@@ -468,7 +583,33 @@ def test_build_unattended_trust_ledger_tracks_family_decision_yield(tmp_path: Pa
         "repo_sandbox": 0,
         "repository": 0,
     }
+    assert ledger["coverage_summary"]["required_family_counted_evidence_summary"]["project"] == {
+        "sampled_progress_count": 0,
+        "verified_signal_count": 2,
+        "retained_decision_count": 1,
+        "decision_yield_count": 1,
+        "clean_task_root_count": 0,
+        "highest_confirmed_stage": "yielded",
+        "missing_decision_yield_after_sampling": False,
+    }
+    assert ledger["coverage_summary"]["required_family_counted_evidence_summary"]["repository"] == {
+        "sampled_progress_count": 0,
+        "verified_signal_count": 2,
+        "retained_decision_count": 1,
+        "decision_yield_count": 0,
+        "clean_task_root_count": 0,
+        "highest_confirmed_stage": "retained",
+        "missing_decision_yield_after_sampling": False,
+    }
     assert ledger["coverage_summary"]["required_families_with_runtime_managed_decision_yield"] == ["project"]
+    assert ledger["coverage_summary"]["required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield"] == []
+    assert ledger["coverage_summary"]["required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts"] == {
+        "integration": 0,
+        "project": 0,
+        "repo_chore": 0,
+        "repo_sandbox": 0,
+        "repository": 0,
+    }
     assert ledger["coverage_summary"]["required_families_missing_runtime_managed_decision_yield"] == [
         "integration",
         "repo_chore",
@@ -522,7 +663,8 @@ def test_build_unattended_trust_ledger_accumulates_recent_campaign_family_signal
         "integration",
         "repo_chore",
     ]
-    assert ledger["coverage_summary"]["missing_required_families"] == []
+    assert ledger["coverage_summary"]["required_families_with_reports"] == []
+    assert ledger["coverage_summary"]["missing_required_families"] == ["integration", "repo_chore"]
 
 
 def test_build_unattended_trust_ledger_tracks_light_supervision_independence(tmp_path: Path):

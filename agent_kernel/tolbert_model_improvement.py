@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from typing import Any
 
 from evals.metrics import EvalMetrics
@@ -42,7 +43,10 @@ def build_tolbert_model_candidate_artifact(
     metrics: EvalMetrics,
     focus: str | None = None,
     current_payload: object | None = None,
+    progress: callable | None = None,
 ) -> dict[str, object]:
+    if progress is not None:
+        progress("stage=tolbert_assets start")
     output_dir.mkdir(parents=True, exist_ok=True)
     assets_dir = output_dir / "assets"
     dataset_dir = output_dir / "dataset"
@@ -54,26 +58,40 @@ def build_tolbert_model_candidate_artifact(
         base_model_name=_baseline_training_controls(current_payload).get("base_model_name", "bert-base-uncased"),
         config=config,
     )
+    if progress is not None:
+        progress("stage=tolbert_assets complete")
+        progress("stage=tolbert_dataset start")
     dataset_manifest = build_tolbert_supervised_dataset_manifest(
         config=config,
         repo_root=repo_root,
         output_dir=dataset_dir,
     )
+    if progress is not None:
+        progress("stage=tolbert_dataset complete")
+        progress("stage=tolbert_universal_dataset start")
     universal_dataset_manifest = materialize_universal_decoder_dataset(
         config=config,
         repo_root=repo_root,
         output_dir=output_dir / "universal_dataset",
     )
+    if progress is not None:
+        progress("stage=tolbert_universal_dataset complete")
     universal_decoder_training_controls = _tolbert_universal_decoder_training_controls(universal_dataset_manifest)
+    if progress is not None:
+        progress("stage=tolbert_training_inputs start")
     training_inputs = _write_training_inputs_manifest(
         output_dir=training_dir,
         dataset_manifest=dataset_manifest,
     )
+    if progress is not None:
+        progress("stage=tolbert_training_inputs complete")
     training_controls = tolbert_training_controls(
         metrics,
         focus=focus,
         baseline=retained_tolbert_model_training_controls(current_payload),
     )
+    if progress is not None:
+        progress("stage=tolbert_train_config start")
     train_config_path = _write_training_config(
         base_config_path=assets.config_path,
         output_dir=training_dir,
@@ -81,6 +99,8 @@ def build_tolbert_model_candidate_artifact(
         dataset_manifest=dataset_manifest,
         training_inputs=training_inputs,
     )
+    if progress is not None:
+        progress("stage=tolbert_train_config complete")
     (
         trained_checkpoint_path,
         cache_path,
@@ -100,7 +120,10 @@ def build_tolbert_model_candidate_artifact(
         universal_dataset_manifest=universal_dataset_manifest,
         universal_decoder_training_controls=universal_decoder_training_controls,
         current_payload=current_payload,
+        progress=progress,
     )
+    if progress is not None:
+        progress("stage=tolbert_runtime_bundle start")
     hybrid_runtime = _tolbert_hybrid_runtime(
         output_dir=output_dir,
         dataset_manifest=dataset_manifest,
@@ -118,6 +141,8 @@ def build_tolbert_model_candidate_artifact(
         output_dir,
         retained_checkpoint_path=trained_checkpoint_path,
     )
+    if progress is not None:
+        progress("stage=tolbert_runtime_bundle complete")
     payload = {
         "spec_version": "asi_v1",
         "artifact_kind": "tolbert_model_bundle",
@@ -211,6 +236,8 @@ def build_tolbert_model_candidate_artifact(
         output_dir=output_dir,
         payload=payload,
     )
+    if progress is not None:
+        progress("stage=tolbert_shared_store complete")
     payload["shared_store"] = shared_store
     payload["materialization_mode"] = str(shared_store.get("mode", "inline_bundle"))
     return payload
@@ -498,6 +525,7 @@ def _run_tolbert_generation_pipelines(
     universal_dataset_manifest: dict[str, object],
     universal_decoder_training_controls: dict[str, object],
     current_payload: object | None,
+    progress: callable | None = None,
 ) -> tuple[
     Path,
     Path,
@@ -507,9 +535,74 @@ def _run_tolbert_generation_pipelines(
     dict[str, object] | None,
     list[dict[str, object]],
 ]:
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        finetune_future = executor.submit(
-            run_tolbert_finetune_pipeline,
+    def _emit(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    device_plan = _tolbert_generation_device_plan(config)
+    if bool(device_plan.get("parallel", True)):
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            _emit("stage=tolbert_finetune_pipeline start")
+            finetune_future = executor.submit(
+                run_tolbert_finetune_pipeline,
+                config=config,
+                repo_root=repo_root,
+                output_dir=output_dir,
+                train_config_path=train_config_path,
+                model_spans_path=model_spans_path,
+                num_epochs=int(training_controls.get("num_epochs", 1)),
+                training_inputs=training_inputs,
+                current_payload=current_payload,
+                device=str(device_plan.get("finetune", config.tolbert_device)),
+            )
+            _emit("stage=tolbert_hybrid_runtime_pipeline start")
+            hybrid_future = executor.submit(
+                run_tolbert_hybrid_runtime_pipeline,
+                config=config,
+                repo_root=repo_root,
+                output_dir=output_dir,
+                current_payload=current_payload,
+                device=str(device_plan.get("hybrid", config.tolbert_device)),
+            )
+            _emit("stage=tolbert_universal_runtime_pipeline start")
+            universal_future = executor.submit(
+                run_tolbert_universal_decoder_pipeline,
+                config=config,
+                repo_root=repo_root,
+                output_dir=output_dir,
+                universal_dataset_manifest=universal_dataset_manifest,
+                training_controls=universal_decoder_training_controls,
+                current_payload=current_payload,
+                device=str(device_plan.get("universal", config.tolbert_device)),
+            )
+            pending = {
+                finetune_future: "tolbert_finetune_pipeline",
+                hybrid_future: "tolbert_hybrid_runtime_pipeline",
+                universal_future: "tolbert_universal_runtime_pipeline",
+            }
+            results: dict[str, object] = {}
+            last_heartbeat = datetime.now(timezone.utc).timestamp()
+            while pending:
+                done, _ = wait(tuple(pending.keys()), timeout=5.0, return_when=FIRST_COMPLETED)
+                now = datetime.now(timezone.utc).timestamp()
+                if not done and now - last_heartbeat >= 30.0:
+                    _emit(
+                        "stage=tolbert_pipeline_heartbeat pending="
+                        + ",".join(sorted(pending.values()))
+                    )
+                    last_heartbeat = now
+                    continue
+                for future in done:
+                    stage_name = pending.pop(future)
+                    results[stage_name] = future.result()
+                    _emit(f"stage={stage_name} complete")
+
+            trained_checkpoint_path, cache_path, job_records = results["tolbert_finetune_pipeline"]
+            hybrid_manifest, hybrid_job_records = results["tolbert_hybrid_runtime_pipeline"]
+            universal_manifest, universal_job_records = results["tolbert_universal_runtime_pipeline"]
+    else:
+        _emit("stage=tolbert_finetune_pipeline start")
+        trained_checkpoint_path, cache_path, job_records = run_tolbert_finetune_pipeline(
             config=config,
             repo_root=repo_root,
             output_dir=output_dir,
@@ -518,27 +611,29 @@ def _run_tolbert_generation_pipelines(
             num_epochs=int(training_controls.get("num_epochs", 1)),
             training_inputs=training_inputs,
             current_payload=current_payload,
+            device=str(device_plan.get("finetune", config.tolbert_device)),
         )
-        hybrid_future = executor.submit(
-            run_tolbert_hybrid_runtime_pipeline,
+        _emit("stage=tolbert_finetune_pipeline complete")
+        _emit("stage=tolbert_hybrid_runtime_pipeline start")
+        hybrid_manifest, hybrid_job_records = run_tolbert_hybrid_runtime_pipeline(
             config=config,
             repo_root=repo_root,
             output_dir=output_dir,
             current_payload=current_payload,
+            device=str(device_plan.get("hybrid", config.tolbert_device)),
         )
-        universal_future = executor.submit(
-            run_tolbert_universal_decoder_pipeline,
+        _emit("stage=tolbert_hybrid_runtime_pipeline complete")
+        _emit("stage=tolbert_universal_runtime_pipeline start")
+        universal_manifest, universal_job_records = run_tolbert_universal_decoder_pipeline(
             config=config,
             repo_root=repo_root,
             output_dir=output_dir,
             universal_dataset_manifest=universal_dataset_manifest,
             training_controls=universal_decoder_training_controls,
             current_payload=current_payload,
+            device=str(device_plan.get("universal", config.tolbert_device)),
         )
-
-        trained_checkpoint_path, cache_path, job_records = finetune_future.result()
-        hybrid_manifest, hybrid_job_records = hybrid_future.result()
-        universal_manifest, universal_job_records = universal_future.result()
+        _emit("stage=tolbert_universal_runtime_pipeline complete")
 
     return (
         trained_checkpoint_path,
@@ -1260,6 +1355,67 @@ def _summarize_action_generation_examples(policy_records: list[dict[str, object]
     }
 
 
+_TOLBERT_ACTIONABLE_TEMPLATE_KINDS = {
+    "structured_edit",
+    "expected_file_content",
+    "missing_expected_file",
+    "cleanup_forbidden_file",
+}
+
+
+def _tolbert_action_generation_summary(dataset_manifest: dict[str, object]) -> dict[str, object]:
+    summary = dataset_manifest.get("action_generation_summary", {})
+    return dict(summary) if isinstance(summary, dict) else {}
+
+
+def _tolbert_actionable_template_preferences(
+    dataset_manifest: dict[str, object],
+    *,
+    minimum_support: int = 1,
+) -> dict[str, list[dict[str, object]]]:
+    summary = _tolbert_action_generation_summary(dataset_manifest)
+    raw_preferences = summary.get("template_preferences", {})
+    if not isinstance(raw_preferences, dict):
+        return {}
+    preferences: dict[str, list[dict[str, object]]] = {}
+    for family, items in raw_preferences.items():
+        if not isinstance(items, list):
+            continue
+        filtered: list[dict[str, object]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            template_kind = str(item.get("template_kind", "")).strip()
+            support = int(item.get("support", 0) or 0)
+            if template_kind not in _TOLBERT_ACTIONABLE_TEMPLATE_KINDS or support < minimum_support:
+                continue
+            filtered.append(
+                {
+                    "template_kind": template_kind,
+                    "support": support,
+                    "success_count": int(item.get("success_count", 0) or 0),
+                    "pass_rate": float(item.get("pass_rate", 0.0) or 0.0),
+                    "provenance": [
+                        str(value).strip()
+                        for value in item.get("provenance", [])
+                        if str(value).strip()
+                    ][:8],
+                }
+            )
+        if filtered:
+            preferences[str(family).strip() or "bounded"] = filtered
+    return preferences
+
+
+def _tolbert_actionable_benchmark_families(dataset_manifest: dict[str, object], *, minimum_support: int = 1) -> list[str]:
+    return sorted(_tolbert_actionable_template_preferences(dataset_manifest, minimum_support=minimum_support))
+
+
+def _tolbert_positive_action_generation_examples(dataset_manifest: dict[str, object]) -> int:
+    summary = _tolbert_action_generation_summary(dataset_manifest)
+    return int(summary.get("positive_example_count", 0) or 0)
+
+
 def _command_template_kind(command: str, *, proposal_source: str = "") -> str:
     source = proposal_source.strip()
     if source:
@@ -1412,36 +1568,11 @@ def _tolbert_action_generation_policy(
             ):
                 if key in current:
                     controls[key] = current[key]
-    summary = dataset_manifest.get("action_generation_summary", {})
-    if isinstance(summary, dict) and isinstance(summary.get("template_preferences", {}), dict):
-        template_preferences = {}
-        minimum_support = max(1, int(controls.get("min_family_support", 1) or 1))
-        for family, items in summary.get("template_preferences", {}).items():
-            if not isinstance(items, list):
-                continue
-            filtered = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                support = int(item.get("support", 0) or 0)
-                if support < minimum_support:
-                    continue
-                filtered.append(
-                    {
-                        "template_kind": str(item.get("template_kind", "")).strip(),
-                        "support": support,
-                        "success_count": int(item.get("success_count", 0) or 0),
-                        "pass_rate": float(item.get("pass_rate", 0.0) or 0.0),
-                        "provenance": [
-                            str(value).strip()
-                            for value in item.get("provenance", [])
-                            if str(value).strip()
-                        ][:8],
-                    }
-                )
-            if filtered:
-                template_preferences[str(family).strip() or "bounded"] = filtered
-        controls["template_preferences"] = template_preferences
+    minimum_support = max(1, int(controls.get("min_family_support", 1) or 1))
+    controls["template_preferences"] = _tolbert_actionable_template_preferences(
+        dataset_manifest,
+        minimum_support=minimum_support,
+    )
     return controls
 
 
@@ -1457,14 +1588,24 @@ def _tolbert_retention_gate(
         if isinstance(raw_current_gate, dict):
             current_gate = raw_current_gate
             gate.update(deepcopy(raw_current_gate))
-    gate.setdefault("require_novel_command_signal", True)
+    has_actionable_surface = bool(_tolbert_actionable_benchmark_families(dataset_manifest))
+    has_positive_action_generation = _tolbert_positive_action_generation_examples(dataset_manifest) > 0
+    require_novel_command_signal = bool(has_actionable_surface and has_positive_action_generation)
+    gate.setdefault("require_novel_command_signal", require_novel_command_signal)
     gate.setdefault("min_proposal_selected_steps_delta", 0)
-    gate.setdefault("min_novel_valid_command_steps", 1)
+    gate.setdefault("min_novel_valid_command_steps", 1 if require_novel_command_signal else 0)
     gate.setdefault("min_novel_valid_command_rate_delta", 0.0)
+    gate.setdefault("allow_selection_signal_fallback", True)
     gate.setdefault("require_long_horizon_non_regression", True)
     gate.setdefault("require_long_horizon_novel_command_non_regression", True)
     gate.setdefault("require_long_horizon_world_feedback_non_regression", True)
     gate.setdefault("required_confirmation_runs", 2)
+    gate.setdefault("require_primary_routing_signal", has_actionable_surface)
+    gate.setdefault("min_primary_episodes", 1 if has_actionable_surface else 0)
+    if not require_novel_command_signal:
+        gate["require_novel_command_signal"] = False
+        gate["min_novel_valid_command_steps"] = 0
+        gate["min_novel_valid_command_rate_delta"] = 0.0
     gate["proposal_gate_by_benchmark_family"] = _tolbert_proposal_gate_by_benchmark_family(
         dataset_manifest,
         current_gate=current_gate,
@@ -1494,11 +1635,19 @@ def _tolbert_proposal_gate_by_benchmark_family(
     }
     families = sorted(dataset_families | configured_families)
     policy: dict[str, dict[str, object]] = {}
+    actionable_families = set(_tolbert_actionable_benchmark_families(dataset_manifest))
     for family in families:
         family_gate = _tolbert_family_proposal_gate(family)
         current_family_gate = existing.get(family, {})
         if isinstance(current_family_gate, dict):
             family_gate.update(deepcopy(current_family_gate))
+        if family not in actionable_families:
+            family_gate["require_novel_command_signal"] = False
+            family_gate["min_proposal_selected_steps_delta"] = 0
+            family_gate["min_novel_valid_command_steps"] = 0
+            family_gate["min_novel_valid_command_rate_delta"] = 0.0
+            family_gate["allow_primary_routing_signal"] = False
+            family_gate["min_primary_episodes"] = 0
         policy[family] = family_gate
     return policy
 
@@ -1511,6 +1660,8 @@ def _tolbert_family_proposal_gate(family: str) -> dict[str, object]:
             "min_proposal_selected_steps_delta": 1,
             "min_novel_valid_command_steps": 1,
             "min_novel_valid_command_rate_delta": 0.1,
+            "allow_primary_routing_signal": True,
+            "min_primary_episodes": 1,
         }
     if normalized in _TOLBERT_MEDIUM_PROPOSAL_FAMILIES or normalized.startswith("repo_"):
         return {
@@ -1518,12 +1669,16 @@ def _tolbert_family_proposal_gate(family: str) -> dict[str, object]:
             "min_proposal_selected_steps_delta": 0,
             "min_novel_valid_command_steps": 1,
             "min_novel_valid_command_rate_delta": 0.0,
+            "allow_primary_routing_signal": True,
+            "min_primary_episodes": 1,
         }
     return {
         "require_novel_command_signal": False,
         "min_proposal_selected_steps_delta": 0,
         "min_novel_valid_command_steps": 0,
         "min_novel_valid_command_rate_delta": 0.0,
+        "allow_primary_routing_signal": False,
+        "min_primary_episodes": 0,
     }
 
 
@@ -1537,6 +1692,7 @@ def run_tolbert_finetune_pipeline(
     num_epochs: int,
     training_inputs: dict[str, object],
     current_payload: object | None = None,
+    device: str | None = None,
 ) -> tuple[Path, Path, list[dict[str, object]]]:
     delegated_config = replace(
         config,
@@ -1558,6 +1714,10 @@ def run_tolbert_finetune_pipeline(
     cache_path = output_dir / "retrieval_cache" / f"{checkpoint_path.stem}.pt"
     cache_shard_size = max(0, int(config.tolbert_cache_shard_size))
     cache_artifact_path = cache_path.with_suffix(".json") if cache_shard_size > 0 else cache_path
+    train_timeout_seconds = _tolbert_finetune_timeout_seconds(
+        config=config,
+        num_epochs=num_epochs,
+    )
     cache_command = [
         config.tolbert_python_bin,
         str(repo_root / "scripts" / "build_tolbert_cache.py"),
@@ -1570,7 +1730,7 @@ def run_tolbert_finetune_pipeline(
         "--out",
         str(cache_path),
         "--device",
-        config.tolbert_device,
+        device or config.tolbert_device,
     ]
     if parent_checkpoint_path is not None:
         cache_command.extend(
@@ -1599,7 +1759,7 @@ def run_tolbert_finetune_pipeline(
                 "--config",
                 str(train_config_path),
                 "--device",
-                config.tolbert_device,
+                device or config.tolbert_device,
             ],
             "worker_env": _tolbert_training_env(
                 training_inputs,
@@ -1607,7 +1767,7 @@ def run_tolbert_finetune_pipeline(
                 checkpoint_delta_path=delta_checkpoint_path if parent_checkpoint_path is not None else None,
             ),
             "worker_cwd": str(repo_root),
-            "worker_timeout_seconds": max(config.command_timeout_seconds, 120),
+            "worker_timeout_seconds": train_timeout_seconds,
         },
     )
     cache_job = queue.enqueue(
@@ -1636,11 +1796,38 @@ def run_tolbert_finetune_pipeline(
     for required_job in (train_job, cache_job):
         finished = by_id.get(required_job.job_id) or queue.get(required_job.job_id)
         if finished is None or finished.state != "completed" or finished.outcome != "success":
-            raise RuntimeError(f"delegated Tolbert worker job failed: {required_job.job_id}")
+            raise RuntimeError(
+                f"delegated Tolbert worker job failed: {required_job.job_id}"
+                f" ({_delegated_job_failure_summary(finished)})"
+            )
     return checkpoint_path, cache_artifact_path, [
         _job_record(queue.get(train_job.job_id)),
         _job_record(queue.get(cache_job.job_id)),
     ]
+
+
+def _tolbert_finetune_timeout_seconds(*, config: KernelConfig, num_epochs: int) -> int:
+    epochs = max(1, int(num_epochs))
+    # Tolbert fine-tunes are materially longer than normal shell tasks, especially on
+    # two-epoch recovery-alignment lanes. Budget them separately from the generic command timeout.
+    return max(int(config.command_timeout_seconds), 180, 120 * epochs + 60)
+
+
+def _delegated_job_failure_summary(job: object) -> str:
+    if job is None:
+        return "missing delegated job record"
+    state = str(getattr(job, "state", "")).strip() or "unknown_state"
+    outcome = str(getattr(job, "outcome", "")).strip() or "unknown_outcome"
+    reasons = getattr(job, "outcome_reasons", [])
+    if isinstance(reasons, list):
+        normalized_reasons = [str(value).strip() for value in reasons if str(value).strip()]
+    else:
+        normalized_reasons = []
+    reason_text = ",".join(normalized_reasons) if normalized_reasons else "no_outcome_reason"
+    last_error = str(getattr(job, "last_error", "")).strip()
+    if last_error:
+        return f"state={state} outcome={outcome} reasons={reason_text} last_error={last_error}"
+    return f"state={state} outcome={outcome} reasons={reason_text}"
 
 
 def run_tolbert_hybrid_runtime_pipeline(
@@ -1649,6 +1836,7 @@ def run_tolbert_hybrid_runtime_pipeline(
     repo_root: Path,
     output_dir: Path,
     current_payload: object | None = None,
+    device: str | None = None,
 ) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
     delegated_config = replace(
         config,
@@ -1690,7 +1878,7 @@ def run_tolbert_hybrid_runtime_pipeline(
                 "--lr",
                 "0.001",
                 "--device",
-                _hybrid_runtime_device(config),
+                device or _hybrid_runtime_device(config),
             ],
             "worker_env": _runtime_training_env(parent_checkpoint_path=parent_checkpoint_path),
             "worker_cwd": str(repo_root),
@@ -1720,6 +1908,7 @@ def run_tolbert_universal_decoder_pipeline(
     universal_dataset_manifest: dict[str, object],
     training_controls: dict[str, object],
     current_payload: object | None = None,
+    device: str | None = None,
 ) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
     dataset_manifest_path = str(universal_dataset_manifest.get("manifest_path", "")).strip()
     if not dataset_manifest_path:
@@ -1779,7 +1968,7 @@ def run_tolbert_universal_decoder_pipeline(
                 "--lr",
                 str(float(training_controls.get("lr", 0.001))),
                 "--device",
-                _hybrid_runtime_device(config),
+                device or _hybrid_runtime_device(config),
             ],
             "worker_env": _runtime_training_env(
                 parent_checkpoint_path=_current_runtime_checkpoint_path(
@@ -1949,16 +2138,21 @@ def _tolbert_runtime_policy(
             for value in current_policy.get("primary_benchmark_families", [])
             if str(value).strip()
         ]
+    if not primary_families:
+        primary_families = _tolbert_actionable_benchmark_families(dataset_manifest)
     shadow_families = list(benchmark_families)
     min_path_confidence = 0.8
     if focus == "recovery_alignment":
         min_path_confidence = 0.72
     elif focus == "discovered_task_adaptation":
         min_path_confidence = 0.7
+    trusted_primary_min_confidence = min(0.4, min_path_confidence)
     return {
         "shadow_benchmark_families": shadow_families,
         "primary_benchmark_families": primary_families,
         "min_path_confidence": min_path_confidence,
+        "allow_trusted_primary_without_min_confidence": True,
+        "trusted_primary_min_confidence": trusted_primary_min_confidence,
         "require_trusted_retrieval": True,
         "fallback_to_vllm_on_low_confidence": True,
         "allow_direct_command_primary": True,
@@ -1988,6 +2182,9 @@ def _tolbert_liftoff_gate(dataset_manifest: dict[str, object]) -> dict[str, obje
         "require_long_horizon_world_feedback_non_regression": True,
         "require_shadow_signal": True,
         "min_shadow_episodes_per_promoted_family": 1,
+        "require_primary_routing_signal": bool(_tolbert_actionable_benchmark_families(dataset_manifest)),
+        "min_primary_episodes": 1 if _tolbert_actionable_benchmark_families(dataset_manifest) else 0,
+        "allow_selection_signal_fallback": True,
         "require_family_novel_command_evidence": True,
         "proposal_gate_by_benchmark_family": _tolbert_proposal_gate_by_benchmark_family(
             dataset_manifest,
@@ -2057,7 +2254,7 @@ def _tolbert_hybrid_runtime(
     runtime = {
         "model_family": "tolbert_ssm_v1",
         "shadow_enabled": bool(ready and manifest is not None),
-        "primary_enabled": False,
+        "primary_enabled": bool(ready and manifest is not None and _tolbert_actionable_benchmark_families(dataset_manifest)),
         "bundle_manifest_path": str(bundle_dir / "hybrid_bundle_manifest.json"),
         "checkpoint_path": str(bundle_dir / "hybrid_checkpoint.pt"),
         "config_path": str(bundle_dir / "hybrid_config.json"),
@@ -2332,6 +2529,71 @@ def _runtime_training_env(*, parent_checkpoint_path: Path | None) -> dict[str, s
     if parent_checkpoint_path is not None and parent_checkpoint_path.exists():
         env["AGENTKERNEL_TOLBERT_PARENT_CHECKPOINT_PATH"] = str(parent_checkpoint_path)
     return env
+
+
+def _tolbert_cuda_device_count(config: KernelConfig) -> int:
+    requested = str(config.tolbert_device).strip().lower()
+    if not requested.startswith("cuda"):
+        return 0
+    if requested != "cuda":
+        return 1
+    try:
+        completed = subprocess.run(
+            [
+                config.tolbert_python_bin,
+                "-c",
+                (
+                    "import torch; "
+                    "print(torch.cuda.device_count() if torch.cuda.is_available() else 0)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1
+    if completed.returncode != 0:
+        return 1
+    try:
+        return max(0, int(str(completed.stdout).strip() or "0"))
+    except ValueError:
+        return 1
+
+
+def _tolbert_generation_device_plan(config: KernelConfig) -> dict[str, object]:
+    requested = str(config.tolbert_device).strip() or "cpu"
+    normalized = requested.lower()
+    if not normalized.startswith("cuda"):
+        return {
+            "parallel": True,
+            "finetune": requested,
+            "hybrid": requested,
+            "universal": requested,
+        }
+    if normalized != "cuda":
+        return {
+            "parallel": False,
+            "finetune": requested,
+            "hybrid": requested,
+            "universal": requested,
+        }
+    available = _tolbert_cuda_device_count(config)
+    if available >= 3:
+        return {
+            "parallel": True,
+            "finetune": "cuda:0",
+            "hybrid": "cuda:1",
+            "universal": "cuda:2",
+        }
+    resolved = "cuda:0" if available > 0 else requested
+    return {
+        "parallel": False,
+        "finetune": resolved,
+        "hybrid": resolved,
+        "universal": resolved,
+    }
 
 
 def _current_tolbert_checkpoint_path(*, current_payload: object | None, artifact_path: Path) -> Path | None:

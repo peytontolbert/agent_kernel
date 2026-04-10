@@ -182,6 +182,23 @@ def iter_episode_documents(root: Path, *, config: KernelConfig | None = None) ->
     return file_documents
 
 
+def load_episode_attempt_documents(root: Path, task_id: str, *, config: KernelConfig | None = None) -> list[dict[str, object]]:
+    normalized_task_id = str(task_id).strip()
+    if not normalized_task_id:
+        return []
+    storage_config = _resolved_storage_config(root, config=config)
+    if storage_config is not None:
+        return [
+            _normalize_summary_from_steps(payload)
+            for payload in storage_config.sqlite_store().load_episode_attempt_documents(normalized_task_id)
+            if isinstance(payload, dict)
+        ]
+    try:
+        return [_load_file_episode_document(root, normalized_task_id)]
+    except FileNotFoundError:
+        return []
+
+
 def load_episode_document(root: Path, task_id: str, *, config: KernelConfig | None = None) -> dict[str, object]:
     normalized_task_id = str(task_id).strip()
     if not normalized_task_id:

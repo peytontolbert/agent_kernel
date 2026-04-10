@@ -103,6 +103,40 @@ def test_universal_dataset_reads_trajectories_from_sqlite_store(tmp_path: Path, 
     assert any("create hello output" in example["prompt"] for example in examples)
 
 
+def test_sqlite_episode_storage_preserves_attempts_and_aggregates_by_task_id(tmp_path: Path, monkeypatch) -> None:
+    config = _storage_config(tmp_path, monkeypatch)
+    memory = EpisodeMemory(config.trajectories_root, config=config)
+
+    primary_success = _episode("shared_task", success=True)
+    primary_success.workspace = "workspace/shared_task"
+    failed_retry = _episode("shared_task", success=False)
+    failed_retry.workspace = "workspace/generated_failure_seed/shared_task"
+
+    memory.save(primary_success)
+    memory.save(failed_retry)
+
+    attempts = config.sqlite_store().load_episode_attempt_documents("shared_task")
+    assert len(attempts) == 2
+    assert {payload["workspace"] for payload in attempts} == {
+        "workspace/shared_task",
+        "workspace/generated_failure_seed/shared_task",
+    }
+    assert {payload["episode_storage"]["phase"] for payload in attempts} == {
+        "primary",
+        "generated_failure_seed",
+    }
+
+    aggregated = memory.load("shared_task")
+    assert aggregated["success"] is True
+    assert aggregated["workspace"] == "workspace/shared_task"
+    assert aggregated["attempt_aggregation"]["attempt_count"] == 2
+    assert aggregated["attempt_aggregation"]["successful_attempts"] == 1
+    assert aggregated["attempt_aggregation"]["attempts_by_phase"] == {
+        "generated_failure_seed": 1,
+        "primary": 1,
+    }
+
+
 def test_hybrid_dataset_removes_stale_shards_by_default(tmp_path: Path, monkeypatch) -> None:
     config = _storage_config(tmp_path, monkeypatch)
     episodes = config.trajectories_root

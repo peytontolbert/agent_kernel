@@ -32,10 +32,28 @@ def choose_tolbert_route(
         if str(value).strip()
     }
     min_confidence = _float_value(runtime_policy.get("min_path_confidence"), 0.75)
+    trusted_confidence_floor = _float_value(runtime_policy.get("trusted_primary_min_confidence"), 0.0)
+    allow_trusted_primary_without_min_confidence = bool(
+        runtime_policy.get("allow_trusted_primary_without_min_confidence", False)
+    )
     require_trusted = bool(runtime_policy.get("require_trusted_retrieval", True))
     use_latent_state = bool(runtime_policy.get("use_latent_state", True))
     if family in primary_families:
-        if path_confidence < min_confidence:
+        if require_trusted and not trust_retrieval:
+            return TolbertRoutingDecision(
+                mode="disabled",
+                benchmark_family=family,
+                reason="retained Tolbert primary route requires trusted retrieval",
+                min_confidence=min_confidence,
+                require_trusted_retrieval=require_trusted,
+                use_latent_state=use_latent_state,
+            )
+        trusted_confidence_override = (
+            trust_retrieval
+            and allow_trusted_primary_without_min_confidence
+            and path_confidence >= trusted_confidence_floor
+        )
+        if path_confidence < min_confidence and not trusted_confidence_override:
             return TolbertRoutingDecision(
                 mode="disabled",
                 benchmark_family=family,
@@ -44,11 +62,11 @@ def choose_tolbert_route(
                 require_trusted_retrieval=require_trusted,
                 use_latent_state=use_latent_state,
             )
-        if require_trusted and not trust_retrieval:
+        if trusted_confidence_override:
             return TolbertRoutingDecision(
-                mode="disabled",
+                mode="primary",
                 benchmark_family=family,
-                reason="retained Tolbert primary route requires trusted retrieval",
+                reason="trusted retrieval satisfied the retained Tolbert primary route override",
                 min_confidence=min_confidence,
                 require_trusted_retrieval=require_trusted,
                 use_latent_state=use_latent_state,

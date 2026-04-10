@@ -1557,12 +1557,26 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
     coverage_summary = trust_ledger.get("coverage_summary", {})
     if not isinstance(coverage_summary, dict):
         coverage_summary = {}
+    sampled_progress_counts = coverage_summary.get("required_family_sampled_progress_counts", {})
+    if not isinstance(sampled_progress_counts, dict):
+        sampled_progress_counts = {}
     signal_counts = coverage_summary.get("required_family_runtime_managed_signal_counts", {})
     if not isinstance(signal_counts, dict):
         signal_counts = {}
     decision_yield_counts = coverage_summary.get("required_family_runtime_managed_decision_yield_counts", {})
     if not isinstance(decision_yield_counts, dict):
         decision_yield_counts = {}
+    credited_yield_gap_families = [
+        str(value).strip()
+        for value in list(
+            coverage_summary.get(
+                "required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield",
+                [],
+            )
+            or []
+        )
+        if str(value).strip()
+    ]
     decision_yield_missing_families = [
         str(value).strip()
         for value in list(coverage_summary.get("required_families_missing_runtime_managed_decision_yield", []) or [])
@@ -1576,15 +1590,23 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
     counts = coverage_summary.get("required_family_clean_task_root_counts", {})
     if not isinstance(counts, dict):
         counts = {}
-    detail_mode = "decision_yield" if decision_yield_missing_families else "runtime_signal" if signal_missing_families else "clean_task_root"
-    missing_families = decision_yield_missing_families or signal_missing_families or [
+    detail_mode = (
+        "credited_family_yield"
+        if credited_yield_gap_families
+        else "decision_yield"
+        if decision_yield_missing_families
+        else "runtime_signal"
+        if signal_missing_families
+        else "clean_task_root"
+    )
+    missing_families = credited_yield_gap_families or decision_yield_missing_families or signal_missing_families or [
         str(value).strip()
         for value in list(coverage_summary.get("required_families_missing_clean_task_root_breadth", []) or [])
         if str(value).strip()
     ]
     threshold = (
         1
-        if decision_yield_missing_families
+        if credited_yield_gap_families or decision_yield_missing_families
         else max(0, _safe_int(coverage_summary.get("family_breadth_min_distinct_task_roots", 0), 0))
     )
     details = [
@@ -1593,10 +1615,16 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
             "observed": max(
                 0,
                 _safe_int(decision_yield_counts.get(family, 0), 0)
-                if decision_yield_missing_families
+                if credited_yield_gap_families or decision_yield_missing_families
                 else _safe_int(signal_counts.get(family, 0), 0)
                 if signal_missing_families
                 else _safe_int(counts.get(family, 0), 0),
+            ),
+            "sampled_progress": max(
+                0,
+                _safe_int(sampled_progress_counts.get(family, 0), 0)
+                if credited_yield_gap_families
+                else 0,
             ),
             "threshold": threshold,
             "remaining": max(
@@ -1605,7 +1633,7 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
                 - max(
                     0,
                     _safe_int(decision_yield_counts.get(family, 0), 0)
-                    if decision_yield_missing_families
+                    if credited_yield_gap_families or decision_yield_missing_families
                     else _safe_int(signal_counts.get(family, 0), 0)
                     if signal_missing_families
                     else _safe_int(counts.get(family, 0), 0),
@@ -1614,6 +1642,13 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
         }
         for family in missing_families
     ]
+    if credited_yield_gap_families:
+        details.sort(
+            key=lambda detail: (
+                -max(0, _safe_int(detail.get("sampled_progress", 0), 0)),
+                str(detail.get("family", "")),
+            )
+        )
     max_remaining = max(
         (
             max(0, _safe_int(detail.get("remaining", 0), 0))
@@ -1635,11 +1670,17 @@ def _trust_breadth_focus(trust_ledger: dict[str, object] | None) -> dict[str, ob
             prioritized_subsystems.append("recovery")
     return {
         "missing_required_family_clean_task_root_breadth": missing_families,
+        "missing_required_family_credited_yield": credited_yield_gap_families,
         "missing_required_family_runtime_managed_decision_yield": decision_yield_missing_families,
         "missing_required_family_runtime_managed_signal_breadth": signal_missing_families,
         "required_family_clean_task_root_counts": {
             str(key).strip(): max(0, _safe_int(value, 0))
             for key, value in counts.items()
+            if str(key).strip()
+        },
+        "required_family_sampled_progress_counts": {
+            str(key).strip(): max(0, _safe_int(value, 0))
+            for key, value in sampled_progress_counts.items()
             if str(key).strip()
         },
         "required_family_runtime_managed_decision_yield_counts": {

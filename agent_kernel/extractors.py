@@ -25,6 +25,21 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         for step in episode.steps
         if step.action == "code_execute" and step.content
     ]
+    execution_source_counts = {
+        "llm_generated": 0,
+        "synthetic_plan": 0,
+        "deterministic_or_other": 0,
+    }
+    for step in episode.steps:
+        if step.action != "code_execute" or not step.content:
+            continue
+        decision_source = str(step.decision_source).strip()
+        if decision_source == "llm":
+            execution_source_counts["llm_generated"] += 1
+        elif decision_source == "synthetic_edit_plan_direct":
+            execution_source_counts["synthetic_plan"] += 1
+        else:
+            execution_source_counts["deterministic_or_other"] += 1
     failure_types = sorted(
         {
             failure_type
@@ -70,6 +85,10 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         "step_count": len(episode.steps),
         "executed_command_count": len(executed_commands),
         "executed_commands": executed_commands,
+        "execution_source_summary": {
+            **execution_source_counts,
+            "total_executed_commands": sum(execution_source_counts.values()),
+        },
         "failure_types": failure_types,
         "failure_signals": failure_signals,
         "transition_failures": transition_failures,
@@ -244,6 +263,12 @@ def _success_skill_candidates_from_learning_artifacts(episodes_root: Path) -> li
             procedure = dict(candidate.get("procedure", {})) if isinstance(candidate.get("procedure", {}), dict) else {}
             commands = [str(command).strip() for command in procedure.get("commands", []) if str(command).strip()]
         if not commands:
+            continue
+        try:
+            source_task = bank.get(source_task_id)
+        except KeyError:
+            source_task = None
+        if source_task is not None and not _procedure_matches_source_task(source_task, commands):
             continue
         skills.append(
             {
@@ -1007,6 +1032,8 @@ def _tool_candidates_from_learning_artifacts(
             fallback_task = bank.get(source_task_id)
         except KeyError:
             fallback_task = None
+        if fallback_task is not None and not _procedure_matches_source_task(fallback_task, commands):
+            continue
         task_contract = _enriched_task_contract(task_contract, fallback_task=fallback_task)
         tool = _tool_candidate_payload(
             source_task_id=source_task_id,
@@ -1066,7 +1093,57 @@ def _learning_candidate_source(
             task = bank.get(alias)
         except KeyError:
             continue
-        if candidate_contract:
+        if candidate_contract and alias == str(candidate.get("source_task_id", "")).strip():
             return alias, candidate_contract
+        if candidate_contract:
+            rebased_contract = task.to_dict()
+            rebased_metadata = (
+                dict(rebased_contract.get("metadata", {}))
+                if isinstance(rebased_contract.get("metadata", {}), dict)
+                else {}
+            )
+            rebased_metadata.update(contract_metadata)
+            if rebased_metadata:
+                rebased_contract["metadata"] = rebased_metadata
+            return alias, rebased_contract
         return alias, task.to_dict()
     return "", candidate_contract
+
+
+def _procedure_matches_source_task(source_task: object, commands: list[str]) -> bool:
+    normalized_commands = " ".join(str(command) for command in commands if str(command).strip())
+    if not normalized_commands:
+        return False
+    expected_paths = [
+        str(path)
+        for path in [
+            *getattr(source_task, "expected_files", []),
+            *getattr(source_task, "expected_file_contents", {}).keys(),
+        ]
+        if str(path).strip()
+    ]
+    if any(path in normalized_commands for path in expected_paths):
+        return True
+    if expected_paths:
+        return False
+    success_command = str(getattr(source_task, "success_command", "")).strip().lower()
+    if not success_command:
+        return False
+    return any(token in normalized_commands.lower() for token in _significant_tokens(success_command))
+
+
+def _significant_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in (
+        str(text)
+        .lower()
+        .replace("/", " ")
+        .replace(".", " ")
+        .replace("'", " ")
+        .replace('"', " ")
+        .split()
+    ):
+        normalized = token.strip()
+        if len(normalized) >= 4 and normalized not in tokens:
+            tokens.append(normalized)
+    return tokens

@@ -4,11 +4,17 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import threading
 import time
 
+from agent_kernel.actors import (
+    coding_actor_applicable,
+    coding_actor_episode_summary,
+    default_coding_actor_policy,
+)
 from agent_kernel.capabilities import capability_enabled, declared_task_capabilities
 from agent_kernel.config import KernelConfig
 from agent_kernel.curriculum import CurriculumEngine
@@ -225,6 +231,50 @@ def _run_tasks_with_progress(
         def _task_progress(progress_payload: dict[str, object]) -> None:
             if on_task_progress is not None:
                 on_task_progress(task, progress_payload, index, total)
+            event_name = str(progress_payload.get("event", "")).strip()
+            step_stage = str(progress_payload.get("step_stage", "")).strip()
+            cognitive_stage = ""
+            if event_name in {
+                "state_estimated",
+                "memory_retrieved",
+                "world_model_updated",
+                "memory_update_written",
+                "critique_reflected",
+                "verification_result",
+            }:
+                cognitive_stage = event_name
+            elif step_stage in {
+                "context_compile",
+                "context_ready",
+                "universe_summary",
+                "plan_candidates",
+                "transition_simulated",
+                "payload_build",
+            }:
+                cognitive_stage = step_stage
+            if progress_label and cognitive_stage:
+                benchmark_family = str(getattr(task, "metadata", {}).get("benchmark_family", "bounded")).strip() or "bounded"
+                parts = [
+                    f"phase={phase}" if phase else "phase=primary",
+                    f"task {index}/{total}",
+                    _task_progress_label(task),
+                    f"family={benchmark_family}",
+                    f"cognitive_stage={cognitive_stage}",
+                ]
+                step_index = int(progress_payload.get("step_index", 0) or 0)
+                if step_index > 0:
+                    parts.append(f"step={step_index}")
+                step_subphase = str(progress_payload.get("step_subphase", "")).strip()
+                if step_subphase:
+                    parts.append(f"subphase={step_subphase}")
+                decision_source = str(progress_payload.get("decision_source", "")).strip()
+                if decision_source:
+                    parts.append(f"decision_source={decision_source}")
+                if "verification_passed" in progress_payload:
+                    parts.append(
+                        f"verification_passed={1 if bool(progress_payload.get('verification_passed', False)) else 0}"
+                    )
+                _emit_eval_progress(progress_label, " ".join(parts))
 
         result = _run_kernel_task(
             kernel,
@@ -250,14 +300,27 @@ def _run_tasks_with_progress(
 
 
 def _run_kernel_task(kernel: AgentKernel, task, *, progress_callback=None):
+    actor_policy = default_coding_actor_policy()
     if progress_callback is None:
-        return kernel.run_task(task)
-    try:
-        return kernel.run_task(task, progress_callback=progress_callback)
-    except TypeError as exc:
-        if "progress_callback" not in str(exc):
-            raise
-        return kernel.run_task(task)
+        episode = kernel.run_task(task)
+    else:
+        try:
+            episode = kernel.run_task(task, progress_callback=progress_callback)
+        except TypeError as exc:
+            if "progress_callback" not in str(exc):
+                raise
+            episode = kernel.run_task(task)
+    if coding_actor_applicable(task, policy=actor_policy):
+        actor_summary = coding_actor_episode_summary(policy=actor_policy, task=task, episode=episode)
+        episode.task_metadata = dict(episode.task_metadata or {})
+        episode.task_metadata["actor_type"] = "coding"
+        episode.task_metadata["actor_summary"] = actor_summary
+        episode.task_contract = dict(episode.task_contract or {})
+        contract_metadata = dict(episode.task_contract.get("metadata", {}) or {})
+        contract_metadata["actor_type"] = "coding"
+        contract_metadata["actor_mode"] = str(actor_summary.get("mode", "")).strip()
+        episode.task_contract["metadata"] = contract_metadata
+    return episode
 
 
 def _episode_record_from_document(document: dict[str, object]) -> EpisodeRecord | None:
@@ -2762,12 +2825,56 @@ def _transfer_alignment_summary(
 
 class _ForcedFailurePolicy(Policy):
     def decide(self, state):
-        del state
+        task = state.task
+        forbidden_files = [
+            str(path).strip()
+            for path in getattr(task, "forbidden_files", [])
+            if str(path).strip()
+        ]
+        if forbidden_files:
+            target = shlex.quote(forbidden_files[0])
+            return ActionDecision(
+                thought="Probe the forbidden artifact contract to seed a recovery task.",
+                action="code_execute",
+                content=f"test ! -f {target}",
+                done=False,
+                decision_source="failure_seed_contract_probe",
+            )
+        expected_files = [
+            str(path).strip()
+            for path in getattr(task, "expected_files", [])
+            if str(path).strip()
+        ]
+        if not expected_files:
+            expected_files = [
+                str(path).strip()
+                for path in getattr(task, "expected_file_contents", {}).keys()
+                if str(path).strip()
+            ]
+        if expected_files:
+            target = shlex.quote(expected_files[0])
+            return ActionDecision(
+                thought="Probe the missing expected artifact contract to seed a recovery task.",
+                action="code_execute",
+                content=f"test -f {target}",
+                done=False,
+                decision_source="failure_seed_contract_probe",
+            )
+        success_command = str(getattr(task, "success_command", "")).strip()
+        if success_command:
+            return ActionDecision(
+                thought="Probe the verifier contract directly to seed a recovery task.",
+                action="code_execute",
+                content=success_command,
+                done=False,
+                decision_source="failure_seed_contract_probe",
+            )
         return ActionDecision(
-            thought="force deterministic failure for curriculum evaluation",
+            thought="Use a bounded missing-artifact probe to seed a recovery task.",
             action="code_execute",
-            content="false",
+            content="test -f .agent_kernel_failure_seed_probe",
             done=False,
+            decision_source="failure_seed_contract_probe",
         )
 
 
@@ -2853,11 +2960,21 @@ def _seed_file_copy(src, dst):
     src_path = Path(src)
     dst_path = Path(dst)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if src_path.exists() and dst_path.exists() and os.path.samefile(src_path, dst_path):
+            return
+    except OSError:
+        pass
     if dst_path.exists() or dst_path.is_symlink():
-        dst_path.unlink()
+        dst_path.unlink(missing_ok=True)
     try:
         os.link(src_path, dst_path)
     except OSError:
+        try:
+            if src_path.exists() and dst_path.exists() and os.path.samefile(src_path, dst_path):
+                return
+        except OSError:
+            pass
         shutil.copy2(src_path, dst_path)
 
 
@@ -3070,6 +3187,7 @@ def run_eval(
     priority_benchmark_families: Sequence[str] | None = None,
     priority_benchmark_family_weights: dict[str, object] | None = None,
     prefer_low_cost_tasks: bool = False,
+    restrict_to_priority_benchmark_families: bool = False,
     progress_label: str | None = None,
     progress_snapshot_path: Path | None = None,
     skill_transfer_target_map: dict[str, str] | None = None,
@@ -3079,6 +3197,7 @@ def run_eval(
     generated_success_seed_output_path: str = "",
     allow_generated_success_seed_fallback: bool = True,
     max_generated_success_schedule_tasks: int = 0,
+    max_generated_failure_schedule_tasks: int = 0,
     write_unattended_reports: bool = False,
     recovery_variant_strategy_family: str = "",
     surface_shared_repo_bundles: bool = True,
@@ -3152,6 +3271,15 @@ def run_eval(
                 tasks.extend(load_discovered_tasks(active_config.trajectories_root))
                 tasks.extend(load_transition_pressure_tasks(active_config.trajectories_root))
             tasks = [task for task in tasks if _task_allowed_for_eval(task, active_config)]
+            if restrict_to_priority_benchmark_families and requested_priority_families:
+                requested_priority_family_set = set(requested_priority_families)
+                tasks = [
+                    task
+                    for task in tasks
+                    if (str(getattr(task, "metadata", {}).get("benchmark_family", "bounded")).strip() or "bounded")
+                    in requested_priority_family_set
+                ]
+                tasks = _drop_retrieval_companions_when_sources_present(tasks)
             if task_limit is not None and task_limit > 0 and len(tasks) > task_limit:
                 effective_priority_families = list(requested_priority_families)
                 if not effective_priority_families:
@@ -3460,6 +3588,10 @@ def run_eval(
                         _cleanup_scoped_runtime_state(success_generated_config)
                 else:
                     _cleanup_scoped_runtime_state(success_generated_config)
+                _emit_eval_progress(
+                    progress_label,
+                    f"phase=generated_success complete total={len(success_generated_tasks)}",
+                )
             if include_failure_generated:
                 _emit_eval_progress(progress_label, f"phase=generated_failure_seed total={len(tasks)}")
                 failure_seed_config = _scoped_config(active_config, "generated_failure_seed")
@@ -3476,10 +3608,16 @@ def run_eval(
                 finally:
                     failing_kernel.close()
                     _cleanup_scoped_runtime_state(failure_seed_config)
+                _emit_eval_progress(
+                    progress_label,
+                    f"phase=generated_failure_seed complete total={len(tasks)}",
+                )
                 failure_seed_results = engine.schedule_generated_seed_episodes(
                     failure_seeds,
                     curriculum_kind="failure_recovery",
                 )
+                if max_generated_failure_schedule_tasks > 0:
+                    failure_seed_results = failure_seed_results[:max_generated_failure_schedule_tasks]
                 failure_generated_tasks = [engine.generate_followup_task(result) for result in failure_seed_results]
                 _emit_eval_progress(
                     progress_label,
@@ -3520,6 +3658,10 @@ def run_eval(
                         _cleanup_scoped_runtime_state(failure_generated_config)
                 else:
                     _cleanup_scoped_runtime_state(failure_generated_config)
+                _emit_eval_progress(
+                    progress_label,
+                    f"phase=generated_failure complete total={len(failure_generated_tasks)}",
+                )
         if generated_success_seed_output_path:
             _write_success_seed_bundle(
                 generated_success_seed_output_path,
@@ -4456,13 +4598,15 @@ def _low_cost_task_key(task) -> tuple[int, int, int, int, int, int, int, int, st
     metadata = getattr(task, "metadata", {}) or {}
     light_supervision_rank = int(not bool(metadata.get("light_supervision_candidate", False)))
     difficulty = str(metadata.get("difficulty", "")).strip() or str(getattr(task, "difficulty", "")).strip()
+    if str(metadata.get("horizon", "")).strip() == "long_horizon":
+        difficulty = "long_horizon"
     difficulty_rank = {
         "seed": 0,
         "bounded": 1,
-        "long_horizon": 2,
         "": 2,
         "git_worker_branch_synthesized": 2,
-        "retrieval": 3,
+        "long_horizon": 3,
+        "retrieval": 4,
     }.get(difficulty, 2)
     long_horizon_surface_rank = 3
     surface = str(metadata.get("long_horizon_coding_surface", "")).strip()
@@ -4568,6 +4712,25 @@ def _required_executable_family_sort_key(task) -> tuple[object, ...]:
         ),
         _low_cost_task_key(task),
     )
+
+
+def _drop_retrieval_companions_when_sources_present(tasks: Sequence) -> list:
+    task_ids = {
+        str(getattr(task, "task_id", "") or "").strip()
+        for task in tasks
+        if str(getattr(task, "task_id", "") or "").strip()
+    }
+    if not task_ids:
+        return list(tasks)
+    return [
+        task
+        for task in tasks
+        if not (
+            bool(getattr(task, "metadata", {}).get("requires_retrieval", False))
+            and bool(str(getattr(task, "metadata", {}).get("source_task", "")).strip())
+            and str(getattr(task, "metadata", {}).get("source_task", "")).strip() in task_ids
+        )
+    ]
 
 
 def _shared_repo_long_horizon_surface(task) -> str:
@@ -4762,6 +4925,13 @@ def _limit_tasks_for_compare(
         for family in list(required_executable_families or [])
         if str(family).strip()
     }
+    if prefer_low_cost_tasks and required_executable_family_set:
+        for family, family_tasks in list(grouped.items()):
+            if family not in required_executable_family_set:
+                continue
+            executable_tasks = _drop_retrieval_companions_when_sources_present(family_tasks)
+            if executable_tasks:
+                grouped[family] = executable_tasks
     if prefer_low_cost_tasks:
         for family, family_tasks in grouped.items():
             if family in required_executable_family_set:

@@ -244,3 +244,29 @@ class EpisodeRecord:
             "termination_reason": self.termination_reason,
             "steps": [asdict(step) for step in self.steps],
         }
+
+
+def step_verification_passed(step: StepRecord | Mapping[str, Any] | None) -> bool:
+    payload: Mapping[str, Any]
+    if isinstance(step, StepRecord):
+        payload = step.verification
+    elif isinstance(step, Mapping):
+        verification = step.get("verification", {})
+        payload = verification if isinstance(verification, Mapping) else {}
+    else:
+        payload = {}
+    return bool(payload.get("passed", False))
+
+
+def episode_success_criteria(episode: EpisodeRecord) -> dict[str, bool]:
+    steps = list(episode.steps or [])
+    terminal_verifier_passed = step_verification_passed(steps[-1]) if steps else bool(episode.success)
+    all_steps_verified = all(step_verification_passed(step) for step in steps) if steps else terminal_verifier_passed
+    task_success = bool(episode.success) or terminal_verifier_passed
+    verifier_aligned_task_success = task_success and terminal_verifier_passed
+    return {
+        "task_success": task_success,
+        "terminal_verifier_passed": terminal_verifier_passed,
+        "all_steps_verified": all_steps_verified,
+        "verifier_aligned_task_success": verifier_aligned_task_success,
+    }

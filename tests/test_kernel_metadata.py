@@ -13,7 +13,7 @@ from agent_kernel.tolbert_model_improvement import (
     _tolbert_family_proposal_gate,
 )
 from agent_kernel.trust_improvement import trust_behavior_controls
-from agent_kernel.unattended_controller import _FOCUSES, _STATE_FEATURE_ORDER, _policy_features
+from agent_kernel.unattended_controller import _DISCOVERED_STATE_FEATURES, _FOCUSES, _STATE_FEATURE_ORDER, _policy_features
 
 
 def test_subsystem_specs_and_flags_are_dataset_backed():
@@ -68,6 +68,10 @@ def test_unattended_controller_feature_catalogs_are_dataset_backed():
         "liftoff_reject",
         "liftoff_retain",
     )
+    assert _DISCOVERED_STATE_FEATURES == (
+        "novel_subsystem_capability_gain",
+        "strategy_hook_coverage",
+    )
 
     features = _policy_features(
         {
@@ -102,12 +106,16 @@ def test_tolbert_family_gates_are_dataset_backed():
         "min_proposal_selected_steps_delta": 1,
         "min_novel_valid_command_steps": 1,
         "min_novel_valid_command_rate_delta": 0.1,
+        "allow_primary_routing_signal": True,
+        "min_primary_episodes": 1,
     }
     assert _tolbert_family_proposal_gate("repo_sandbox") == {
         "require_novel_command_signal": True,
         "min_proposal_selected_steps_delta": 0,
         "min_novel_valid_command_steps": 1,
         "min_novel_valid_command_rate_delta": 0.0,
+        "allow_primary_routing_signal": True,
+        "min_primary_episodes": 1,
     }
 
 

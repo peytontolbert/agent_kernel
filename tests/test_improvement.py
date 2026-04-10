@@ -415,7 +415,7 @@ def test_assess_artifact_compatibility_accepts_valid_tolbert_model_artifact(tmp_
     payload = {
         "spec_version": "asi_v1",
         "artifact_kind": "tolbert_model_bundle",
-        "lifecycle_state": "candidate",
+        "lifecycle_state": "proposed",
         "generation_focus": "balanced",
         "model_surfaces": {
             "retrieval_surface": True,
@@ -749,6 +749,263 @@ def test_evaluate_artifact_retention_accepts_qwen_adapter_candidate(tmp_path: Pa
 
     assert state == "retain"
     assert "Qwen adapter candidate improved or preserved the coding baseline" in reason
+
+
+def test_evaluate_artifact_retention_accepts_tolbert_selection_signal_fallback_without_proposals(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    cache_path = tmp_path / "cache.pt"
+    for path in (
+        checkpoint_path,
+        cache_path,
+        tmp_path / "config.json",
+        tmp_path / "nodes.jsonl",
+        tmp_path / "label_map.json",
+        tmp_path / "source_spans.jsonl",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "tolbert_model_bundle",
+        "lifecycle_state": "candidate",
+        "runtime_policy": {
+            "shadow_benchmark_families": ["repository"],
+            "primary_benchmark_families": ["repository"],
+            "min_path_confidence": 0.7,
+            "allow_trusted_primary_without_min_confidence": True,
+            "trusted_primary_min_confidence": 0.4,
+            "require_trusted_retrieval": True,
+        },
+        "model_surfaces": {
+            "retrieval_surface": True,
+            "policy_head": True,
+            "value_head": True,
+            "transition_head": True,
+            "latent_state": True,
+        },
+        "decoder_policy": {
+            "allow_retrieval_guidance": True,
+            "allow_skill_commands": True,
+            "allow_task_suggestions": True,
+            "allow_stop_decision": True,
+            "min_stop_completion_ratio": 0.95,
+            "max_task_suggestions": 3,
+        },
+        "rollout_policy": {
+            "predicted_progress_gain_weight": 3.0,
+            "predicted_conflict_penalty_weight": 4.0,
+            "predicted_preserved_bonus_weight": 1.0,
+            "predicted_workflow_bonus_weight": 1.5,
+            "latent_progress_bonus_weight": 1.0,
+            "latent_risk_penalty_weight": 2.0,
+            "recover_from_stall_bonus_weight": 1.5,
+            "stop_completion_weight": 8.0,
+            "stop_missing_expected_penalty_weight": 6.0,
+            "stop_forbidden_penalty_weight": 6.0,
+            "stop_preserved_penalty_weight": 4.0,
+            "stable_stop_bonus_weight": 1.5,
+        },
+        "liftoff_gate": {
+            "min_pass_rate_delta": 0.0,
+            "max_step_regression": 0.0,
+            "max_regressed_families": 0,
+            "require_generated_lane_non_regression": True,
+            "require_failure_recovery_non_regression": True,
+            "require_primary_routing_signal": True,
+            "min_primary_episodes": 1,
+            "allow_selection_signal_fallback": True,
+            "proposal_gate_by_benchmark_family": {},
+        },
+        "retention_gate": {
+            "min_pass_rate_delta_abs": 0.0,
+            "max_step_regression": 0.0,
+            "max_low_confidence_episode_regression": 0,
+            "min_first_step_confidence_delta": 0.0,
+            "min_trusted_retrieval_delta": 0,
+            "require_novel_command_signal": True,
+            "allow_selection_signal_fallback": True,
+            "require_primary_routing_signal": True,
+            "min_primary_episodes": 1,
+            "min_proposal_selected_steps_delta": 0,
+            "min_novel_valid_command_steps": 0,
+            "min_novel_valid_command_rate_delta": 0.0,
+            "require_generated_lane_non_regression": True,
+            "require_failure_recovery_non_regression": True,
+        },
+        "runtime_paths": {
+            "config_path": str(tmp_path / "config.json"),
+            "checkpoint_path": str(checkpoint_path),
+            "nodes_path": str(tmp_path / "nodes.jsonl"),
+            "label_map_path": str(tmp_path / "label_map.json"),
+            "source_spans_paths": [str(tmp_path / "source_spans.jsonl")],
+            "cache_paths": [str(cache_path)],
+        },
+        "training_controls": {"base_model_name": "bert-base-uncased"},
+        "dataset_manifest": {"total_examples": 8},
+        "build_policy": {"allow_kernel_autobuild": False, "allow_kernel_rebuild": False},
+        "proposals": [{"area": "selection_signal", "priority": 4, "reason": "test"}],
+    }
+
+    state, reason = evaluate_artifact_retention(
+        "tolbert_model",
+        EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.5,
+            trusted_retrieval_steps=1,
+            retrieval_selected_steps=0,
+            tolbert_primary_episodes=0,
+            average_first_step_path_confidence=0.4,
+            proposal_selected_steps=0,
+            novel_command_steps=0,
+            novel_valid_command_steps=0,
+            generated_total=2,
+            generated_passed=1,
+        ),
+        EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.4,
+            trusted_retrieval_steps=3,
+            retrieval_selected_steps=2,
+            tolbert_primary_episodes=2,
+            average_first_step_path_confidence=0.7,
+            proposal_selected_steps=0,
+            novel_command_steps=0,
+            novel_valid_command_steps=0,
+            generated_total=2,
+            generated_passed=1,
+        ),
+        payload=payload,
+    )
+
+    assert state == "retain"
+    assert "Tolbert model candidate improved" in reason
+
+
+def test_evaluate_artifact_retention_rejects_tolbert_model_without_primary_routing_signal(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    cache_path = tmp_path / "cache.pt"
+    for path in (
+        checkpoint_path,
+        cache_path,
+        tmp_path / "config.json",
+        tmp_path / "nodes.jsonl",
+        tmp_path / "label_map.json",
+        tmp_path / "source_spans.jsonl",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "tolbert_model_bundle",
+        "lifecycle_state": "candidate",
+        "runtime_policy": {
+            "shadow_benchmark_families": ["repository"],
+            "primary_benchmark_families": ["repository"],
+            "min_path_confidence": 0.7,
+            "require_trusted_retrieval": True,
+        },
+        "model_surfaces": {
+            "retrieval_surface": True,
+            "policy_head": True,
+            "value_head": True,
+            "transition_head": True,
+            "latent_state": True,
+        },
+        "decoder_policy": {
+            "allow_retrieval_guidance": True,
+            "allow_skill_commands": True,
+            "allow_task_suggestions": True,
+            "allow_stop_decision": True,
+            "min_stop_completion_ratio": 0.95,
+            "max_task_suggestions": 3,
+        },
+        "rollout_policy": {
+            "predicted_progress_gain_weight": 3.0,
+            "predicted_conflict_penalty_weight": 4.0,
+            "predicted_preserved_bonus_weight": 1.0,
+            "predicted_workflow_bonus_weight": 1.5,
+            "latent_progress_bonus_weight": 1.0,
+            "latent_risk_penalty_weight": 2.0,
+            "recover_from_stall_bonus_weight": 1.5,
+            "stop_completion_weight": 8.0,
+            "stop_missing_expected_penalty_weight": 6.0,
+            "stop_forbidden_penalty_weight": 6.0,
+            "stop_preserved_penalty_weight": 4.0,
+            "stable_stop_bonus_weight": 1.5,
+        },
+        "liftoff_gate": {
+            "min_pass_rate_delta": 0.0,
+            "max_step_regression": 0.0,
+            "max_regressed_families": 0,
+            "require_generated_lane_non_regression": True,
+            "require_failure_recovery_non_regression": True,
+            "require_primary_routing_signal": True,
+            "min_primary_episodes": 1,
+            "allow_selection_signal_fallback": True,
+            "proposal_gate_by_benchmark_family": {},
+        },
+        "retention_gate": {
+            "min_pass_rate_delta_abs": 0.0,
+            "max_step_regression": 0.0,
+            "max_low_confidence_episode_regression": 0,
+            "min_first_step_confidence_delta": 0.0,
+            "min_trusted_retrieval_delta": 0,
+            "require_novel_command_signal": True,
+            "allow_selection_signal_fallback": True,
+            "require_primary_routing_signal": True,
+            "min_primary_episodes": 1,
+            "min_proposal_selected_steps_delta": 0,
+            "min_novel_valid_command_steps": 0,
+            "min_novel_valid_command_rate_delta": 0.0,
+            "require_generated_lane_non_regression": True,
+            "require_failure_recovery_non_regression": True,
+        },
+        "runtime_paths": {
+            "config_path": str(tmp_path / "config.json"),
+            "checkpoint_path": str(checkpoint_path),
+            "nodes_path": str(tmp_path / "nodes.jsonl"),
+            "label_map_path": str(tmp_path / "label_map.json"),
+            "source_spans_paths": [str(tmp_path / "source_spans.jsonl")],
+            "cache_paths": [str(cache_path)],
+        },
+        "training_controls": {"base_model_name": "bert-base-uncased"},
+        "dataset_manifest": {"total_examples": 8},
+        "build_policy": {"allow_kernel_autobuild": False, "allow_kernel_rebuild": False},
+        "proposals": [{"area": "selection_signal", "priority": 4, "reason": "test"}],
+    }
+
+    state, reason = evaluate_artifact_retention(
+        "tolbert_model",
+        EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.5,
+            trusted_retrieval_steps=1,
+            average_first_step_path_confidence=0.4,
+            proposal_selected_steps=0,
+            novel_command_steps=0,
+            novel_valid_command_steps=0,
+            generated_total=2,
+            generated_passed=1,
+        ),
+        EvalMetrics(
+            total=10,
+            passed=8,
+            average_steps=1.4,
+            trusted_retrieval_steps=2,
+            average_first_step_path_confidence=0.7,
+            proposal_selected_steps=0,
+            novel_command_steps=0,
+            novel_valid_command_steps=0,
+            tolbert_primary_episodes=0,
+            generated_total=2,
+            generated_passed=1,
+        ),
+        payload=payload,
+    )
+
+    assert state == "reject"
+    assert "never entered retained Tolbert primary routing" in reason
 
 
 def test_evaluate_artifact_retention_rejects_tolbert_model_without_verifier_valid_novel_commands(tmp_path: Path):
@@ -3892,6 +4149,249 @@ def test_select_portfolio_campaign_keeps_clear_leader_despite_recent_saturation(
     assert [candidate.subsystem for candidate in campaign] == ["retrieval"]
 
 
+def test_select_portfolio_campaign_prefers_non_retrieval_after_strong_broad_observe(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("retrieval", "r", 5, 0.04, 2, 0.10, {}),
+        ImprovementExperiment("verifier", "v", 4, 0.02, 2, 0.04, {}),
+        ImprovementExperiment("tooling", "t", 4, 0.015, 2, 0.03, {}),
+    ]
+
+    metrics = EvalMetrics(
+        total=4,
+        passed=4,
+        generated_total=4,
+        generated_passed=4,
+        low_confidence_episodes=1,
+        trusted_retrieval_steps=1,
+        total_by_benchmark_family={"repository": 1, "project": 1, "integration": 1, "repo_chore": 1},
+        passed_by_benchmark_family={"repository": 1, "project": 1, "integration": 1, "repo_chore": 1},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["verifier"]
+    assert (
+        campaign[0].evidence["portfolio"]["broad_observe_diversification"]["active"] is True
+    )
+    assert "broad_observe_diversification_preferred" in campaign[0].evidence["portfolio"]["reasons"]
+    strategy_candidate = campaign[0].evidence["strategy_candidate"]
+    assert strategy_candidate["origin"] == "discovered_strategy"
+    assert strategy_candidate["strategy_id"] == "strategy:broad_observe_diversification"
+    assert "broad_observe_ready" in strategy_candidate["generation_basis"]["repo_signals"]
+    assert strategy_candidate["retention_inputs"]["selected_subsystem"] == "verifier"
+
+
+def test_select_portfolio_campaign_allows_retrieval_first_when_broad_observe_has_retrieval_emergency(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("retrieval", "r", 5, 0.04, 2, 0.10, {}),
+        ImprovementExperiment("verifier", "v", 4, 0.02, 2, 0.04, {}),
+    ]
+
+    metrics = EvalMetrics(
+        total=5,
+        passed=5,
+        generated_total=5,
+        generated_passed=5,
+        low_confidence_episodes=3,
+        trusted_retrieval_steps=1,
+        total_by_benchmark_family={"repository": 2, "project": 1, "integration": 1, "repo_chore": 1},
+        passed_by_benchmark_family={"repository": 2, "project": 1, "integration": 1, "repo_chore": 1},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["retrieval"]
+    assert (
+        campaign[0].evidence["portfolio"]["broad_observe_diversification"]["retrieval_emergency"] is True
+    )
+    assert "broad_observe_diversification_blocked_by_retrieval_emergency" in campaign[0].evidence["portfolio"]["reasons"]
+
+
+def test_select_portfolio_campaign_skips_retrieval_when_only_retrieval_is_available_after_strong_broad_observe(
+    tmp_path: Path,
+):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("retrieval", "r", 5, 0.04, 2, 0.10, {}),
+    ]
+
+    metrics = EvalMetrics(
+        total=4,
+        passed=4,
+        generated_total=4,
+        generated_passed=4,
+        low_confidence_episodes=1,
+        trusted_retrieval_steps=1,
+        total_by_benchmark_family={"repository": 1, "project": 1, "integration": 1, "repo_chore": 1},
+        passed_by_benchmark_family={"repository": 1, "project": 1, "integration": 1, "repo_chore": 1},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert campaign == []
+
+
+def test_select_portfolio_campaign_emits_synthesized_strategy_candidate(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    metrics = EvalMetrics(
+        total=8,
+        passed=8,
+        total_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert campaign
+    strategy_candidate = campaign[0].evidence.get("strategy_candidate", {})
+    assert isinstance(strategy_candidate, dict)
+    assert str(strategy_candidate.get("strategy_candidate_id", "")).startswith("strategy:")
+    assert str(strategy_candidate.get("strategy_candidate_kind", "")).strip()
+    assert strategy_candidate["strategy_id"] == strategy_candidate["strategy_candidate_id"]
+    assert isinstance(strategy_candidate.get("generation_basis", {}), dict)
+    assert isinstance(strategy_candidate.get("target_conditions", {}), dict)
+    assert isinstance(strategy_candidate.get("controls", {}), dict)
+    assert isinstance(strategy_candidate.get("retention_inputs", {}), dict)
+
+
+def test_select_portfolio_campaign_reuses_retained_strategy_history_as_score_boost(tmp_path: Path):
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:strategy:1",
+            state="retain",
+            subsystem="policy",
+            action="finalize_cycle",
+            artifact_path="/tmp/runtime_managed/policy.json",
+            artifact_kind="prompt_proposal_set",
+            reason="retained",
+            strategy_candidate_id="strategy:subsystem:policy",
+            strategy_candidate_kind="subsystem_direct",
+            metrics_summary={"strategy_candidate_id": "strategy:subsystem:policy"},
+        ),
+        govern_exports=False,
+    )
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("policy", "p", 5, 0.04, 2, 0.10, {}),
+        ImprovementExperiment("retrieval", "r", 4, 0.03, 2, 0.08, {}),
+    ]
+    metrics = EvalMetrics(
+        total=8,
+        passed=8,
+        total_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    strategy_candidate = campaign[0].evidence.get("strategy_candidate", {})
+    assert strategy_candidate["strategy_candidate_id"] == "strategy:subsystem:policy"
+    assert strategy_candidate["score_delta"] > 0.0
+
+
+def test_select_portfolio_campaign_prefers_discovered_countermeasure_for_low_yield_fixed_lane(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment(
+            "policy",
+            "p",
+            5,
+            0.04,
+            2,
+            0.10,
+            {
+                "failure_counts": {"command_failure": 3},
+                "transition_failure_counts": {"state_regression": 2},
+                "repo_world_model_total": 2,
+            },
+        ),
+        ImprovementExperiment("retrieval", "r", 4, 0.03, 2, 0.08, {}),
+        ]
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: (
+        {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 2,
+            "recent_incomplete_cycles": 1,
+        }
+        if subsystem == "policy"
+        else {}
+    )
+    planner._portfolio_adjusted_experiment_score = lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+
+    metrics = EvalMetrics(
+        total=6,
+        passed=4,
+        generated_total=2,
+        generated_passed=1,
+        low_confidence_episodes=2,
+        trusted_retrieval_steps=1,
+        total_by_benchmark_family={"project": 2, "repository": 2, "bounded": 2},
+        passed_by_benchmark_family={"project": 1, "repository": 1, "bounded": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["policy"]
+    strategy_candidate = campaign[0].evidence["strategy_candidate"]
+    assert strategy_candidate["origin"] == "discovered_strategy"
+    assert strategy_candidate["strategy_candidate_kind"] == "adaptive_countermeasure"
+    assert strategy_candidate["strategy_candidate_id"].startswith("strategy:adaptive_countermeasure:policy:")
+    assert "state_regression" in strategy_candidate["generation_basis"]["repeated_failure_motifs"]
+    assert "retrieval_confidence_gap" in strategy_candidate["generation_basis"]["transfer_gaps"]
+
+
+def test_recent_strategy_activity_summary_uses_canonical_strategy_id_fallback(tmp_path: Path):
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    strategy_candidate = {
+        "strategy_id": "strategy:adaptive_countermeasure:policy:abc123",
+        "strategy_kind": "adaptive_countermeasure",
+    }
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:strategy:discover",
+            state="select",
+            subsystem="policy",
+            action="select_campaign",
+            artifact_path="/tmp/runtime_managed/policy.json",
+            artifact_kind="prompt_proposal_set",
+            reason="selected",
+            metrics_summary={"strategy_candidate": strategy_candidate},
+        ),
+        govern_exports=False,
+    )
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:strategy:discover",
+            state="retain",
+            subsystem="policy",
+            action="finalize_cycle",
+            artifact_path="/tmp/runtime_managed/policy.json",
+            artifact_kind="prompt_proposal_set",
+            reason="retained",
+            metrics_summary={"strategy_candidate": strategy_candidate},
+        ),
+        govern_exports=False,
+    )
+
+    summary = planner.recent_strategy_activity_summary(
+        strategy_candidate_id="strategy:adaptive_countermeasure:policy:abc123",
+        output_path=cycles_path,
+    )
+
+    assert summary["selected_cycles"] == 1
+    assert summary["retained_cycles"] == 1
+    assert summary["rejected_cycles"] == 0
+
+
 def test_rank_experiments_cools_off_repeated_no_yield_bootstrap_subsystem(tmp_path: Path):
     cycles_path = tmp_path / "improvement" / "cycles.jsonl"
     planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
@@ -5967,6 +6467,35 @@ def test_retrieval_improvement_emits_policy_artifact():
     assert artifact["retention_gate"]["require_failure_recovery_non_regression"] is True
 
 
+def test_select_portfolio_campaign_applies_observe_hypothesis_bonus(tmp_path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    metrics = EvalMetrics(total=10, passed=8)
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("retrieval", "r", 5, 0.04, 2, 0.10, {}),
+        ImprovementExperiment("policy", "p", 5, 0.039, 2, 0.095, {}),
+    ]
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: {}
+    planner._portfolio_adjusted_experiment_score = lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    planner._synthesized_strategy_candidate = lambda candidate, metrics, recent_activity, broad_observe_signal: {
+        "strategy_candidate_id": f"strategy:{candidate.subsystem}",
+        "strategy_candidate_kind": "subsystem_direct",
+    }
+    planner.recent_strategy_activity_summary = lambda strategy_candidate_id: {}
+    planner._strategy_history_score_delta = lambda strategy_candidate, recent_activity: 0.0
+    planner._strategy_memory_summary = lambda candidate_subsystem, strategy_candidate: {}
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {}
+    planner._campaign_breadth_pressure = lambda summary: 0.0
+    planner._improvement_planner_controls = lambda: {}
+
+    campaign = planner.select_portfolio_campaign(
+        metrics,
+        max_candidates=1,
+        observe_hypothesis_bonus={"policy": 0.02},
+    )
+
+    assert [candidate.subsystem for candidate in campaign] == ["policy"]
+
+
 def test_retrieval_confidence_gating_emits_runtime_caution_controls():
     metrics = EvalMetrics(total=10, passed=8, low_confidence_episodes=4, trusted_retrieval_steps=1)
 
@@ -6609,7 +7138,7 @@ def test_retrieval_artifact_emits_preview_controls_for_low_signal_carryover_pres
 
     artifact = build_retrieval_proposal_artifact(metrics, focus="confidence")
 
-    assert artifact["preview_controls"]["comparison_task_limit_floor"] == 24
+    assert artifact["preview_controls"]["comparison_task_limit_floor"] == 8
     assert artifact["preview_controls"]["priority_benchmark_families"] == [
         "benchmark_candidate",
         "integration",
@@ -7286,6 +7815,207 @@ def test_evaluate_artifact_retention_retains_retrieval_with_preserved_carryover_
 
     assert state == "retain"
     assert "preserved verified long-horizon trusted-retrieval carryover" in reason
+
+
+def test_evaluate_artifact_retention_retains_retrieval_with_broad_coding_support_gain():
+    baseline = EvalMetrics(
+        total=10,
+        passed=8,
+        average_steps=1.2,
+        trusted_retrieval_steps=1,
+        retrieval_influenced_steps=1,
+        retrieval_selected_steps=1,
+        low_confidence_episodes=1,
+        total_by_benchmark_family={
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+            "repo_chore": 2,
+            "bounded": 2,
+        },
+        passed_by_benchmark_family={
+            "project": 2,
+            "repository": 2,
+            "integration": 1,
+            "repo_chore": 2,
+            "bounded": 1,
+        },
+    )
+    candidate = EvalMetrics(
+        total=10,
+        passed=9,
+        average_steps=1.1,
+        trusted_retrieval_steps=1,
+        retrieval_influenced_steps=2,
+        retrieval_selected_steps=1,
+        low_confidence_episodes=1,
+        total_by_benchmark_family={
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+            "repo_chore": 2,
+            "bounded": 2,
+        },
+        passed_by_benchmark_family={
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+            "repo_chore": 2,
+            "bounded": 1,
+        },
+    )
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_state": "proposed",
+        "overrides": {"tolbert_context_max_chunks": 4},
+        "proposals": [
+            {
+                "proposal_id": "retrieval:breadth_rebalance",
+                "area": "breadth",
+                "reason": "test broad coding support retain path",
+                "overrides": {"tolbert_context_max_chunks": 4},
+            }
+        ],
+        "retention_gate": {
+            "min_pass_rate_delta_abs": 0.02,
+            "require_family_discrimination": True,
+            "max_false_failure_rate": 1.0,
+            "required_confirmation_runs": 1,
+            "max_regressed_families": 0,
+            "max_low_confidence_episode_regression": 0,
+        },
+    }
+
+    state, reason = evaluate_artifact_retention("retrieval", baseline, candidate, payload=payload)
+
+    assert state == "retain"
+    assert "broad coding-family support" in reason
+
+
+def test_evaluate_artifact_retention_retains_retrieval_with_broad_coding_support_gain_at_equal_pass_rate():
+    baseline = EvalMetrics(
+        total=10,
+        passed=8,
+        average_steps=1.1,
+        trusted_retrieval_steps=1,
+        retrieval_influenced_steps=2,
+        retrieval_selected_steps=1,
+        low_confidence_episodes=1,
+        total_by_benchmark_family={
+            "project": 3,
+            "repository": 3,
+            "integration": 2,
+            "bounded": 2,
+        },
+        passed_by_benchmark_family={
+            "project": 3,
+            "repository": 2,
+            "integration": 2,
+            "bounded": 1,
+        },
+    )
+    candidate = EvalMetrics(
+        total=12,
+        passed=10,
+        average_steps=1.1,
+        trusted_retrieval_steps=1,
+        retrieval_influenced_steps=2,
+        retrieval_selected_steps=1,
+        low_confidence_episodes=1,
+        total_by_benchmark_family={
+            "project": 3,
+            "repository": 3,
+            "integration": 2,
+            "repo_chore": 2,
+            "bounded": 2,
+        },
+        passed_by_benchmark_family={
+            "project": 3,
+            "repository": 2,
+            "integration": 2,
+            "repo_chore": 2,
+            "bounded": 2,
+        },
+    )
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_state": "proposed",
+        "overrides": {"tolbert_context_max_chunks": 4},
+        "proposals": [
+            {
+                "proposal_id": "retrieval:breadth_support_gain",
+                "area": "breadth",
+                "reason": "test broad coding support gain at equal pass rate",
+                "overrides": {"tolbert_context_max_chunks": 4},
+            }
+        ],
+        "retention_gate": {
+            "min_pass_rate_delta_abs": 0.02,
+            "require_family_discrimination": True,
+            "max_false_failure_rate": 0.02,
+            "required_confirmation_runs": 1,
+            "max_regressed_families": 0,
+            "max_low_confidence_episode_regression": 0,
+        },
+    }
+
+    state, reason = evaluate_artifact_retention("retrieval", baseline, candidate, payload=payload)
+
+    assert state == "retain"
+    assert "coding-family support" in reason
+
+
+def test_evaluate_artifact_retention_retains_retrieval_with_complementary_support_gain_at_equal_pass_rate():
+    baseline = EvalMetrics(
+        total=8,
+        passed=8,
+        average_steps=1.0,
+        trusted_retrieval_steps=1,
+        retrieval_influenced_steps=1,
+        retrieval_selected_steps=1,
+        low_confidence_episodes=2,
+        total_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        total_by_origin_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_origin_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        task_outcomes={
+            "project_release_cutover_task": {
+                "termination_reason": "success",
+                "difficulty": "long_horizon",
+                "trusted_retrieval_steps": 1,
+                "trusted_retrieval_carryover_verified_steps": 0,
+            },
+        },
+    )
+    candidate = EvalMetrics(
+        total=8,
+        passed=8,
+        average_steps=1.0,
+        trusted_retrieval_steps=2,
+        retrieval_influenced_steps=2,
+        retrieval_selected_steps=2,
+        low_confidence_episodes=1,
+        total_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        total_by_origin_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        passed_by_origin_benchmark_family={"project": 2, "repository": 2, "integration": 2, "repo_chore": 2},
+        task_outcomes={
+            "project_release_cutover_task": {
+                "termination_reason": "success",
+                "difficulty": "long_horizon",
+                "trusted_retrieval_steps": 1,
+                "trusted_retrieval_carryover_verified_steps": 1,
+            },
+        },
+    )
+    payload = build_retrieval_proposal_artifact(candidate, focus="confidence")
+
+    state, reason = evaluate_artifact_retention("retrieval", baseline, candidate, payload=payload)
+
+    assert state == "retain"
+    assert "complementary retrieval support" in reason
 
 
 def test_evaluate_artifact_retention_retains_capability_surface_growth_without_runtime_regression(tmp_path: Path):

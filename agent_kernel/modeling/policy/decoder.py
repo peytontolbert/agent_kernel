@@ -7,6 +7,7 @@ import re
 import shlex
 from typing import TYPE_CHECKING
 
+from ...unattended_controller import discover_structural_classes, structural_class_family_aliases
 from ...syntax_motor import summarize_python_edit_step
 from ..world.rollout import rollout_action_value
 
@@ -174,6 +175,7 @@ def decode_action_generation_candidates(
     if not bool(proposal_policy.get("enabled", True)):
         return []
     benchmark_family = str(state.task.metadata.get("benchmark_family", "bounded")).strip() or "bounded"
+    routing_benchmark_families = _routing_benchmark_families(dict(state.task.metadata))
     blocked = {canonicalize_command_fn(command) for command in blocked_commands}
     baseline_commands = _baseline_command_set(
         state=state,
@@ -185,7 +187,7 @@ def decode_action_generation_candidates(
     )
     seen: set[str] = set()
     candidates: list[DecodedActionCandidate] = []
-    template_support = _template_support_by_kind(proposal_policy, benchmark_family)
+    template_support = _template_support_by_kind(proposal_policy, routing_benchmark_families)
     missing_expected = [
         str(path).strip()
         for path in state.world_model_summary.get("missing_expected_artifacts", [])
@@ -215,7 +217,7 @@ def decode_action_generation_candidates(
     raw_proposals.extend(
         _structured_edit_raw_proposals(
             state=state,
-            benchmark_family=benchmark_family,
+            benchmark_family=routing_benchmark_families,
             unsatisfied_expected=unsatisfied_expected,
             proposal_policy=proposal_policy,
         )
@@ -258,13 +260,18 @@ def decode_action_generation_candidates(
                 "expected_file_content",
                 {
                     "benchmark_family": benchmark_family,
+                    "routing_benchmark_families": list(routing_benchmark_families),
                     "template_kind": "expected_file_content",
                     "target_path": path,
                     "support": template_support.get("expected_file_content", 0),
                     "safety": "bounded_write_expected_content",
                     "verifier_aligned": True,
                     "fallback_from_workspace_preview": path in structured_edit_fallback_paths,
-                    "provenance": _template_provenance(proposal_policy, benchmark_family, "expected_file_content"),
+                    "provenance": _template_provenance(
+                        proposal_policy,
+                        routing_benchmark_families,
+                        "expected_file_content",
+                    ),
                     **fallback_summary,
                 },
             )
@@ -278,12 +285,17 @@ def decode_action_generation_candidates(
                 "missing_expected_file",
                 {
                     "benchmark_family": benchmark_family,
+                    "routing_benchmark_families": list(routing_benchmark_families),
                     "template_kind": "missing_expected_file",
                     "target_path": path,
                     "support": template_support.get("missing_expected_file", 0),
                     "safety": "bounded_materialize_expected_file",
                     "verifier_aligned": True,
-                    "provenance": _template_provenance(proposal_policy, benchmark_family, "missing_expected_file"),
+                    "provenance": _template_provenance(
+                        proposal_policy,
+                        routing_benchmark_families,
+                        "missing_expected_file",
+                    ),
                 },
             )
         )
@@ -294,12 +306,17 @@ def decode_action_generation_candidates(
                 "cleanup_forbidden_file",
                 {
                     "benchmark_family": benchmark_family,
+                    "routing_benchmark_families": list(routing_benchmark_families),
                     "template_kind": "cleanup_forbidden_file",
                     "target_path": path,
                     "support": template_support.get("cleanup_forbidden_file", 0),
                     "safety": "bounded_remove_forbidden_file",
                     "verifier_aligned": True,
-                    "provenance": _template_provenance(proposal_policy, benchmark_family, "cleanup_forbidden_file"),
+                    "provenance": _template_provenance(
+                        proposal_policy,
+                        routing_benchmark_families,
+                        "cleanup_forbidden_file",
+                    ),
                 },
             )
         )
@@ -610,39 +627,71 @@ def _baseline_command_set(
 
 def _template_support_by_kind(
     proposal_policy: dict[str, object],
-    benchmark_family: str,
+    benchmark_family: str | list[str] | tuple[str, ...],
 ) -> dict[str, int]:
     preferences = proposal_policy.get("template_preferences", {})
-    family_preferences = preferences.get(benchmark_family, []) if isinstance(preferences, dict) else []
     support: dict[str, int] = {}
-    for item in family_preferences:
-        if not isinstance(item, dict):
-            continue
-        template_kind = str(item.get("template_kind", "")).strip()
-        if not template_kind:
-            continue
-        support[template_kind] = int(item.get("support", 0) or 0)
+    for family in _normalize_benchmark_family_candidates(benchmark_family):
+        family_preferences = preferences.get(family, []) if isinstance(preferences, dict) else []
+        for item in family_preferences:
+            if not isinstance(item, dict):
+                continue
+            template_kind = str(item.get("template_kind", "")).strip()
+            if not template_kind:
+                continue
+            support[template_kind] = max(support.get(template_kind, 0), int(item.get("support", 0) or 0))
     return support
 
 
 def _template_provenance(
     proposal_policy: dict[str, object],
-    benchmark_family: str,
+    benchmark_family: str | list[str] | tuple[str, ...],
     template_kind: str,
 ) -> list[str]:
     preferences = proposal_policy.get("template_preferences", {})
-    family_preferences = preferences.get(benchmark_family, []) if isinstance(preferences, dict) else []
-    for item in family_preferences:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("template_kind", "")).strip() != template_kind:
-            continue
-        return [
-            str(value).strip()
-            for value in item.get("provenance", [])
-            if str(value).strip()
-        ][:8]
+    seen: set[str] = set()
+    provenance: list[str] = []
+    for family in _normalize_benchmark_family_candidates(benchmark_family):
+        family_preferences = preferences.get(family, []) if isinstance(preferences, dict) else []
+        for item in family_preferences:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("template_kind", "")).strip() != template_kind:
+                continue
+            for value in item.get("provenance", []):
+                token = str(value).strip()
+                if token and token not in seen:
+                    seen.add(token)
+                    provenance.append(token)
+            if provenance:
+                return provenance[:8]
     return []
+
+
+def _normalize_benchmark_family_candidates(
+    benchmark_family: str | list[str] | tuple[str, ...],
+) -> list[str]:
+    values = (
+        [benchmark_family]
+        if isinstance(benchmark_family, str)
+        else list(benchmark_family)
+        if isinstance(benchmark_family, (list, tuple))
+        else []
+    )
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in values:
+        token = str(value).strip()
+        if token and token not in seen:
+            seen.add(token)
+            normalized.append(token)
+    return normalized
+
+
+def _routing_benchmark_families(task_metadata: dict[str, object]) -> list[str]:
+    primary_family = str(task_metadata.get("benchmark_family", "bounded")).strip() or "bounded"
+    structural_aliases = structural_class_family_aliases(discover_structural_classes(task_metadata))
+    return _normalize_benchmark_family_candidates([primary_family, *structural_aliases])
 
 
 def _render_write_command(path: str, content: str) -> str:
@@ -675,11 +724,13 @@ def _shell_quote(value: str) -> str:
 def _structured_edit_raw_proposals(
     *,
     state: "AgentState",
-    benchmark_family: str,
+    benchmark_family: str | list[str] | tuple[str, ...],
     unsatisfied_expected: dict[str, str],
     proposal_policy: dict[str, object],
 ) -> list[tuple[str, str, dict[str, object]]]:
     raw: list[tuple[str, str, dict[str, object]]] = []
+    routing_benchmark_families = _normalize_benchmark_family_candidates(benchmark_family)
+    primary_benchmark_family = routing_benchmark_families[0] if routing_benchmark_families else "bounded"
     planned_steps = _synthetic_edit_plan_steps(state)
     for path, target_content in unsatisfied_expected.items():
         step = planned_steps.get(path)
@@ -699,7 +750,8 @@ def _structured_edit_raw_proposals(
                     f"structured_edit:{edit_kind or 'rewrite'}",
                     {
                         "command": command,
-                        "benchmark_family": benchmark_family,
+                        "benchmark_family": primary_benchmark_family,
+                        "routing_benchmark_families": routing_benchmark_families,
                         "template_kind": "structured_edit",
                         "target_path": path,
                         "proposal_source": f"structured_edit:{edit_kind or 'rewrite'}",
@@ -752,7 +804,8 @@ def _structured_edit_raw_proposals(
                     str(proposal.get("proposal_source", "")),
                     {
                         "command": str(proposal.get("command", "")),
-                        "benchmark_family": benchmark_family,
+                        "benchmark_family": primary_benchmark_family,
+                        "routing_benchmark_families": routing_benchmark_families,
                         "template_kind": "structured_edit",
                         "target_path": path,
                         "proposal_source": str(proposal.get("proposal_source", "")),
@@ -1836,6 +1889,11 @@ def _workspace_preview_window_proposals(
         and _int_value(proposal.get("safe_inexact_window_count"), 0)
         >= _int_value(proposal.get("inexact_window_count"), 0)
         and _int_value(proposal.get("overlap_alias_pair_count"), 0) > 0
+        and (
+            _int_value(proposal.get("inexact_window_count"), 0) <= 0
+            or str(proposal.get("edit_kind", "")).strip() == "multi_edit"
+            or _preview_block_proposal_proof_quality_score(proposal) >= 8
+        )
         for proposal in proposals
     )
     if (
@@ -5700,7 +5758,7 @@ def _prune_cross_family_preview_bounded_duplicates(
     proposals: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     canonical_block_replace_commands: set[str] = set()
-    canonical_block_replace_spans: set[tuple[int, int, int, int]] = set()
+    canonical_high_confidence_block_spans: dict[tuple[int, int, int, int], dict[str, object]] = {}
     for proposal in proposals:
         if str(proposal.get("proposal_source", "")).strip() != "structured_edit:block_replace":
             continue
@@ -5712,10 +5770,11 @@ def _prune_cross_family_preview_bounded_duplicates(
         command = str(proposal.get("command", "")).strip()
         if command:
             canonical_block_replace_commands.add(command)
-        span_signature = _preview_structured_edit_proposal_span_signature(proposal)
-        if span_signature is not None:
-            canonical_block_replace_spans.add(span_signature)
-    if not canonical_block_replace_commands and not canonical_block_replace_spans:
+        if _preview_block_proposal_proof_quality_score(proposal) >= 8:
+            span_signature = _preview_structured_edit_proposal_span_signature(proposal)
+            if span_signature is not None:
+                canonical_high_confidence_block_spans[span_signature] = proposal
+    if not canonical_block_replace_commands:
         return proposals
     deduped: list[dict[str, object]] = []
     for proposal in proposals:
@@ -5733,10 +5792,26 @@ def _prune_cross_family_preview_bounded_duplicates(
             deduped.append(proposal)
             continue
         command = str(proposal.get("command", "")).strip()
-        span_signature = _preview_structured_edit_proposal_span_signature(proposal)
         if command and command in canonical_block_replace_commands:
             continue
-        if span_signature is not None and span_signature in canonical_block_replace_spans:
+        span_signature = _preview_structured_edit_proposal_span_signature(proposal)
+        block_span_proposal = (
+            canonical_high_confidence_block_spans.get(span_signature)
+            if span_signature is not None
+            else None
+        )
+        component_edit_kinds = {
+            str(kind).strip()
+            for kind in proposal.get("component_edit_kinds", [])
+            if str(kind).strip()
+        }
+        if (
+            proposal_source == "structured_edit:multi_edit"
+            and block_span_proposal is not None
+            and "block_replace" in component_edit_kinds
+            and component_edit_kinds <= {"block_replace", "token_replace", "line_replace"}
+            and _int_value(block_span_proposal.get("shared_anchor_exact_neighbor_count"), 0) < 2
+        ):
             continue
         deduped.append(proposal)
     return deduped
@@ -7962,11 +8037,17 @@ def _structured_edit_bridged_hidden_gap_region_block_adjustment(metadata: dict[s
     if hidden_gap_line_count <= 0:
         return 0.0
     hidden_gap_bridge_count = max(1, _int_value(metadata.get("hidden_gap_bridge_count"), 1))
+    retained_window_count = max(
+        0,
+        _int_value(metadata.get("retained_window_count"), covered_window_count),
+    )
     bonus = 5.0 + min(1.5, (covered_window_count - 2) * 0.5)
     bonus += min(1.5, hidden_gap_line_count * 0.5)
     bonus += min(1.0, (hidden_gap_bridge_count - 1) * 0.5)
     if bool(metadata.get("explicit_hidden_gap_current_proof", False)):
         bonus += 1.0
+    if covered_window_count > retained_window_count:
+        bonus += 12.0
     if not bool(metadata.get("partial_window_coverage", False)):
         bonus += 0.5
     if bool(metadata.get("shared_anchor_exact_region_block", False)):
@@ -8109,7 +8190,7 @@ def _structured_edit_bridge_run_frontier_adjustment(metadata: dict[str, object])
         adjustment -= min(6.0, frontier_gap)
     if exact_localized_alternative_count > 0:
         if partial_window_coverage:
-            adjustment -= 3.0 + min(4.0, exact_localized_gap)
+            adjustment -= 18.0 + min(6.0, exact_localized_gap * 2.0)
         elif inexact_window_count > 0:
             adjustment -= 1.5 + min(2.5, exact_localized_gap * 0.75)
         elif exact_localized_gap > 0.0:
@@ -8138,15 +8219,19 @@ def _structured_edit_exact_localized_bridge_competition_adjustment(
         0,
         _int_value(metadata.get("bridge_run_partial_alternative_count"), 0),
     )
-    if partial_bridge_run_count <= 0:
+    exact_localized_alternative_count = max(
+        0,
+        _int_value(metadata.get("bridge_run_exact_localized_alternative_count"), 0),
+    )
+    if partial_bridge_run_count <= 0 or exact_localized_alternative_count > 1:
         return 0.0
     bridge_run_max_covered_window_count = max(
         covered_window_count,
         _int_value(metadata.get("bridge_run_max_covered_window_count"), covered_window_count),
     )
-    bonus = 2.0 + min(2.0, (bridge_run_max_covered_window_count - covered_window_count) * 0.75)
+    bonus = 18.0 + min(6.0, (bridge_run_max_covered_window_count - covered_window_count) * 3.0)
     if bool(metadata.get("same_window_exact_block_alternative", False)):
-        bonus += 0.5
+        bonus += 2.0
     return bonus
 
 
@@ -8283,6 +8368,8 @@ def _structured_edit_hidden_gap_region_ambiguity_penalty(metadata: dict[str, obj
     ambiguity_count = max(0, _int_value(metadata.get("hidden_gap_region_ambiguity_count"), 0))
     frontier_count = max(0, _int_value(metadata.get("hidden_gap_region_frontier_count"), 0))
     frontier_gap = max(0.0, _float_value(metadata.get("hidden_gap_region_frontier_gap"), 0.0))
+    current_line_count = max(0, _int_value(metadata.get("hidden_gap_current_line_count"), 0))
+    target_line_count = max(0, _int_value(metadata.get("hidden_gap_target_line_count"), 0))
     if ambiguity_count <= 1 and frontier_gap <= 0.0:
         return 0.0
     penalty = 0.0
@@ -8297,7 +8384,10 @@ def _structured_edit_hidden_gap_region_ambiguity_penalty(metadata: dict[str, obj
         if _int_value(metadata.get("inexact_window_count"), 0) > 0:
             penalty += 1.0
         if str(metadata.get("edit_kind", "")).strip() == "multi_edit":
-            penalty += 2.0
+            if current_line_count <= 0 and target_line_count <= 0:
+                penalty = max(0.0, penalty - 3.0)
+            else:
+                penalty += 2.0
     if frontier_gap > 0.0:
         penalty += min(4.0, frontier_gap)
         if frontier_count > 1:
@@ -8329,6 +8419,11 @@ def _structured_edit_hidden_gap_bounded_alternative_penalty(metadata: dict[str, 
         penalty += 1.0
     if bool(metadata.get("exact_hidden_gap_region_block", False)):
         penalty += 2.0
+        if (
+            _int_value(metadata.get("inexact_window_count"), 0) > 0
+            and not bool(metadata.get("explicit_hidden_gap_current_proof", False))
+        ):
+            penalty += 4.0
     if str(metadata.get("edit_kind", "")).strip() == "block_replace":
         penalty += 1.0
     if bounded_gap <= 0.0:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 import fnmatch
+import hashlib
 import json
 import sqlite3
 from threading import Lock
@@ -33,10 +34,17 @@ class SQLiteKernelStore:
 
     def _initialize(self) -> None:
         with self._connect() as conn:
+            episode_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(episodes)").fetchall()
+            }
+            if episode_columns and "episode_id" not in episode_columns:
+                conn.execute("ALTER TABLE episodes RENAME TO episodes_legacy_v1")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS episodes (
-                    task_id TEXT PRIMARY KEY,
+                    episode_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     summary_json TEXT NOT NULL,
                     benchmark_family TEXT NOT NULL,
@@ -48,6 +56,8 @@ class SQLiteKernelStore:
                     storage_depth INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_episodes_task_updated
+                    ON episodes(task_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_episodes_family_success
                     ON episodes(benchmark_family, success, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_episodes_storage_path
@@ -106,6 +116,91 @@ class SQLiteKernelStore:
                 );
                 """
             )
+            legacy_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='episodes_legacy_v1'"
+            ).fetchone()
+            if legacy_exists is not None:
+                legacy_rows = conn.execute(
+                    """
+                    SELECT task_id, payload_json, summary_json, benchmark_family, success, storage_json,
+                           storage_phase, storage_source_group, storage_relative_path, storage_depth, updated_at
+                    FROM episodes_legacy_v1
+                    ORDER BY updated_at, task_id
+                    """
+                ).fetchall()
+                for row in legacy_rows:
+                    payload_json = str(row["payload_json"])
+                    storage_json = str(row["storage_json"])
+                    episode_id = self._episode_id_from_payload_json(
+                        task_id=str(row["task_id"]),
+                        payload_json=payload_json,
+                        storage_json=storage_json,
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO episodes(
+                            episode_id,
+                            task_id,
+                            payload_json,
+                            summary_json,
+                            benchmark_family,
+                            success,
+                            storage_json,
+                            storage_phase,
+                            storage_source_group,
+                            storage_relative_path,
+                            storage_depth,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            episode_id,
+                            str(row["task_id"]),
+                            payload_json,
+                            str(row["summary_json"]),
+                            str(row["benchmark_family"]),
+                            int(row["success"]),
+                            storage_json,
+                            str(row["storage_phase"]),
+                            str(row["storage_source_group"]),
+                            str(row["storage_relative_path"]),
+                            int(row["storage_depth"]),
+                            str(row["updated_at"]),
+                        ),
+                    )
+                conn.execute("DROP TABLE episodes_legacy_v1")
+
+    @staticmethod
+    def _episode_id_from_payload_json(
+        *,
+        task_id: str,
+        payload_json: str,
+        storage_json: str,
+    ) -> str:
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            payload = {}
+        try:
+            storage = json.loads(storage_json)
+        except json.JSONDecodeError:
+            storage = {}
+        workspace = ""
+        if isinstance(payload, dict):
+            workspace = str(payload.get("workspace", "")).strip()
+        storage_payload = dict(storage) if isinstance(storage, dict) else {}
+        identity_payload = {
+            "task_id": str(task_id).strip(),
+            "workspace": workspace,
+            "relative_path": str(storage_payload.get("relative_path", "")).strip(),
+            "phase": str(storage_payload.get("phase", "")).strip(),
+            "source_group": str(storage_payload.get("source_group", "")).strip(),
+            "payload_sha1": hashlib.sha1(payload_json.encode("utf-8")).hexdigest(),
+        }
+        digest = hashlib.sha1(
+            json.dumps(identity_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"{identity_payload['task_id']}:{digest}"
 
     def upsert_episode_document(
         self,
@@ -130,11 +225,19 @@ class SQLiteKernelStore:
             storage_depth = int(storage_payload.get("depth", 0) or 0)
         except (TypeError, ValueError):
             storage_depth = 0
+        payload_json = json.dumps(payload, sort_keys=True)
+        storage_json = json.dumps(storage_payload, sort_keys=True)
+        episode_id = self._episode_id_from_payload_json(
+            task_id=task_id,
+            payload_json=payload_json,
+            storage_json=storage_json,
+        )
         updated_at = _utcnow()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO episodes(
+                    episode_id,
                     task_id,
                     payload_json,
                     summary_json,
@@ -146,8 +249,9 @@ class SQLiteKernelStore:
                     storage_relative_path,
                     storage_depth,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(episode_id) DO UPDATE SET
+                    task_id=excluded.task_id,
                     payload_json=excluded.payload_json,
                     summary_json=excluded.summary_json,
                     benchmark_family=excluded.benchmark_family,
@@ -160,12 +264,13 @@ class SQLiteKernelStore:
                     updated_at=excluded.updated_at
                 """,
                 (
+                    episode_id,
                     task_id,
-                    json.dumps(payload, sort_keys=True),
+                    payload_json,
                     json.dumps(summary, sort_keys=True),
                     str(task_metadata.get("benchmark_family", "bounded")).strip() or "bounded",
                     1 if bool(payload.get("success", False)) else 0,
-                    json.dumps(storage_payload, sort_keys=True),
+                    storage_json,
                     storage_phase,
                     storage_source_group,
                     storage_relative_path,
@@ -174,64 +279,133 @@ class SQLiteKernelStore:
                 ),
             )
 
-    def iter_episode_documents(self, *, flat_only: bool = False) -> list[dict[str, object]]:
+    def _row_to_episode_payload(self, row: sqlite3.Row) -> dict[str, object] | None:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            storage = json.loads(str(row["storage_json"]))
+        except json.JSONDecodeError:
+            storage = {}
+        payload = dict(payload)
+        storage_payload = dict(storage) if isinstance(storage, dict) else {}
+        storage_payload.setdefault("episode_id", str(row["episode_id"]))
+        storage_payload.setdefault("updated_at", str(row["updated_at"]))
+        if storage_payload:
+            payload["episode_storage"] = storage_payload
+            task_metadata = dict(payload.get("task_metadata", {})) if isinstance(payload.get("task_metadata", {}), dict) else {}
+            task_metadata.setdefault("episode_phase", str(storage_payload.get("phase", "")))
+            task_metadata.setdefault("episode_source_group", str(storage_payload.get("source_group", "")))
+            task_metadata.setdefault("episode_relative_path", str(storage_payload.get("relative_path", "")))
+            payload["task_metadata"] = task_metadata
+        return payload
+
+    @staticmethod
+    def _phase_preference(phase: str) -> int:
+        normalized = str(phase).strip()
+        if normalized == "primary":
+            return 4
+        if normalized == "generated_success":
+            return 3
+        if normalized == "generated_failure_seed":
+            return 2
+        if normalized == "generated_failure":
+            return 1
+        return 0
+
+    def _aggregate_episode_documents(self, documents: list[dict[str, object]]) -> list[dict[str, object]]:
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for payload in documents:
+            task_id = str(payload.get("task_id", "")).strip()
+            if not task_id:
+                continue
+            grouped.setdefault(task_id, []).append(payload)
+        aggregated: list[dict[str, object]] = []
+        for task_id, attempts in grouped.items():
+            ranked_attempts = sorted(
+                attempts,
+                key=lambda payload: (
+                    1 if bool(payload.get("success", False)) else 0,
+                    float(dict(payload.get("summary", {})).get("final_completion_ratio", 0.0) or 0.0),
+                    float(dict(payload.get("summary", {})).get("net_state_progress_delta", 0.0) or 0.0),
+                    self._phase_preference(dict(payload.get("episode_storage", {})).get("phase", "")),
+                    str(dict(payload.get("episode_storage", {})).get("updated_at", "")),
+                ),
+                reverse=True,
+            )
+            representative = dict(ranked_attempts[0])
+            attempts_by_phase: dict[str, int] = {}
+            successful_attempts = 0
+            for attempt in attempts:
+                storage = dict(attempt.get("episode_storage", {}))
+                phase = str(storage.get("phase", "primary")).strip() or "primary"
+                attempts_by_phase[phase] = attempts_by_phase.get(phase, 0) + 1
+                if bool(attempt.get("success", False)):
+                    successful_attempts += 1
+            representative["attempt_aggregation"] = {
+                "attempt_count": len(attempts),
+                "successful_attempts": successful_attempts,
+                "failed_attempts": max(0, len(attempts) - successful_attempts),
+                "attempts_by_phase": attempts_by_phase,
+                "latest_updated_at": max(
+                    str(dict(attempt.get("episode_storage", {})).get("updated_at", ""))
+                    for attempt in attempts
+                ),
+                "representative_episode_id": str(
+                    dict(representative.get("episode_storage", {})).get("episode_id", "")
+                ).strip(),
+            }
+            aggregated.append(representative)
+        return sorted(aggregated, key=lambda payload: str(payload.get("task_id", "")).strip())
+
+    def iter_episode_attempt_documents(self, *, flat_only: bool = False) -> list[dict[str, object]]:
         query = """
-            SELECT payload_json, storage_json
+            SELECT episode_id, payload_json, storage_json, updated_at
             FROM episodes
         """
         params: list[object] = []
         if flat_only:
             query += " WHERE storage_depth = 0"
-        query += " ORDER BY storage_relative_path, task_id"
+        query += " ORDER BY updated_at, storage_relative_path, task_id, episode_id"
         documents: list[dict[str, object]] = []
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         for row in rows:
-            try:
-                payload = json.loads(str(row["payload_json"]))
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            try:
-                storage = json.loads(str(row["storage_json"]))
-            except json.JSONDecodeError:
-                storage = {}
-            if isinstance(storage, dict) and storage:
-                payload = dict(payload)
-                payload["episode_storage"] = dict(storage)
-                task_metadata = dict(payload.get("task_metadata", {})) if isinstance(payload.get("task_metadata", {}), dict) else {}
-                task_metadata.setdefault("episode_phase", str(storage.get("phase", "")))
-                task_metadata.setdefault("episode_source_group", str(storage.get("source_group", "")))
-                task_metadata.setdefault("episode_relative_path", str(storage.get("relative_path", "")))
-                payload["task_metadata"] = task_metadata
-            documents.append(payload)
+            payload = self._row_to_episode_payload(row)
+            if payload is not None:
+                documents.append(payload)
         return documents
 
-    def load_episode_document(self, task_id: str) -> dict[str, object]:
+    def iter_episode_documents(self, *, flat_only: bool = False) -> list[dict[str, object]]:
+        return self._aggregate_episode_documents(
+            self.iter_episode_attempt_documents(flat_only=flat_only)
+        )
+
+    def load_episode_attempt_documents(self, task_id: str) -> list[dict[str, object]]:
         normalized = str(task_id).strip()
         if not normalized:
-            raise FileNotFoundError("episode task_id must not be empty")
+            return []
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT payload_json, storage_json FROM episodes WHERE task_id = ?",
+            rows = conn.execute(
+                """
+                SELECT episode_id, payload_json, storage_json, updated_at
+                FROM episodes
+                WHERE task_id = ?
+                ORDER BY updated_at, episode_id
+                """,
                 (normalized,),
-            ).fetchone()
-        if row is None:
+            ).fetchall()
+        attempts = [payload for row in rows if (payload := self._row_to_episode_payload(row)) is not None]
+        return attempts
+
+    def load_episode_document(self, task_id: str) -> dict[str, object]:
+        attempts = self.load_episode_attempt_documents(task_id)
+        if not attempts:
             raise FileNotFoundError(f"episode document not found for task_id={normalized}")
-        payload = json.loads(str(row["payload_json"]))
-        if not isinstance(payload, dict):
-            raise FileNotFoundError(f"episode document not found for task_id={normalized}")
-        storage = json.loads(str(row["storage_json"])) if str(row["storage_json"]).strip() else {}
-        if isinstance(storage, dict) and storage:
-            payload = dict(payload)
-            payload["episode_storage"] = dict(storage)
-            task_metadata = dict(payload.get("task_metadata", {})) if isinstance(payload.get("task_metadata", {}), dict) else {}
-            task_metadata.setdefault("episode_phase", str(storage.get("phase", "")))
-            task_metadata.setdefault("episode_source_group", str(storage.get("source_group", "")))
-            task_metadata.setdefault("episode_relative_path", str(storage.get("relative_path", "")))
-            payload["task_metadata"] = task_metadata
-        return payload
+        return self._aggregate_episode_documents(attempts)[0]
 
     def iter_trajectory_payloads(self) -> list[dict[str, object]]:
         return self.iter_episode_documents(flat_only=True)

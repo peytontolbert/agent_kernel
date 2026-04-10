@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import KernelConfig
-from .state import AgentState
+from .state import AgentState, _software_work_objective_phase, _software_work_phase_rank
 
 
 @dataclass(slots=True)
@@ -73,7 +73,7 @@ class ContextBudgeter:
             )
             if isinstance(state.planner_recovery_artifact, dict)
             else [],
-            "software_work_plan_update": state.software_work_plan_update(),
+            "software_work_plan_update": self._planner_software_work_plan_update(state),
             "software_work_stage_state": state.software_work_stage_overview(),
             "software_work_phase_state": state.software_work_phase_state(),
             "software_work_phase_gate_state": state.software_work_phase_gate_state(),
@@ -121,6 +121,64 @@ class ContextBudgeter:
         if not payload["active_subgoal"]:
             payload["active_subgoal"] = active_subgoal
         return payload
+
+    @staticmethod
+    def _planner_software_work_plan_update(state: AgentState) -> list[str]:
+        objectives = [str(item).strip() for item in state.software_work_plan_update() if str(item).strip()]
+        if not objectives or str(state.current_role or "").strip() != "planner":
+            return objectives
+        phase_state = state.software_work_phase_state()
+        suggested_phase = str(phase_state.get("suggested_phase", "")).strip()
+        current_phase = str(phase_state.get("current_phase", "")).strip()
+        overview = state.software_work_stage_overview()
+        objective_states = overview.get("objective_states", {})
+        objective_states = objective_states if isinstance(objective_states, dict) else {}
+        objective_index = {objective: index for index, objective in enumerate(objectives)}
+
+        def prefix_priority(objective: str) -> int:
+            normalized = str(objective).strip()
+            for index, prefix in enumerate(
+                (
+                    "apply planned edit ",
+                    "complete implementation for ",
+                    "materialize expected artifact ",
+                    "revise implementation for ",
+                    "remove forbidden artifact ",
+                    "preserve required artifact ",
+                    "update workflow path ",
+                    "prepare workflow branch ",
+                    "accept required branch ",
+                    "regenerate generated artifact ",
+                    "run workflow test ",
+                    "write workflow report ",
+                )
+            ):
+                if normalized.startswith(prefix):
+                    return index
+            return 99
+
+        def phase_distance(phase: str) -> int:
+            if suggested_phase:
+                return abs(_software_work_phase_rank(phase) - _software_work_phase_rank(suggested_phase))
+            if current_phase:
+                return abs(_software_work_phase_rank(phase) - _software_work_phase_rank(current_phase))
+            return _software_work_phase_rank(phase)
+
+        ranked = sorted(
+            objectives,
+            key=lambda objective: (
+                phase_distance(_software_work_objective_phase(objective)),
+                prefix_priority(objective),
+                1 if str(objective_states.get(objective, "pending")).strip() == "completed" else 0,
+                objective_index.get(objective, 0),
+                objective,
+            ),
+        )
+        ordered: list[str] = []
+        for objective in ranked:
+            if objective not in ordered:
+                ordered.append(objective)
+        return ordered[:6]
 
     def _select_chunks(
         self,

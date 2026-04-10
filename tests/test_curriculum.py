@@ -46,6 +46,71 @@ def test_task_bank_uplifts_frontier_task_contract_budgets():
     assert bank.get("git_generated_conflict_resolution_task").max_steps >= 20
 
 
+def test_task_bank_infers_repo_semantics_for_builtin_tasks():
+    bank = TaskBank()
+
+    project_task = bank.get("deployment_manifest_task")
+    shared_repo_task = bank.get("git_parallel_merge_acceptance_task")
+
+    assert "project" in project_task.metadata["repo_semantics"]
+    assert "validation" in project_task.metadata["repo_semantics"]
+    assert project_task.metadata["workflow_shape"] in {"multi_artifact_workspace", "command_driven", "single_workspace"}
+    assert project_task.metadata["contract_shape"] == "workspace_acceptance"
+    assert "shared_repo" in shared_repo_task.metadata["repo_semantics"]
+    assert "integration" in shared_repo_task.metadata["repo_semantics"]
+    assert shared_repo_task.metadata["workflow_shape"] == "shared_repo_parallel"
+
+
+def test_curriculum_failure_recovery_selection_prefers_new_repo_semantic_clusters():
+    engine = CurriculumEngine()
+    alpha = EpisodeRecord(
+        task_id="alpha_project_seed",
+        prompt="repair project release packet",
+        workspace="workspace/alpha_project_seed",
+        success=False,
+        termination_reason="command_failure",
+        task_metadata={
+            "benchmark_family": "project",
+            "repo_semantics": ["project", "validation"],
+            "light_supervision_candidate": True,
+            "light_supervision_contract_kind": "workspace_acceptance",
+        },
+        steps=[],
+    )
+    beta = EpisodeRecord(
+        task_id="beta_repository_seed",
+        prompt="repair repo validation packet",
+        workspace="workspace/beta_repository_seed",
+        success=False,
+        termination_reason="command_failure",
+        task_metadata={
+            "benchmark_family": "project",
+            "repo_semantics": ["repository", "integration"],
+            "light_supervision_candidate": True,
+            "light_supervision_contract_kind": "workspace_acceptance",
+        },
+        steps=[],
+    )
+    gamma = EpisodeRecord(
+        task_id="gamma_project_seed",
+        prompt="repair project checklist",
+        workspace="workspace/gamma_project_seed",
+        success=False,
+        termination_reason="command_failure",
+        task_metadata={
+            "benchmark_family": "project",
+            "repo_semantics": ["project", "validation"],
+            "light_supervision_candidate": True,
+            "light_supervision_contract_kind": "workspace_acceptance",
+        },
+        steps=[],
+    )
+
+    selected = engine._select_failure_recovery_seed_set([alpha, beta, gamma], limit=2)
+
+    assert [episode.task_id for episode in selected] == ["alpha_project_seed", "beta_repository_seed"]
+
+
 def test_curriculum_templates_surface_synthetic_edit_plan_in_metadata():
     task = render_curriculum_template(
         "adjudication_cleanup_ruling_bundle",

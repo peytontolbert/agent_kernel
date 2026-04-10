@@ -65,8 +65,14 @@ class Policy:
     def set_decision_progress_callback(self, callback) -> None:
         del callback
 
-    def fallback_decision(self, state: AgentState, *, failure_origin: str = "") -> ActionDecision | None:
-        del state, failure_origin
+    def fallback_decision(
+        self,
+        state: AgentState,
+        *,
+        failure_origin: str = "",
+        error_text: str = "",
+    ) -> ActionDecision | None:
+        del state, failure_origin, error_text
         return None
 
 
@@ -262,8 +268,35 @@ class LLMDecisionPolicy(Policy):
     def set_decision_progress_callback(self, callback) -> None:
         self._decision_progress_callback = callback
 
-    def fallback_decision(self, state: AgentState, *, failure_origin: str = "") -> ActionDecision | None:
-        if str(failure_origin).strip() != "inference_failure":
+    @staticmethod
+    def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
+        normalized = str(error_text).strip().lower()
+        if not normalized:
+            return False
+        return (
+            "tolbert service failed to become ready" in normalized
+            or "tolbert service exited before startup ready" in normalized
+        )
+
+    def fallback_decision(
+        self,
+        state: AgentState,
+        *,
+        failure_origin: str = "",
+        error_text: str = "",
+    ) -> ActionDecision | None:
+        normalized_failure_origin = str(failure_origin).strip()
+        allow_fallback = normalized_failure_origin == "inference_failure"
+        allow_progressive_first_step = False
+        if (
+            not allow_fallback
+            and normalized_failure_origin == "retrieval_failure"
+            and bool(self.config.use_tolbert_context)
+            and self._is_retryable_tolbert_startup_failure(error_text)
+        ):
+            allow_fallback = True
+            allow_progressive_first_step = True
+        if not allow_fallback:
             return None
         source_task_id = str(state.task.metadata.get("source_task", "")).strip()
         preferred_task_ids = [source_task_id] if source_task_id else []
@@ -281,6 +314,7 @@ class LLMDecisionPolicy(Policy):
             top_skill=top_skill,
             retrieval_guidance=retrieval_guidance,
             blocked_commands=blocked_commands,
+            allow_partial_first_step=allow_progressive_first_step,
         )
         if fallback is None:
             return None
@@ -292,7 +326,7 @@ class LLMDecisionPolicy(Policy):
             blocked_commands=blocked_commands,
             route_mode=tolbert_route.mode,
         )
-        return self._apply_tolbert_shadow(fallback, tolbert_shadow, tolbert_route.mode)
+        return self._apply_tolbert_shadow(fallback, tolbert_shadow, tolbert_route.mode, state=state)
 
     def _emit_decision_progress(self, stage: str, **payload: object) -> None:
         if self._decision_progress_callback is None:
@@ -351,6 +385,11 @@ class LLMDecisionPolicy(Policy):
         tolbert_mode = self._tolbert_mode()
         source_task_id = str(state.task.metadata.get("source_task", "")).strip()
         retrieval_guidance = self._retrieval_guidance(state)
+        self._emit_decision_progress(
+            "memory_retrieved",
+            retrieval_candidate_count=len(list(retrieval_guidance.get("recommended_commands", []) or [])),
+            retrieval_evidence_count=len(list(retrieval_guidance.get("evidence", []) or [])),
+        )
         preferred_task_ids = self._preferred_task_ids(state) if self._tolbert_skill_ranking_active(state) else []
         if source_task_id and source_task_id not in preferred_task_ids:
             preferred_task_ids = [source_task_id, *preferred_task_ids]
@@ -395,7 +434,7 @@ class LLMDecisionPolicy(Policy):
                 blocked_commands=blocked_commands,
             )
             if primary_decision is not None:
-                return self._apply_tolbert_shadow(primary_decision, tolbert_shadow, tolbert_route.mode)
+                return self._apply_tolbert_shadow(primary_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
         role = self._normalized_role(state)
         deterministic_decision = self._deterministic_role_decision(
@@ -406,9 +445,10 @@ class LLMDecisionPolicy(Policy):
             blocked_commands=blocked_commands,
             tolbert_mode=tolbert_mode,
             retrieval_has_signal=retrieval_has_signal,
+            tolbert_route_mode=tolbert_route.mode,
         )
         if deterministic_decision is not None:
-            return self._apply_tolbert_shadow(deterministic_decision, tolbert_shadow, tolbert_route.mode)
+            return self._apply_tolbert_shadow(deterministic_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
         followup_skill_decision = self._followup_skill_decision(
             state,
@@ -419,8 +459,14 @@ class LLMDecisionPolicy(Policy):
             retrieval_has_signal=retrieval_has_signal,
         )
         if followup_skill_decision is not None:
-            return self._apply_tolbert_shadow(followup_skill_decision, tolbert_shadow, tolbert_route.mode)
+            return self._apply_tolbert_shadow(followup_skill_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
+        self._emit_decision_progress("plan_candidates")
+        transition_preview = self._transition_preview(state)
+        self._emit_decision_progress(
+            "transition_simulated",
+            preview_candidate_count=len(list(transition_preview.get("candidates", []) or [])),
+        )
         self._emit_decision_progress("payload_build")
         payload = self.context_budgeter.build_payload(
             state=state,
@@ -432,7 +478,7 @@ class LLMDecisionPolicy(Policy):
             history_archive=dict(state.history_archive),
             llm_context_packet=self._llm_context_packet(state),
             retrieval_plan=self._retrieval_plan(state),
-            transition_preview=self._transition_preview(state),
+            transition_preview=transition_preview,
             available_skills=state.available_skills,
             prompt_adjustments=self._active_prompt_adjustments(),
             allowed_actions=sorted(ALLOWED_ACTIONS),
@@ -494,6 +540,30 @@ class LLMDecisionPolicy(Policy):
                 content,
                 state.task.workspace_subdir,
             )
+            if self._is_prohibited_null_command(state, content):
+                guarded_fallback = self._best_deterministic_fallback_decision(
+                    state,
+                    top_skill=top_skill,
+                    retrieval_guidance=retrieval_guidance,
+                    blocked_commands=blocked_commands,
+                )
+                if guarded_fallback is not None and not self._is_prohibited_null_command(
+                    state,
+                    guarded_fallback.content,
+                ):
+                    return self._apply_tolbert_shadow(guarded_fallback, tolbert_shadow, tolbert_route.mode, state=state)
+                return self._apply_tolbert_shadow(
+                    ActionDecision(
+                        thought="Reject null failing command proposed by the model.",
+                        action="respond",
+                        content="Stopping because the model proposed a prohibited null failing command.",
+                        done=True,
+                        decision_source="llm_guardrail",
+                    ),
+                    tolbert_shadow,
+                    tolbert_route.mode,
+                    state=state,
+                )
         matched_span_id = None
         if normalized["action"] == CODE_EXECUTE:
             matched_span_id = self._matching_retrieval_span_id(
@@ -510,7 +580,7 @@ class LLMDecisionPolicy(Policy):
                 or (retrieval_has_signal and self._tolbert_influence_enabled())
             ),
             selected_retrieval_span_id=matched_span_id,
-        ), tolbert_shadow, tolbert_route.mode)
+        ), tolbert_shadow, tolbert_route.mode, state=state)
 
     def _deterministic_role_decision(
         self,
@@ -522,6 +592,7 @@ class LLMDecisionPolicy(Policy):
         blocked_commands: list[str],
         tolbert_mode: str,
         retrieval_has_signal: bool,
+        tolbert_route_mode: str,
     ) -> ActionDecision | None:
         if role == "planner":
             decision = self._planner_direct_decision(
@@ -531,6 +602,7 @@ class LLMDecisionPolicy(Policy):
                 blocked_commands=blocked_commands,
                 tolbert_mode=tolbert_mode,
                 retrieval_has_signal=retrieval_has_signal,
+                tolbert_route_mode=tolbert_route_mode,
             )
             if decision is not None:
                 return decision
@@ -542,6 +614,7 @@ class LLMDecisionPolicy(Policy):
                 blocked_commands=blocked_commands,
                 tolbert_mode=tolbert_mode,
                 retrieval_has_signal=retrieval_has_signal,
+                tolbert_route_mode=tolbert_route_mode,
             )
             if decision is not None:
                 return decision
@@ -552,6 +625,7 @@ class LLMDecisionPolicy(Policy):
             blocked_commands=blocked_commands,
             tolbert_mode=tolbert_mode,
             retrieval_has_signal=retrieval_has_signal,
+            tolbert_route_mode=tolbert_route_mode,
         )
 
     def _planner_direct_decision(
@@ -563,6 +637,7 @@ class LLMDecisionPolicy(Policy):
         blocked_commands: list[str],
         tolbert_mode: str,
         retrieval_has_signal: bool,
+        tolbert_route_mode: str,
     ) -> ActionDecision | None:
         integrator_segment_decision = self._shared_repo_integrator_segment_direct_decision(
             state,
@@ -598,6 +673,7 @@ class LLMDecisionPolicy(Policy):
             top_skill=top_skill,
             recommended_commands=retrieval_guidance.get("recommended_command_spans", []),
             blocked_commands=blocked_commands,
+            route_mode=tolbert_route_mode,
         )
         if decision is None:
             return None
@@ -614,8 +690,9 @@ class LLMDecisionPolicy(Policy):
         blocked_commands: list[str],
         tolbert_mode: str,
         retrieval_has_signal: bool,
+        tolbert_route_mode: str,
     ) -> ActionDecision | None:
-        del top_skill, retrieval_guidance, tolbert_mode, retrieval_has_signal
+        del top_skill, retrieval_guidance, tolbert_mode, retrieval_has_signal, tolbert_route_mode
         integrator_segment_decision = self._shared_repo_integrator_segment_direct_decision(
             state,
             blocked_commands=blocked_commands,
@@ -666,6 +743,7 @@ class LLMDecisionPolicy(Policy):
         blocked_commands: list[str],
         tolbert_mode: str,
         retrieval_has_signal: bool,
+        tolbert_route_mode: str,
     ) -> ActionDecision | None:
         del tolbert_mode, retrieval_has_signal
         integrator_segment_decision = self._shared_repo_integrator_segment_direct_decision(
@@ -700,6 +778,7 @@ class LLMDecisionPolicy(Policy):
             top_skill=top_skill,
             recommended_commands=retrieval_guidance.get("recommended_command_spans", []),
             blocked_commands=blocked_commands,
+            route_mode=tolbert_route_mode,
         )
 
     def _followup_skill_decision(
@@ -902,6 +981,25 @@ class LLMDecisionPolicy(Policy):
         segments = self._shared_repo_integrator_grouped_segments(primary_command)
         if len(segments) < 2:
             return None
+        premerge_segment = self._shared_repo_integrator_premerge_segment(
+            state,
+            segments=segments,
+            required_branches=required_branches,
+            blocked_commands=blocked_commands,
+        )
+        if premerge_segment is not None:
+            normalized = _normalize_command_for_workspace(
+                premerge_segment,
+                state.task.workspace_subdir,
+            )
+            return ActionDecision(
+                thought="Prepare the shared-repo integrator workspace before accepting the required worker branch.",
+                action=CODE_EXECUTE,
+                content=normalized,
+                done=False,
+                decision_source="shared_repo_integrator_segment_direct",
+                retrieval_influenced=False,
+            )
         required_branch_segment = self._shared_repo_required_branch_segment(
             state,
             segments=segments,
@@ -965,6 +1063,87 @@ class LLMDecisionPolicy(Policy):
         )
 
     @staticmethod
+    def _shared_repo_unresolved_required_branches(
+        state: AgentState,
+        *,
+        required_branches: list[str],
+    ) -> set[str]:
+        unresolved = {branch for branch in required_branches if branch}
+        if not state.history:
+            return unresolved
+        unresolved = set()
+        verification = state.history[-1].verification if isinstance(state.history[-1].verification, dict) else {}
+        for reason in verification.get("reasons", []):
+            text = str(reason).strip()
+            if not text.startswith("required worker branch not accepted into "):
+                continue
+            branch = text.rsplit(": ", 1)[-1].strip()
+            if branch:
+                unresolved.add(branch)
+        return unresolved
+
+    def _shared_repo_integrator_premerge_segment(
+        self,
+        state: AgentState,
+        *,
+        segments: list[str],
+        required_branches: list[str],
+        blocked_commands: list[str],
+    ) -> str | None:
+        if not segments or not required_branches:
+            return None
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        workflow_guard = metadata.get("workflow_guard", {})
+        workflow_guard = dict(workflow_guard) if isinstance(workflow_guard, dict) else {}
+        if not (
+            verifier.get("resolved_conflict_paths")
+            or verifier.get("generated_paths")
+            or bool(workflow_guard.get("touches_generated_paths", False))
+        ):
+            return None
+        unresolved = self._shared_repo_unresolved_required_branches(
+            state,
+            required_branches=required_branches,
+        )
+        if not unresolved:
+            return None
+        blocked = {_canonicalize_command(command) for command in blocked_commands}
+        successful = state.all_successful_command_signatures()
+        prioritized_paths = [
+            str(path).strip()
+            for path in (
+                list(verifier.get("resolved_conflict_paths", []))
+                + list(verifier.get("expected_changed_paths", []))
+                + list(verifier.get("generated_paths", []))
+                + list(workflow_guard.get("claimed_paths", []))
+            )
+            if str(path).strip()
+        ]
+        first_unresolved_merge_index: int | None = None
+        for index, segment in enumerate(segments):
+            normalized = _normalize_command_for_workspace(segment, state.task.workspace_subdir)
+            if "git merge" in normalized and any(branch in normalized for branch in unresolved):
+                first_unresolved_merge_index = index
+                break
+        if first_unresolved_merge_index in {None, 0}:
+            return None
+        for segment in segments[:first_unresolved_merge_index]:
+            normalized = _normalize_command_for_workspace(segment, state.task.workspace_subdir)
+            canonical = _canonicalize_command(normalized)
+            if not canonical or canonical in blocked or canonical in successful:
+                continue
+            if prioritized_paths and not any(path in normalized for path in prioritized_paths):
+                continue
+            control_score = self._command_control_score(state, normalized)
+            adjusted_control_score = control_score + max(0, self._software_work_phase_gate_command_score(state, normalized))
+            if adjusted_control_score < -8:
+                continue
+            return segment
+        return None
+
+    @staticmethod
     def _shared_repo_required_branch_segment(
         state: AgentState,
         *,
@@ -973,17 +1152,10 @@ class LLMDecisionPolicy(Policy):
     ) -> str | None:
         if not segments or not required_branches:
             return None
-        unresolved = {branch for branch in required_branches if branch}
-        if state.history:
-            unresolved = set()
-            verification = state.history[-1].verification if isinstance(state.history[-1].verification, dict) else {}
-            for reason in verification.get("reasons", []):
-                text = str(reason).strip()
-                if not text.startswith("required worker branch not accepted into "):
-                    continue
-                branch = text.rsplit(": ", 1)[-1].strip()
-                if branch:
-                    unresolved.add(branch)
+        unresolved = LLMDecisionPolicy._shared_repo_unresolved_required_branches(
+            state,
+            required_branches=required_branches,
+        )
         if not unresolved:
             return None
         successful = state.all_successful_command_signatures()
@@ -1154,12 +1326,20 @@ class LLMDecisionPolicy(Policy):
             for item in phase_gate.get("gate_objectives", [])
             if str(item).strip()
         ] if isinstance(phase_gate, dict) else []
+        concrete_gate_objectives = [
+            objective
+            for objective in gate_objectives
+            if not state._is_generic_contract_subgoal(objective)
+        ]
         for command in state.task.suggested_commands[:5]:
             normalized = str(command).strip()
             canonical = _canonicalize_command(normalized)
             if not canonical or canonical in normalized_blocked:
                 continue
-            if gate_objectives and not self._command_matches_any_software_work_objective(normalized, gate_objectives):
+            if concrete_gate_objectives and not self._command_matches_any_software_work_objective(
+                normalized,
+                concrete_gate_objectives,
+            ):
                 continue
             if canonical in failed_commands and (state.consecutive_failures > 0 or state.consecutive_no_progress_steps > 0):
                 continue
@@ -1483,7 +1663,7 @@ class LLMDecisionPolicy(Policy):
 
     def _apply_pre_context_tolbert_route(self, state: AgentState, decision: ActionDecision) -> ActionDecision:
         route = self._tolbert_route_decision(state)
-        return self._apply_tolbert_shadow(decision, {}, route.mode)
+        return self._apply_tolbert_shadow(decision, {}, route.mode, state=state)
 
     def _reusable_context_packet(self, state: AgentState):
         packet = state.context_packet
@@ -1681,8 +1861,9 @@ class LLMDecisionPolicy(Policy):
         top_skill: dict[str, object] | None,
         recommended_commands: list[dict[str, str]],
         blocked_commands: list[str],
+        route_mode: str,
     ) -> ActionDecision | None:
-        if state.context_packet is None or not self._tolbert_direct_command_enabled():
+        if route_mode == "shadow" or state.context_packet is None or not self._tolbert_direct_command_enabled():
             return None
         trust_retrieval = bool(state.context_packet.control.get("trust_retrieval", False))
         confidence = float(state.context_packet.control.get("path_confidence", 0.0))
@@ -1711,6 +1892,7 @@ class LLMDecisionPolicy(Policy):
                     done=False,
                     selected_retrieval_span_id=str(entry.get("span_id", "")).strip() or None,
                     retrieval_influenced=True,
+                    decision_source="tolbert_direct",
                 )
         if (
             top_skill is not None
@@ -1920,6 +2102,8 @@ class LLMDecisionPolicy(Policy):
         return bool(covered_paths and covered_paths & expected_outputs and "git " in command)
 
     def _command_control_score(self, state: AgentState, command: str) -> int:
+        if self._is_prohibited_null_command(state, command):
+            return -1000
         score = self.universe_model.score_command(state.universe_summary, command)
         score += self.world_model.score_command(state.world_model_summary, command)
         score += self._transition_model_command_score(state, command)
@@ -1978,6 +2162,33 @@ class LLMDecisionPolicy(Policy):
             if "printf " in command or "> " in command:
                 score += 1
         return score
+
+    @staticmethod
+    def _is_literal_null_failing_command(command: str) -> bool:
+        normalized = str(command).strip()
+        return normalized in {"false", "/bin/false"}
+
+    def _command_explicitly_required_for_task(self, state: AgentState, command: str) -> bool:
+        normalized = str(command).strip()
+        if not normalized:
+            return False
+        if bool(state.task.metadata.get("allow_literal_failure_commands", False)):
+            return True
+        allowed_commands = [
+            *list(state.task.setup_commands),
+            *list(state.task.suggested_commands),
+        ]
+        success_command = str(state.task.success_command).strip()
+        if success_command:
+            allowed_commands.append(success_command)
+        normalized_allowed = {_canonicalize_command(candidate) for candidate in allowed_commands if str(candidate).strip()}
+        return _canonicalize_command(normalized) in normalized_allowed
+
+    def _is_prohibited_null_command(self, state: AgentState, command: str) -> bool:
+        return self._is_literal_null_failing_command(command) and not self._command_explicitly_required_for_task(
+            state,
+            command,
+        )
 
     def _campaign_contract_command_score(
         self,
@@ -2378,6 +2589,7 @@ class LLMDecisionPolicy(Policy):
             return None
         hybrid_runtime = self._tolbert_hybrid_runtime()
         best = candidates[0]
+        raw_best = best
         if bool(hybrid_runtime.get("primary_enabled", False)):
             candidate_lookup = {
                 f"{candidate.action}:{candidate.content}": candidate
@@ -2412,6 +2624,16 @@ class LLMDecisionPolicy(Policy):
                     **dict(best.proposal_metadata or {}),
                     **self._hybrid_candidate_metadata(scored[0]),
                 }
+        if (
+            raw_best.proposal_source == "expected_file_content"
+            and bool(dict(raw_best.proposal_metadata or {}).get("fallback_from_workspace_preview", False))
+            and not bool(dict(raw_best.proposal_metadata or {}).get("workspace_preview_has_complete_current_proof", False))
+            and not bool(dict(raw_best.proposal_metadata or {}).get("workspace_preview_has_explicit_hidden_gap_current_proof", False))
+            and not bool(dict(raw_best.proposal_metadata or {}).get("workspace_preview_has_bridged_hidden_gap_region_block", False))
+            and bool(best.proposal_source)
+            and best.proposal_source.startswith("structured_edit:")
+        ):
+            best = raw_best
         if best.action == CODE_EXECUTE and float(best.score) < float(runtime_policy.get("primary_min_command_score", 2)):
             return None
         return ActionDecision(
@@ -2647,6 +2869,7 @@ class LLMDecisionPolicy(Policy):
         top_skill: dict[str, object] | None,
         retrieval_guidance: dict[str, list[str]],
         blocked_commands: list[str],
+        allow_partial_first_step: bool = False,
     ) -> ActionDecision | None:
         candidates = self._tolbert_ranked_candidates(
             state,
@@ -2660,7 +2883,10 @@ class LLMDecisionPolicy(Policy):
                 continue
             if int(candidate.get("score", 0)) <= 0:
                 continue
-            if not self._first_step_command_covers_required_artifacts(state, command):
+            if (
+                not allow_partial_first_step
+                and not self._first_step_command_covers_required_artifacts(state, command)
+            ):
                 continue
             return ActionDecision(
                 thought="Use deterministic fallback after inference failure.",
@@ -2710,7 +2936,21 @@ class LLMDecisionPolicy(Policy):
         decision: ActionDecision,
         shadow_decision: dict[str, object],
         route_mode: str,
+        *,
+        state: AgentState | None = None,
     ) -> ActionDecision:
+        if (
+            state is not None
+            and decision.action == CODE_EXECUTE
+            and self._is_prohibited_null_command(state, decision.content)
+        ):
+            decision = ActionDecision(
+                thought="Reject prohibited null failing command before execution.",
+                action="respond",
+                content="Stopping because policy selected a prohibited null failing command.",
+                done=True,
+                decision_source="command_guardrail",
+            )
         decision.shadow_decision = dict(shadow_decision)
         if not decision.tolbert_route_mode:
             decision.tolbert_route_mode = route_mode if route_mode in {"shadow", "primary"} else ""
@@ -3191,6 +3431,7 @@ class LLMDecisionPolicy(Policy):
             selected_retrieval_span_id=selected_retrieval_span_id,
             retrieval_influenced=retrieval_influenced,
             retrieval_ranked_skill=retrieval_ranked_skill,
+            decision_source="skill_direct",
         )
 
     @staticmethod

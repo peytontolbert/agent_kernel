@@ -22,7 +22,7 @@ from .state_estimation_improvement import build_state_estimation_proposal_artifa
 from .tolbert_model_improvement import build_tolbert_model_candidate_artifact, cleanup_tolbert_model_candidate_storage
 from .transition_model_improvement import build_transition_model_proposal_artifact
 from .trust_improvement import build_trust_proposal_artifact
-from .kernel_catalog import kernel_catalog_list, kernel_catalog_mapping
+from .kernel_catalog import kernel_catalog_list, kernel_catalog_mapping, kernel_catalog_record_list
 from .universe_improvement import (
     build_operating_envelope_artifact,
     build_universe_constitution_artifact,
@@ -47,6 +47,8 @@ class SubsystemSpec:
     action: str = "observe"
     baseline_flag_updates: dict[str, bool] = field(default_factory=dict)
     candidate_flag_updates: dict[str, bool] = field(default_factory=dict)
+    capability_tags: tuple[str, ...] = ()
+    strategy_hooks: dict[str, str] = field(default_factory=dict)
 
 
 _BASE_FLAGS = {
@@ -57,9 +59,7 @@ _BASE_FLAGS = {
 
 def _load_builtin_specs() -> dict[str, SubsystemSpec]:
     specs: dict[str, SubsystemSpec] = {}
-    for item in kernel_catalog_list("subsystems", "builtin_specs"):
-        if not isinstance(item, dict):
-            continue
+    for item in kernel_catalog_record_list("subsystems", "builtin_specs"):
         subsystem_id = str(item.get("subsystem", "")).strip()
         if not subsystem_id:
             continue
@@ -80,6 +80,16 @@ def _load_builtin_specs() -> dict[str, SubsystemSpec]:
                 str(key): bool(value)
                 for key, value in dict(item.get("candidate_flag_updates", {})).items()
                 if str(key).strip()
+            },
+            capability_tags=tuple(
+                token
+                for token in (str(value).strip() for value in item.get("capability_tags", []))
+                if token
+            ),
+            strategy_hooks={
+                str(key): str(value).strip()
+                for key, value in dict(item.get("strategy_hooks", {})).items()
+                if str(key).strip() and str(value).strip()
             },
         )
     return specs
@@ -462,6 +472,7 @@ def generate_candidate_artifact(
     metrics,
     generation_kwargs: dict[str, object],
     candidate_artifact_path: Path,
+    progress=None,
 ) -> tuple[str, str, str]:
     spec = resolved_subsystem_spec(subsystem, config.capability_modules_path)
     artifact = ""
@@ -487,6 +498,7 @@ def generate_candidate_artifact(
             output_dir=candidate_artifact_path.parent / candidate_artifact_path.stem,
             metrics=metrics,
             current_payload=current_payload,
+            progress=progress,
             **generation_kwargs,
         )
         candidate_artifact_path.write_text(json.dumps(candidate_payload, indent=2), encoding="utf-8")
@@ -695,6 +707,22 @@ def external_subsystem_specs(capability_modules_path: Path | None) -> dict[str, 
             proposal_toggle_attr = str(item.get("proposal_toggle_attr", "")).strip()
             if proposal_toggle_attr and proposal_toggle_attr not in _CONFIG_FIELD_NAMES:
                 proposal_toggle_attr = ""
+            capability_tags: list[str] = list(base_spec.capability_tags)
+            seen_capability_tags = set(capability_tags)
+            for raw_tag in item.get("capability_tags", []):
+                tag = str(raw_tag).strip()
+                if tag and tag not in seen_capability_tags:
+                    seen_capability_tags.add(tag)
+                    capability_tags.append(tag)
+            strategy_hooks = dict(base_spec.strategy_hooks)
+            if isinstance(item.get("strategy_hooks"), dict):
+                strategy_hooks.update(
+                    {
+                        str(key): str(value).strip()
+                        for key, value in item["strategy_hooks"].items()
+                        if str(key).strip() and str(value).strip()
+                    }
+                )
             specs[subsystem_id] = SubsystemSpec(
                 subsystem=subsystem_id,
                 base_subsystem=base_subsystem,
@@ -705,6 +733,8 @@ def external_subsystem_specs(capability_modules_path: Path | None) -> dict[str, 
                 action=str(item.get("action", base_spec.action)).strip() or base_spec.action,
                 baseline_flag_updates=baseline_updates,
                 candidate_flag_updates=candidate_updates,
+                capability_tags=tuple(capability_tags),
+                strategy_hooks=strategy_hooks,
             )
     return specs
 

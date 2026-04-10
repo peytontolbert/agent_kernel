@@ -14,7 +14,7 @@ from .actions import CODE_EXECUTE
 from .config import KernelConfig
 from .episode_store import episode_storage_metadata
 from .learning_compiler import persist_episode_learning_candidates
-from .llm import MockLLMClient, OllamaClient, TolbertFallbackClient, VLLMClient
+from .llm import MockLLMClient, OllamaClient, VLLMClient
 from .memory import EpisodeMemory, GraphMemory
 from .modeling.artifacts import load_model_artifact, retained_tolbert_hybrid_runtime
 from .modeling.tolbert.runtime import infer_hybrid_world_signal
@@ -30,7 +30,7 @@ from .policy import LLMDecisionPolicy, Policy, SkillLibrary
 from .runtime_supervision import atomic_write_json
 from .prompt_improvement import retained_planner_controls
 from .sandbox import Sandbox
-from .schemas import EpisodeRecord, StepRecord, TaskSpec
+from .schemas import EpisodeRecord, StepRecord, TaskSpec, episode_success_criteria
 from .shared_repo import (
     materialize_shared_repo_workspace,
     prepare_runtime_task,
@@ -69,9 +69,10 @@ class AgentKernel:
 
     def _build_default_policy(self) -> Policy:
         repo_root = Path(__file__).resolve().parents[1]
+        provider = self.config.normalized_provider()
         context_provider = None
         if self.config.use_tolbert_context:
-            if self.config.provider == "mock":
+            if provider == "mock":
                 context_provider = MockTolbertContextCompiler(config=self.config, repo_root=repo_root)
             else:
                 context_provider = TolbertContextCompiler(config=self.config, repo_root=repo_root)
@@ -83,7 +84,7 @@ class AgentKernel:
             if self.config.use_skills
             else SkillLibrary([])
         )
-        if self.config.provider == "ollama":
+        if provider == "ollama":
             client = OllamaClient(
                 host=self.config.ollama_host,
                 model_name=self.config.model_name,
@@ -97,7 +98,7 @@ class AgentKernel:
                 skill_library=skill_library,
                 config=self.config,
             )
-        if self.config.provider == "vllm":
+        if provider == "vllm":
             client = VLLMClient(
                 host=self.config.vllm_host,
                 model_name=self.config.model_name,
@@ -112,16 +113,9 @@ class AgentKernel:
                 skill_library=skill_library,
                 config=self.config,
             )
-        if self.config.provider == "mock":
+        if provider == "mock":
             return LLMDecisionPolicy(
                 MockLLMClient(),
-                context_provider=context_provider,
-                skill_library=skill_library,
-                config=self.config,
-            )
-        if self.config.provider == "tolbert":
-            return LLMDecisionPolicy(
-                TolbertFallbackClient(),
                 context_provider=context_provider,
                 skill_library=skill_library,
                 config=self.config,
@@ -284,6 +278,15 @@ class AgentKernel:
                     )
         if self.config.use_graph_memory and not state.graph_summary:
             state.graph_summary = self.graph_memory.summarize(task.task_id)
+            self._emit_progress_callback(
+                progress_callback,
+                {
+                    "event": "memory_retrieved",
+                    "step_stage": "memory_retrieved",
+                    "step_subphase": "graph_memory",
+                    "completed_steps": state.completed_step_count(),
+                },
+            )
         if not state.universe_summary:
             state.universe_summary = self.universe_model.summarize(
                 task,
@@ -302,6 +305,15 @@ class AgentKernel:
                     state.graph_summary,
                     workspace=workspace,
                     workspace_snapshot=state.workspace_snapshot,
+                )
+                self._emit_progress_callback(
+                    progress_callback,
+                    {
+                        "event": "state_estimated",
+                        "step_stage": "state_estimated",
+                        "step_subphase": "world_model_initial",
+                        "completed_steps": state.completed_step_count(),
+                    },
                 )
                 state.universe_summary = self.universe_model.summarize(
                     task,
@@ -384,7 +396,11 @@ class AgentKernel:
             except Exception as exc:
                 failure_origin = self.classify_policy_failure(exc)
                 failure_signals = [failure_origin]
-                fallback_decision = self.policy.fallback_decision(state, failure_origin=failure_origin)
+                fallback_decision = self.policy.fallback_decision(
+                    state,
+                    failure_origin=failure_origin,
+                    error_text=str(exc),
+                )
                 if fallback_decision is not None:
                     fallback_decision.proposal_metadata = {
                         **dict(fallback_decision.proposal_metadata or {}),
@@ -448,6 +464,17 @@ class AgentKernel:
                     state.graph_summary,
                     workspace=workspace,
                     workspace_snapshot=state.workspace_snapshot,
+                )
+                self._emit_progress_callback(
+                    progress_callback,
+                    {
+                        "event": "world_model_updated",
+                        "step_index": step_index,
+                        "step_stage": "world_model_updated",
+                        "completed_steps": state.completed_step_count(),
+                        "active_subgoal": step_active_subgoal,
+                        "acting_role": step_role,
+                    },
                 )
                 state.universe_summary = self.universe_model.summarize(
                     task,
@@ -524,6 +551,18 @@ class AgentKernel:
                 state_transition=transition,
                 software_work_objective=step_software_work_objective,
             )
+            self._emit_progress_callback(
+                progress_callback,
+                {
+                    "event": "memory_update_written",
+                    "step_index": step_index,
+                    "step_stage": "memory_update_written",
+                    "completed_steps": state.completed_step_count(),
+                    "active_subgoal": step_active_subgoal,
+                    "acting_role": step_role,
+                    "verification_passed": bool(verification["passed"]),
+                },
+            )
             if step_role == "critic":
                 self._attach_critic_subgoal_diagnoses(
                     state,
@@ -533,11 +572,34 @@ class AgentKernel:
                     failure_origin=failure_origin,
                     command_result=command_result,
                 )
+                self._emit_progress_callback(
+                    progress_callback,
+                    {
+                        "event": "critique_reflected",
+                        "step_index": step_index,
+                        "step_stage": "critique_reflected",
+                        "completed_steps": state.completed_step_count(),
+                        "active_subgoal": step_active_subgoal,
+                        "acting_role": step_role,
+                    },
+                )
             if not verification["passed"]:
                 self._attach_verifier_subgoal_diagnoses(
                     state,
                     step_index=step_index,
                     verification_reasons=verification["reasons"],
+                )
+                self._emit_progress_callback(
+                    progress_callback,
+                    {
+                        "event": "verification_result",
+                        "step_index": step_index,
+                        "step_stage": "verification_result",
+                        "completed_steps": state.completed_step_count(),
+                        "active_subgoal": step_active_subgoal,
+                        "acting_role": step_role,
+                        "verification_passed": False,
+                    },
                 )
                 if self.config.use_planner:
                     self._promote_prioritized_subgoals(
@@ -653,6 +715,8 @@ class AgentKernel:
             history_archive=dict(state.history_archive),
             termination_reason=termination_reason,
         )
+        success_contract = episode_success_criteria(episode)
+        episode.success = bool(success_contract["verifier_aligned_task_success"])
         episode_path = None
         if self.config.persist_episode_memory:
             episode_path = self.memory.save(episode)
@@ -950,11 +1014,15 @@ class AgentKernel:
         return deduped[:max_initial_subgoals]
 
     def _refresh_planner_subgoals(self, state: AgentState) -> None:
-        state.refresh_plan_progress(state.world_model_summary)
         verifier_hotspots = self._verifier_hotspot_subgoals(self._latest_failed_verification_reasons(state))
         learned_hotspots = self._learned_world_hotspot_entries(state)
         hotspot_subgoals = [*verifier_hotspots, *[str(entry.get("subgoal", "")).strip() for entry in learned_hotspots]]
+        state.refresh_plan_progress(
+            state.world_model_summary,
+            expand_long_horizon=bool(hotspot_subgoals),
+        )
         if not hotspot_subgoals:
+            self._refresh_planner_recovery_artifact(state)
             return
         learned_priority_by_goal = {
             str(entry.get("subgoal", "")).strip(): int(entry.get("priority", 0) or 0)

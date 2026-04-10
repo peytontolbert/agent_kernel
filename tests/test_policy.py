@@ -15,7 +15,7 @@ from agent_kernel.modeling.policy.decoder import (
 from agent_kernel.modeling.world.latent_state import build_latent_state_summary
 from agent_kernel.modeling.world.rollout import rollout_action_value
 from agent_kernel.policy import LLMDecisionPolicy, SkillLibrary
-from agent_kernel.schemas import ContextPacket, StepRecord, TaskSpec
+from agent_kernel.schemas import ActionDecision, ContextPacket, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
 from agent_kernel.task_bank import TaskBank
 
@@ -179,6 +179,9 @@ def test_llm_policy_emits_decision_progress_stages_for_llm_path():
         "context_compile",
         "context_ready",
         "universe_summary",
+        "memory_retrieved",
+        "plan_candidates",
+        "transition_simulated",
         "payload_build",
         "llm_request",
         "llm_response",
@@ -16778,6 +16781,17 @@ class WorkspacePrefixedClient:
         }
 
 
+class FalseCommandClient:
+    def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+        del system_prompt, decision_prompt, state_payload
+        return {
+            "thought": "run a null failing command",
+            "action": "code_execute",
+            "content": "false",
+            "done": False,
+        }
+
+
 def test_llm_policy_falls_back_on_unsupported_action():
     decision = LLMDecisionPolicy(InvalidActionClient()).decide(AgentState(task=TaskBank().get("hello_task")))
 
@@ -16793,6 +16807,91 @@ def test_llm_policy_normalizes_workspace_prefixed_llm_commands():
 
     assert decision.action == "code_execute"
     assert decision.content == "printf 'done\\n' > note.txt"
+
+
+def test_llm_policy_rejects_prohibited_null_failing_llm_commands():
+    decision = LLMDecisionPolicy(FalseCommandClient(), config=KernelConfig(provider="mock", use_tolbert_context=False)).decide(
+        AgentState(
+            task=TaskSpec(
+                task_id="null_guard_task",
+                prompt="Create ready.txt.",
+                workspace_subdir="null_guard_task",
+                suggested_commands=[],
+                expected_files=["ready.txt"],
+                expected_file_contents={"ready.txt": "ready\n"},
+                metadata={"benchmark_family": "bounded"},
+            )
+        )
+    )
+
+    assert decision.action == "respond"
+    assert decision.done is True
+    assert decision.decision_source == "llm_guardrail"
+
+
+def test_llm_policy_allows_explicit_task_required_false_command():
+    decision = LLMDecisionPolicy(FalseCommandClient(), config=KernelConfig(provider="mock", use_tolbert_context=False)).decide(
+        AgentState(
+            task=TaskSpec(
+                task_id="explicit_false_task",
+                prompt="Run the explicit failing command.",
+                workspace_subdir="explicit_false_task",
+                suggested_commands=["false"],
+                metadata={"benchmark_family": "bounded"},
+            )
+        )
+    )
+
+    assert decision.action == "code_execute"
+    assert decision.content == "false"
+
+
+def test_apply_tolbert_shadow_rejects_prohibited_null_failing_direct_command():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(provider="mock", use_tolbert_context=False))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="null_guard_task",
+            prompt="Create ready.txt.",
+            workspace_subdir="null_guard_task",
+            expected_files=["ready.txt"],
+            expected_file_contents={"ready.txt": "ready\n"},
+            metadata={"benchmark_family": "bounded"},
+        )
+    )
+
+    decision = policy._apply_tolbert_shadow(
+        ActionDecision(
+            thought="execute direct command",
+            action="code_execute",
+            content="false",
+            done=False,
+            decision_source="tolbert_direct",
+        ),
+        {},
+        "primary",
+        state=state,
+    )
+
+    assert decision.action == "respond"
+    assert decision.done is True
+    assert decision.decision_source == "command_guardrail"
+
+
+def test_skill_action_decision_uses_non_llm_source():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(provider="mock", use_tolbert_context=False))
+    state = AgentState(task=TaskBank().get("hello_task"))
+
+    decision = policy._skill_action_decision(
+        state,
+        {
+            "skill_id": "skill:hello_task:primary",
+            "procedure": {"commands": ["printf 'hello agent kernel\\n' > hello.txt"]},
+        },
+        thought_prefix="Use skill",
+    )
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "skill_direct"
 
 
 def test_llm_policy_uses_matching_skill_before_llm():
@@ -17629,6 +17728,28 @@ def test_llm_policy_records_retrieval_span_for_ranked_skill():
     assert decision.selected_skill_id == "skill:hello_task:primary"
     assert decision.selected_retrieval_span_id == "task:hello:suggested:1"
     assert decision.retrieval_ranked_skill is True
+
+
+def test_choose_tolbert_route_allows_trusted_primary_override_below_min_confidence():
+    from agent_kernel.modeling.policy.runtime import choose_tolbert_route
+
+    route = choose_tolbert_route(
+        runtime_policy={
+            "primary_benchmark_families": ["project"],
+            "shadow_benchmark_families": ["project"],
+            "min_path_confidence": 0.7,
+            "allow_trusted_primary_without_min_confidence": True,
+            "trusted_primary_min_confidence": 0.4,
+            "require_trusted_retrieval": True,
+            "use_latent_state": True,
+        },
+        benchmark_family="project",
+        path_confidence=0.45,
+        trust_retrieval=True,
+    )
+
+    assert route.mode == "primary"
+    assert "override" in route.reason
 
 
 def test_llm_policy_applies_retained_retrieval_threshold_overrides(tmp_path):

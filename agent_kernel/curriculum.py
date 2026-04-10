@@ -322,9 +322,10 @@ class CurriculumEngine:
         selected_groups: set[str] = set()
         selected_families: set[str] = set()
         selected_contract_kinds: set[str] = set()
+        selected_repo_semantic_clusters: set[str] = set()
         while remaining and len(selected) < limit:
             best_index = 0
-            best_score: tuple[int, int, int, int] | None = None
+            best_score: tuple[int, int, int, int, int, int] | None = None
             for index, episode in enumerate(remaining):
                 incremental_bonus = self._failure_recovery_seed_incremental_bonus(
                     episode,
@@ -333,6 +334,10 @@ class CurriculumEngine:
                     selected_families=selected_families,
                     selected_contract_kinds=selected_contract_kinds,
                 )
+                semantic_cluster_gain = self._repo_semantic_cluster_gain(
+                    episode,
+                    selected_clusters=selected_repo_semantic_clusters,
+                )
                 replay_penalty = self._failure_recovery_replay_penalty(episode)
                 score = (
                     self._generated_seed_base_priority(
@@ -340,13 +345,15 @@ class CurriculumEngine:
                         preferred_family=preferred_family,
                     )
                     + self._failure_recovery_seed_priority(episode)
-                    + incremental_bonus,
+                    + incremental_bonus
+                    + semantic_cluster_gain,
                     self._generated_seed_base_priority(
                         episode,
                         preferred_family=preferred_family,
                     )
                     + self._failure_recovery_seed_priority(episode),
                     self._failure_recovery_seed_priority(episode) + incremental_bonus,
+                    semantic_cluster_gain,
                     -replay_penalty,
                     len(self._failure_types(episode)),
                 )
@@ -366,6 +373,7 @@ class CurriculumEngine:
             contract_kind = self._episode_light_supervision_contract_kind(chosen)
             if contract_kind:
                 selected_contract_kinds.add(contract_kind)
+            selected_repo_semantic_clusters.update(self._episode_repo_semantic_clusters(chosen))
         return selected
 
     def _late_wave_seed_coverage_expansion_priority(self, episode: EpisodeRecord) -> int:
@@ -1062,6 +1070,7 @@ class CurriculumEngine:
         selected_branch_kinds: set[str] = set()
         selected_stage_family_keys: set[str] = set()
         selected_groups: set[str] = set()
+        selected_repo_semantic_clusters: set[str] = set()
         selected_shared_repo_worker_branches: dict[str, set[str]] = {}
         remaining_budget_units = self._adjacent_success_seed_budget_units(limit)
         bundle_state = self._adjacent_success_shared_repo_bundle_state(episodes)
@@ -1094,6 +1103,12 @@ class CurriculumEngine:
                 total_value = (
                     (4.0 if seed_group not in selected_groups else -4.0)
                     + float(incremental_bonus)
+                    + float(
+                        self._repo_semantic_cluster_gain(
+                            episode,
+                            selected_clusters=selected_repo_semantic_clusters,
+                        )
+                    )
                     + float(
                         self._adjacent_success_shared_repo_incremental_bonus(
                             episode,
@@ -1225,6 +1240,7 @@ class CurriculumEngine:
             if branch_kind:
                 selected_branch_kinds.add(branch_kind)
             selected_groups.add(self._adjacent_success_seed_group(episode))
+            selected_repo_semantic_clusters.update(self._episode_repo_semantic_clusters(episode))
             selected_shared_repo_worker_branches = self._selected_shared_repo_worker_branches_after_pick(
                 selected_shared_repo_worker_branches,
                 episode,
@@ -2090,6 +2106,31 @@ class CurriculumEngine:
             for key, value in contract_metadata.items():
                 metadata.setdefault(str(key), value)
         return metadata
+
+    @staticmethod
+    def _episode_repo_semantic_clusters(episode: EpisodeRecord) -> list[str]:
+        metadata = CurriculumEngine._episode_curriculum_metadata(episode)
+        values = metadata.get("repo_semantics", [])
+        if not isinstance(values, list):
+            values = []
+        normalized = [str(value).strip().lower() for value in values if str(value).strip()]
+        if not normalized:
+            benchmark_family = str(metadata.get("benchmark_family", "bounded")).strip().lower() or "bounded"
+            normalized = [benchmark_family]
+        deduped: list[str] = []
+        for value in normalized:
+            if value not in deduped:
+                deduped.append(value)
+        return deduped
+
+    @classmethod
+    def _repo_semantic_cluster_gain(cls, episode: EpisodeRecord, *, selected_clusters: set[str]) -> int:
+        clusters = {
+            value
+            for value in cls._episode_repo_semantic_clusters(episode)
+            if str(value).strip()
+        }
+        return min(3, len(clusters - set(selected_clusters)))
 
     @staticmethod
     def _episode_lineage_families(episode: EpisodeRecord) -> list[str]:

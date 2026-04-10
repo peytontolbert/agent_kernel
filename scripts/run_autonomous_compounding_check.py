@@ -1467,6 +1467,119 @@ def _average(values: list[float]) -> float:
     return 0.0 if not values else sum(values) / len(values)
 
 
+def _coerced_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerced_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _retrieval_carryover_summary(results: list[dict[str, object]]) -> dict[str, object]:
+    runs_with_metrics: list[int] = []
+    runs_with_verified_improvement: list[int] = []
+    runs_with_verified_non_regression: list[int] = []
+    runs_missing_verified_non_regression: list[int] = []
+    observed_retrieval_decision_count = 0
+    best_trusted_carryover_repair_rate = 0.0
+    best_trusted_carryover_verified_steps = 0
+
+    carryover_metric_keys = {
+        "trusted_carryover_repair_rate",
+        "baseline_trusted_carryover_repair_rate",
+        "trusted_carryover_verified_steps",
+        "baseline_trusted_carryover_verified_steps",
+        "trusted_carryover_verified_step_delta",
+    }
+
+    for result in results:
+        run_index = int(result.get("run_index", 0) or 0)
+        report_payload = result.get("report_payload", {})
+        if not isinstance(report_payload, dict):
+            report_payload = {}
+        decisions = report_payload.get("recent_runtime_managed_decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+        run_observed_metrics = False
+        run_verified_improvement = False
+        run_verified_non_regression = False
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+            subsystem = str(decision.get("subsystem", "")).strip()
+            if subsystem and subsystem != "retrieval":
+                continue
+            metrics = decision.get("metrics_summary", {})
+            if not isinstance(metrics, dict) or not any(key in metrics for key in carryover_metric_keys):
+                continue
+            observed_retrieval_decision_count += 1
+            run_observed_metrics = True
+            trusted_carryover_repair_rate = max(
+                0.0,
+                _coerced_float(metrics.get("trusted_carryover_repair_rate", 0.0)),
+            )
+            baseline_trusted_carryover_repair_rate = max(
+                0.0,
+                _coerced_float(metrics.get("baseline_trusted_carryover_repair_rate", 0.0)),
+            )
+            trusted_carryover_verified_steps = max(
+                0,
+                _coerced_int(metrics.get("trusted_carryover_verified_steps", 0)),
+            )
+            baseline_trusted_carryover_verified_steps = max(
+                0,
+                _coerced_int(metrics.get("baseline_trusted_carryover_verified_steps", 0)),
+            )
+            trusted_carryover_verified_step_delta = _coerced_int(
+                metrics.get("trusted_carryover_verified_step_delta", 0)
+            )
+            best_trusted_carryover_repair_rate = max(
+                best_trusted_carryover_repair_rate,
+                trusted_carryover_repair_rate,
+            )
+            best_trusted_carryover_verified_steps = max(
+                best_trusted_carryover_verified_steps,
+                trusted_carryover_verified_steps,
+            )
+            if (
+                trusted_carryover_verified_step_delta > 0
+                or trusted_carryover_repair_rate > baseline_trusted_carryover_repair_rate
+            ):
+                run_verified_improvement = True
+            if (
+                trusted_carryover_verified_steps > 0
+                and trusted_carryover_repair_rate >= baseline_trusted_carryover_repair_rate
+                and trusted_carryover_verified_steps >= baseline_trusted_carryover_verified_steps
+            ):
+                run_verified_non_regression = True
+        if run_observed_metrics:
+            runs_with_metrics.append(run_index)
+            if run_verified_improvement:
+                runs_with_verified_improvement.append(run_index)
+            if run_verified_non_regression:
+                runs_with_verified_non_regression.append(run_index)
+            else:
+                runs_missing_verified_non_regression.append(run_index)
+
+    return {
+        "runs_checked": len(results),
+        "observed_retrieval_decision_count": observed_retrieval_decision_count,
+        "runs_with_retrieval_carryover_metrics": runs_with_metrics,
+        "runs_with_verified_carryover_improvement": runs_with_verified_improvement,
+        "runs_with_verified_carryover_non_regression": runs_with_verified_non_regression,
+        "runs_missing_verified_carryover_non_regression": runs_missing_verified_non_regression,
+        "best_trusted_carryover_repair_rate": round(best_trusted_carryover_repair_rate, 4),
+        "best_trusted_carryover_verified_steps": best_trusted_carryover_verified_steps,
+        "carryover_pressure": bool(runs_missing_verified_non_regression),
+    }
+
+
 def _result_stream_for_run(result: dict[str, object]) -> dict[str, object]:
     report_payload = result.get("report_payload", {})
     if not isinstance(report_payload, dict):
@@ -2400,6 +2513,7 @@ def _claim_gate_summary(
     family_transfer_investment_ranking = _family_transfer_investment_ranking(results)
     frontier_expansion_summary = _frontier_expansion_summary(results)
     required_family_clean_task_root_breadth = _required_family_clean_task_root_breadth_summary(results)
+    retrieval_carryover_summary = _retrieval_carryover_summary(results)
     priority_family_allocation_audit = _priority_family_allocation_audit(
         results,
         confidence_controls=confidence_controls,
@@ -2452,6 +2566,8 @@ def _claim_gate_summary(
         blockers.append("non_replay_transfer_return_on_cost_too_low")
     if required_family_clean_task_root_breadth["families_missing_clean_task_root_breadth"]:
         blockers.append("required_family_clean_task_root_breadth_too_narrow")
+    if bool(retrieval_carryover_summary.get("carryover_pressure", False)):
+        blockers.append("trusted_retrieval_carryover_not_proven")
     retained_cycle_spread = 0.0 if not retained_cycles else max(retained_cycles) - min(retained_cycles)
     retained_pass_rate_delta_spread = (
         0.0 if not retained_pass_deltas else max(retained_pass_deltas) - min(retained_pass_deltas)
@@ -2477,6 +2593,7 @@ def _claim_gate_summary(
         "family_transfer_investment_ranking": family_transfer_investment_ranking,
         "frontier_expansion_summary": frontier_expansion_summary,
         "required_family_clean_task_root_breadth": required_family_clean_task_root_breadth,
+        "retrieval_carryover_summary": retrieval_carryover_summary,
         "priority_family_allocation_audit": priority_family_allocation_audit,
         "autonomous_compounding_claim_ready": not blockers,
         "blockers": blockers,
@@ -2568,17 +2685,20 @@ def _write_status(
         requested_priority_benchmark_families=priority_benchmark_families,
     )
     families_sampled = _string_list(frontier_expansion_summary, "families_sampled")
-    if not families_sampled:
+    if "families_sampled" not in frontier_expansion_summary:
         families_sampled = retained_child_snapshot["families_sampled"]
     families_never_sampled = _string_list(frontier_expansion_summary, "families_never_sampled")
-    if not families_never_sampled:
+    if "families_never_sampled" not in frontier_expansion_summary:
         families_never_sampled = retained_child_snapshot["families_never_sampled"]
     pressure_families_without_sampling = _string_list(frontier_expansion_summary, "pressure_families_without_sampling")
-    if not pressure_families_without_sampling:
+    if "pressure_families_without_sampling" not in frontier_expansion_summary:
         pressure_families_without_sampling = retained_child_snapshot["pressure_families_without_sampling"]
     family_transfer_summary = claim_gate_summary.get("family_transfer_summary", {})
     if not isinstance(family_transfer_summary, dict):
         family_transfer_summary = {}
+    retrieval_carryover_summary = claim_gate_summary.get("retrieval_carryover_summary", {})
+    if not isinstance(retrieval_carryover_summary, dict):
+        retrieval_carryover_summary = {}
     latest_completed_run = results[-1] if results else {}
     completed_run_summaries = [
         {
@@ -2626,6 +2746,7 @@ def _write_status(
         "partial_summary": summary,
         "partial_frontier_expansion_summary": frontier_expansion_summary,
         "partial_family_transfer_summary": family_transfer_summary,
+        "partial_retrieval_carryover_summary": retrieval_carryover_summary,
         "pressure_families_without_sampling": pressure_families_without_sampling,
         "families_sampled": families_sampled,
         "families_never_sampled": families_never_sampled,

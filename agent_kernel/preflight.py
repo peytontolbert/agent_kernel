@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import sys
 from typing import Any, Callable
 from urllib import error as url_error
 from urllib import request as url_request
@@ -638,16 +639,17 @@ def _provider_health_check(
     *,
     opener: Callable[..., Any],
 ) -> PreflightCheck:
-    if config.provider == "mock":
+    provider = config.normalized_provider()
+    if provider == "mock":
         return PreflightCheck(name="provider_health", passed=True, detail="mock provider requires no health probe")
-    if config.provider == "ollama":
+    if provider == "ollama":
         return _http_health_check(
             name="provider_health",
             detail_label="ollama",
             url=f"{config.ollama_host.rstrip('/')}/api/tags",
             opener=opener,
         )
-    if config.provider == "vllm":
+    if provider == "vllm":
         headers = {}
         if config.vllm_api_key.strip():
             headers["Authorization"] = f"Bearer {config.vllm_api_key.strip()}"
@@ -734,7 +736,41 @@ def _tolbert_assets_check(config: KernelConfig, *, repo_root: Path) -> Preflight
             passed=False,
             detail="missing required tolbert assets: " + ", ".join(missing),
         )
-    return PreflightCheck(name="tolbert_assets", passed=True, detail="required tolbert assets present")
+    runtime_check = _tolbert_runtime_import_check(repo_root=repo_root)
+    if not runtime_check.passed:
+        return runtime_check
+    return PreflightCheck(name="tolbert_assets", passed=True, detail="required tolbert assets and runtime imports present")
+
+
+def _tolbert_runtime_import_check(*, repo_root: Path) -> PreflightCheck:
+    tolbert_root = repo_root / "other_repos" / "TOLBERT"
+    tolbert_brain_root = Path("/data/TOLBERT_BRAIN")
+    search_roots = [tolbert_root, tolbert_brain_root]
+    missing_roots = [str(path) for path in search_roots if not path.exists()]
+    if missing_roots:
+        return PreflightCheck(
+            name="tolbert_assets",
+            passed=False,
+            detail="missing tolbert runtime roots: " + ", ".join(missing_roots),
+        )
+    for path in reversed(search_roots):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    missing_runtime_paths: list[str] = []
+    expected_paths = {
+        "tolbert": tolbert_root / "tolbert" / "__init__.py",
+        "tolbert_brain.brain": tolbert_brain_root / "tolbert_brain" / "brain.py",
+    }
+    for label, path in expected_paths.items():
+        if not path.exists():
+            missing_runtime_paths.append(f"{label}={path}")
+    if missing_runtime_paths:
+        return PreflightCheck(
+            name="tolbert_assets",
+            passed=False,
+            detail="missing tolbert runtime modules: " + ", ".join(missing_runtime_paths),
+        )
+    return PreflightCheck(name="tolbert_assets", passed=True, detail="tolbert runtime imports resolved")
 
 
 def _paper_research_assets_check(config: KernelConfig, *, repo_root: Path) -> PreflightCheck:

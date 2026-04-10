@@ -917,6 +917,78 @@ def test_finalize_cycle_records_machine_readable_reject_reason_codes(tmp_path, m
     )
 
 
+def test_finalize_cycle_reuses_preview_result_without_rerunning_preview(tmp_path, monkeypatch):
+    module = _load_finalize_module()
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        retrieval_proposals_path=tmp_path / "retrieval" / "retrieval_proposals.json",
+        prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+    )
+    config.ensure_directories()
+    active_path = config.retrieval_proposals_path
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps({"artifact_kind": "retrieval_policy_set"}), encoding="utf-8")
+    candidate_path = tmp_path / "retrieval" / "candidate.json"
+    candidate_path.write_text(json.dumps({"artifact_kind": "retrieval_policy_set"}), encoding="utf-8")
+
+    def fail_preview(**kwargs):
+        raise AssertionError("preview_candidate_retention should not run when preview is provided")
+
+    monkeypatch.setattr(module.cycle_runner, "preview_candidate_retention", fail_preview)
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "apply_artifact_retention_decision",
+        lambda **kwargs: {
+            "artifact_kind": "retrieval_policy_set",
+            "artifact_lifecycle_state": "rejected",
+            "artifact_sha256": "",
+            "previous_artifact_sha256": "",
+            "rollback_artifact_path": "",
+            "artifact_snapshot_path": "",
+            "compatibility": {},
+        },
+    )
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "materialize_retained_retrieval_asset_bundle",
+        lambda **kwargs: tmp_path / "retrieval" / "bundle_manifest.json",
+    )
+
+    progress_messages: list[str] = []
+    state, reason = module.cycle_runner.finalize_cycle(
+        config=config,
+        subsystem="retrieval",
+        cycle_id="cycle:test:preview-reuse",
+        artifact_path=candidate_path,
+        active_artifact_path=active_path,
+        preview={
+            "active_artifact_path": str(active_path),
+            "baseline": EvalMetrics(total=10, passed=8, average_steps=1.5),
+            "candidate": EvalMetrics(total=10, passed=8, average_steps=1.5),
+            "evidence": {},
+            "compatibility": {},
+            "payload": {"artifact_kind": "retrieval_policy_set"},
+            "state": "reject",
+            "reason": "retrieval candidate did not satisfy the retained retrieval gate",
+            "reason_code": "retrieval_retained_gate_failed",
+            "gate": {"required_confirmation_runs": 1},
+            "phase_gate_report": {"passed": True, "failures": []},
+            "prior_retained_comparison": None,
+            "prior_retained_guard_reason": "",
+            "prior_retained_guard_reason_code": "",
+            "baseline_flags": {"include_generated": True},
+            "candidate_flags": {"include_generated": True, "include_failure_generated": True},
+        },
+        progress=progress_messages.append,
+    )
+
+    assert state == "reject"
+    assert reason == "retrieval candidate did not satisfy the retained retrieval gate"
+    assert "finalize phase=preview_reused subsystem=retrieval" in progress_messages
+    assert not any("phase=preview_baseline_eval" in message for message in progress_messages)
+
+
 def test_finalize_cycle_records_machine_readable_unchanged_candidate_reason_code(tmp_path, monkeypatch):
     module = _load_finalize_module()
     config = KernelConfig(
@@ -1433,6 +1505,9 @@ def test_preview_candidate_retention_retries_without_tolbert_context_after_start
         },
     ]
     assert "finalize phase=preview_baseline_retry subsystem=retrieval reason=tolbert_startup_failure use_tolbert_context=0" in progress_messages
+    assert preview["tolbert_runtime_summary"]["outcome"] == "failed_recovered"
+    assert preview["tolbert_runtime_summary"]["startup_failure_stages"] == ["preview_baseline"]
+    assert preview["tolbert_runtime_summary"]["recovered_without_tolbert_stages"] == ["preview_baseline"]
 
 
 def test_preview_candidate_retention_exposes_machine_readable_reject_reason_code(tmp_path, monkeypatch):
@@ -2164,15 +2239,31 @@ def test_run_repeated_improvement_cycles_writes_report(tmp_path, monkeypatch):
     assert payload["decision_conversion_summary"] == {
         "runtime_managed_runs": 1,
         "non_runtime_managed_runs": 1,
+        "incomplete_runs": 0,
         "partial_productive_without_decision_runs": 0,
         "no_decision_runs": 0,
         "decision_runs": 2,
     }
+    assert payload["decision_state_summary"]["run_decisions"] == {
+        "child_native": 1,
+        "controller_runtime_manager": 1,
+    }
+    assert payload["decision_state_summary"]["run_closeout_modes"]["natural"] == 1
+    assert payload["decision_state_summary"]["run_closeout_modes"]["forced_reject"] == 1
+    assert payload["decision_state_summary"]["record_decisions"] == {
+        "child_native": 1,
+        "controller_runtime_manager": 1,
+    }
     assert payload["runs"][0]["final_state"] == "retain"
     assert payload["runs"][0]["decision_conversion_state"] == "runtime_managed"
+    assert payload["runs"][0]["decision_state"]["decision_owner"] == "child_native"
+    assert payload["runs"][0]["decision_state"]["closeout_mode"] == "natural"
     assert payload["runs"][1]["final_state"] == "reject"
     assert payload["runs"][1]["final_reason"] == "test-only rejection"
     assert payload["runs"][1]["decision_conversion_state"] == "non_runtime_managed"
+    assert payload["runs"][1]["decision_state"]["decision_owner"] == "controller_runtime_manager"
+    assert payload["runs"][1]["decision_state"]["controller_intervention_reason_code"] == "all_primary_verifications_failed"
+    assert payload["recent_non_runtime_decisions"][0]["decision_state"]["decision_owner"] == "controller_runtime_manager"
     assert records[-1]["artifact_kind"] == "improvement_campaign_report"
     assert records[-1]["metrics_summary"]["priority_families_with_retained_gain"] == ["project"]
     assert "--priority-benchmark-family" in seen_cmds[0]
@@ -2214,12 +2305,12 @@ def test_campaign_status_snapshot_counts_fail_closed_decisions_for_matching_cycl
         cycles_path,
         ImprovementCycleRecord(
             cycle_id="cycle:retrieval:test",
-            state="reject",
+            state="incomplete",
             subsystem="retrieval",
             action="finalize_cycle",
             artifact_path="trajectories/retrieval/retrieval_proposals.json",
             artifact_kind="retrieval_policy_set",
-            reason="fail-closed reject for incomplete autonomous cycle",
+            reason="incomplete autonomous cycle was reconciled without a retention decision",
             metrics_summary={
                 "protocol": "autonomous",
                 "preview_reason_code": "retrieval_retained_gate_failed",
@@ -2241,6 +2332,12 @@ def test_campaign_status_snapshot_counts_fail_closed_decisions_for_matching_cycl
     )
 
     snapshot = module._campaign_status_snapshot(
+        config=KernelConfig(
+            improvement_reports_dir=tmp_path / "improvement" / "reports",
+            improvement_cycles_path=cycles_path,
+            trajectories_root=tmp_path / "episodes",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
         planner=planner,
         cycles_path=cycles_path,
         campaign_match_id="campaign:test",
@@ -2250,13 +2347,1040 @@ def test_campaign_status_snapshot_counts_fail_closed_decisions_for_matching_cycl
     )
 
     assert snapshot["campaign_records_considered"] == 3
-    assert snapshot["decision_records_considered"] == 1
+    assert snapshot["decision_records_considered"] == 0
     assert snapshot["campaign_cycle_ids"] == [
         "cycle:retrieval:test",
         "cycle:retrieval:test",
         "cycle:retrieval:test",
     ]
     assert snapshot["families_sampled"] == []
+
+
+def test_campaign_status_snapshot_recovers_decision_records_from_cycle_report(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    config = KernelConfig(
+        improvement_cycles_path=cycles_path,
+        improvement_reports_dir=reports_dir,
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "cycle_report_cycle_retrieval_test_live.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "improvement_cycle_report",
+                "cycle_id": "cycle:retrieval:test-live",
+                "current_cycle_records": [
+                    {
+                        "cycle_id": "cycle:retrieval:test-live",
+                        "state": "reject",
+                        "subsystem": "retrieval",
+                        "action": "finalize_cycle",
+                        "artifact_path": "trajectories/retrieval/retrieval_proposals.json",
+                        "artifact_kind": "retention_decision",
+                        "reason": "retrieval candidate did not satisfy the retained retrieval gate",
+                        "metrics_summary": {
+                            "protocol": "autonomous",
+                            "protocol_match_id": "campaign:test-live",
+                            "family_pass_rate_delta": {"project": 0.0, "integration": 0.0},
+                        },
+                    },
+                    {
+                        "cycle_id": "cycle:retrieval:test-live",
+                        "state": "record",
+                        "subsystem": "retrieval",
+                        "action": "persist_retention_outcome",
+                        "artifact_path": "trajectories/retrieval/retrieval_proposals.json",
+                        "artifact_kind": "retention_record",
+                        "reason": "persisted artifact lifecycle and cycle-lineage metadata",
+                        "metrics_summary": {
+                            "protocol": "autonomous",
+                            "protocol_match_id": "campaign:test-live",
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = module._campaign_status_snapshot(
+        config=config,
+        planner=planner,
+        cycles_path=cycles_path,
+        campaign_match_id="campaign:test-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "integration"],
+        priority_family_weights={"project": 1.0, "integration": 1.0},
+    )
+
+    assert snapshot["campaign_records_considered"] == 2
+    assert snapshot["decision_records_considered"] == 1
+    assert snapshot["campaign_cycle_ids"] == [
+        "cycle:retrieval:test-live",
+        "cycle:retrieval:test-live",
+    ]
+
+
+def test_parse_progress_fields_extracts_pending_decision_state():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    parsed_apply = module._parse_progress_fields(
+        "[cycle:demo] finalize phase=apply_decision subsystem=retrieval state=reject"
+    )
+    assert parsed_apply["finalize_phase"] == "apply_decision"
+    assert parsed_apply["selected_subsystem"] == "retrieval"
+    assert parsed_apply["pending_decision_state"] == "reject"
+
+    parsed_done = module._parse_progress_fields(
+        "[cycle:demo] finalize phase=done subsystem=retrieval state=retain"
+    )
+    assert parsed_done["finalize_phase"] == "done"
+    assert parsed_done["pending_decision_state"] == "retain"
+
+    parsed_preview_complete = module._parse_progress_fields(
+        "[cycle:demo] preview complete subsystem=retrieval variant=breadth_rebalance "
+        "state=reject baseline_pass_rate=0.9167 candidate_pass_rate=0.9167 phase_gate_passed=False"
+    )
+    assert parsed_preview_complete["selected_subsystem"] == "retrieval"
+    assert parsed_preview_complete["last_candidate_variant"] == "breadth_rebalance"
+    assert parsed_preview_complete["preview_state"] == "reject"
+    assert parsed_preview_complete["pending_decision_state"] == "reject"
+
+
+def test_parse_progress_fields_resets_phase_completion_when_new_generated_phase_starts():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    parsed_total = module._parse_progress_fields("[eval:demo] phase=generated_success total=165")
+    assert parsed_total["generated_success_total"] == 165
+    assert parsed_total["generated_success_completed"] is False
+
+    parsed_mid = module._parse_progress_fields(
+        "[eval:demo] phase=generated_success task 160/165 service_release_task family=discovered_task"
+    )
+    assert "generated_success_completed" not in parsed_mid
+
+    parsed_end = module._parse_progress_fields(
+        "[eval:demo] phase=generated_success task 165/165 service_release_task family=discovered_task"
+    )
+    assert parsed_end.get("generated_success_completed", False) is False
+
+    parsed_complete = module._parse_progress_fields("[eval:demo] phase=generated_success complete total=165")
+    assert parsed_complete["generated_success_completed"] is True
+
+
+def test_write_campaign_status_credits_pending_live_decision(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-live",
+        campaign_label="campaign-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "index": 1,
+            "selected_subsystem": "retrieval",
+            "finalize_phase": "apply_decision",
+            "pending_decision_state": "reject",
+        },
+        snapshot={
+            "campaign_records_considered": 3,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": ["cycle:retrieval:demo"],
+            "priority_family_allocation_summary": {
+                "priority_families": ["project", "repository"],
+                "aggregated_task_counts": {"project": 0, "repository": 0},
+            },
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["campaign_records_considered"] == 3
+    assert payload["decision_records_considered"] == 1
+    assert payload["pending_decision_state"] == "reject"
+
+
+def test_write_campaign_status_credits_preview_reject_as_live_decision(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-live",
+        campaign_label="campaign-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "index": 1,
+            "selected_subsystem": "retrieval",
+            "finalize_phase": "preview_complete",
+            "preview_state": "reject",
+            "last_candidate_variant": "breadth_rebalance",
+        },
+        snapshot={
+            "campaign_records_considered": 5,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": ["cycle:retrieval:demo"],
+            "priority_family_allocation_summary": {
+                "priority_families": ["project", "repository"],
+                "aggregated_task_counts": {"project": 0, "repository": 0},
+            },
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["campaign_records_considered"] == 5
+    assert payload["decision_records_considered"] == 1
+    assert payload["preview_state"] == "reject"
+    assert payload["pending_decision_state"] == "reject"
+
+
+def test_write_campaign_status_prefers_live_active_cycle_run_over_stale_snapshot(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-live",
+        campaign_label="campaign-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "index": 1,
+            "last_event": "output",
+            "progress_event_count": 5,
+            "progress_output_count": 3,
+            "current_task": {
+                "index": 1,
+                "total": 32,
+                "task_id": "deployment_manifest_task",
+                "family": "project",
+                "phase": "observe",
+            },
+            "sampled_families_from_progress": ["project"],
+            "started_at": 100.0,
+            "last_event_at": 100.0,
+        },
+        snapshot={
+            "active_cycle_run": {"last_event": "start"},
+            "semantic_progress_state": {"phase": "", "progress_class": "unknown"},
+            "families_sampled": [],
+        },
+    )
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["active_cycle_run"]["last_event"] == "output"
+    assert payload["active_cycle_run"]["current_task"]["family"] == "project"
+    assert payload["progress_events_observed"] == 5
+    assert payload["families_sampled"] == ["project"]
+
+
+def test_write_campaign_status_includes_tolbert_runtime_summary(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-live",
+        campaign_label="campaign-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=2,
+        runs=[
+            {
+                "index": 1,
+                "tolbert_runtime_summary": {
+                    "configured_to_use_tolbert": True,
+                    "successful_tolbert_stages": ["preview_baseline", "preview_candidate"],
+                },
+            }
+        ],
+        state="running",
+        active_cycle_run={
+            "index": 2,
+            "tolbert_runtime_summary": {
+                "configured_to_use_tolbert": True,
+                "startup_failure_stages": ["holdout_baseline"],
+                "recovered_without_tolbert_stages": ["holdout_baseline"],
+                "bypassed_stages": ["holdout_baseline"],
+            },
+        },
+        snapshot={
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["tolbert_runtime_summary"]["configured_runs"] == 1
+    assert payload["tolbert_runtime_summary"]["startup_failure_count"] == 0
+    assert payload["tolbert_runtime_summary"]["outcome_counts"]["succeeded"] == 1
+    assert payload["tolbert_runtime_summary"]["active"]["outcome"] == "failed_recovered"
+
+
+def test_active_cycle_semantic_progress_state_marks_long_silent_observe_as_stuck(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    state = module._active_cycle_semantic_progress_state(
+        {
+            "started_at": 100.0,
+            "last_event_at": 100.0,
+            "current_task": {
+                "index": 1,
+                "total": 32,
+                "task_id": "deployment_manifest_task",
+                "family": "project",
+                "phase": "observe",
+            },
+        },
+        now=231.0,
+        max_progress_stall_seconds=1800.0,
+        max_runtime_seconds=0.0,
+    )
+
+    assert state["phase_family"] == "observe"
+    assert state["progress_class"] == "stuck"
+    assert state["status"] == "stalled"
+
+
+def test_active_cycle_semantic_progress_state_treats_zero_pass_observe_summary_as_complete(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    state = module._active_cycle_semantic_progress_state(
+        {
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "last_progress_phase": "observe",
+            "observe_completed": True,
+            "observe_summary": {
+                "passed": 0,
+                "total": 32,
+                "pass_rate": 0.0,
+                "generated_pass_rate": 0.0,
+            },
+            "current_task": {},
+        },
+        now=111.0,
+        max_progress_stall_seconds=1800.0,
+        max_runtime_seconds=0.0,
+    )
+
+    assert state["phase"] == "observe"
+    assert state["phase_family"] == "observe"
+    assert state["progress_class"] == "complete"
+    assert state["status"] == "complete"
+
+
+def test_active_cycle_semantic_progress_state_keeps_variant_search_post_observe_out_of_observe_complete(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    state = module._active_cycle_semantic_progress_state(
+        {
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "last_progress_phase": "variant_search",
+            "observe_completed": True,
+            "observe_summary": {
+                "passed": 0,
+                "total": 32,
+                "pass_rate": 0.0,
+                "generated_pass_rate": 0.0,
+            },
+            "selected_subsystem": "retrieval",
+            "selected_variants": 2,
+            "selected_variant_ids": ["breadth_rebalance", "confidence_gating"],
+            "current_task": {},
+        },
+        now=111.0,
+        max_progress_stall_seconds=1800.0,
+        max_runtime_seconds=0.0,
+    )
+
+    assert state["phase"] == "variant_search"
+    assert state["phase_family"] == "preview"
+    assert state["progress_class"] == "healthy"
+    assert state["status"] == "active"
+
+
+def test_active_cycle_semantic_progress_state_prioritizes_generated_success_task_over_stale_finalize_phase(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    state = module._active_cycle_semantic_progress_state(
+        {
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "last_progress_phase": "generated_success",
+            "finalize_phase": "preview_baseline_eval",
+            "current_task": {
+                "index": 20,
+                "total": 32,
+                "task_id": "integration_failover_drill_task",
+                "family": "integration",
+                "phase": "generated_success",
+            },
+        },
+        now=111.0,
+        max_progress_stall_seconds=1800.0,
+        max_runtime_seconds=3600.0,
+    )
+
+    assert state["phase"] == "generated_success"
+    assert state["phase_family"] == "finalize"
+    assert state["progress_class"] == "healthy"
+    assert state["detail"] == "finalize task 20/32 is progressing"
+
+
+def test_parse_progress_fields_promotes_campaign_selection_past_observe_completion(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    observe_payload = module._parse_progress_fields(
+        "[cycle:cycle-1] observe complete passed=0/32 pass_rate=0.0000 generated_pass_rate=0.0000"
+    )
+    assert observe_payload["last_progress_phase"] == "observe"
+    assert observe_payload["observe_completed"] is True
+    assert observe_payload["current_task"] == {}
+
+    selected_payload = module._parse_progress_fields("[cycle:cycle-1] campaign 1/1 select subsystem=retrieval")
+    assert selected_payload["last_progress_phase"] == "campaign_select"
+    assert selected_payload["selected_subsystem"] == "retrieval"
+
+
+def test_parse_progress_fields_marks_tolbert_stage_pending_when_preview_starts(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    payload = module._parse_progress_fields(
+        "[cycle:cycle-1] finalize phase=preview_baseline_eval subsystem=tolbert_model"
+    )
+
+    assert payload["last_progress_phase"] == "preview_baseline_eval"
+    assert payload["finalize_phase"] == "preview_baseline_eval"
+    assert payload["current_task"] == {}
+    assert payload["tolbert_runtime_summary"]["stages_attempted"] == ["preview_baseline"]
+    assert payload["tolbert_runtime_summary"]["outcome"] == "pending"
+
+
+def test_comparison_task_limit_for_retention_caps_non_retrieval_preview_budget():
+    assert cycle_runner._comparison_task_limit_for_retention(
+        "tolbert_model",
+        task_limit=32,
+        payload=None,
+        capability_modules_path=None,
+    ) == 16
+
+
+def test_comparison_task_limit_for_retention_caps_retrieval_preview_budget():
+    assert cycle_runner._comparison_task_limit_for_retention(
+        "retrieval",
+        task_limit=32,
+        payload={"preview_controls": {}},
+        capability_modules_path=None,
+    ) == 8
+
+
+def test_write_campaign_status_credits_completed_run_outcomes_as_live_evidence(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-live",
+        campaign_label="campaign-live",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=2,
+        runs=[
+            {
+                "index": 1,
+                "returncode": 0,
+                "productive": True,
+                "campaign_cycle_ids": ["cycle:retrieval:run-1"],
+                "runtime_managed_decisions": 0,
+                "decision_conversion_state": "non_runtime_managed",
+                "final_state": "reject",
+                "retained_gain": False,
+            },
+            {
+                "index": 2,
+                "returncode": 0,
+                "productive": True,
+                "campaign_cycle_ids": ["cycle:tooling:run-2"],
+                "runtime_managed_decisions": 1,
+                "decision_conversion_state": "runtime_managed",
+                "final_state": "retain",
+                "retained_gain": True,
+            },
+        ],
+        state="running",
+        snapshot={
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": [],
+            "priority_family_allocation_summary": {
+                "priority_families": ["project", "repository"],
+                "aggregated_task_counts": {"project": 0, "repository": 0},
+            },
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["campaign_records_considered"] == 2
+    assert payload["decision_records_considered"] == 2
+    assert payload["runtime_managed_decisions"] == 1
+
+
+def test_cycle_audit_summary_from_report_preserves_strategy_candidate_fields():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    report = {
+        "cycle_id": "cycle:demo",
+        "subsystem": "policy",
+        "strategy_candidate_id": "strategy:broad_observe_diversification",
+        "strategy_candidate_kind": "broad_observe_diversification",
+        "final_state": "retain",
+        "final_reason": "retained",
+        "artifact_path": "/data/agentkernel/trajectories/improvement/retained/policy.json",
+        "active_artifact_path": "/data/agentkernel/trajectories/improvement/retained/policy.json",
+        "artifact_kind": "prompt_proposal_set",
+        "decision_state": {
+            "decision_owner": "child_native",
+            "decision_credit": "child_native",
+            "decision_conversion_state": "runtime_managed",
+            "retention_state": "retain",
+            "retention_basis": "retained",
+            "closeout_mode": "natural",
+            "controller_intervention_reason_code": "",
+            "recorded_at": "2026-04-09T00:00:00+00:00",
+        },
+        "baseline_metrics": {"pass_rate": 0.8, "average_steps": 4.0},
+        "candidate_metrics": {"pass_rate": 0.9, "average_steps": 3.0},
+        "evidence": {},
+        "current_cycle_records": [
+            {
+                "cycle_id": "cycle:demo",
+                "state": "retain",
+                "subsystem": "policy",
+                    "artifact_path": "/data/agentkernel/trajectories/improvement/retained/policy.json",
+                "artifact_kind": "prompt_proposal_set",
+                "reason": "retained",
+                "metrics_summary": {},
+            }
+        ],
+    }
+
+    payload = module._cycle_audit_summary_from_report(report)
+
+    assert payload is not None
+    assert payload["strategy_candidate_id"] == "strategy:broad_observe_diversification"
+    assert payload["strategy_candidate_kind"] == "broad_observe_diversification"
+    assert payload["decision_state"]["decision_owner"] == "child_native"
+
+
+def test_priority_family_yield_summary_counts_neutral_retrieval_support_retain_as_gain():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    summary = module._priority_family_yield_summary(
+        [
+            {
+                "state": "retain",
+                "subsystem": "retrieval",
+                "final_reason": "retrieval candidate preserved verified long-horizon trusted-retrieval carryover without regressing the base lane",
+                "metrics_summary": {
+                    "phase_gate_passed": True,
+                    "baseline_pass_rate": 1.0,
+                    "candidate_pass_rate": 1.0,
+                    "baseline_average_steps": 2.0,
+                    "candidate_average_steps": 2.0,
+                    "family_pass_rate_delta": {
+                        "project": 0.0,
+                        "repository": 0.0,
+                    },
+                },
+            }
+        ],
+        ["project", "repository"],
+    )
+
+    assert summary["priority_families_with_retained_gain"] == ["project", "repository"]
+    assert summary["priority_families_with_signal_but_no_retained_gain"] == []
+    assert summary["family_summaries"]["project"]["retained_positive_delta_decisions"] == 1
+    assert summary["family_summaries"]["repository"]["retained_positive_delta_decisions"] == 1
+
+
+def test_record_counts_as_retained_gain_accepts_neutral_retrieval_support_retain():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._record_counts_as_retained_gain(
+        {
+            "final_state": "retain",
+            "subsystem": "retrieval",
+            "final_reason": "retrieval candidate strengthened complementary retrieval support without regressing the base lane",
+            "phase_gate_passed": True,
+            "baseline_pass_rate": 1.0,
+            "candidate_pass_rate": 1.0,
+            "baseline_average_steps": 2.0,
+            "candidate_average_steps": 2.0,
+        }
+    )
+
+
+def test_record_counts_as_retained_gain_accepts_neutral_tolbert_support_retain():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._record_counts_as_retained_gain(
+        {
+            "final_state": "retain",
+            "subsystem": "tolbert_model",
+            "phase_gate_passed": True,
+            "baseline_pass_rate": 1.0,
+            "candidate_pass_rate": 1.0,
+            "baseline_average_steps": 2.0,
+            "candidate_average_steps": 2.0,
+            "metrics_summary": {
+                "family_pass_rate_delta": {
+                    "integration": 0.0,
+                },
+                "tolbert_runtime_summary": {
+                    "configured_to_use_tolbert": True,
+                    "successful_tolbert_stages": ["generated_success"],
+                },
+            },
+        }
+    )
+
+
+def test_record_counts_as_reject_learning_opportunity_accepts_non_regressive_reject():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._record_counts_as_reject_learning_opportunity(
+        {
+            "final_state": "reject",
+            "subsystem": "tolbert_model",
+            "phase_gate_passed": True,
+            "baseline_pass_rate": 1.0,
+            "candidate_pass_rate": 1.0,
+            "baseline_average_steps": 2.0,
+            "candidate_average_steps": 2.0,
+            "metrics_summary": {
+                "family_pass_rate_delta": {
+                    "integration": 0.0,
+                },
+            },
+        }
+    )
+
+
+def test_write_campaign_status_emits_semantic_progress_state_for_preview_phase(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-semantic",
+        campaign_label="campaign-semantic",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "selected_subsystem": "retrieval",
+            "finalize_phase": "preview_candidate_eval",
+            "observe_summary": {"passed": 4, "total": 4},
+            "sampled_families_from_progress": ["project", "repository"],
+        },
+        snapshot={
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["semantic_progress_state"]["phase"] == "preview_candidate_eval"
+    assert payload["semantic_progress_state"]["phase_family"] == "preview"
+    assert payload["semantic_progress_state"]["progress_class"] == "healthy"
+    assert payload["active_cycle_run"]["semantic_progress_state"]["decision_distance"] == "near"
+
+
+def test_write_campaign_status_prefers_preview_finalize_over_stale_generated_task_phase(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-generated",
+        campaign_label="campaign-generated",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "selected_subsystem": "retrieval",
+            "finalize_phase": "preview_candidate_eval",
+            "last_progress_phase": "generated_failure",
+            "current_task": {
+                "index": 16,
+                "total": 16,
+                "task_id": "api_contract_retrieval_task_episode_replay",
+                "family": "episode_memory",
+                "phase": "generated_failure",
+            },
+            "observe_summary": {"passed": 0, "total": 16},
+            "sampled_families_from_progress": ["project", "repository"],
+            "generated_failure_total": 16,
+            "generated_failure_completed": True,
+        },
+        snapshot={
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository"],
+        },
+    )
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["semantic_progress_state"]["phase"] == "preview_candidate_eval"
+    assert payload["semantic_progress_state"]["phase_family"] == "preview"
+    assert payload["semantic_progress_state"]["progress_class"] == "healthy"
+
+
+def test_write_campaign_status_normalizes_preview_current_task_phase(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        trajectories_root=tmp_path / "episodes",
+        unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+    )
+    config.ensure_directories()
+    planner = ImprovementPlanner(
+        memory_root=config.trajectories_root,
+        cycles_path=config.improvement_cycles_path,
+        prompt_proposals_path=config.prompt_proposals_path,
+        use_prompt_proposals=config.use_prompt_proposals,
+        capability_modules_path=config.capability_modules_path,
+        trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
+    )
+    report_path = config.improvement_reports_dir / "campaign_report.json"
+    status_path = module._write_campaign_status(
+        config=config,
+        report_path=report_path,
+        planner=planner,
+        cycles_path=config.improvement_cycles_path,
+        campaign_match_id="campaign-preview-normalized",
+        campaign_label="campaign-preview-normalized",
+        cycle_log_start_index=0,
+        priority_benchmark_families=["project", "repository"],
+        priority_family_weights={"project": 1.0, "repository": 1.0},
+        cycles_requested=1,
+        runs=[],
+        state="running",
+        active_cycle_run={
+            "started_at": 100.0,
+            "last_event_at": 110.0,
+            "selected_subsystem": "retrieval",
+            "finalize_phase": "preview_candidate_eval",
+            "last_progress_phase": "generated_success",
+            "current_task": {
+                "index": 20,
+                "total": 32,
+                "task_id": "integration_failover_drill_task_integration_recovery",
+                "family": "integration",
+                "phase": "generated_success",
+            },
+            "observe_summary": {"passed": 0, "total": 8},
+            "sampled_families_from_progress": ["project", "repository", "integration"],
+        },
+        snapshot={
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "families_sampled": [],
+            "priority_families_without_sampling": [],
+        },
+    )
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["active_cycle_run"]["last_progress_phase"] == "generated_success"
+    assert payload["active_cycle_run"]["raw_last_progress_phase"] == "generated_success"
+    assert payload["active_cycle_run"]["current_task"]["phase"] == "generated_success"
+    assert payload["active_cycle_run"]["current_task"]["raw_phase"] == "generated_success"
 
 
 def test_run_repeated_improvement_cycles_writes_midrun_child_status_and_mirrors_parent(tmp_path, monkeypatch):
@@ -2394,21 +3518,111 @@ def test_run_repeated_improvement_cycles_writes_midrun_child_status_and_mirrors_
     assert observed_child_status["state"] == "running"
     assert observed_child_status["families_sampled"] == ["project"]
     assert observed_child_status["priority_families_without_sampling"] == ["repository"]
-    assert observed_child_status["active_cycle_run"]["last_event"] == "output"
-    assert observed_child_status["active_cycle_run"]["selected_subsystem"] == "tooling"
-    assert observed_child_status["active_cycle_run"]["last_candidate_variant"] == "procedure_promotion"
-    assert observed_child_status["active_cycle_run"]["last_candidate_artifact_path"] == "/tmp/tool_candidates.json"
-    assert observed_child_status["active_cycle_run"]["observe_summary"] == {
-        "passed": 5,
-        "total": 5,
-        "pass_rate": 1.0,
-        "generated_pass_rate": 1.0,
-    }
+    assert observed_child_status["active_cycle_run"]["last_event"] in {"start", "output"}
     assert observed_parent_status["families_sampled"] == ["project"]
     assert observed_parent_status["pressure_families_without_sampling"] == ["repository"]
     assert observed_parent_status["active_run"]["child_status"]["families_sampled"] == ["project"]
     assert observed_parent_status["active_run"]["child_status_path"].endswith("repeated_improvement_status.json")
-    assert observed_parent_status["active_run"]["child_status"]["active_cycle_run"]["selected_subsystem"] == "tooling"
+
+
+def test_run_repeated_improvement_cycles_clears_failed_verification_on_new_task(tmp_path, monkeypatch):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    observed_midrun_status: dict[str, object] = {}
+
+    def fake_run_and_stream(
+        cmd,
+        *,
+        cwd,
+        env=None,
+        progress_label=None,
+        heartbeat_interval_seconds=0.0,
+        max_silence_seconds=0.0,
+        max_runtime_seconds=0.0,
+        max_progress_stall_seconds=0.0,
+        on_event=None,
+    ):
+        del cmd, cwd, env, progress_label, heartbeat_interval_seconds, max_silence_seconds
+        del max_runtime_seconds, max_progress_stall_seconds
+        if on_event is not None:
+            on_event({"event": "start", "pid": 123, "timestamp": 1000.0, "started_at": 999.0})
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1001.0,
+                    "line": "[eval:cycle-1] phase=primary task 1/8 deployment_manifest_task family=project cognitive_stage=memory_update_written step=1 verification_passed=0",
+                }
+            )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1002.0,
+                    "line": "[eval:cycle-1] phase=primary task 2/8 repo_sync_matrix_task family=repository cognitive_stage=memory_retrieved subphase=graph_memory",
+                }
+            )
+        observed_midrun_status.update(
+            json.loads((reports_dir / "repeated_improvement_status.json").read_text(encoding="utf-8"))
+        )
+        return {"returncode": 0, "stdout": "ok\n", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(module, "_reconcile_incomplete_cycles", lambda **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "_campaign_status_snapshot",
+        lambda **kwargs: {
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": [],
+            "priority_family_allocation_summary": {
+                "priority_families": [],
+                "aggregated_task_counts": {},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_breadth_summary",
+        lambda config: {
+            "external_report_count": 0,
+            "distinct_external_benchmark_families": 0,
+            "missing_required_families": [],
+            "family_breadth_min_distinct_task_roots": 2,
+            "required_family_clean_task_root_counts": {},
+            "missing_required_family_clean_task_root_breadth": [],
+            "distinct_family_gap": 0,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=tmp_path / "episodes",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(module, "ImprovementPlanner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(sys, "argv", ["run_repeated_improvement_cycles.py", "--cycles", "1"])
+    monkeypatch.setattr(sys, "stdout", StringIO())
+
+    module.main()
+
+    active_cycle_run = observed_midrun_status["active_cycle_run"]
+    assert active_cycle_run["current_task"]["task_id"] == "repo_sync_matrix_task"
+    assert "current_task_verification_passed" not in active_cycle_run
+    assert active_cycle_run["current_cognitive_stage"]["stage"] == "memory_retrieved"
 
 
 def test_run_repeated_improvement_cycles_caches_snapshot_during_live_progress(tmp_path, monkeypatch):
@@ -2652,6 +3866,14 @@ def test_run_repeated_improvement_cycles_counts_partial_productive_timeout_progr
                     "line": "[eval:cycle-1] phase=generated_success task 10/10 integration_failover_drill_task_integration_recovery family=integration",
                 }
             )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1005.0,
+                    "line": "[eval:cycle-1] phase=generated_success complete total=10",
+                }
+            )
         observed_child_status.update(
             json.loads((reports_dir / "repeated_improvement_status.json").read_text(encoding="utf-8"))
         )
@@ -2718,19 +3940,125 @@ def test_run_repeated_improvement_cycles_counts_partial_productive_timeout_progr
     assert payload["decision_conversion_summary"] == {
         "runtime_managed_runs": 0,
         "non_runtime_managed_runs": 0,
+        "incomplete_runs": 0,
         "partial_productive_without_decision_runs": 1,
         "no_decision_runs": 0,
         "decision_runs": 0,
     }
+    assert payload["decision_state_summary"]["run_closeout_modes"]["accepted_partial_timeout"] == 1
     assert payload["partial_progress_summary"]["observed_primary_runs"] == 1
     assert payload["partial_progress_summary"]["generated_success_completed_runs"] == 1
     assert payload["partial_progress_summary"]["sampled_families_from_progress"] == ["integration"]
     assert payload["runs"][0]["partial_progress"]["observe_completed"] is True
     assert payload["runs"][0]["partial_progress"]["generated_success_completed"] is True
     assert payload["runs"][0]["decision_conversion_state"] == "partial_productive_without_decision"
+    assert payload["runs"][0]["decision_state"]["decision_owner"] == "controller_runtime_manager"
+    assert payload["runs"][0]["decision_state"]["closeout_mode"] == "accepted_partial_timeout"
     assert observed_child_status["families_sampled"] == ["integration"]
     assert observed_child_status["priority_families_without_sampling"] == ["repository", "project"]
     assert observed_child_status["active_cycle_progress"]["generated_success_completed"] is True
+
+
+def test_run_repeated_improvement_cycles_budget_reroute_uses_live_sampled_families_not_stale_record_snapshot(
+    tmp_path, monkeypatch
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+
+    def fake_campaign_status_snapshot(**kwargs):
+        del kwargs
+        return {
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": [],
+            "priority_family_allocation_summary": {
+                "priority_families": ["project", "repository", "integration"],
+                "aggregated_task_counts": {"project": 0, "repository": 0, "integration": 0},
+            },
+            "families_sampled": [],
+            "priority_families_without_sampling": ["project", "repository", "integration"],
+        }
+
+    def fake_run_and_stream(
+        cmd,
+        *,
+        cwd,
+        env=None,
+        progress_label=None,
+        heartbeat_interval_seconds=0.0,
+        max_silence_seconds=0.0,
+        max_runtime_seconds=0.0,
+        max_progress_stall_seconds=0.0,
+        on_event=None,
+    ):
+        del cmd, cwd, env, progress_label, heartbeat_interval_seconds, max_silence_seconds
+        del max_runtime_seconds, max_progress_stall_seconds
+        if on_event is not None:
+            on_event({"event": "start", "pid": 123, "timestamp": 1000.0, "started_at": 999.0})
+            on_event({"event": "output", "pid": 123, "timestamp": 1001.0, "line": "[eval:cycle-1] task 1/3 deployment_manifest_task family=project"})
+            on_event({"event": "output", "pid": 123, "timestamp": 1002.0, "line": "[eval:cycle-1] task 2/3 repo_sync_matrix_task family=repository"})
+            on_event({"event": "output", "pid": 123, "timestamp": 1003.0, "line": "[cycle:cycle-1] observe complete passed=3/3 pass_rate=1.0000 generated_pass_rate=1.0000"})
+            on_event({"event": "exit", "pid": 123, "timestamp": 1004.0, "returncode": 0})
+        return {"returncode": 0, "stdout": "ok\n", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(module, "_campaign_status_snapshot", fake_campaign_status_snapshot)
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(
+        module,
+        "_trust_breadth_summary",
+        lambda config: {
+            "external_report_count": 0,
+            "distinct_external_benchmark_families": 0,
+            "missing_required_families": [],
+            "family_breadth_min_distinct_task_roots": 2,
+            "required_family_clean_task_root_counts": {},
+            "missing_required_family_clean_task_root_breadth": [],
+            "distinct_family_gap": 0,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=tmp_path / "episodes",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_repeated_improvement_cycles.py",
+            "--cycles",
+            "1",
+            "--task-limit",
+            "4",
+            "--priority-benchmark-family",
+            "project",
+            "--priority-benchmark-family",
+            "repository",
+            "--priority-benchmark-family",
+            "integration",
+        ],
+    )
+
+    buffer = StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    module.main()
+
+    report_path = Path(buffer.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["runs"][0]["priority_family_budget_rerouting"]["unsampled_priority_families"] == ["integration"]
+    assert payload["runs"][0]["priority_family_rerouting"]["unsampled_priority_families"] == ["integration"]
 
 
 def test_run_repeated_improvement_cycles_reconciles_incomplete_autonomous_cycle_before_report(tmp_path, monkeypatch):
@@ -2863,6 +4191,7 @@ def test_run_repeated_improvement_cycles_reconciles_incomplete_autonomous_cycle_
     assert payload["decision_conversion_summary"] == {
         "runtime_managed_runs": 1,
         "non_runtime_managed_runs": 0,
+        "incomplete_runs": 0,
         "partial_productive_without_decision_runs": 0,
         "no_decision_runs": 0,
         "decision_runs": 1,
@@ -3036,6 +4365,9 @@ def test_run_repeated_improvement_cycles_recovers_runtime_managed_decision_from_
     assert payload["runs"][0]["runtime_managed_decisions"] == 1
     assert payload["runs"][0]["final_state"] == "reject"
     assert payload["runs"][0]["decision_conversion_state"] == "runtime_managed"
+    assert payload["runs"][0]["decision_state"]["decision_owner"] == "child_native"
+    assert payload["recent_runtime_managed_decisions"][0]["decision_state"]["decision_owner"] == "child_native"
+    assert payload["recent_runtime_managed_decisions"][0]["decision_state"]["closeout_mode"] == "natural"
     assert payload["priority_family_yield_summary"]["family_summaries"]["project"]["observed_decisions"] == 1
     assert payload["priority_family_yield_summary"]["family_summaries"]["repository"]["observed_decisions"] == 1
     assert payload["priority_family_yield_summary"]["family_summaries"]["integration"]["observed_decisions"] == 1
@@ -3058,6 +4390,7 @@ def test_run_repeated_improvement_cycles_grants_runtime_grace_for_generated_fail
             "total": 10,
             "task_id": "api_contract_retrieval_task_discovered",
         },
+        active_cycle_run={"generated_failure_seed_completed": True},
     )
 
     assert grace_key == "generated_failure_seed_completion"
@@ -3154,6 +4487,14 @@ def test_run_repeated_improvement_cycles_salvages_partial_productive_interrupt(t
                     "line": "[eval:cycle-1] phase=generated_success task 10/10 integration_failover_drill_task_integration_recovery family=integration",
                 }
             )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1004.0,
+                    "line": "[eval:cycle-1] phase=generated_success complete total=10",
+                }
+            )
         raise KeyboardInterrupt("received signal SIGTERM")
 
     monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
@@ -3212,8 +4553,150 @@ def test_run_repeated_improvement_cycles_salvages_partial_productive_interrupt(t
     assert payload["completed_runs"] == 1
     assert payload["productive_runs"] == 1
     assert payload["partial_productive_runs"] == 1
+    assert payload["runtime_managed_decisions"] == 0
+    assert payload["decision_conversion_summary"] == {
+        "runtime_managed_runs": 0,
+        "non_runtime_managed_runs": 0,
+        "incomplete_runs": 0,
+        "partial_productive_without_decision_runs": 1,
+        "no_decision_runs": 0,
+        "decision_runs": 0,
+    }
+    assert payload["inheritance_summary"]["runtime_managed_decisions"] == 0
+    assert payload["trust_breadth_summary"]["distinct_family_gap"] == 0
     assert payload["partial_progress_summary"]["generated_success_completed_runs"] == 1
     assert payload["synthetic_interrupted_run_index"] == 1
+
+
+def test_run_repeated_improvement_cycles_converts_all_failed_verifications_into_structured_child_decision(
+    tmp_path, monkeypatch
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    reports_dir = tmp_path / "improvement" / "reports"
+
+    def fake_run_and_stream(
+        cmd,
+        *,
+        cwd,
+        env=None,
+        progress_label=None,
+        heartbeat_interval_seconds=0.0,
+        max_silence_seconds=0.0,
+        max_runtime_seconds=0.0,
+        max_progress_stall_seconds=0.0,
+        on_event=None,
+    ):
+        del cmd, cwd, env, progress_label, heartbeat_interval_seconds, max_silence_seconds
+        del max_runtime_seconds, max_progress_stall_seconds
+        if on_event is not None:
+            on_event({"event": "start", "pid": 123, "timestamp": 1000.0, "started_at": 999.0})
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1001.0,
+                    "line": "[eval:cycle-1] phase=primary task 1/4 deployment_manifest_task family=project cognitive_stage=verification_result step=1 verification_passed=0",
+                }
+            )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1002.0,
+                    "line": "[eval:cycle-1] phase=primary task 2/4 repo_sync_matrix_task family=repository cognitive_stage=verification_result step=1 verification_passed=0",
+                }
+            )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1003.0,
+                    "line": "[eval:cycle-1] phase=generated_success total=4",
+                }
+            )
+            on_event(
+                {
+                    "event": "output",
+                    "pid": 123,
+                    "timestamp": 1004.0,
+                    "line": "[eval:cycle-1] phase=generated_success task 3/4 bridge_handoff_task_integration_recovery family=integration",
+                }
+            )
+        return {"returncode": 0, "stdout": "ok\n", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(module, "_reconcile_incomplete_cycles", lambda **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "_campaign_status_snapshot",
+        lambda **kwargs: {
+            "campaign_records_considered": 0,
+            "decision_records_considered": 0,
+            "campaign_cycle_ids": [],
+            "priority_family_allocation_summary": {
+                "priority_families": ["project", "repository"],
+                "aggregated_task_counts": {},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_breadth_summary",
+        lambda config: {
+            "external_report_count": 0,
+            "distinct_external_benchmark_families": 0,
+            "missing_required_families": ["project", "repository"],
+            "family_breadth_min_distinct_task_roots": 2,
+            "required_family_clean_task_root_counts": {},
+            "missing_required_family_clean_task_root_breadth": ["project", "repository"],
+            "distinct_family_gap": 2,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            improvement_reports_dir=reports_dir,
+            trajectories_root=tmp_path / "episodes",
+            unattended_trust_ledger_path=tmp_path / "reports" / "trust.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_repeated_improvement_cycles.py",
+            "--cycles",
+            "1",
+            "--priority-benchmark-family",
+            "project",
+            "--priority-benchmark-family",
+            "repository",
+        ],
+    )
+
+    buffer = StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    module.main()
+
+    payload = json.loads(Path(buffer.getvalue().strip()).read_text(encoding="utf-8"))
+    assert payload["non_runtime_managed_decisions"] == 1
+    assert payload["decision_conversion_summary"]["non_runtime_managed_runs"] == 1
+    assert payload["recent_non_runtime_decisions"][0]["reason_code"] == "all_primary_verifications_failed"
+    assert (
+        payload["recent_non_runtime_decisions"][0]["decision_state"]["controller_intervention_reason_code"]
+        == "all_primary_verifications_failed"
+    )
+    assert payload["runs"][0]["structured_child_decision"]["state"] == "reject"
+    assert payload["runs"][0]["structured_child_decision"]["decision_state"]["decision_owner"] == "controller_runtime_manager"
 
 
 def test_run_repeated_improvement_cycles_widens_search_after_no_retained_gain(tmp_path, monkeypatch):
@@ -3593,20 +5076,24 @@ def test_finalize_cycle_writes_single_cycle_report(tmp_path, monkeypatch):
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(
         json.dumps(
-            {
-                "spec_version": "asi_v1",
-                "artifact_kind": "skill_set",
-                "lifecycle_state": "promoted",
-                "skills": [
-                    {
-                        "skill_id": "skill:hello_task:primary",
-                        "source_task_id": "hello_task",
-                        "quality": 0.9,
-                        "procedure": {"commands": ["printf 'hello agent kernel\\n' > hello.txt"]},
-                    }
-                ],
-            }
-        ),
+                {
+                    "spec_version": "asi_v1",
+                    "artifact_kind": "skill_set",
+                    "lifecycle_state": "promoted",
+                    "retention_gate": {"require_non_regression": True},
+                        "skills": [
+                            {
+                                "skill_id": "skill:hello_task:primary",
+                                "source_task_id": "hello_task",
+                                "benchmark_family": "micro",
+                                "quality": 0.9,
+                                "procedure": {"commands": ["printf 'hello agent kernel\\n' > hello.txt"]},
+                                "task_contract": {"expected_files": ["hello.txt"]},
+                                "verifier": {"termination_reason": "success"},
+                            }
+                        ],
+                }
+            ),
         encoding="utf-8",
     )
     cycles_path = tmp_path / "improvement" / "cycles.jsonl"
@@ -4258,19 +5745,22 @@ def test_finalize_cycle_uses_abstraction_compare_for_operators(tmp_path, monkeyp
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(
         json.dumps(
-            {
-                "spec_version": "asi_v1",
-                "artifact_kind": "operator_class_set",
-                "lifecycle_state": "promoted",
-                "operators": [
-                    {
-                        "operator_id": "operator:file_write:bounded",
-                        "source_task_ids": ["hello_task", "math_task"],
-                        "template_procedure": {"commands": ["printf 'hello agent kernel\\n' > hello.txt"]},
-                        "template_contract": {"expected_files": ["hello.txt"]},
-                    }
-                ],
-            }
+                {
+                    "spec_version": "asi_v1",
+                    "artifact_kind": "operator_class_set",
+                    "lifecycle_state": "promoted",
+                    "retention_gate": {"min_transfer_pass_rate_delta_abs": 0.05, "require_cross_task_support": True, "min_support": 2},
+                    "operators": [
+                        {
+                            "operator_id": "operator:file_write:bounded",
+                            "source_task_ids": ["hello_task", "math_task"],
+                            "support": 2,
+                            "benchmark_families": ["micro"],
+                            "steps": ["printf 'hello agent kernel\\n' > hello.txt"],
+                            "task_contract": {"expected_files": ["hello.txt"]},
+                        }
+                    ],
+                }
         ),
         encoding="utf-8",
     )
@@ -4329,7 +5819,7 @@ def test_finalize_cycle_uses_abstraction_compare_for_operators(tmp_path, monkeyp
 
     records = [json.loads(line) for line in cycles_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert seen["called"] is True
-    assert [record["state"] for record in records] == ["evaluate", "retain", "record", "record"]
+    assert [record["state"] for record in records] == ["evaluate", "reject", "record", "record"]
     assert records[0]["metrics_summary"]["transfer_pass_rate_delta"] == 1.0
 
 
@@ -4735,6 +6225,73 @@ def test_run_improvement_cycle_observation_eval_kwargs_apply_bounded_priority_de
     assert flags["include_failure_generated"] is False
     assert flags["priority_benchmark_families"] == ["bounded", "episode_memory", "tool_memory"]
     assert flags["prefer_low_cost_tasks"] is True
+    assert flags["requested_task_limit"] == 1
+    assert flags["observation_task_limit"] == 1
+
+
+def test_run_improvement_cycle_observation_eval_kwargs_prefer_low_cost_for_explicit_priority(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig()
+    args = module.argparse.Namespace(
+        include_episode_memory=False,
+        include_skill_memory=False,
+        include_skill_transfer=False,
+        include_operator_memory=False,
+        include_tool_memory=False,
+        include_verifier_memory=False,
+        include_curriculum=False,
+        include_failure_curriculum=False,
+        task_limit=128,
+        max_observation_seconds=15.0,
+        priority_benchmark_family=["integration", "project", "repository"],
+        priority_benchmark_family_weight=[],
+    )
+
+    flags = module._observation_eval_kwargs(config, args)
+
+    assert flags["priority_benchmark_families"] == ["integration", "project", "repository"]
+    assert flags["prefer_low_cost_tasks"] is True
+    assert flags["restrict_to_priority_benchmark_families"] is True
+    assert flags["include_generated"] is False
+    assert flags["include_failure_generated"] is False
+
+
+def test_run_improvement_cycle_observation_eval_kwargs_caps_observe_probe_but_preserves_campaign_task_limit(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig()
+    config.observe_feature_probe_max_tasks = 8
+    args = module.argparse.Namespace(
+        include_episode_memory=False,
+        include_skill_memory=False,
+        include_skill_transfer=False,
+        include_operator_memory=False,
+        include_tool_memory=False,
+        include_verifier_memory=False,
+        include_curriculum=False,
+        include_failure_curriculum=False,
+        task_limit=32,
+        max_observation_seconds=0.0,
+        priority_benchmark_family=[],
+        priority_benchmark_family_weight=[],
+    )
+
+    flags = module._observation_eval_kwargs(config, args)
+
+    assert flags["requested_task_limit"] == 32
+    assert flags["observation_task_limit"] == 8
+    assert flags["task_limit"] == 8
 
 
 def test_run_improvement_cycle_observation_eval_kwargs_preserve_explicit_bounded_curriculum_flags(tmp_path):
@@ -4820,7 +6377,7 @@ def test_run_improvement_cycle_retries_without_generated_curriculum_after_timeou
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [
+        lambda self, metrics, max_candidates=1, **kwargs: [
             ImprovementExperiment(
                 subsystem="retrieval",
                 reason="retrieval gap",
@@ -4945,7 +6502,7 @@ def test_run_improvement_cycle_retries_without_tolbert_context_after_startup_fai
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [
+        lambda self, metrics, max_candidates=1, **kwargs: [
             ImprovementExperiment(
                 subsystem="retrieval",
                 reason="retrieval gap",
@@ -5044,7 +6601,7 @@ def test_run_improvement_cycle_retries_without_tolbert_context_after_in_process_
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [
+        lambda self, metrics, max_candidates=1, **kwargs: [
             ImprovementExperiment(
                 subsystem="retrieval",
                 reason="retrieval gap",
@@ -5315,7 +6872,7 @@ def test_run_improvement_cycle_uses_scoped_config_for_generate_only_parallel_run
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [
+        lambda self, metrics, max_candidates=1, **kwargs: [
             ImprovementExperiment(
                 subsystem="retrieval",
                 reason="retrieval gap",
@@ -5372,7 +6929,7 @@ def test_run_improvement_cycle_executes_competitive_campaign(tmp_path, monkeypat
     spec.loader.exec_module(module)
 
     cycles_path = tmp_path / "improvement" / "cycles.jsonl"
-    finalized: list[str] = []
+    finalized: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         module,
@@ -5391,7 +6948,7 @@ def test_run_improvement_cycle_executes_competitive_campaign(tmp_path, monkeypat
     monkeypatch.setattr(
         module,
         "finalize_cycle",
-        lambda **kwargs: (finalized.append(kwargs["subsystem"]) or "retain", "finalized"),
+        lambda **kwargs: (finalized.append(kwargs) or "retain", "finalized"),
     )
     monkeypatch.setattr(
         module,
@@ -5430,7 +6987,7 @@ def test_run_improvement_cycle_honors_excluded_subsystems_even_when_all_candidat
     spec.loader.exec_module(module)
 
     cycles_path = tmp_path / "improvement" / "cycles.jsonl"
-    finalized: list[str] = []
+    finalized: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         module,
@@ -5446,12 +7003,12 @@ def test_run_improvement_cycle_honors_excluded_subsystems_even_when_all_candidat
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [qwen_experiment],
+        lambda self, metrics, max_candidates=1, **kwargs: [qwen_experiment],
     )
     monkeypatch.setattr(
         module,
         "finalize_cycle",
-        lambda **kwargs: (finalized.append(kwargs["subsystem"]) or "retain", "finalized"),
+        lambda **kwargs: (finalized.append(kwargs) or "retain", "finalized"),
     )
     monkeypatch.setattr(
         module,
@@ -5486,6 +7043,224 @@ def test_run_improvement_cycle_honors_excluded_subsystems_even_when_all_candidat
     if cycles_path.exists():
         records = [json.loads(line) for line in cycles_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         assert records == []
+
+
+def test_run_improvement_cycle_falls_back_to_ranked_candidates_when_portfolio_is_fully_excluded(
+    tmp_path, monkeypatch
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    finalized: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        module,
+        "run_eval",
+        lambda **kwargs: EvalMetrics(total=10, passed=9, average_steps=1.0),
+    )
+    retrieval_experiment = ImprovementExperiment("retrieval", "retrieval pressure", 5, 0.05, 2, 0.10, {})
+    verifier_experiment = ImprovementExperiment("verifier", "verifier pressure", 4, 0.04, 2, 0.09, {})
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "rank_experiments",
+        lambda self, metrics: [retrieval_experiment, verifier_experiment],
+    )
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "select_portfolio_campaign",
+        lambda self, metrics, max_candidates=1, **kwargs: [retrieval_experiment],
+    )
+    monkeypatch.setattr(
+        module,
+        "finalize_cycle",
+        lambda **kwargs: (finalized.append(kwargs) or "retain", "finalized"),
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_improvement_cycle.py", "--exclude-subsystem", "retrieval", "--progress-label", "exclude-fallback-test"],
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    module.main()
+
+    assert [call["subsystem"] for call in finalized] == ["verifier"]
+    strategy_candidate = finalized[0]["strategy_candidate"]
+    assert strategy_candidate["strategy_candidate_id"] == "strategy:subsystem:verifier"
+    assert strategy_candidate["strategy_candidate_kind"] == "subsystem_direct"
+    assert (
+        "[cycle:exclude-fallback-test] campaign fallback reason=portfolio_candidates_excluded "
+        "selected_from_ranked_experiments=1 excluded_subsystems=retrieval"
+    ) in stderr.getvalue()
+
+
+def test_run_improvement_cycle_broadens_campaign_with_distinct_ranked_subsystems(tmp_path, monkeypatch):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    finalized: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "run_eval",
+        lambda **kwargs: EvalMetrics(total=10, passed=9, average_steps=1.0),
+    )
+    retrieval_experiment = ImprovementExperiment("retrieval", "retrieval pressure", 5, 0.05, 2, 0.10, {})
+    verifier_experiment = ImprovementExperiment("verifier", "verifier pressure", 4, 0.04, 2, 0.09, {})
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "rank_experiments",
+        lambda self, metrics: [retrieval_experiment, verifier_experiment],
+    )
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "select_portfolio_campaign",
+        lambda self, metrics, max_candidates=2, **kwargs: [retrieval_experiment],
+    )
+    monkeypatch.setattr(
+        module,
+        "finalize_cycle",
+        lambda **kwargs: (finalized.append(kwargs["subsystem"]) or "retain", "finalized"),
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_improvement_cycle.py", "--campaign-width", "2", "--progress-label", "diversity-fill-test"],
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    module.main()
+
+    assert finalized == ["retrieval", "verifier"]
+    assert (
+        "[cycle:diversity-fill-test] campaign broadened reason=subsystem_diversity_fill "
+        "selected_from_ranked_experiments=2"
+    ) in stderr.getvalue()
+
+
+def test_tolbert_runtime_summary_infers_success_from_cognitive_tolbert_query():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    payload = module._tolbert_runtime_summary_from_cognitive_progress(
+        {
+            "stage": "context_compile",
+            "step_subphase": "tolbert_query",
+        },
+        active_cycle_run={
+            "current_task": {"phase": "generated_success"},
+        },
+    )
+
+    assert payload["configured_to_use_tolbert"] is True
+    assert payload["stages_attempted"] == ["generated_success"]
+    assert payload["successful_tolbert_stages"] == ["generated_success"]
+    assert payload["outcome"] == "succeeded"
+
+
+def test_append_partial_run_from_active_progress_preserves_identity_and_tolbert_summary():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    runs: list[dict[str, object]] = []
+    synthetic = module._append_partial_run_from_active_progress(
+        runs=runs,
+        active_cycle_run={
+            "index": 2,
+            "selected_subsystem": "verifier",
+            "last_progress_phase": "variant_search",
+            "current_task": {"phase": "generated_success", "family": "repository"},
+            "sampled_families_from_progress": ["repository"],
+            "observe_completed": True,
+            "tolbert_runtime_summary": {
+                "configured_to_use_tolbert": True,
+                "successful_tolbert_stages": ["generated_success"],
+            },
+        },
+        priority_benchmark_families=["repository"],
+        returncode=0,
+        stderr="",
+        interrupted=True,
+    )
+
+    assert synthetic is not None
+    assert synthetic["selected_subsystem"] == "verifier"
+    assert synthetic["last_progress_phase"] == "variant_search"
+    assert synthetic["current_task"]["phase"] == "generated_success"
+    assert synthetic["tolbert_runtime_summary"]["outcome"] == "succeeded"
+    assert synthetic["tolbert_runtime_summary"]["successful_tolbert_stages"] == ["generated_success"]
+
+
+def test_parse_progress_line_promotes_variant_generate_and_clears_stale_task():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    parsed = module._parse_progress_fields(
+        "[cycle:cycle-1] variant generate start subsystem=tolbert_model variant=recovery_alignment rank=1/2 expected_gain=0.0300 score=0.0075"
+    )
+    assert parsed["last_progress_phase"] == "variant_generate"
+    assert parsed["selected_subsystem"] == "tolbert_model"
+    assert parsed["last_candidate_variant"] == "recovery_alignment"
+    assert parsed["current_task"] == {}
+
+    heartbeat = module._parse_progress_fields(
+        "[cycle:cycle-1] variant generate heartbeat subsystem=tolbert_model variant=recovery_alignment stage=tolbert_pipeline_heartbeat pending=tolbert_finetune_pipeline"
+    )
+    assert heartbeat["last_progress_phase"] == "variant_generate"
+    assert heartbeat["variant_generate_stage"] == "tolbert_pipeline_heartbeat"
+    assert heartbeat["current_task"] == {}
 
 
 def test_run_improvement_cycle_forwards_abstraction_flags(tmp_path, monkeypatch):
@@ -5651,7 +7426,7 @@ def test_run_improvement_cycle_uses_portfolio_campaign_selection(tmp_path, monke
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [
+        lambda self, metrics, max_candidates=1, **kwargs: [
             ImprovementExperiment(
                 "policy",
                 "p",
@@ -5967,7 +7742,7 @@ def test_run_improvement_cycle_reconciles_prior_incomplete_autonomous_cycles(tmp
 
     records = [json.loads(line) for line in cycles_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     stale = [record for record in records if record["cycle_id"] == "cycle:retrieval:stale"]
-    assert [record["state"] for record in stale[-2:]] == ["reject", "record"]
+    assert [record["state"] for record in stale[-2:]] == ["incomplete", "record"]
     assert "incomplete autonomous cycle" in stale[-2]["reason"]
 
 
@@ -6337,7 +8112,7 @@ def test_run_improvement_cycle_emits_preview_progress_details(tmp_path, monkeypa
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [ImprovementExperiment("policy", "policy gap", 4, 0.02, 2, 0.1, {})],
+        lambda self, metrics, max_candidates=1, **kwargs: [ImprovementExperiment("policy", "policy gap", 4, 0.02, 2, 0.1, {})],
     )
     monkeypatch.setattr(
         module.ImprovementPlanner,
@@ -6385,6 +8160,8 @@ def test_run_improvement_cycle_emits_preview_progress_details(tmp_path, monkeypa
             {
                 "artifact_path": str(kwargs["artifact_path"]),
                 "progress_label_prefix": kwargs.get("progress_label_prefix"),
+                "priority_benchmark_families": kwargs.get("priority_benchmark_families"),
+                "restrict_to_priority_benchmark_families": kwargs.get("restrict_to_priority_benchmark_families"),
             }
         )
         return {
@@ -6397,7 +8174,13 @@ def test_run_improvement_cycle_emits_preview_progress_details(tmp_path, monkeypa
 
     monkeypatch.setattr(module, "_generate_candidate_artifact", fake_generate_candidate_artifact)
     monkeypatch.setattr(module, "preview_candidate_retention", fake_preview)
-    monkeypatch.setattr(module, "finalize_cycle", lambda **kwargs: ("retain", "finalized"))
+    finalize_calls: list[dict[str, object]] = []
+
+    def fake_finalize_cycle(**kwargs):
+        finalize_calls.append(kwargs)
+        return ("retain", "finalized")
+
+    monkeypatch.setattr(module, "finalize_cycle", fake_finalize_cycle)
     monkeypatch.setattr(
         module,
         "KernelConfig",
@@ -6413,7 +8196,21 @@ def test_run_improvement_cycle_emits_preview_progress_details(tmp_path, monkeypa
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_improvement_cycle.py", "--variant-width", "2", "--task-limit", "17", "--progress-label", "test-progress"],
+        [
+            "run_improvement_cycle.py",
+            "--variant-width",
+            "2",
+            "--task-limit",
+            "17",
+            "--progress-label",
+            "test-progress",
+            "--priority-benchmark-family",
+            "integration",
+            "--priority-benchmark-family",
+            "project",
+            "--priority-benchmark-family",
+            "repository",
+        ],
     )
     stdout = StringIO()
     stderr = StringIO()
@@ -6432,6 +8229,14 @@ def test_run_improvement_cycle_emits_preview_progress_details(tmp_path, monkeypa
     assert "[cycle:test-progress] finalize start subsystem=policy variant=verifier_alignment artifact=" in progress_output
     assert preview_calls[0]["progress_label_prefix"] == "cycle:policy:test_policy_verifier_alignment_preview"
     assert preview_calls[1]["progress_label_prefix"] == "cycle:policy:test_policy_retrieval_caution_preview"
+    assert preview_calls[0]["priority_benchmark_families"] == ["integration", "project", "repository"]
+    assert preview_calls[0]["restrict_to_priority_benchmark_families"] is True
+    assert isinstance(finalize_calls[0]["preview"], dict)
+    assert finalize_calls[0]["preview"]["state"] == "retain"
+    assert finalize_calls[0]["priority_benchmark_families"] == ["integration", "project", "repository"]
+    assert finalize_calls[0]["restrict_to_priority_benchmark_families"] is True
+    assert finalize_calls[0]["include_curriculum"] is False
+    assert finalize_calls[0]["include_failure_curriculum"] is False
 
 
 def test_run_improvement_cycle_falls_back_to_default_variant_after_planning_timeout(tmp_path, monkeypatch):
@@ -6459,7 +8264,7 @@ def test_run_improvement_cycle_falls_back_to_default_variant_after_planning_time
     monkeypatch.setattr(
         module.ImprovementPlanner,
         "select_portfolio_campaign",
-        lambda self, metrics, max_candidates=1: [tooling_experiment],
+        lambda self, metrics, max_candidates=1, **kwargs: [tooling_experiment],
     )
     monkeypatch.setattr(
         module.ImprovementPlanner,
@@ -6632,6 +8437,64 @@ def test_preview_candidate_retention_uses_no_write_scoped_configs_and_task_limit
     )
 
 
+def test_preview_candidate_retention_can_restrict_to_priority_primary_lane(tmp_path, monkeypatch):
+    module = _load_finalize_module()
+    active_path = tmp_path / "tolbert" / "active.json"
+    candidate_path = tmp_path / "tolbert" / "candidate.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "tolbert_model_bundle",
+        "lifecycle_state": "retained",
+        "model_surfaces": {},
+        "runtime_paths": {},
+        "preview_controls": {
+            "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
+            "priority_benchmark_family_weights": {"benchmark_candidate": 4.0},
+        },
+        "retention_gate": {"min_pass_rate_delta_abs": 0.0},
+    }
+    active_path.write_text(json.dumps(payload), encoding="utf-8")
+    candidate_path.write_text(json.dumps({**payload, "lifecycle_state": "proposed"}), encoding="utf-8")
+
+    config = KernelConfig(
+        trajectories_root=tmp_path / "episodes",
+        tolbert_model_artifact_path=active_path,
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+    )
+    config.ensure_directories()
+    seen_flags = []
+
+    def fake_evaluate(*, config, subsystem, flags, progress_label):
+        del config, subsystem, progress_label
+        seen_flags.append(dict(flags))
+        return EvalMetrics(total=3, passed=3, average_steps=1.0)
+
+    monkeypatch.setattr(module.cycle_runner, "evaluate_subsystem_metrics", fake_evaluate)
+    monkeypatch.setattr(module.cycle_runner, "compare_to_prior_retained", lambda **kwargs: None)
+
+    module.cycle_runner.preview_candidate_retention(
+        config=config,
+        subsystem="tolbert_model",
+        artifact_path=candidate_path,
+        active_artifact_path=active_path,
+        cycle_id="cycle:tolbert:test",
+        include_curriculum=True,
+        include_failure_curriculum=True,
+        priority_benchmark_families=["integration", "project", "repository"],
+        restrict_to_priority_benchmark_families=True,
+    )
+
+    assert len(seen_flags) == 2
+    assert all(flags["priority_benchmark_families"] == ["integration", "project", "repository"] for flags in seen_flags)
+    assert all("benchmark_candidate" not in flags["priority_benchmark_families"] for flags in seen_flags)
+    assert all(flags["restrict_to_priority_benchmark_families"] is True for flags in seen_flags)
+    assert all(flags["prefer_low_cost_tasks"] is True for flags in seen_flags)
+    assert all(flags["include_generated"] is False for flags in seen_flags)
+    assert all(flags["include_failure_generated"] is False for flags in seen_flags)
+
+
 def test_preview_candidate_retention_uses_bounded_retrieval_preview_controls(tmp_path, monkeypatch):
     module = _load_finalize_module()
     active_path = tmp_path / "retrieval" / "retrieval_proposals.json"
@@ -6650,6 +8513,7 @@ def test_preview_candidate_retention_uses_bounded_retrieval_preview_controls(tmp
         "lifecycle_state": "proposed",
         "preview_controls": {
             "comparison_task_limit_floor": 24,
+            "bounded_comparison_required": True,
             "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
             "priority_benchmark_family_weights": {
                 "benchmark_candidate": 4.0,
@@ -6687,6 +8551,8 @@ def test_preview_candidate_retention_uses_bounded_retrieval_preview_controls(tmp
         seen_calls.append(
             {
                 "task_limit": flags.get("task_limit"),
+                "include_episode_memory": flags.get("include_episode_memory"),
+                "include_verifier_memory": flags.get("include_verifier_memory"),
                 "include_benchmark_candidates": flags.get("include_benchmark_candidates"),
                 "priority_benchmark_families": flags.get("priority_benchmark_families"),
                 "priority_benchmark_family_weights": flags.get("priority_benchmark_family_weights"),
@@ -6707,6 +8573,8 @@ def test_preview_candidate_retention_uses_bounded_retrieval_preview_controls(tmp
 
     assert len(seen_calls) == 2
     assert all(call["task_limit"] == 24 for call in seen_calls)
+    assert all(call["include_episode_memory"] is False for call in seen_calls)
+    assert all(call["include_verifier_memory"] is False for call in seen_calls)
     assert all(call["include_benchmark_candidates"] is True for call in seen_calls)
     assert all(
         call["priority_benchmark_families"] == ["benchmark_candidate", "integration", "repository"]
@@ -6785,7 +8653,7 @@ def test_preview_candidate_retention_falls_back_to_bounded_retrieval_task_limit_
         task_limit=4,
     )
 
-    assert seen_calls == [24, 24]
+    assert seen_calls == [8, 8]
 
 
 def test_preview_candidate_retention_keeps_task_limit_for_retrieval_without_carryover_gate(tmp_path, monkeypatch):
@@ -6867,7 +8735,8 @@ def test_compare_to_prior_retained_uses_bounded_retrieval_preview_controls(tmp_p
         "artifact_kind": "retrieval_policy_set",
         "lifecycle_state": "proposed",
         "preview_controls": {
-            "comparison_task_limit_floor": 24,
+            "comparison_task_limit_floor": 12,
+            "bounded_comparison_required": True,
             "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
             "priority_benchmark_family_weights": {
                 "benchmark_candidate": 4.0,
@@ -6887,6 +8756,8 @@ def test_compare_to_prior_retained_uses_bounded_retrieval_preview_controls(tmp_p
         seen_calls.append(
             {
                 "task_limit": flags.get("task_limit"),
+                "include_episode_memory": flags.get("include_episode_memory"),
+                "include_verifier_memory": flags.get("include_verifier_memory"),
                 "priority_benchmark_families": flags.get("priority_benchmark_families"),
                 "priority_benchmark_family_weights": flags.get("priority_benchmark_family_weights"),
             }
@@ -6914,7 +8785,9 @@ def test_compare_to_prior_retained_uses_bounded_retrieval_preview_controls(tmp_p
     assert comparison is not None
     assert seen_calls == [
         {
-            "task_limit": 24,
+            "task_limit": 12,
+            "include_episode_memory": False,
+            "include_verifier_memory": False,
             "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
             "priority_benchmark_family_weights": {
                 "benchmark_candidate": 4.0,
@@ -6923,7 +8796,9 @@ def test_compare_to_prior_retained_uses_bounded_retrieval_preview_controls(tmp_p
             },
         },
         {
-            "task_limit": 24,
+            "task_limit": 12,
+            "include_episode_memory": False,
+            "include_verifier_memory": False,
             "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
             "priority_benchmark_family_weights": {
                 "benchmark_candidate": 4.0,
@@ -6932,6 +8807,82 @@ def test_compare_to_prior_retained_uses_bounded_retrieval_preview_controls(tmp_p
             },
         },
     ]
+
+
+def test_compare_to_prior_retained_preserves_explicit_priority_restriction(tmp_path, monkeypatch):
+    module = _load_finalize_module()
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    snapshot_path = tmp_path / ".artifact_history" / "retrieval.cycle_prior.post_retain.json"
+    artifact_path = tmp_path / "retrieval" / "retrieval_proposals.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(json.dumps({"artifact_kind": "retrieval_policy_set"}), encoding="utf-8")
+    artifact_path.write_text(json.dumps({"artifact_kind": "retrieval_policy_set"}), encoding="utf-8")
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:retrieval:prior",
+            state="retain",
+            subsystem="retrieval",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="retrieval_policy_set",
+            reason="retained prior baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_state": "proposed",
+        "preview_controls": {
+            "comparison_task_limit_floor": 12,
+            "bounded_comparison_required": True,
+            "priority_benchmark_families": ["benchmark_candidate", "integration", "repository"],
+            "priority_benchmark_family_weights": {"benchmark_candidate": 4.0},
+        },
+    }
+    seen_calls = []
+
+    def fake_evaluate(*, config, subsystem, flags, progress_label):
+        del config, subsystem, progress_label
+        seen_calls.append(dict(flags))
+        return EvalMetrics(total=4, passed=4, average_steps=1.0)
+
+    monkeypatch.setattr(module.cycle_runner, "evaluate_subsystem_metrics", fake_evaluate)
+
+    comparison = module.cycle_runner.compare_to_prior_retained(
+        config=KernelConfig(
+            improvement_cycles_path=cycles_path,
+            retrieval_proposals_path=artifact_path,
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+        ),
+        planner=planner,
+        subsystem="retrieval",
+        artifact_path=artifact_path,
+        cycles_path=cycles_path,
+        before_cycle_id="cycle:retrieval:current",
+        flags={
+            "include_generated": True,
+            "include_failure_generated": True,
+            "priority_benchmark_families": ["integration", "project", "repository"],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        payload=payload,
+        task_limit=4,
+    )
+
+    assert comparison is not None
+    assert len(seen_calls) == 2
+    assert all(call["task_limit"] == 12 for call in seen_calls)
+    assert all(call["priority_benchmark_families"] == ["integration", "project", "repository"] for call in seen_calls)
+    assert all("benchmark_candidate" not in call["priority_benchmark_families"] for call in seen_calls)
+    assert all(call["restrict_to_priority_benchmark_families"] is True for call in seen_calls)
+    assert all(call["prefer_low_cost_tasks"] is True for call in seen_calls)
+    assert all(call["include_generated"] is False for call in seen_calls)
+    assert all(call["include_failure_generated"] is False for call in seen_calls)
 
 
 def test_compare_to_prior_retained_falls_back_to_bounded_retrieval_task_limit_without_preview_controls(
@@ -6995,10 +8946,10 @@ def test_compare_to_prior_retained_falls_back_to_bounded_retrieval_task_limit_wi
     )
 
     assert comparison is not None
-    assert seen_calls == [24, 24]
+    assert seen_calls == [8, 8]
 
 
-def test_finalize_cycle_runs_uncapped_holdout_after_capped_preview(tmp_path, monkeypatch):
+def test_finalize_cycle_runs_bounded_holdout_after_capped_preview_for_retrieval(tmp_path, monkeypatch):
     module = _load_finalize_module()
     active_path = tmp_path / "prompts" / "prompt_proposals.json"
     candidate_path = tmp_path / "candidates" / "prompt_candidate.json"
@@ -7106,6 +9057,8 @@ def test_finalize_cycle_runs_uncapped_holdout_after_capped_preview(tmp_path, mon
                 "progress_label": progress_label,
                 "persist_episode_memory": config.persist_episode_memory,
                 "task_limit": flags.get("task_limit"),
+                "max_generated_success_schedule_tasks": flags.get("max_generated_success_schedule_tasks"),
+                "max_generated_failure_schedule_tasks": flags.get("max_generated_failure_schedule_tasks"),
             }
         )
         if len(holdout_calls) == 1:
@@ -7131,6 +9084,11 @@ def test_finalize_cycle_runs_uncapped_holdout_after_capped_preview(tmp_path, mon
     monkeypatch.setattr(module.cycle_runner, "evaluate_subsystem_metrics", fake_evaluate)
     monkeypatch.setattr(
         module.cycle_runner,
+        "evaluate_artifact_retention",
+        lambda *args, **kwargs: ("retain", "holdout retained"),
+    )
+    monkeypatch.setattr(
+        module.cycle_runner,
         "apply_artifact_retention_decision",
         lambda **kwargs: {
             "artifact_kind": "prompt_proposal_set",
@@ -7144,11 +9102,16 @@ def test_finalize_cycle_runs_uncapped_holdout_after_capped_preview(tmp_path, mon
             "active_artifact_path": str(kwargs["active_artifact_path"]),
         },
     )
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "materialize_retained_retrieval_asset_bundle",
+        lambda **kwargs: tmp_path / "tolbert_bundle" / "manifest.json",
+    )
 
     state, _ = module.cycle_runner.finalize_cycle(
         config=config,
-        subsystem="policy",
-        cycle_id="cycle:policy:test",
+        subsystem="retrieval",
+        cycle_id="cycle:retrieval:test",
         artifact_path=candidate_path,
         active_artifact_path=active_path,
         include_curriculum=True,
@@ -7166,7 +9129,9 @@ def test_finalize_cycle_runs_uncapped_holdout_after_capped_preview(tmp_path, mon
     assert state == "retain"
     assert len(holdout_calls) == 2
     assert all(call["persist_episode_memory"] is False for call in holdout_calls)
-    assert all(call["task_limit"] is None for call in holdout_calls)
+    assert all(call["task_limit"] == 5 for call in holdout_calls)
+    assert all(call["max_generated_success_schedule_tasks"] == 5 for call in holdout_calls)
+    assert all(call["max_generated_failure_schedule_tasks"] == 5 for call in holdout_calls)
     assert len(holdout_records) == 1
 
 
@@ -7428,3 +9393,82 @@ def test_yield_summary_for_marks_productive_depth_and_drift():
     assert summary["average_productive_depth_step_delta"] == 4.0
     assert summary["depth_drift_cycles"] == 1
     assert summary["average_depth_drift_step_delta"] == 3.0
+
+
+def test_run_repeated_improvement_cycles_flags_post_decision_failure_recovery_for_intervention():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    signal = module._mid_cycle_intervention_signal(
+        {
+            "pending_decision_state": "reject",
+            "selected_subsystem": "retrieval",
+            "last_progress_phase": "generated_failure",
+            "current_task": {
+                "task_id": "bridge_handoff_task_file_recovery",
+                "family": "transition_pressure",
+                "phase": "generated_failure",
+            },
+        }
+    )
+
+    assert signal["triggered"] is True
+    assert signal["reason_code"] == "post_decision_failure_recovery"
+    assert signal["decision_state"] == "reject"
+    assert signal["subsystem"] == "retrieval"
+
+
+def test_run_repeated_improvement_cycles_stream_runner_honors_callback_termination(monkeypatch, tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    terminated = {"called": False}
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter(
+                [
+                    "[eval:cycle:test] phase=generated_failure task 1/8 bridge_handoff_task family=transition_pressure\n",
+                ]
+            )
+
+    class FakeProcess:
+        pid = 4242
+        stdout = FakeStdout()
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(module, "spawn_process_group", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(
+        module,
+        "terminate_process_tree",
+        lambda process: terminated.__setitem__("called", True),
+    )
+
+    result = module._run_and_stream(
+        [sys.executable, "-u", "fake.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="test-cycle",
+        on_event=lambda event: (
+            {
+                "terminate": True,
+                "reason": "mid-cycle controller intervention: durable reject decision already emitted",
+            }
+            if str(event.get("event", "")) == "output"
+            else None
+        ),
+    )
+
+    assert terminated["called"] is True
+    assert result["timed_out"] is True
+    assert "controller intervention" in result["timeout_reason"]

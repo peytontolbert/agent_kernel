@@ -267,9 +267,14 @@ class AgentState:
             f"exit_code={command_result.exit_code} timed_out={command_result.timed_out} outcome={outcome}"
         )
 
-    def refresh_plan_progress(self, world_model_summary: dict[str, object]) -> None:
+    def refresh_plan_progress(
+        self,
+        world_model_summary: dict[str, object],
+        *,
+        expand_long_horizon: bool = True,
+    ) -> None:
         remaining = [goal for goal in self.plan if not self._subgoal_satisfied(goal, world_model_summary)]
-        if self.world_horizon() == "long_horizon":
+        if self.world_horizon() == "long_horizon" and expand_long_horizon:
             remaining = self._reconcile_long_horizon_plan(remaining, world_model_summary)
         self.plan = remaining
         self.active_subgoal = remaining[0] if remaining else ""

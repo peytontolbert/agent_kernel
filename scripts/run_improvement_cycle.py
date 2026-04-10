@@ -21,6 +21,7 @@ from agent_kernel.cycle_runner import autonomous_runtime_eval_flags, finalize_cy
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import (
     ImprovementCycleRecord,
+    ImprovementExperiment,
     ImprovementPlanner,
     ImprovementSearchBudget,
     ImprovementVariant,
@@ -29,7 +30,9 @@ from agent_kernel.improvement import (
     stamp_artifact_experiment_variant,
     stamp_artifact_generation_context,
 )
+from agent_kernel.llm import VLLMClient, _extract_json_object
 from agent_kernel.runtime_supervision import atomic_write_json, terminate_process_tree
+from agent_kernel.strategy_memory import record_pending_strategy_node
 from agent_kernel.subsystems import (
     active_artifact_path_for_subsystem,
     base_subsystem_for,
@@ -67,6 +70,8 @@ _PLANNING_STAGE_TIMEOUT_SECONDS = max(
     0.0,
     float(os.getenv("AGENT_KERNEL_IMPROVEMENT_PLANNING_TIMEOUT_SECONDS", "30") or 0.0),
 )
+_OBSERVE_HYPOTHESIS_MAX_SUBSYSTEMS = 3
+_OBSERVE_HYPOTHESIS_BONUS_CAP = 0.03
 
 
 class _PlanningStageTimeout(RuntimeError):
@@ -126,6 +131,262 @@ def _fallback_default_variants(
             )
         )
     return [variant for variant in variants if variant.variant_id]
+
+
+def _planner_memory_root(config: KernelConfig) -> Path:
+    trajectories_root = config.trajectories_root
+    if trajectories_root.is_absolute():
+        return trajectories_root
+    improvement_cycles_path = config.improvement_cycles_path
+    if improvement_cycles_path.is_absolute():
+        return improvement_cycles_path.parent.parent / "episodes"
+    return trajectories_root
+
+
+def _planner_trust_ledger_path(config: KernelConfig) -> Path:
+    trust_ledger_path = config.unattended_trust_ledger_path
+    if trust_ledger_path.is_absolute():
+        return trust_ledger_path
+    planner_memory_root = _planner_memory_root(config)
+    if planner_memory_root.is_absolute():
+        return planner_memory_root.parent / "reports" / trust_ledger_path.name
+    return trust_ledger_path
+
+
+def _planner_runtime_config(config: KernelConfig) -> KernelConfig:
+    planner_memory_root = _planner_memory_root(config)
+    if not planner_memory_root.is_absolute():
+        return config
+    strategy_memory_dir = planner_memory_root.parent / "improvement" / "strategy_memory"
+    learning_dir = planner_memory_root.parent / "learning"
+    return replace(
+        config,
+        storage_backend="json" if str(config.storage_backend).strip().lower() != "json" else config.storage_backend,
+        trajectories_root=planner_memory_root,
+        strategy_memory_nodes_path=(
+            config.strategy_memory_nodes_path
+            if config.strategy_memory_nodes_path.is_absolute()
+            else strategy_memory_dir / config.strategy_memory_nodes_path.name
+        ),
+        strategy_memory_snapshots_path=(
+            config.strategy_memory_snapshots_path
+            if config.strategy_memory_snapshots_path.is_absolute()
+            else strategy_memory_dir / config.strategy_memory_snapshots_path.name
+        ),
+        learning_artifacts_path=(
+            config.learning_artifacts_path
+            if config.learning_artifacts_path.is_absolute()
+            else learning_dir / config.learning_artifacts_path.name
+        ),
+        unattended_trust_ledger_path=_planner_trust_ledger_path(config),
+    )
+
+
+def _campaign_surface_key(subsystem: str, *, capability_modules_path: Path | None = None) -> str:
+    base_subsystem = base_subsystem_for(subsystem, capability_modules_path) or str(subsystem).strip()
+    if base_subsystem in {"retrieval", "tolbert_model", "qwen_adapter"}:
+        return "retrieval_stack"
+    return base_subsystem
+
+
+def _diversify_campaign_from_ranked_experiments(
+    campaign: list[ImprovementExperiment],
+    ranked_experiments: list[ImprovementExperiment],
+    *,
+    max_candidates: int,
+    capability_modules_path: Path | None = None,
+) -> list[ImprovementExperiment]:
+    diversified: list[ImprovementExperiment] = []
+    selected_bases: set[str] = set()
+    for group in (campaign, ranked_experiments):
+        for experiment in group:
+            if len(diversified) >= max(1, max_candidates):
+                return diversified
+            base_subsystem = _campaign_surface_key(
+                experiment.subsystem,
+                capability_modules_path=capability_modules_path,
+            )
+            if base_subsystem in selected_bases:
+                continue
+            diversified.append(experiment)
+            selected_bases.add(base_subsystem)
+    return diversified
+
+
+def _observe_hypothesis_prompt(*, metrics: EvalMetrics, ranked_experiments) -> str:
+    ranked_payload = [
+        {
+            "subsystem": experiment.subsystem,
+            "reason": experiment.reason,
+            "priority": experiment.priority,
+            "expected_gain": round(float(experiment.expected_gain), 4),
+            "estimated_cost": int(experiment.estimated_cost),
+            "score": round(float(experiment.score), 4),
+        }
+        for experiment in list(ranked_experiments)[:6]
+    ]
+    metrics_payload = {
+        "total": int(metrics.total),
+        "passed": int(metrics.passed),
+        "pass_rate": round(float(metrics.pass_rate), 4),
+        "generated_pass_rate": round(float(metrics.generated_pass_rate), 4),
+        "low_confidence_episodes": int(metrics.low_confidence_episodes),
+        "trusted_retrieval_steps": int(metrics.trusted_retrieval_steps),
+        "families": {
+            str(key): int(value)
+            for key, value in sorted(metrics.total_by_benchmark_family.items())
+            if int(value) > 0
+        },
+    }
+    return (
+        "Observe phase has completed. Produce a short JSON object with keys "
+        "`summary` and `hypotheses`. `hypotheses` must be a list with at most 3 items. "
+        "Each item must have keys `subsystem`, `confidence`, and `rationale`. "
+        "Choose only subsystem values that appear in ranked_experiments. "
+        "Use confidence between 0 and 1. Favor broad coding yield, decision conversion, "
+        "and the next intervention most likely to produce retained gain.\n\n"
+        f"metrics={json.dumps(metrics_payload, sort_keys=True)}\n"
+        f"ranked_experiments={json.dumps(ranked_payload, sort_keys=True)}"
+    )
+
+
+def _extract_llm_json_payload(data: dict[str, object]) -> dict[str, object] | None:
+    choices = data.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return _extract_json_object(str(content)) or _extract_json_object(str(message.get("reasoning", "")))
+
+
+def _normalize_observe_hypothesis(
+    payload: dict[str, object] | None,
+    *,
+    allowed_subsystems: set[str],
+    provider: str,
+    status: str = "generated",
+    reason: str = "",
+) -> dict[str, object]:
+    normalized = {
+        "status": status,
+        "provider": provider,
+        "reason": str(reason).strip(),
+        "summary": "",
+        "hypotheses": [],
+        "bonus_by_subsystem": {},
+    }
+    if not isinstance(payload, dict):
+        return normalized
+    normalized["summary"] = str(payload.get("summary", "")).strip()
+    raw_hypotheses = payload.get("hypotheses", [])
+    if not isinstance(raw_hypotheses, list):
+        return normalized
+    hypotheses: list[dict[str, object]] = []
+    bonuses: dict[str, float] = {}
+    for index, item in enumerate(raw_hypotheses[:_OBSERVE_HYPOTHESIS_MAX_SUBSYSTEMS]):
+        if not isinstance(item, dict):
+            continue
+        subsystem = str(item.get("subsystem", "")).strip()
+        if subsystem not in allowed_subsystems:
+            continue
+        try:
+            confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        rationale = str(item.get("rationale", "")).strip()
+        if not rationale:
+            continue
+        rank_decay = max(0.4, 1.0 - (index * 0.25))
+        bonus = min(_OBSERVE_HYPOTHESIS_BONUS_CAP, round(confidence * 0.03 * rank_decay, 4))
+        hypotheses.append(
+            {
+                "subsystem": subsystem,
+                "confidence": round(confidence, 4),
+                "rationale": rationale,
+                "bonus": bonus,
+            }
+        )
+        bonuses[subsystem] = max(bonuses.get(subsystem, 0.0), bonus)
+    normalized["hypotheses"] = hypotheses
+    normalized["bonus_by_subsystem"] = bonuses
+    return normalized
+
+
+def _generate_observe_hypothesis(
+    *,
+    config: KernelConfig,
+    metrics: EvalMetrics,
+    ranked_experiments,
+    progress_label: str | None,
+) -> dict[str, object]:
+    provider = config.normalized_provider()
+    allowed_subsystems = {str(experiment.subsystem).strip() for experiment in ranked_experiments}
+    if provider != "vllm" or not allowed_subsystems:
+        return _normalize_observe_hypothesis(
+            {},
+            allowed_subsystems=allowed_subsystems,
+            provider=provider,
+            status="skipped",
+            reason="observe_hypothesis_requires_vllm_and_ranked_candidates",
+        )
+    _progress(progress_label, "phase=observe_hypothesis start provider=vllm")
+    client = VLLMClient(
+        host=config.vllm_host,
+        model_name=config.model_name,
+        timeout_seconds=max(5, min(int(config.llm_timeout_seconds), 20)),
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        api_key=config.vllm_api_key,
+    )
+    try:
+        data = client._chat_completion(
+            system_prompt=(
+                "You are the observe-phase intervention strategist for an autonomous coding-improvement kernel. "
+                "Return compact JSON only."
+            ),
+            prompt=_observe_hypothesis_prompt(metrics=metrics, ranked_experiments=ranked_experiments),
+            use_json_schema=False,
+        )
+        payload = _extract_llm_json_payload(data)
+        normalized = _normalize_observe_hypothesis(
+            payload,
+            allowed_subsystems=allowed_subsystems,
+            provider=provider,
+        )
+        _progress(
+            progress_label,
+            "phase=observe_hypothesis complete "
+            f"hypotheses={len(list(normalized.get('hypotheses', [])))}",
+        )
+        return normalized
+    except Exception as exc:
+        _progress(progress_label, f"phase=observe_hypothesis warning={exc.__class__.__name__}:{exc}")
+        return _normalize_observe_hypothesis(
+            {},
+            allowed_subsystems=allowed_subsystems,
+            provider=provider,
+            status="error",
+            reason=f"{exc.__class__.__name__}:{exc}",
+        )
+
+
+def _sort_experiments_with_observe_bonus(ranked_experiments, observe_hypothesis: dict[str, object]):
+    bonus_by_subsystem = dict(observe_hypothesis.get("bonus_by_subsystem", {})) if isinstance(observe_hypothesis, dict) else {}
+    if not bonus_by_subsystem:
+        return list(ranked_experiments)
+    return sorted(
+        list(ranked_experiments),
+        key=lambda experiment: (
+            float(experiment.score) + float(bonus_by_subsystem.get(experiment.subsystem, 0.0) or 0.0),
+            int(experiment.priority),
+            str(experiment.subsystem),
+        ),
+        reverse=True,
+    )
 
 
 def _select_variants_for_campaign(
@@ -303,6 +564,7 @@ def _generate_candidate_artifact(
     candidate_artifact_path_obj: Path,
     prior_retained_cycle_id: str,
     prior_retained_snapshot_path: Path | None,
+    progress_label: str | None = None,
 ) -> dict[str, object]:
     generation_kwargs = _variant_generation_kwargs(variant, capability_modules_path=config.capability_modules_path)
     artifact = ""
@@ -323,6 +585,15 @@ def _generate_candidate_artifact(
         metrics=metrics,
         generation_kwargs=generation_kwargs,
         candidate_artifact_path=candidate_artifact_path_obj,
+        progress=(
+            None
+            if not progress_label
+            else lambda message: _progress(
+                progress_label,
+                f"variant generate heartbeat subsystem={target.subsystem} "
+                f"variant={variant.variant_id} {message}",
+            )
+        ),
     )
 
     if artifact:
@@ -384,6 +655,16 @@ def _comparison_task_limit(config: KernelConfig, args: argparse.Namespace) -> in
     return min(positive_limits)
 
 
+def _observation_task_limit(config: KernelConfig, args: argparse.Namespace) -> int | None:
+    requested = max(0, int(getattr(args, "task_limit", 0) or 0))
+    if requested <= 0:
+        return None
+    probe_cap = max(0, int(getattr(config, "observe_feature_probe_max_tasks", 0) or 0))
+    if probe_cap <= 0:
+        return requested
+    return min(requested, probe_cap)
+
+
 def _variant_ids_summary(selected_variants) -> str:
     return ",".join(str(getattr(variant, "variant_id", "")).strip() for variant in selected_variants if str(getattr(variant, "variant_id", "")).strip())
 
@@ -409,27 +690,98 @@ def _filter_experiments_by_subsystem(experiments, *, excluded_subsystems: set[st
     return [experiment for experiment in experiments if experiment.subsystem not in excluded_subsystems]
 
 
+def _fallback_campaign_from_ranked_experiments(
+    ranked_experiments,
+    *,
+    max_candidates: int,
+    planner: ImprovementPlanner | None = None,
+    metrics: EvalMetrics | None = None,
+):
+    if max_candidates <= 0:
+        return []
+    selected = []
+    seen_surfaces: set[str] = set()
+    for experiment in ranked_experiments:
+        subsystem = str(getattr(experiment, "subsystem", "")).strip()
+        if not subsystem:
+            continue
+        surface = subsystem.split(":", 1)[0]
+        if surface in seen_surfaces:
+            continue
+        if planner is not None and metrics is not None:
+            strategy_choice = planner._strategy_portfolio_choice(
+                experiment,
+                metrics=metrics,
+                recent_activity=planner.recent_subsystem_activity_summary(subsystem=experiment.subsystem),
+                broad_observe_signal=planner._broad_coding_observe_diversification_signal(metrics),
+            )
+            strategy_candidate = dict(strategy_choice.get("strategy_candidate", {}))
+            strategy_memory_summary = dict(strategy_choice.get("strategy_memory_summary", {}))
+            strategy_candidate["parent_strategy_node_ids"] = list(
+                strategy_memory_summary.get("selected_parent_strategy_node_ids", [])
+            )
+            strategy_candidate["best_retained_strategy_node_id"] = str(
+                strategy_memory_summary.get("best_retained_strategy_node_id", "")
+            ).strip()
+            strategy_candidate["continuation_parent_node_id"] = str(
+                strategy_memory_summary.get("continuation_parent_node_id", "")
+            ).strip()
+            strategy_candidate["continuation_artifact_path"] = str(
+                strategy_memory_summary.get("continuation_artifact_path", "")
+            ).strip()
+            strategy_candidate["continuation_workspace_ref"] = str(
+                strategy_memory_summary.get("continuation_workspace_ref", "")
+            ).strip()
+            strategy_candidate["continuation_branch"] = str(
+                strategy_memory_summary.get("continuation_branch", "")
+            ).strip()
+            evidence = dict(getattr(experiment, "evidence", {}) or {})
+            evidence["strategy_candidate"] = strategy_candidate
+            experiment = ImprovementExperiment(
+                subsystem=experiment.subsystem,
+                reason=experiment.reason,
+                priority=experiment.priority,
+                expected_gain=experiment.expected_gain,
+                estimated_cost=experiment.estimated_cost,
+                score=experiment.score,
+                evidence=evidence,
+            )
+        selected.append(experiment)
+        seen_surfaces.add(surface)
+        if len(selected) >= max_candidates:
+            break
+    return selected
+
+
 def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> dict[str, object]:
-    task_limit = max(0, int(getattr(args, "task_limit", 0) or 0))
-    bounded_preview = task_limit > 0 and max(0.0, float(getattr(args, "max_observation_seconds", 0.0) or 0.0)) > 0.0
-    flags = autonomous_runtime_eval_flags(
-        config,
-        {
+    requested_task_limit = max(0, int(getattr(args, "task_limit", 0) or 0))
+    observation_task_limit = _observation_task_limit(config, args)
+    bounded_preview = requested_task_limit > 0 and max(0.0, float(getattr(args, "max_observation_seconds", 0.0) or 0.0)) > 0.0
+    runtime_flags: dict[str, bool] = {
         "include_discovered_tasks": True,
-        "include_episode_memory": args.include_episode_memory,
-        "include_skill_memory": args.include_skill_memory,
-        "include_skill_transfer": args.include_skill_transfer,
-        "include_operator_memory": args.include_operator_memory,
-        "include_tool_memory": args.include_tool_memory,
-        "include_verifier_memory": args.include_verifier_memory,
-        "include_benchmark_candidates": False,
-        "include_verifier_candidates": False,
         "include_generated": bool(args.include_curriculum) if bounded_preview else True,
         "include_failure_generated": bool(args.include_failure_curriculum) if bounded_preview else True,
-        },
+    }
+    for key in (
+        "include_episode_memory",
+        "include_skill_memory",
+        "include_skill_transfer",
+        "include_operator_memory",
+        "include_tool_memory",
+        "include_verifier_memory",
+        "include_benchmark_candidates",
+        "include_verifier_candidates",
+    ):
+        if bool(getattr(args, key, False)):
+            runtime_flags[key] = True
+    flags = autonomous_runtime_eval_flags(
+        config,
+        runtime_flags,
     )
-    if task_limit > 0:
-        flags["task_limit"] = task_limit
+    if isinstance(observation_task_limit, int) and observation_task_limit > 0:
+        flags["task_limit"] = observation_task_limit
+    flags["requested_task_limit"] = requested_task_limit
+    flags["observation_task_limit"] = 0 if observation_task_limit is None else observation_task_limit
     priority_benchmark_families = [
         str(value).strip()
         for value in getattr(args, "priority_benchmark_family", [])
@@ -437,6 +789,10 @@ def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> 
     ]
     if priority_benchmark_families:
         flags["priority_benchmark_families"] = priority_benchmark_families
+        flags["prefer_low_cost_tasks"] = True
+        flags["restrict_to_priority_benchmark_families"] = True
+        flags["include_generated"] = False
+        flags["include_failure_generated"] = False
     elif bounded_preview:
         flags["priority_benchmark_families"] = list(_DEFAULT_BOUNDED_OBSERVATION_PRIORITY_FAMILIES)
         flags["prefer_low_cost_tasks"] = True
@@ -782,6 +1138,13 @@ def _without_generated_curriculum(eval_kwargs: dict[str, object]) -> dict[str, o
     return degraded
 
 
+def _runtime_eval_kwargs(eval_kwargs: dict[str, object]) -> dict[str, object]:
+    runtime_kwargs = dict(eval_kwargs)
+    runtime_kwargs.pop("requested_task_limit", None)
+    runtime_kwargs.pop("observation_task_limit", None)
+    return runtime_kwargs
+
+
 def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
     normalized = str(error_text).strip().lower()
     if not normalized:
@@ -797,9 +1160,11 @@ def _run_observation_eval(
     max_observation_seconds: float,
 ) -> dict[str, object]:
     budget_seconds = max(0.0, float(max_observation_seconds))
+    runtime_eval_kwargs = _runtime_eval_kwargs(eval_kwargs)
+    requested_task_limit = max(0, int(eval_kwargs.get("requested_task_limit", 0) or 0))
     active_config = config
     if budget_seconds > 0.0 and float(config.tolbert_context_compile_budget_seconds or 0.0) <= 0.0:
-        task_limit = max(0, int(eval_kwargs.get("task_limit", 0) or 0))
+        task_limit = max(0, int(runtime_eval_kwargs.get("task_limit", 0) or 0))
         stage_budget_seconds = budget_seconds
         if task_limit > 0:
             if task_limit == 1:
@@ -814,10 +1179,12 @@ def _run_observation_eval(
             tolbert_context_compile_budget_seconds=max(0.25, stage_budget_seconds),
         )
     if budget_seconds <= 0.0:
+        if requested_task_limit > 0:
+            runtime_eval_kwargs["task_limit"] = requested_task_limit
         try:
             return {
                 "mode": "in_process",
-                "metrics": run_eval(config=active_config, progress_label=progress_label, **eval_kwargs),
+                "metrics": run_eval(config=active_config, progress_label=progress_label, **runtime_eval_kwargs),
                 "timed_out": False,
                 "timeout_reason": "",
                 "returncode": 0,
@@ -854,7 +1221,7 @@ def _run_observation_eval(
             payload_path,
             {
                 "config": _kernel_config_snapshot(active_config),
-                "eval_kwargs": _json_ready(eval_kwargs),
+                "eval_kwargs": _json_ready(runtime_eval_kwargs),
                 "progress_label": progress_label or "",
                 "result_path": str(result_path),
                 "progress_path": str(progress_path),
@@ -1017,8 +1384,8 @@ def _reconcile_incomplete_cycles(
         candidate_artifact_path = str(summary.get("candidate_artifact_path", "")).strip()
         artifact_kind = str(summary.get("artifact_kind", "")).strip() or "retention_decision"
         reason = (
-            "cycle ended before retention finalization; recorded fail-closed rejection "
-            "for stale incomplete autonomous cycle"
+            "incomplete autonomous cycle ended before retention finalization; "
+            "recorded incomplete state for stale autonomous cycle"
         )
         metrics_summary = {
             "protocol": "autonomous",
@@ -1034,7 +1401,7 @@ def _reconcile_incomplete_cycles(
             config.improvement_cycles_path,
             ImprovementCycleRecord(
                 cycle_id=cycle_id,
-                state="reject",
+                state="incomplete",
                 subsystem=subsystem,
                 action="finalize_cycle",
                 artifact_path=active_artifact_path,
@@ -1180,14 +1547,15 @@ def main() -> None:
     if scope_id:
         config = scoped_improvement_cycle_config(config, _sanitize_scope_id(scope_id))
     config.ensure_directories()
+    planner_runtime_config = _planner_runtime_config(config)
     planner = ImprovementPlanner(
-        memory_root=config.trajectories_root,
+        memory_root=_planner_memory_root(config),
         cycles_path=config.improvement_cycles_path,
         prompt_proposals_path=config.prompt_proposals_path,
         use_prompt_proposals=config.use_prompt_proposals,
         capability_modules_path=config.capability_modules_path,
-        trust_ledger_path=config.unattended_trust_ledger_path,
-        runtime_config=config,
+        trust_ledger_path=_planner_trust_ledger_path(config),
+        runtime_config=planner_runtime_config,
     )
     _reconcile_incomplete_cycles(
         config=config,
@@ -1196,6 +1564,8 @@ def main() -> None:
     )
     eval_kwargs = _observation_eval_kwargs(config, args)
     comparison_task_limit = _comparison_task_limit(config, args)
+    observation_task_limit = int(eval_kwargs.get("observation_task_limit", 0) or 0)
+    requested_task_limit = int(eval_kwargs.get("requested_task_limit", 0) or 0)
 
     progress_label = str(args.progress_label).strip() or None
     protocol_match_id = str(args.protocol_match_id).strip()
@@ -1203,6 +1573,11 @@ def main() -> None:
     observation_started_monotonic = time.monotonic()
     max_observation_seconds = max(0.0, float(args.max_observation_seconds or 0.0))
     _progress(progress_label, "phase=observe start")
+    if observation_task_limit > 0 and requested_task_limit > 0 and observation_task_limit != requested_task_limit:
+        _progress(
+            progress_label,
+            f"phase=observe probe_task_limit={observation_task_limit} requested_task_limit={requested_task_limit}",
+        )
     observation_result = _run_observation_eval(
         config=config,
         eval_kwargs=eval_kwargs,
@@ -1407,6 +1782,9 @@ def main() -> None:
                     "observation_current_task_timeout_budget_source": observation_current_task_timeout_budget_source,
                     "observation_partial_summary": observation_partial_summary,
                     "observation_initial_partial_summary": initial_observation_partial_summary,
+                    "requested_task_limit": requested_task_limit,
+                    "observation_task_limit": observation_task_limit,
+                    "comparison_task_limit": comparison_task_limit or 0,
                     **_partial_summary_metric_fields(
                         observation_partial_summary,
                         current_task_id=observation_last_progress_task_id,
@@ -1420,21 +1798,65 @@ def main() -> None:
     _progress(
         progress_label,
         f"observe complete passed={metrics.passed}/{metrics.total} "
-        f"pass_rate={metrics.pass_rate:.4f} generated_pass_rate={metrics.generated_pass_rate:.4f}",
+        f"pass_rate={metrics.pass_rate:.4f} generated_pass_rate={metrics.generated_pass_rate:.4f} "
+        f"probe_task_limit={observation_task_limit or metrics.total} decision_task_limit={comparison_task_limit or 0}",
     )
     excluded_subsystems = _normalize_excluded_subsystems(args.exclude_subsystem)
-    ranked_experiments = _filter_experiments_by_subsystem(
+    observed_ranked_experiments = _filter_experiments_by_subsystem(
         planner.rank_experiments(metrics),
         excluded_subsystems=excluded_subsystems,
     )
+    observe_hypothesis = _generate_observe_hypothesis(
+        config=config,
+        metrics=metrics,
+        ranked_experiments=observed_ranked_experiments,
+        progress_label=progress_label,
+    )
+    ranked_experiments = _sort_experiments_with_observe_bonus(observed_ranked_experiments, observe_hypothesis)
     campaign_budget = planner.recommend_campaign_budget(metrics, max_width=max(1, args.campaign_width))
     campaign = _filter_experiments_by_subsystem(
         planner.select_portfolio_campaign(
-        metrics,
-        max_candidates=campaign_budget.width if args.adaptive_search else max(1, args.campaign_width),
+            metrics,
+            max_candidates=campaign_budget.width if args.adaptive_search else max(1, args.campaign_width),
+            observe_hypothesis_bonus=dict(observe_hypothesis.get("bonus_by_subsystem", {})),
         ),
         excluded_subsystems=excluded_subsystems,
     )
+    if campaign:
+        top_ranked_subsystem = str(ranked_experiments[0].subsystem).strip() if ranked_experiments else ""
+        if top_ranked_subsystem and any(
+            str(candidate.subsystem).strip() == top_ranked_subsystem for candidate in campaign
+        ):
+            diversified_campaign = _diversify_campaign_from_ranked_experiments(
+                campaign,
+                ranked_experiments,
+                max_candidates=campaign_budget.width,
+                capability_modules_path=config.capability_modules_path,
+            )
+            if len(diversified_campaign) > len(campaign):
+                campaign = diversified_campaign
+                _progress(
+                    progress_label,
+                    "campaign broadened reason=subsystem_diversity_fill "
+                    f"selected_from_ranked_experiments={len(campaign)}",
+                )
+    if excluded_subsystems and not campaign and ranked_experiments:
+        campaign = _fallback_campaign_from_ranked_experiments(
+            _filter_experiments_by_subsystem(
+                ranked_experiments,
+                excluded_subsystems=excluded_subsystems,
+            ),
+            max_candidates=campaign_budget.width if args.adaptive_search else max(1, args.campaign_width),
+            planner=planner,
+            metrics=metrics,
+        )
+        if campaign:
+            _progress(
+                progress_label,
+                "campaign fallback reason=portfolio_candidates_excluded "
+                f"selected_from_ranked_experiments={len(campaign)} "
+                f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
+            )
     outputs: list[str] = []
     if excluded_subsystems and not ranked_experiments:
         _progress(
@@ -1455,6 +1877,7 @@ def main() -> None:
         cycle_id = _cycle_id_for_experiment(target.subsystem)
         active_artifact_path_obj = active_artifact_path_for_subsystem(config, target.subsystem)
         target_portfolio = dict(target.evidence.get("portfolio", {})) if isinstance(target.evidence, dict) else {}
+        target_strategy = dict(target.evidence.get("strategy_candidate", {})) if isinstance(target.evidence, dict) else {}
         campaign_breadth_pressure = float(target_portfolio.get("campaign_breadth_pressure", 0.0) or 0.0)
         variant_budget, selected_variants, variant_planning_info = _select_variants_for_campaign(
             planner=planner,
@@ -1481,6 +1904,26 @@ def main() -> None:
             output_path=config.improvement_cycles_path,
         )
         primary_variant_breadth_pressure = float(planner._variant_breadth_pressure(primary_variant_recent_activity))
+        target_strategy["selected_variant_id"] = primary_variant.variant_id
+        pending_strategy_node = record_pending_strategy_node(
+            config,
+            cycle_id=cycle_id,
+            subsystem=target.subsystem,
+            selected_variant_id=primary_variant.variant_id,
+            strategy_candidate=target_strategy,
+            motivation=target.reason,
+            controls=dict(primary_variant.controls),
+            score=float(target.score),
+            family_coverage=dict(
+                priority_family_allocation_summary.get("aggregated_task_counts", {})
+                if isinstance(priority_family_allocation_summary, dict)
+                else {}
+            ),
+            artifact_paths={
+                "active_artifact_path": str(active_artifact_path_obj),
+            },
+        )
+        target_strategy["strategy_node_id"] = pending_strategy_node.strategy_node_id
 
         planner.append_cycle_record(
             config.improvement_cycles_path,
@@ -1502,6 +1945,10 @@ def main() -> None:
                     "selected_experiment_score": target.score,
                     "selected_experiment_expected_gain": target.expected_gain,
                     "selected_experiment_estimated_cost": target.estimated_cost,
+                    "strategy_candidate": target_strategy,
+                    "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                    "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                    "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
                     "selected_variant_id": primary_variant.variant_id,
                     "selected_variant_score": primary_variant.score,
                     "campaign_index": index,
@@ -1512,6 +1959,7 @@ def main() -> None:
                     "requested_campaign_width": max(1, args.campaign_width),
                     "requested_variant_width": max(1, args.variant_width),
                     "priority_family_allocation_summary": priority_family_allocation_summary,
+                    "observe_hypothesis": observe_hypothesis,
                     "campaign_budget": {
                         "width": campaign_budget.width,
                         "max_width": campaign_budget.max_width,
@@ -1592,6 +2040,9 @@ def main() -> None:
                     "observation_current_task_timeout_budget_source": observation_current_task_timeout_budget_source,
                     "observation_partial_summary": observation_partial_summary,
                     "observation_initial_partial_summary": initial_observation_partial_summary,
+                    "requested_task_limit": requested_task_limit,
+                    "observation_task_limit": observation_task_limit,
+                    "comparison_task_limit": comparison_task_limit or 0,
                     **_partial_summary_metric_fields(
                         observation_partial_summary,
                         current_task_id=observation_last_progress_task_id,
@@ -1612,7 +2063,12 @@ def main() -> None:
                 reason=target.reason,
                 metrics_summary={
                     "priority": target.priority,
+                    "strategy_candidate": target_strategy,
+                    "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                    "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                    "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
                     "candidate_subsystems": [candidate.subsystem for candidate in ranked_experiments],
+                    "observe_hypothesis": observe_hypothesis,
                     "excluded_subsystems": sorted(excluded_subsystems),
                     "campaign_breadth_pressure": campaign_breadth_pressure,
                     "campaign_recent_activity": dict(target_portfolio.get("recent_activity", {}))
@@ -1747,10 +2203,42 @@ def main() -> None:
                 candidate_artifact_path_obj=variant_candidate_artifact_path_obj,
                 prior_retained_cycle_id=prior_retained_cycle_id,
                 prior_retained_snapshot_path=prior_retained_snapshot_path,
+                progress_label=progress_label,
             )
             artifact = str(generated["artifact"])
             action = str(generated["action"])
             artifact_kind = str(generated["artifact_kind"])
+            if not artifact:
+                _progress(
+                    progress_label,
+                    f"variant generate failed subsystem={target.subsystem} "
+                    f"variant={variant.variant_id} reason=no_candidate_artifact",
+                )
+                planner.append_cycle_record(
+                    config.improvement_cycles_path,
+                    ImprovementCycleRecord(
+                        cycle_id=cycle_id,
+                        state="generate",
+                        subsystem=target.subsystem,
+                        action=action,
+                        artifact_path=str(active_artifact_path_obj),
+                        artifact_kind=artifact_kind or "candidate_generation_failure",
+                        reason="candidate generation produced no artifact",
+                        metrics_summary={
+                            "campaign_index": index,
+                            "campaign_width": len(campaign),
+                            "variant_width": len(selected_variants),
+                            "variant_rank": variant_rank,
+                            "selected_variant_id": variant.variant_id,
+                            "selected_variant_score": variant.score,
+                            "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                        },
+                        candidate_artifact_path="",
+                        active_artifact_path=str(active_artifact_path_obj),
+                    ),
+                    govern_exports=False,
+                )
+                continue
             _progress(
                 progress_label,
                 f"variant generate complete subsystem={target.subsystem} "
@@ -1765,8 +2253,10 @@ def main() -> None:
                     action=action,
                     artifact_path=str(active_artifact_path_obj),
                     artifact_kind=artifact_kind,
-                    reason=target.reason,
-                    metrics_summary={
+                reason=target.reason,
+                strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                metrics_summary={
                         "total": metrics.total,
                         "passed": metrics.passed,
                         "pass_rate": metrics.pass_rate,
@@ -1777,6 +2267,7 @@ def main() -> None:
                         "campaign_width": len(campaign),
                         "variant_width": len(selected_variants),
                         "variant_rank": variant_rank,
+                        "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
                         "search_strategy": "adaptive_history" if args.adaptive_search else "fixed_width",
                         "prior_retained_cycle_id": prior_retained_cycle_id,
                         "prior_retained_artifact_snapshot_path": "" if prior_retained_snapshot_path is None else str(prior_retained_snapshot_path),
@@ -1825,6 +2316,9 @@ def main() -> None:
                     task_limit=comparison_task_limit,
                     priority_benchmark_families=eval_kwargs.get("priority_benchmark_families"),
                     priority_benchmark_family_weights=eval_kwargs.get("priority_benchmark_family_weights"),
+                    restrict_to_priority_benchmark_families=bool(
+                        eval_kwargs.get("restrict_to_priority_benchmark_families", False)
+                    ),
                     progress_label_prefix=preview_progress_label,
                     progress=lambda message: _progress(progress_label, message),
                 )
@@ -1958,11 +2452,22 @@ def main() -> None:
                     include_operator_memory=eval_kwargs["include_operator_memory"],
                     include_tool_memory=args.include_tool_memory,
                     include_verifier_memory=args.include_verifier_memory,
-                    include_curriculum=True,
-                    include_failure_curriculum=True,
+                    include_curriculum=bool(eval_kwargs.get("include_generated", True)),
+                    include_failure_curriculum=bool(eval_kwargs.get("include_failure_generated", True)),
                     comparison_task_limit=comparison_task_limit,
+                    priority_benchmark_families=eval_kwargs.get("priority_benchmark_families"),
+                    priority_benchmark_family_weights=eval_kwargs.get("priority_benchmark_family_weights"),
+                    restrict_to_priority_benchmark_families=bool(
+                        eval_kwargs.get("restrict_to_priority_benchmark_families", False)
+                    ),
+                    preview=(
+                        selected_variant_entry["preview"]
+                        if len(generated_variants) > 1 and isinstance(selected_variant_entry.get("preview"), dict)
+                        else None
+                    ),
                     progress=lambda message: _progress(progress_label, message),
                     protocol_match_id=protocol_match_id,
+                    strategy_candidate=target_strategy,
                 )
             except Exception as exc:
                 state, reason = _record_finalize_failure(

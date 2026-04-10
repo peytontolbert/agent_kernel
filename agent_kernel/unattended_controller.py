@@ -3,22 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import math
 
-from .kernel_catalog import kernel_catalog_string_list, kernel_catalog_string_set
-
-_FOCUSES = tuple(kernel_catalog_string_list("unattended_controller", "focuses"))
-_BINARY_FEATURES = kernel_catalog_string_set("unattended_controller", "binary_features")
-_NONNEGATIVE_FEATURES = kernel_catalog_string_set("unattended_controller", "nonnegative_features")
-_STATE_FEATURE_ORDER = tuple(kernel_catalog_string_list("unattended_controller", "state_feature_order"))
-_ACTION_FEATURE_ORDER = tuple(kernel_catalog_string_list("unattended_controller", "action_feature_order"))
-_TRANSITION_CONTEXT_STATE_FEATURES = tuple(
-    kernel_catalog_string_list("unattended_controller", "transition_context_state_features")
-)
-_PRIORITY_BROAD_REQUIRED_FAMILIES = kernel_catalog_string_set(
-    "unattended_controller",
-    "priority_broad_required_families",
-)
-_LATENT_WORLD_FEATURE_ORDER = tuple(feature for feature in _STATE_FEATURE_ORDER if feature != "bias")
-_RECENT_STATE_FEATURE_MEMORY_LIMIT = 12
+from .kernel_catalog import kernel_catalog_record_list, kernel_catalog_string_list, kernel_catalog_string_set
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -35,6 +20,67 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+_FOCUSES = tuple(kernel_catalog_string_list("unattended_controller", "focuses"))
+_STATE_FEATURE_ORDER = tuple(kernel_catalog_string_list("unattended_controller", "state_feature_order"))
+_ACTION_FEATURE_ORDER = tuple(kernel_catalog_string_list("unattended_controller", "action_feature_order"))
+_TRANSITION_CONTEXT_STATE_FEATURES = tuple(
+    kernel_catalog_string_list("unattended_controller", "transition_context_state_features")
+)
+_PRIORITY_BROAD_REQUIRED_FAMILIES = kernel_catalog_string_set(
+    "unattended_controller",
+    "priority_broad_required_families",
+)
+_RECENT_STATE_FEATURE_MEMORY_LIMIT = 12
+_DISCOVERED_STATE_FEATURE_SPECS = tuple(kernel_catalog_record_list("unattended_controller", "discovered_state_features"))
+_DISCOVERED_STATE_FEATURES = tuple(
+    token
+    for token in (str(item.get("name", "")).strip() for item in _DISCOVERED_STATE_FEATURE_SPECS)
+    if token and token not in set(_STATE_FEATURE_ORDER)
+)
+_ALL_STATE_FEATURE_ORDER = (*_STATE_FEATURE_ORDER, *_DISCOVERED_STATE_FEATURES)
+_FEATURE_REWARD_WEIGHTS = {
+    str(item.get("name", "")).strip(): _safe_float(item.get("reward_weight"))
+    for item in _DISCOVERED_STATE_FEATURE_SPECS
+    if str(item.get("name", "")).strip()
+}
+_BINARY_FEATURES = kernel_catalog_string_set("unattended_controller", "binary_features") | {
+    str(item.get("name", "")).strip()
+    for item in _DISCOVERED_STATE_FEATURE_SPECS
+    if bool(item.get("binary", False)) and str(item.get("name", "")).strip()
+}
+_NONNEGATIVE_FEATURES = kernel_catalog_string_set("unattended_controller", "nonnegative_features") | {
+    str(item.get("name", "")).strip()
+    for item in _DISCOVERED_STATE_FEATURE_SPECS
+    if bool(item.get("nonnegative", False)) and str(item.get("name", "")).strip()
+}
+_STRUCTURAL_CLASS_SIGNAL_KEYS = (
+    "repo_semantics",
+    "artifact_kinds",
+    "workflow_shape",
+    "contract_shape",
+    "workflow_guard",
+    "semantic_verifier",
+    "discovered_structural_classes",
+)
+_STRUCTURAL_SIGNAL_FAMILY_ALIASES = {
+    "project": "project",
+    "repository": "repository",
+    "integration": "integration",
+    "tooling": "tooling",
+    "workflow": "workflow",
+    "cleanup": "repo_chore",
+    "shared_repo": "integration",
+    "validation": "integration",
+    "semantic_verifier": "integration",
+    "workspace_acceptance": "repository",
+    "command_acceptance": "workflow",
+    "shared_repo_parallel": "integration",
+    "multi_branch_validation": "integration",
+    "multi_artifact_workspace": "repository",
+    "command_driven": "workflow",
+}
+
+
 def _normalize_benchmark_families(values: object) -> list[str]:
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
         return []
@@ -45,6 +91,254 @@ def _normalize_benchmark_families(values: object) -> list[str]:
         if token and token not in seen:
             seen.add(token)
             normalized.append(token)
+    return normalized
+
+
+def _normalize_signal_tokens(values: object) -> list[str]:
+    if isinstance(values, str):
+        return [values.strip()] if values.strip() else []
+    if not isinstance(values, Sequence) or isinstance(values, (bytes, bytearray)):
+        return []
+    return _normalize_benchmark_families(values)
+
+
+def _unique_signal_tokens(*groups: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for group in groups:
+        for value in group:
+            token = str(value).strip()
+            if token and token not in seen:
+                seen.add(token)
+                ordered.append(token)
+    return ordered
+
+
+def _canonical_structural_class_id(prefix: str, signals: Sequence[str]) -> str:
+    normalized_prefix = str(prefix).strip().lower().replace(" ", "_") or "class"
+    normalized_signals = [str(signal).strip().lower().replace(" ", "_") for signal in signals if str(signal).strip()]
+    if not normalized_signals:
+        return normalized_prefix
+    return f"{normalized_prefix}:{'+'.join(normalized_signals)}"
+
+
+def _structural_class_record(
+    *,
+    class_kind: str,
+    derivation_basis: Sequence[str],
+    repo_topology_signals: Sequence[str],
+    verifier_shape_signals: Sequence[str],
+    edit_pattern_signals: Sequence[str],
+    workflow_shape_signals: Sequence[str],
+) -> dict[str, object]:
+    return {
+        "class_id": _canonical_structural_class_id(
+            class_kind,
+            _unique_signal_tokens(
+                repo_topology_signals,
+                verifier_shape_signals,
+                edit_pattern_signals,
+                workflow_shape_signals,
+            ),
+        ),
+        "class_kind": str(class_kind).strip(),
+        "derivation_basis": [str(value).strip() for value in derivation_basis if str(value).strip()],
+        "repo_topology_signals": [str(value).strip() for value in repo_topology_signals if str(value).strip()],
+        "verifier_shape_signals": [str(value).strip() for value in verifier_shape_signals if str(value).strip()],
+        "edit_pattern_signals": [str(value).strip() for value in edit_pattern_signals if str(value).strip()],
+        "workflow_shape_signals": [str(value).strip() for value in workflow_shape_signals if str(value).strip()],
+    }
+
+
+def _merge_structural_class_records(*groups: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for group in groups:
+        for raw_record in group:
+            if not isinstance(raw_record, Mapping):
+                continue
+            class_kind = str(raw_record.get("class_kind", "")).strip()
+            class_id = str(raw_record.get("class_id", "")).strip()
+            if not class_kind and not class_id:
+                continue
+            repo_topology_signals = _normalize_signal_tokens(raw_record.get("repo_topology_signals", []))
+            verifier_shape_signals = _normalize_signal_tokens(raw_record.get("verifier_shape_signals", []))
+            edit_pattern_signals = _normalize_signal_tokens(raw_record.get("edit_pattern_signals", []))
+            workflow_shape_signals = _normalize_signal_tokens(raw_record.get("workflow_shape_signals", []))
+            derivation_basis = _normalize_signal_tokens(raw_record.get("derivation_basis", []))
+            record = _structural_class_record(
+                class_kind=class_kind or class_id.split(":", 1)[0],
+                derivation_basis=derivation_basis,
+                repo_topology_signals=repo_topology_signals,
+                verifier_shape_signals=verifier_shape_signals,
+                edit_pattern_signals=edit_pattern_signals,
+                workflow_shape_signals=workflow_shape_signals,
+            )
+            merged[record["class_id"]] = record
+    return [merged[key] for key in sorted(merged)]
+
+
+def discover_structural_classes(payload: Mapping[str, object] | None) -> list[dict[str, object]]:
+    if not isinstance(payload, Mapping):
+        return []
+    raw_classes = payload.get("discovered_structural_classes", [])
+    existing_records = raw_classes if isinstance(raw_classes, Sequence) and not isinstance(raw_classes, (str, bytes)) else []
+    repo_semantics = _normalize_signal_tokens(payload.get("repo_semantics", []))
+    artifact_kinds = _normalize_signal_tokens(payload.get("artifact_kinds", []))
+    workflow_guard = payload.get("workflow_guard", {})
+    workflow_guard = dict(workflow_guard) if isinstance(workflow_guard, Mapping) else {}
+    semantic_verifier = payload.get("semantic_verifier", {})
+    semantic_verifier = dict(semantic_verifier) if isinstance(semantic_verifier, Mapping) else {}
+    workflow_shape = str(payload.get("workflow_shape", "")).strip().lower()
+    contract_shape = str(payload.get("contract_shape", "")).strip().lower()
+
+    repo_topology_signals = list(repo_semantics)
+    verifier_shape_signals = [contract_shape] if contract_shape else []
+    edit_pattern_signals = list(artifact_kinds)
+    workflow_shape_signals = [workflow_shape] if workflow_shape else []
+
+    if bool(workflow_guard.get("shared_repo_id")) and "shared_repo" not in repo_topology_signals:
+        repo_topology_signals.append("shared_repo")
+    if bool(workflow_guard.get("shared_repo_id")) and "shared_repo_parallel" not in workflow_shape_signals:
+        workflow_shape_signals.append("shared_repo_parallel")
+    required_merged_branches = _normalize_signal_tokens(semantic_verifier.get("required_merged_branches", []))
+    if required_merged_branches and "semantic_verifier" not in verifier_shape_signals:
+        verifier_shape_signals.append("semantic_verifier")
+    if required_merged_branches and "multi_branch_validation" not in workflow_shape_signals:
+        workflow_shape_signals.append("multi_branch_validation")
+
+    derived_records: list[dict[str, object]] = []
+    if repo_topology_signals:
+        derived_records.append(
+            _structural_class_record(
+                class_kind="repo_topology",
+                derivation_basis=["task_metadata:repo_semantics", "task_metadata:workflow_guard"],
+                repo_topology_signals=repo_topology_signals,
+                verifier_shape_signals=[],
+                edit_pattern_signals=[],
+                workflow_shape_signals=[],
+            )
+        )
+    if verifier_shape_signals:
+        derived_records.append(
+            _structural_class_record(
+                class_kind="verifier_shape",
+                derivation_basis=["task_metadata:contract_shape", "task_metadata:semantic_verifier"],
+                repo_topology_signals=[],
+                verifier_shape_signals=verifier_shape_signals,
+                edit_pattern_signals=[],
+                workflow_shape_signals=[],
+            )
+        )
+    if edit_pattern_signals:
+        derived_records.append(
+            _structural_class_record(
+                class_kind="edit_pattern",
+                derivation_basis=["task_metadata:artifact_kinds"],
+                repo_topology_signals=[],
+                verifier_shape_signals=[],
+                edit_pattern_signals=edit_pattern_signals,
+                workflow_shape_signals=[],
+            )
+        )
+    if workflow_shape_signals:
+        derived_records.append(
+            _structural_class_record(
+                class_kind="workflow_shape",
+                derivation_basis=["task_metadata:workflow_shape", "task_metadata:semantic_verifier", "task_metadata:workflow_guard"],
+                repo_topology_signals=[],
+                verifier_shape_signals=[],
+                edit_pattern_signals=[],
+                workflow_shape_signals=workflow_shape_signals,
+            )
+        )
+    return _merge_structural_class_records(existing_records, derived_records)
+
+
+def structural_class_family_aliases(classes: Sequence[Mapping[str, object]]) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for record in classes:
+        if not isinstance(record, Mapping):
+            continue
+        for key in (
+            "repo_topology_signals",
+            "verifier_shape_signals",
+            "edit_pattern_signals",
+            "workflow_shape_signals",
+        ):
+            for raw_value in _normalize_signal_tokens(record.get(key, [])):
+                alias = _STRUCTURAL_SIGNAL_FAMILY_ALIASES.get(raw_value)
+                if alias and alias not in seen:
+                    seen.add(alias)
+                    aliases.append(alias)
+    return aliases
+
+
+def structural_class_summary(*payloads: Mapping[str, object] | None) -> dict[str, object]:
+    records = _merge_structural_class_records(
+        *(
+            discover_structural_classes(payload)
+            for payload in payloads
+            if isinstance(payload, Mapping)
+        )
+    )
+    family_aliases = structural_class_family_aliases(records)
+    return {
+        "classes": records,
+        "class_ids": [str(record.get("class_id", "")).strip() for record in records if str(record.get("class_id", "")).strip()],
+        "class_kinds": [
+            str(record.get("class_kind", "")).strip()
+            for record in records
+            if str(record.get("class_kind", "")).strip()
+        ],
+        "family_aliases": family_aliases,
+    }
+
+
+def _ordered_feature_names(*feature_maps: Mapping[str, object] | None) -> tuple[str, ...]:
+    ordered = list(_ALL_STATE_FEATURE_ORDER)
+    seen = set(ordered)
+    for feature_map in feature_maps:
+        if not isinstance(feature_map, Mapping):
+            continue
+        for raw_name in feature_map:
+            name = str(raw_name).strip()
+            if name and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+    return tuple(ordered)
+
+
+def _declared_controller_features(*signals: Mapping[str, object] | None) -> dict[str, float]:
+    features: dict[str, float] = {}
+    for signal in signals:
+        if not isinstance(signal, Mapping):
+            continue
+        for key in ("controller_features", "discovered_features"):
+            raw_features = signal.get(key, {})
+            if not isinstance(raw_features, Mapping):
+                continue
+            for raw_name, raw_value in raw_features.items():
+                name = str(raw_name).strip()
+                if not name:
+                    continue
+                features[name] = _safe_float(raw_value)
+    return features
+
+
+def _apply_feature_constraints(features: Mapping[str, object] | None) -> dict[str, float]:
+    normalized = {
+        str(name).strip(): _safe_float(value)
+        for name, value in dict(features or {}).items()
+        if str(name).strip()
+    }
+    normalized["bias"] = 1.0
+    for feature in _BINARY_FEATURES:
+        if feature in normalized:
+            normalized[feature] = max(0.0, min(1.0, normalized.get(feature, 0.0)))
+    for feature in _NONNEGATIVE_FEATURES:
+        if feature in normalized:
+            normalized[feature] = max(0.0, normalized.get(feature, 0.0))
     return normalized
 
 
@@ -90,6 +384,7 @@ def default_controller_state(
         "recent_state_features": [],
         "last_action_key": "",
         "repo_setting_policy_priors": {},
+        "strategy_memory_priors": {},
     }
 
 
@@ -388,6 +683,36 @@ def normalize_controller_state(payload: Mapping[str, object] | None) -> dict[str
                 else {},
             }
         state["repo_setting_policy_priors"] = normalized_priors
+    strategy_memory_priors = payload.get("strategy_memory_priors", {})
+    if isinstance(strategy_memory_priors, Mapping):
+        normalized_strategy_priors: dict[str, object] = {}
+        for key, value in strategy_memory_priors.items():
+            token = str(key).strip()
+            if not token:
+                continue
+            if token in {
+                "retained_family_gains",
+                "recent_rejects_by_family",
+                "retained_subsystems",
+                "recent_rejects_by_subsystem",
+            } and isinstance(value, Mapping):
+                normalized_strategy_priors[token] = {
+                    str(name).strip(): (
+                        max(0, _safe_int(item))
+                        if token.startswith("recent_rejects")
+                        else max(0.0, _safe_float(item))
+                    )
+                    for name, item in value.items()
+                    if str(name).strip()
+                }
+                continue
+            if token in {"node_count", "retained_count", "rejected_count", "recent_rejects", "recent_retains"}:
+                normalized_strategy_priors[token] = max(0, _safe_int(value))
+                continue
+            if token == "best_retained_gain":
+                normalized_strategy_priors[token] = max(0.0, _safe_float(value))
+                continue
+        state["strategy_memory_priors"] = normalized_strategy_priors
     return state
 
 
@@ -444,6 +769,16 @@ def _policy_pressure_alignment_bonus(
         _safe_float(features.get("breadth_pressure")) + _safe_float(features.get("priority_family_yield_gap")),
     )
     no_retained_gain_pressure = max(0.0, _safe_float(features.get("no_retained_gain_pressure")))
+    retained_gain_conversion_pressure = max(0.0, _safe_float(features.get("retained_gain_conversion_pressure")))
+    broad_observe_then_retrieval_first = max(
+        0.0,
+        _safe_float(features.get("broad_observe_then_retrieval_first")),
+    )
+    live_decision_credit_gap = max(0.0, _safe_float(features.get("live_decision_credit_gap")))
+    observability_pressure = max(0.0, _safe_float(features.get("observability_pressure")))
+    subsystem_robustness_pressure = max(0.0, _safe_float(features.get("subsystem_robustness_pressure")))
+    structural_class_gap = max(0.0, _safe_float(features.get("structural_class_gap")))
+    structural_class_alignment = max(0.0, _safe_float(features.get("structural_class_alignment")))
     retrieval_pressure = max(
         0.0,
         _safe_float(features.get("low_confidence_pressure")) + _safe_float(features.get("retrieval_regression")),
@@ -484,6 +819,62 @@ def _policy_pressure_alignment_bonus(
             + 0.5 * breadth_pressure
             + 0.4 * retrieval_pressure
         )
+    if retained_gain_conversion_pressure > 0.0:
+        bonus += retained_gain_conversion_pressure * (
+            1.35 * adaptive_search
+            + 1.25 * focus_discovered
+            + 0.95 * focus_recovery
+            + 0.9 * priority_breadth
+            + 0.65 * campaign_width
+            + 0.65 * variant_width
+        )
+    if broad_observe_then_retrieval_first > 0.0:
+        bonus += broad_observe_then_retrieval_first * (
+            1.6 * focus_discovered
+            + 1.1 * adaptive_search
+            + 0.95 * priority_breadth
+            + 0.8 * campaign_width
+            + 0.65 * variant_width
+            + 0.35 * no_retained_gain_pressure
+        )
+    if live_decision_credit_gap > 0.0:
+        bonus += live_decision_credit_gap * (
+            1.2 * adaptive_search
+            + 1.05 * focus_discovered
+            + 0.75 * campaign_width
+            + 0.6 * variant_width
+        )
+    if observability_pressure > 0.0:
+        bonus += observability_pressure * (
+            1.25 * adaptive_search
+            + 1.1 * focus_discovered
+            + 0.85 * focus_recovery
+            + 0.8 * campaign_width
+            + 0.7 * variant_width
+            + 0.35 * priority_breadth
+        )
+    if subsystem_robustness_pressure > 0.0:
+        bonus += subsystem_robustness_pressure * (
+            1.2 * adaptive_search
+            + 1.05 * focus_recovery
+            + 0.9 * focus_discovered
+            + 0.65 * campaign_width
+            + 0.5 * variant_width
+        )
+    if structural_class_gap > 0.0:
+        bonus += structural_class_gap * (
+            1.25 * adaptive_search
+            + 1.15 * focus_discovered
+            + 0.8 * priority_breadth
+            + 0.6 * campaign_width
+            + 0.45 * variant_width
+        )
+    if structural_class_alignment > 0.0:
+        bonus += structural_class_alignment * (
+            0.45 * focus_discovered
+            + 0.35 * adaptive_search
+            + 0.25 * priority_breadth
+        )
     if retrieval_pressure > 0.0:
         bonus += retrieval_pressure * (
             0.9 * focus_discovered
@@ -511,11 +902,13 @@ def build_round_observation(
     subsystem_signal: Mapping[str, object] | None = None,
     planner_pressure_signal: Mapping[str, object] | None = None,
     liftoff_signal: Mapping[str, object] | None = None,
+    round_signal: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     campaign = campaign_signal if isinstance(campaign_signal, Mapping) else {}
     subsystem = subsystem_signal if isinstance(subsystem_signal, Mapping) else {}
     pressure = planner_pressure_signal if isinstance(planner_pressure_signal, Mapping) else {}
     liftoff = liftoff_signal if isinstance(liftoff_signal, Mapping) else {}
+    round_state = round_signal if isinstance(round_signal, Mapping) else {}
     worst_family_delta = _safe_float(campaign.get("worst_family_delta"))
     worst_generated_family_delta = _safe_float(campaign.get("worst_generated_family_delta"))
     retained_cycles = max(0, _safe_int(campaign.get("retained_cycles"), 0))
@@ -529,6 +922,12 @@ def build_round_observation(
     priority_families_with_signal_but_no_retained_gain = _normalize_benchmark_families(
         campaign.get("priority_families_with_signal_but_no_retained_gain", [])
     )
+    priority_families_needing_retained_gain_conversion = _normalize_benchmark_families(
+        campaign.get(
+            "priority_families_needing_retained_gain_conversion",
+            priority_families_with_signal_but_no_retained_gain,
+        )
+    )
     priority_families = _normalize_benchmark_families(campaign.get("priority_families", []))
     frontier_failure_motif_families = _normalize_benchmark_families(
         pressure.get("frontier_failure_motif_families", [])
@@ -536,14 +935,25 @@ def build_round_observation(
     frontier_repo_setting_families = _normalize_benchmark_families(
         pressure.get("frontier_repo_setting_families", [])
     )
+    structural_summary = structural_class_summary(campaign, subsystem, pressure, liftoff, round_state)
+    structural_family_aliases = _normalize_benchmark_families(structural_summary.get("family_aliases", []))
+    structural_family_alias_set = set(structural_family_aliases)
     priority_family_yield_gap = {
         *priority_families_without_signal,
         *priority_families_with_signal_but_no_retained_gain,
     }
     productive_priority_family_count = len(priority_families_with_retained_gain)
+    unresolved_priority_family_count = max(
+        len(priority_family_yield_gap),
+        max(0, len(priority_families) - productive_priority_family_count),
+    )
     no_retained_gain_pressure = (
-        min(1.0, float(max(len(priority_family_yield_gap), rejected_cycles)) / 3.0)
-        if productive_priority_family_count <= 0 and (priority_family_yield_gap or rejected_cycles > 0)
+        min(
+            1.0,
+            float(max(unresolved_priority_family_count, rejected_cycles))
+            / float(max(1, min(4, len(priority_families) or 3))),
+        )
+        if unresolved_priority_family_count > 0 or rejected_cycles > 0
         else 0.0
     )
     target_priority_family_count = max(
@@ -593,6 +1003,63 @@ def build_round_observation(
         min(1.0, float(depth_drift_cycles) / 3.0)
         + min(1.0, average_depth_drift_step_delta / 12.0),
     )
+    partial_productive_without_decision_runs = max(
+        0,
+        _safe_int(campaign.get("partial_productive_without_decision_runs"), 0),
+    )
+    incomplete_cycle_count = max(0, _safe_int(campaign.get("incomplete_cycle_count"), 0))
+    failed_run_present = 1.0 if isinstance(campaign.get("recent_failed_run", {}), Mapping) and campaign.get("recent_failed_run", {}) else 0.0
+    failed_decision_present = (
+        1.0
+        if isinstance(campaign.get("recent_failed_decision", {}), Mapping) and campaign.get("recent_failed_decision", {})
+        else 0.0
+    )
+    broad_observe_then_retrieval_first = 1.0 if bool(round_state.get("broad_observe_then_retrieval_first", False)) else 0.0
+    live_decision_credit_gap = 1.0 if bool(round_state.get("live_decision_credit_gap", False)) else 0.0
+    semantic_progress_drift = 1.0 if bool(round_state.get("semantic_progress_drift", False)) else 0.0
+    intermediate_decision_evidence = bool(campaign.get("intermediate_decision_evidence", False))
+    intermediate_decision_count = max(
+        0,
+        _safe_int(campaign.get("non_runtime_managed_decisions"), 0),
+        _safe_int(campaign.get("non_runtime_managed_runs"), 0),
+    )
+    if intermediate_decision_count <= 0 and intermediate_decision_evidence:
+        intermediate_decision_count = max(
+            0,
+            sum(max(0, _safe_int(value, 0)) for value in dict(subsystem.get("retained_by_subsystem", {})).values())
+            + sum(max(0, _safe_int(value, 0)) for value in dict(subsystem.get("rejected_by_subsystem", {})).values()),
+        )
+    intermediate_decision_gain = min(1.0, float(intermediate_decision_count) / 3.0)
+    observability_pressure = min(
+        1.0,
+        (
+            live_decision_credit_gap
+            + semantic_progress_drift
+            + min(1.0, float(partial_productive_without_decision_runs) / 2.0)
+            + (1.0 if incomplete_cycle_count > 0 else 0.0)
+        )
+        / 4.0,
+    )
+    subsystem_robustness_pressure = min(
+        1.0,
+        (
+            failed_run_present
+            + failed_decision_present
+            + min(1.0, float(partial_productive_without_decision_runs) / 2.0)
+            + (1.0 if incomplete_cycle_count > 0 else 0.0)
+            + min(1.0, float(max(0, _safe_int(campaign.get("failed_decisions"), 0))) / 2.0)
+        )
+        / 5.0,
+    )
+    structural_class_coverage = min(1.0, float(len(structural_summary.get("class_ids", []))) / 4.0)
+    structural_class_alignment = min(
+        1.0,
+        float(len(set(priority_families_with_retained_gain) & structural_family_alias_set)) / 3.0,
+    )
+    structural_class_gap = min(
+        1.0,
+        float(len(priority_family_yield_gap & structural_family_alias_set)) / 3.0,
+    )
     features = {
         "bias": 1.0,
         "retained_cycles": float(retained_cycles),
@@ -618,12 +1085,24 @@ def build_round_observation(
         "priority_family_retained_gain": min(1.0, float(len(priority_families_with_retained_gain)) / 3.0),
         "priority_family_yield_gap": min(1.0, float(len(priority_family_yield_gap)) / 3.0),
         "no_retained_gain_pressure": no_retained_gain_pressure,
+        "retained_gain_conversion_pressure": min(
+            1.0,
+            float(len(priority_families_needing_retained_gain_conversion)) / 3.0,
+        ),
         "generalization_gain": generalization_gain,
         "generalization_gap": generalization_gap,
         "frontier_failure_motif_gain": frontier_failure_motif_gain,
         "frontier_failure_motif_pressure": frontier_failure_motif_pressure,
         "frontier_repo_setting_gain": frontier_repo_setting_gain,
         "frontier_repo_setting_pressure": frontier_repo_setting_pressure,
+        "intermediate_decision_gain": intermediate_decision_gain,
+        "broad_observe_then_retrieval_first": broad_observe_then_retrieval_first,
+        "live_decision_credit_gap": live_decision_credit_gap,
+        "observability_pressure": observability_pressure,
+        "subsystem_robustness_pressure": subsystem_robustness_pressure,
+        "structural_class_coverage": structural_class_coverage,
+        "structural_class_alignment": structural_class_alignment,
+        "structural_class_gap": structural_class_gap,
         "subsystem_reject_pressure": float(
             sum(max(0, _safe_int(value, 0)) for value in dict(subsystem.get("rejected_by_subsystem", {})).values())
         ),
@@ -635,12 +1114,17 @@ def build_round_observation(
         "liftoff_reject": 1.0 if str(liftoff.get("state", "")).strip() == "reject" else 0.0,
         "liftoff_retain": 1.0 if str(liftoff.get("state", "")).strip() == "retain" else 0.0,
     }
+    features.update(_declared_controller_features(campaign, subsystem, pressure, liftoff, round_state))
+    features = _apply_feature_constraints(features)
     return {
         "features": features,
         "campaign_signal": dict(campaign),
         "subsystem_signal": dict(subsystem),
         "planner_pressure_signal": dict(pressure),
         "liftoff_signal": dict(liftoff),
+        "round_signal": dict(round_state),
+        "discovered_structural_classes": list(structural_summary.get("classes", [])),
+        "discovered_structural_family_aliases": structural_family_aliases,
     }
 
 
@@ -649,11 +1133,12 @@ def build_failure_observation(
     phase: str,
     reason: str,
     subsystem: str = "",
+    supplemental_observation: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     normalized_phase = str(phase).strip()
     normalized_reason = str(reason).lower()
     normalized_subsystem = str(subsystem).strip()
-    features = {
+    failure_features = {
         "bias": 1.0,
         "retained_cycles": 0.0,
         "rejected_cycles": 1.0,
@@ -672,12 +1157,16 @@ def build_failure_observation(
         "breadth_pressure": 1.0 if "stalled" in normalized_reason or "timeout" in normalized_reason else 0.0,
         "priority_family_retained_gain": 0.0,
         "priority_family_yield_gap": 0.0,
+        "retained_gain_conversion_pressure": 0.0,
         "generalization_gain": 0.0,
         "generalization_gap": 1.0 if "generalization" in normalized_reason else 0.0,
         "frontier_failure_motif_gain": 0.0,
         "frontier_failure_motif_pressure": 0.0,
         "frontier_repo_setting_gain": 0.0,
         "frontier_repo_setting_pressure": 0.0,
+        "structural_class_coverage": 0.0,
+        "structural_class_alignment": 0.0,
+        "structural_class_gap": 0.0,
         "subsystem_reject_pressure": 1.0,
         "subsystem_retain_pressure": 0.0,
         "allow_kernel_autobuild": 0.0,
@@ -685,8 +1174,70 @@ def build_failure_observation(
         "liftoff_reject": 1.0 if normalized_phase == "liftoff" else 0.0,
         "liftoff_retain": 0.0,
     }
+    supplemental_features = supplemental_observation.get("features", {}) if isinstance(supplemental_observation, Mapping) else {}
+    if not isinstance(supplemental_features, Mapping):
+        supplemental_features = {}
+    features = {
+        str(name).strip(): _safe_float(value)
+        for name, value in supplemental_features.items()
+        if str(name).strip()
+    }
+    max_merge_features = {
+        "retained_cycles",
+        "rejected_cycles",
+        "productive_depth_gain",
+        "depth_drift_pressure",
+        "long_horizon_retained_gain",
+        "failed_decisions",
+        "family_regression",
+        "generated_family_regression",
+        "family_regression_count",
+        "generated_family_regression_count",
+        "low_confidence_pressure",
+        "retrieval_regression",
+        "breadth_pressure",
+        "priority_family_retained_gain",
+        "priority_family_yield_gap",
+        "no_retained_gain_pressure",
+        "retained_gain_conversion_pressure",
+        "generalization_gain",
+        "generalization_gap",
+        "frontier_failure_motif_gain",
+        "frontier_failure_motif_pressure",
+        "frontier_repo_setting_gain",
+        "frontier_repo_setting_pressure",
+        "subsystem_reject_pressure",
+        "subsystem_retain_pressure",
+        "allow_kernel_autobuild",
+        "liftoff_shadow",
+        "liftoff_reject",
+        "liftoff_retain",
+        "intermediate_decision_gain",
+        "broad_observe_then_retrieval_first",
+        "live_decision_credit_gap",
+        "observability_pressure",
+        "subsystem_robustness_pressure",
+        "structural_class_coverage",
+        "structural_class_alignment",
+        "structural_class_gap",
+    }
+    for feature, value in failure_features.items():
+        if feature == "bias":
+            continue
+        if feature == "pass_rate_delta":
+            features[feature] = min(_safe_float(features.get(feature)), _safe_float(value))
+            continue
+        if feature == "step_delta":
+            features[feature] = max(_safe_float(features.get(feature)), _safe_float(value))
+            continue
+        if feature in max_merge_features:
+            features[feature] = max(_safe_float(features.get(feature)), _safe_float(value))
+            continue
+        if feature not in features:
+            features[feature] = _safe_float(value)
+    features["bias"] = 1.0
     return {
-        "features": features,
+        "features": _apply_feature_constraints(features),
         "failure": {
             "phase": normalized_phase,
             "reason": str(reason).strip(),
@@ -721,16 +1272,27 @@ def observation_reward(observation: Mapping[str, object] | None) -> float:
     reward += _safe_float(features.get("priority_family_retained_gain")) * 3.0
     reward -= _safe_float(features.get("priority_family_yield_gap")) * 3.0
     reward -= _safe_float(features.get("no_retained_gain_pressure")) * 5.0
+    reward -= _safe_float(features.get("retained_gain_conversion_pressure")) * 4.0
     reward += _safe_float(features.get("generalization_gain")) * 4.0
     reward -= _safe_float(features.get("generalization_gap")) * 4.0
     reward += _safe_float(features.get("frontier_failure_motif_gain")) * 3.0
     reward -= _safe_float(features.get("frontier_failure_motif_pressure")) * 3.0
     reward += _safe_float(features.get("frontier_repo_setting_gain")) * 4.0
     reward -= _safe_float(features.get("frontier_repo_setting_pressure")) * 4.0
+    reward += _safe_float(features.get("intermediate_decision_gain")) * 2.5
+    reward -= _safe_float(features.get("broad_observe_then_retrieval_first")) * 4.5
+    reward -= _safe_float(features.get("live_decision_credit_gap")) * 3.5
+    reward -= _safe_float(features.get("observability_pressure")) * 4.0
+    reward -= _safe_float(features.get("subsystem_robustness_pressure")) * 4.5
+    reward += _safe_float(features.get("structural_class_coverage")) * 2.5
+    reward += _safe_float(features.get("structural_class_alignment")) * 3.5
+    reward -= _safe_float(features.get("structural_class_gap")) * 4.0
     reward += _safe_float(features.get("allow_kernel_autobuild")) * 2.0
     reward += _safe_float(features.get("liftoff_shadow")) * 3.0
     reward += _safe_float(features.get("liftoff_retain")) * 12.0
     reward -= _safe_float(features.get("liftoff_reject")) * 8.0
+    for feature, weight in _FEATURE_REWARD_WEIGHTS.items():
+        reward += _safe_float(features.get(feature)) * _safe_float(weight)
     return reward
 
 
@@ -758,10 +1320,13 @@ def _reward_stddev(action_stats: Mapping[str, object]) -> float:
 
 def _latent_world_feature_snapshot(features: Mapping[str, object] | None) -> dict[str, float]:
     payload = features if isinstance(features, Mapping) else {}
-    return {
-        feature: _safe_float(payload.get(feature))
-        for feature in _LATENT_WORLD_FEATURE_ORDER
-    }
+    return _apply_feature_constraints(
+        {
+            feature: _safe_float(value)
+            for feature, value in payload.items()
+            if str(feature).strip() and str(feature).strip() != "bias"
+        }
+    )
 
 
 def _latent_world_similarity(
@@ -770,11 +1335,12 @@ def _latent_world_similarity(
 ) -> float:
     left = _latent_world_feature_snapshot(left_features)
     right = _latent_world_feature_snapshot(right_features)
-    active_features = [
+    active_features = sorted(
         feature
-        for feature in _LATENT_WORLD_FEATURE_ORDER
-        if abs(_safe_float(left.get(feature))) > 1e-6 or abs(_safe_float(right.get(feature))) > 1e-6
-    ]
+        for feature in set(left) | set(right)
+        if feature != "bias"
+        and (abs(_safe_float(left.get(feature))) > 1e-6 or abs(_safe_float(right.get(feature))) > 1e-6)
+    )
     if not active_features:
         return 1.0
     distance = 0.0
@@ -838,11 +1404,12 @@ def predict_next_observation(
     current_features = observation.get("features", {})
     if not isinstance(current_features, Mapping):
         current_features = {}
-    predicted_features = {
-        feature: _safe_float(current_features.get(feature))
-        for feature in _STATE_FEATURE_ORDER
-    }
-    predicted_features["bias"] = 1.0
+    predicted_features = _apply_feature_constraints(
+        {
+            feature: _safe_float(current_features.get(feature))
+            for feature in _ordered_feature_names(current_features)
+        }
+    )
     context_features = _transition_context_features(predicted_features, policy)
     action_models = controller_state.get("action_models", {})
     if isinstance(action_models, Mapping):
@@ -861,11 +1428,7 @@ def predict_next_observation(
                 context_features=context_features,
             )
             predicted_features[token] = predicted_features.get(token, 0.0) + _safe_float(delta) + residual
-    for feature in _BINARY_FEATURES:
-        predicted_features[feature] = max(0.0, min(1.0, predicted_features.get(feature, 0.0)))
-    for feature in _NONNEGATIVE_FEATURES:
-        predicted_features[feature] = max(0.0, predicted_features.get(feature, 0.0))
-    return {"features": predicted_features}
+    return {"features": _apply_feature_constraints(predicted_features)}
 
 
 def update_controller_state(
@@ -886,11 +1449,12 @@ def update_controller_state(
         if isinstance(end_observation, Mapping) and isinstance(end_observation.get("features", {}), Mapping)
         else {}
     )
-    for feature in _STATE_FEATURE_ORDER:
+    feature_order = _ordered_feature_names(start_features, end_features)
+    for feature in feature_order:
         start_features.setdefault(feature, 0.0)
         end_features.setdefault(feature, 0.0)
-    start_features["bias"] = 1.0
-    end_features["bias"] = 1.0
+    start_features = _apply_feature_constraints(start_features)
+    end_features = _apply_feature_constraints(end_features)
     reward = observation_reward(end_observation)
     action_key = action_key_for_policy(action_policy)
     action_models = state.setdefault("action_models", {})
@@ -931,7 +1495,7 @@ def update_controller_state(
     transition_context_error_ema = state.setdefault("transition_context_error_ema", {})
     transition_learning_rate = _safe_float(state.get("transition_learning_rate"), 0.15)
     context_features = _transition_context_features(start_features, action_policy)
-    for feature in _STATE_FEATURE_ORDER:
+    for feature in feature_order:
         if feature == "bias":
             continue
         delta = _safe_float(end_features.get(feature)) - _safe_float(start_features.get(feature))
@@ -1229,6 +1793,8 @@ def controller_state_summary(controller_state: Mapping[str, object] | None) -> d
         "controller_kind": str(state.get("controller_kind", "")).strip(),
         "updates": max(0, _safe_int(state.get("updates"), 0)),
         "known_actions": len(ranked),
+        "core_state_features": list(_STATE_FEATURE_ORDER),
+        "discovered_state_features": list(_DISCOVERED_STATE_FEATURES),
         "last_action_key": str(state.get("last_action_key", "")).strip(),
         "recent_rewards": list(state.get("recent_rewards", [])),
         "rollout_depth": max(1, _safe_int(state.get("rollout_depth"), 2)),
@@ -1244,6 +1810,23 @@ def controller_state_summary(controller_state: Mapping[str, object] | None) -> d
             str(signal): dict(entry)
             for signal, entry in dict(state.get("repo_setting_policy_priors", {})).items()
             if str(signal).strip() and isinstance(entry, Mapping)
+        },
+        "strategy_memory_priors": {
+            str(key): (
+                {
+                    str(name): (
+                        max(0, _safe_int(item))
+                        if str(key).startswith("recent_rejects")
+                        else max(0.0, _safe_float(item))
+                    )
+                    for name, item in dict(value).items()
+                    if str(name).strip()
+                }
+                if isinstance(value, Mapping)
+                else (max(0.0, _safe_float(value)) if "gain" in str(key) else max(0, _safe_int(value)))
+            )
+            for key, value in dict(state.get("strategy_memory_priors", {})).items()
+            if str(key).strip()
         },
         "policy_value_weights": {
             feature: _safe_float(weight)

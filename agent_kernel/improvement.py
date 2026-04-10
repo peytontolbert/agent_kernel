@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import re
 import shutil
 from pathlib import Path
@@ -24,6 +25,7 @@ from .modeling.tolbert.delta import materialize_tolbert_checkpoint_from_delta, r
 from .operator_policy import operator_policy_snapshot
 from .prompt_improvement import retained_improvement_planner_controls
 from .runtime_supervision import atomic_copy_file, atomic_write_json
+from .strategy_memory import load_strategy_nodes, summarize_strategy_priors
 from .state_estimation_improvement import (
     STATE_ESTIMATION_GENERATION_FOCI,
     STATE_ESTIMATION_LATENT_CONTROL_KEYS,
@@ -178,6 +180,8 @@ class ImprovementCycleRecord:
     rollback_artifact_path: str = ""
     artifact_snapshot_path: str = ""
     selected_variant_id: str = ""
+    strategy_candidate_id: str = ""
+    strategy_candidate_kind: str = ""
     prior_retained_cycle_id: str = ""
     baseline_pass_rate: float | None = None
     candidate_pass_rate: float | None = None
@@ -205,6 +209,8 @@ class ImprovementCycleRecord:
             "rollback_artifact_path": self.rollback_artifact_path,
             "artifact_snapshot_path": self.artifact_snapshot_path,
             "selected_variant_id": self.selected_variant_id,
+            "strategy_candidate_id": self.strategy_candidate_id,
+            "strategy_candidate_kind": self.strategy_candidate_kind,
             "prior_retained_cycle_id": self.prior_retained_cycle_id,
             "compatibility": self.compatibility or {},
         }
@@ -225,6 +231,7 @@ class RetentionDecisionContext:
     subsystem: str
     gate: dict[str, object]
     evidence: dict[str, object]
+    artifact_update: dict[str, object]
     baseline_metrics: EvalMetrics
     candidate_metrics: EvalMetrics
     pass_rate_delta: float
@@ -274,6 +281,12 @@ class ImprovementPlanner:
         except ValueError:
             return normalized
 
+    def _campaign_surface_key(self, subsystem: str) -> str:
+        base_subsystem = self._base_subsystem(subsystem)
+        if base_subsystem in {"retrieval", "tolbert_model", "qwen_adapter"}:
+            return "retrieval_stack"
+        return base_subsystem
+
     def _subsystems_match(self, left: str, right: str) -> bool:
         normalized_left = str(left).strip()
         normalized_right = str(right).strip()
@@ -309,6 +322,59 @@ class ImprovementPlanner:
             "pass_rate": round(coding_pass_rate, 4),
             "overall_pass_rate": round(float(metrics.pass_rate), 4),
             "generated_pass_rate": round(float(metrics.generated_pass_rate), 4),
+        }
+
+    @classmethod
+    def _broad_coding_observe_diversification_signal(cls, metrics: EvalMetrics) -> dict[str, object]:
+        coding_summary = cls._coding_strength_summary(metrics)
+        broad_coding_families = ("repository", "project", "integration", "repo_chore")
+        observed_families = {
+            family
+            for family in broad_coding_families
+            if int(metrics.total_by_benchmark_family.get(family, 0) or 0) > 0
+        }
+        broad_coding_total = sum(
+            int(metrics.total_by_benchmark_family.get(family, 0) or 0)
+            for family in broad_coding_families
+        )
+        broad_coding_passed = sum(
+            int(metrics.passed_by_benchmark_family.get(family, 0) or 0)
+            for family in broad_coding_families
+        )
+        coding_total = max(int(coding_summary.get("total", 0) or 0), broad_coding_total)
+        coding_pass_rate = (
+            0.0 if broad_coding_total <= 0 else float(broad_coding_passed) / float(broad_coding_total)
+        )
+        generated_total = int(getattr(metrics, "generated_total", 0) or 0)
+        low_confidence = int(getattr(metrics, "low_confidence_episodes", 0) or 0)
+        trusted_retrieval_steps = int(getattr(metrics, "trusted_retrieval_steps", 0) or 0)
+        overall_total = max(0, int(getattr(metrics, "total", 0) or 0))
+        active = (
+            len(observed_families) >= 3
+            and coding_total >= 4
+            and coding_pass_rate >= 0.95
+            and float(coding_summary.get("overall_pass_rate", 0.0) or 0.0) >= 0.95
+            and generated_total > 0
+            and float(coding_summary.get("generated_pass_rate", 0.0) or 0.0) >= 0.95
+        )
+        retrieval_emergency = bool(
+            overall_total > 0
+            and (
+                low_confidence >= max(2, int(math.ceil(float(overall_total) * 0.4)))
+                or (low_confidence > 0 and trusted_retrieval_steps <= 0)
+            )
+        )
+        return {
+            "active": active,
+            "retrieval_emergency": retrieval_emergency,
+            "observed_families": sorted(observed_families),
+            "observed_family_count": len(observed_families),
+            "coding_total": coding_total,
+            "coding_pass_rate": round(coding_pass_rate, 4),
+            "overall_pass_rate": round(float(coding_summary.get("overall_pass_rate", 0.0) or 0.0), 4),
+            "generated_pass_rate": round(float(coding_summary.get("generated_pass_rate", 0.0) or 0.0), 4),
+            "low_confidence_episodes": low_confidence,
+            "trusted_retrieval_steps": trusted_retrieval_steps,
         }
 
     @classmethod
@@ -920,14 +986,14 @@ class ImprovementPlanner:
         if not ranked:
             return []
         campaign = [ranked[0]]
-        selected_surfaces = {self._base_subsystem(ranked[0].subsystem)}
+        selected_surfaces = {self._campaign_surface_key(ranked[0].subsystem)}
         if max_candidates <= 1:
             return campaign
         top_score = ranked[0].score
         for candidate in ranked[1:]:
             if len(campaign) >= max_candidates:
                 break
-            if self._base_subsystem(candidate.subsystem) in selected_surfaces:
+            if self._campaign_surface_key(candidate.subsystem) in selected_surfaces:
                 continue
             if top_score <= 0.0:
                 break
@@ -938,7 +1004,7 @@ class ImprovementPlanner:
             if score_margin > absolute_score_margin and candidate.priority < ranked[0].priority:
                 continue
             campaign.append(candidate)
-            selected_surfaces.add(self._base_subsystem(candidate.subsystem))
+            selected_surfaces.add(self._campaign_surface_key(candidate.subsystem))
         return campaign
 
     def select_portfolio_campaign(
@@ -949,6 +1015,7 @@ class ImprovementPlanner:
         relative_score_floor: float = 0.75,
         absolute_score_margin: float = 0.04,
         recent_cycle_window: int = 6,
+        observe_hypothesis_bonus: dict[str, float] | None = None,
     ) -> list[ImprovementExperiment]:
         planner_controls = self._improvement_planner_controls()
         relative_score_floor = self._planner_guardrail_float(
@@ -980,16 +1047,37 @@ class ImprovementPlanner:
             )
             for candidate in ranked
         }
+        broad_observe_signal = self._broad_coding_observe_diversification_signal(metrics)
         lead_recent_activity = recent_activity.get(ranked[0].subsystem, {})
         breadth_pressure = self._campaign_breadth_pressure(lead_recent_activity)
+        observe_bonus = {
+            str(subsystem).strip(): float(value)
+            for subsystem, value in dict(observe_hypothesis_bonus or {}).items()
+            if str(subsystem).strip()
+        }
         selected: list[ImprovementExperiment] = []
         selected_surfaces: set[str] = set()
         available = list(ranked)
         while available and len(selected) < max(1, max_candidates):
+            candidate_pool = list(available)
+            if bool(broad_observe_signal.get("active", False)) and not bool(
+                broad_observe_signal.get("retrieval_emergency", False)
+            ):
+                non_retrieval_available = [
+                    candidate
+                    for candidate in candidate_pool
+                    if self._base_subsystem(candidate.subsystem) not in {"retrieval", "tolbert_model", "qwen_adapter"}
+                ]
+                if non_retrieval_available:
+                    candidate_pool = non_retrieval_available
+                elif not selected:
+                    # A clean broad observe should not hand the first intervention lane back to retrieval
+                    # unless the metrics show an explicit retrieval-emergency condition.
+                    return []
             best_candidate: ImprovementExperiment | None = None
             best_sort_key: tuple[float, int, str] = (float("-inf"), -1, "")
-            for candidate in available:
-                if self._base_subsystem(candidate.subsystem) in selected_surfaces:
+            for candidate in candidate_pool:
+                if self._campaign_surface_key(candidate.subsystem) in selected_surfaces:
                     continue
                 relative_score = 0.0 if top_score <= 0.0 else float(candidate.score) / top_score
                 score_margin = top_score - float(candidate.score)
@@ -998,21 +1086,122 @@ class ImprovementPlanner:
                     recent_activity=recent_activity.get(candidate.subsystem, {}),
                     planner_controls=planner_controls,
                 )
+                strategy_choice = self._strategy_portfolio_choice(
+                    candidate,
+                    metrics=metrics,
+                    recent_activity=recent_activity.get(candidate.subsystem, {}),
+                    broad_observe_signal=broad_observe_signal,
+                )
+                strategy_candidate = dict(strategy_choice.get("strategy_candidate", {}))
+                strategy_recent_activity = dict(strategy_choice.get("recent_activity", {}))
+                strategy_memory_summary = dict(strategy_choice.get("strategy_memory_summary", {}))
+                strategy_score_delta = float(strategy_choice.get("score_delta", 0.0) or 0.0)
+                adjusted_score += strategy_score_delta
+                hypothesis_score_delta = float(observe_bonus.get(candidate.subsystem, 0.0) or 0.0)
+                adjusted_score += hypothesis_score_delta
                 if breadth_pressure > 0.0:
                     reasons.append(f"campaign_breadth_pressure={breadth_pressure:.4f}")
+                if strategy_score_delta != 0.0:
+                    reasons.append(f"strategy_history_score_delta={strategy_score_delta:.4f}")
+                reasons.extend(
+                    [
+                        str(reason).strip()
+                        for reason in list(strategy_choice.get("reasons", []))
+                        if str(reason).strip()
+                    ]
+                )
+                if hypothesis_score_delta != 0.0:
+                    reasons.append(f"observe_hypothesis_score_delta={hypothesis_score_delta:.4f}")
+                if float(strategy_memory_summary.get("score_delta", 0.0) or 0.0) != 0.0:
+                    reasons.append(
+                        "strategy_memory_score_delta="
+                        f"{float(strategy_memory_summary.get('score_delta', 0.0) or 0.0):.4f}"
+                    )
+                if bool(broad_observe_signal.get("active", False)):
+                    if bool(broad_observe_signal.get("retrieval_emergency", False)):
+                        reasons.append("broad_observe_diversification_blocked_by_retrieval_emergency")
+                    elif self._base_subsystem(candidate.subsystem) not in {"retrieval", "tolbert_model", "qwen_adapter"}:
+                        reasons.append("broad_observe_diversification_preferred")
+                if (
+                    self._base_subsystem(candidate.subsystem) == "retrieval"
+                    and bool(strategy_memory_summary.get("avoid_reselection", False))
+                    and any(
+                        self._base_subsystem(other.subsystem) not in {"retrieval", "tolbert_model", "qwen_adapter"}
+                        for other in candidate_pool
+                    )
+                ):
+                    continue
                 if selected and relative_score < relative_score_floor and score_margin > absolute_score_margin:
                     continue
                 sort_key = (adjusted_score, candidate.priority, candidate.subsystem)
                 if best_candidate is None or sort_key > best_sort_key:
                     evidence = dict(candidate.evidence)
+                    strategy_candidate_payload = {
+                        **strategy_candidate,
+                        "parent_strategy_node_ids": list(
+                            strategy_memory_summary.get("selected_parent_strategy_node_ids", [])
+                        ),
+                        "best_retained_strategy_node_id": str(
+                            strategy_memory_summary.get("best_retained_strategy_node_id", "")
+                        ).strip(),
+                        "continuation_parent_node_id": str(
+                            strategy_memory_summary.get("continuation_parent_node_id", "")
+                        ).strip(),
+                        "continuation_artifact_path": str(
+                            strategy_memory_summary.get("continuation_artifact_path", "")
+                        ).strip(),
+                        "continuation_workspace_ref": str(
+                            strategy_memory_summary.get("continuation_workspace_ref", "")
+                        ).strip(),
+                        "continuation_branch": str(
+                            strategy_memory_summary.get("continuation_branch", "")
+                        ).strip(),
+                        "recent_activity": dict(strategy_recent_activity),
+                        "score_delta": round(strategy_score_delta, 4),
+                        "strategy_memory_score_delta": round(
+                            float(strategy_memory_summary.get("score_delta", 0.0) or 0.0), 4
+                        ),
+                        "strategy_memory_recent_rejects": int(
+                            strategy_memory_summary.get("recent_rejects", 0) or 0
+                        ),
+                        "strategy_memory_recent_retains": int(
+                            strategy_memory_summary.get("recent_retains", 0) or 0
+                        ),
+                        "strategy_memory_avoid_reselection": bool(
+                            strategy_memory_summary.get("avoid_reselection", False)
+                        ),
+                    }
+                    retention_inputs = (
+                        dict(strategy_candidate_payload.get("retention_inputs", {}))
+                        if isinstance(strategy_candidate_payload.get("retention_inputs", {}), dict)
+                        else {}
+                    )
+                    retention_inputs.update(
+                        {
+                            "selected_subsystem": candidate.subsystem,
+                            "portfolio_adjusted_score": round(adjusted_score, 4),
+                            "relative_score": round(relative_score, 4),
+                            "score_margin": round(score_margin, 4),
+                            "recent_cycle_window": max(1, recent_cycle_window),
+                            "parent_strategy_node_ids": list(
+                                strategy_memory_summary.get("selected_parent_strategy_node_ids", [])
+                            ),
+                            "best_retained_strategy_node_id": str(
+                                strategy_memory_summary.get("best_retained_strategy_node_id", "")
+                            ).strip(),
+                        }
+                    )
+                    strategy_candidate_payload["retention_inputs"] = retention_inputs
                     evidence["portfolio"] = {
                         "adjusted_score": round(adjusted_score, 4),
                         "relative_score": round(relative_score, 4),
                         "score_margin": round(score_margin, 4),
                         "campaign_breadth_pressure": round(breadth_pressure, 4),
+                        "broad_observe_diversification": dict(broad_observe_signal),
                         "recent_activity": dict(recent_activity.get(candidate.subsystem, {})),
                         "reasons": reasons,
                     }
+                    evidence["strategy_candidate"] = strategy_candidate_payload
                     best_candidate = ImprovementExperiment(
                         subsystem=candidate.subsystem,
                         reason=candidate.reason,
@@ -1026,15 +1215,549 @@ class ImprovementPlanner:
             if best_candidate is None:
                 break
             selected.append(best_candidate)
-            selected_surfaces.add(self._base_subsystem(best_candidate.subsystem))
+            selected_surfaces.add(self._campaign_surface_key(best_candidate.subsystem))
             available = [
                 candidate
                 for candidate in available
-                if self._base_subsystem(candidate.subsystem) != self._base_subsystem(best_candidate.subsystem)
+                if self._campaign_surface_key(candidate.subsystem) != self._campaign_surface_key(best_candidate.subsystem)
             ]
         if selected:
             return selected
         return [ranked[0]]
+
+    def _strategy_portfolio_choice(
+        self,
+        candidate: ImprovementExperiment,
+        *,
+        metrics: EvalMetrics,
+        recent_activity: dict[str, object] | None = None,
+        broad_observe_signal: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        options = self._strategy_candidate_options(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+        best_choice: dict[str, object] | None = None
+        best_sort_key: tuple[float, int, str] = (float("-inf"), -1, "")
+        for option in options:
+            strategy_candidate = self._normalized_strategy_candidate(
+                candidate_subsystem=candidate.subsystem,
+                strategy_candidate=option,
+            )
+            strategy_recent_activity = self.recent_strategy_activity_summary(
+                strategy_candidate_id=str(strategy_candidate.get("strategy_candidate_id", "")).strip()
+            )
+            history_score_delta = self._strategy_history_score_delta(
+                strategy_candidate,
+                recent_activity=strategy_recent_activity,
+            )
+            strategy_memory_summary = self._strategy_memory_summary(
+                candidate_subsystem=candidate.subsystem,
+                strategy_candidate=strategy_candidate,
+            )
+            memory_score_delta = float(strategy_memory_summary.get("score_delta", 0.0) or 0.0)
+            selection_bonus = float(strategy_candidate.get("selection_bonus", 0.0) or 0.0)
+            total_score_delta = round(selection_bonus + history_score_delta + memory_score_delta, 4)
+            choice_reasons = [
+                str(reason).strip()
+                for reason in list(strategy_candidate.get("portfolio_reasons", []))
+                if str(reason).strip()
+            ]
+            if selection_bonus != 0.0:
+                choice_reasons.append(f"strategy_selection_bonus={selection_bonus:.4f}")
+            origin_rank = 1 if str(strategy_candidate.get("origin", "")).strip() == "discovered_strategy" else 0
+            sort_key = (
+                total_score_delta,
+                origin_rank,
+                str(strategy_candidate.get("strategy_candidate_id", "")).strip(),
+            )
+            if best_choice is None or sort_key > best_sort_key:
+                best_choice = {
+                    "strategy_candidate": strategy_candidate,
+                    "recent_activity": strategy_recent_activity,
+                    "strategy_memory_summary": strategy_memory_summary,
+                    "score_delta": total_score_delta,
+                    "reasons": choice_reasons,
+                }
+                best_sort_key = sort_key
+        if best_choice is not None:
+            return best_choice
+        fallback = self._normalized_strategy_candidate(
+            candidate_subsystem=candidate.subsystem,
+            strategy_candidate={},
+        )
+        return {
+            "strategy_candidate": fallback,
+            "recent_activity": {},
+            "strategy_memory_summary": {},
+            "score_delta": 0.0,
+            "reasons": [],
+        }
+
+    def _strategy_candidate_options(
+        self,
+        candidate: ImprovementExperiment,
+        *,
+        metrics: EvalMetrics,
+        recent_activity: dict[str, object] | None = None,
+        broad_observe_signal: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        authored = self._authored_strategy_candidate(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+        synthesized = self._synthesized_strategy_candidate(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+        options: list[dict[str, object]] = [authored]
+        synthesized_id = str(synthesized.get("strategy_candidate_id", synthesized.get("strategy_id", ""))).strip()
+        authored_id = str(authored.get("strategy_candidate_id", authored.get("strategy_id", ""))).strip()
+        if synthesized_id and synthesized_id != authored_id:
+            options.append(synthesized)
+        return options
+
+    def _strategy_signal_basis(
+        self,
+        candidate: ImprovementExperiment,
+        *,
+        metrics: EvalMetrics,
+        recent_activity: dict[str, object] | None = None,
+        broad_observe_signal: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        evidence = dict(candidate.evidence) if isinstance(candidate.evidence, dict) else {}
+        recent = recent_activity if isinstance(recent_activity, dict) else {}
+        broad_signal = broad_observe_signal if isinstance(broad_observe_signal, dict) else {}
+        transition_failure_counts = (
+            dict(evidence.get("transition_failure_counts", {}))
+            if isinstance(evidence.get("transition_failure_counts", {}), dict)
+            else {}
+        )
+        failure_counts = (
+            dict(evidence.get("failure_counts", {}))
+            if isinstance(evidence.get("failure_counts", {}), dict)
+            else {}
+        )
+        repeated_failure_motifs = normalized_control_mapping(
+            {
+                "items": [
+                    _dominant_count_label(transition_failure_counts),
+                    _dominant_count_label(failure_counts),
+                    "recent_no_yield" if int(recent.get("no_yield_cycles", 0) or 0) > 0 else "",
+                    "recent_reject" if int(recent.get("rejected_cycles", 0) or 0) > 0 else "",
+                    "recent_incomplete" if int(recent.get("recent_incomplete_cycles", 0) or 0) > 0 else "",
+                    "recent_regression" if int(recent.get("recent_regression_cycles", 0) or 0) > 0 else "",
+                ]
+            },
+            list_fields=("items",),
+        ).get("items", [])
+        transfer_gaps = normalized_control_mapping(
+            {
+                "items": [
+                    "retrieval_confidence_gap"
+                    if int(getattr(metrics, "low_confidence_episodes", 0) or 0) > 0
+                    else "",
+                    "retrieval_carryover_gap"
+                    if int(getattr(metrics, "trusted_retrieval_steps", 0) or 0)
+                    < max(1, int(getattr(metrics, "total", 0) or 0) // 2)
+                    else "",
+                    "generated_task_transfer_gap"
+                    if int(getattr(metrics, "generated_total", 0) or 0) > 0
+                    and float(getattr(metrics, "generated_pass_rate", 0.0) or 0.0)
+                    < float(getattr(metrics, "pass_rate", 0.0) or 0.0)
+                    else "",
+                    "skill_transfer_gap"
+                    if int(metrics.total_by_memory_source.get("skill_transfer", 0) or 0) <= 0
+                    else "",
+                    "operator_transfer_gap"
+                    if int(metrics.total_by_memory_source.get("operator", 0) or 0) <= 0
+                    and int(metrics.total_by_memory_source.get("skill_transfer", 0) or 0) <= 0
+                    else "",
+                ]
+            },
+            list_fields=("items",),
+        ).get("items", [])
+        repo_signals = [
+            f"family:{family}"
+            for family in ("repository", "project", "integration", "repo_chore")
+            if int(metrics.total_by_benchmark_family.get(family, 0) or 0) > 0
+        ]
+        if bool(broad_signal.get("active", False)):
+            repo_signals.append("broad_observe_ready")
+        elif int(broad_signal.get("observed_family_count", 0) or 0) >= 2:
+            repo_signals.append("multi_family_repo_activity")
+        if int(evidence.get("repo_world_model_total", 0) or 0) > 0:
+            repo_signals.append("repo_workflow_failures")
+        return {
+            "repeated_failure_motifs": normalized_control_mapping(
+                {"items": repeated_failure_motifs},
+                list_fields=("items",),
+            ).get("items", []),
+            "transfer_gaps": normalized_control_mapping(
+                {"items": transfer_gaps},
+                list_fields=("items",),
+            ).get("items", []),
+            "repo_signals": normalized_control_mapping(
+                {"items": repo_signals},
+                list_fields=("items",),
+            ).get("items", []),
+        }
+
+    def _build_strategy_candidate(
+        self,
+        *,
+        strategy_candidate_id: str,
+        strategy_candidate_kind: str,
+        origin: str,
+        strategy_label: str,
+        target_subsystem: str,
+        rationale: str,
+        generation_basis: dict[str, object] | None = None,
+        target_conditions: dict[str, object] | None = None,
+        controls: dict[str, object] | None = None,
+        expected_signals: list[str] | None = None,
+        selection_bonus: float = 0.0,
+        portfolio_reasons: list[str] | None = None,
+    ) -> dict[str, object]:
+        strategy_id = str(strategy_candidate_id).strip()
+        basis = dict(generation_basis or {})
+        basis.setdefault("repeated_failure_motifs", [])
+        basis.setdefault("transfer_gaps", [])
+        basis.setdefault("repo_signals", [])
+        return {
+            "strategy_id": strategy_id,
+            "strategy_candidate_id": strategy_id,
+            "strategy_kind": str(strategy_candidate_kind).strip(),
+            "strategy_candidate_kind": str(strategy_candidate_kind).strip(),
+            "origin": str(origin).strip() or "authored_strategy",
+            "strategy_label": str(strategy_label).strip() or strategy_id.rsplit(":", 1)[-1],
+            "target_subsystem": str(target_subsystem).strip(),
+            "rationale": str(rationale).strip(),
+            "generation_basis": basis,
+            "target_conditions": dict(target_conditions or {}),
+            "controls": dict(controls or {}),
+            "expected_signals": normalized_control_mapping(
+                {"items": list(expected_signals or [])},
+                list_fields=("items",),
+            ).get("items", []),
+            "parent_strategy_node_ids": [],
+            "retention_inputs": {},
+            "selection_bonus": round(float(selection_bonus), 4),
+            "portfolio_reasons": normalized_control_mapping(
+                {"items": list(portfolio_reasons or [])},
+                list_fields=("items",),
+            ).get("items", []),
+            "source": "runtime_synthesized",
+        }
+
+    def _authored_strategy_candidate(
+        self,
+        candidate: ImprovementExperiment,
+        *,
+        metrics: EvalMetrics,
+        recent_activity: dict[str, object] | None = None,
+        broad_observe_signal: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        base_subsystem = self._base_subsystem(candidate.subsystem)
+        generation_basis = self._strategy_signal_basis(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+        if base_subsystem == "retrieval":
+            return self._build_strategy_candidate(
+                strategy_candidate_id="strategy:retrieval_direct_iteration",
+                strategy_candidate_kind="retrieval_direct_iteration",
+                origin="authored_strategy",
+                strategy_label="retrieval_direct_iteration",
+                target_subsystem=candidate.subsystem,
+                rationale="retrieval selected directly without a broader composite intervention",
+                generation_basis={**generation_basis, "selection_basis": "direct_portfolio"},
+                target_conditions={
+                    "target_subsystem": candidate.subsystem,
+                    "base_subsystem": base_subsystem,
+                },
+                controls={"selection_mode": "direct_portfolio"},
+                expected_signals=["retrieval_signal", "preview_outcome"],
+            )
+        return self._build_strategy_candidate(
+            strategy_candidate_id=f"strategy:subsystem:{base_subsystem or candidate.subsystem}",
+            strategy_candidate_kind="subsystem_direct",
+            origin="authored_strategy",
+            strategy_label=f"{base_subsystem or candidate.subsystem}_direct",
+            target_subsystem=candidate.subsystem,
+            rationale="candidate selected directly from planner-scored subsystem portfolio",
+            generation_basis={**generation_basis, "selection_basis": "direct_portfolio"},
+            target_conditions={
+                "target_subsystem": candidate.subsystem,
+                "base_subsystem": base_subsystem,
+            },
+            controls={"selection_mode": "direct_portfolio"},
+            expected_signals=["decision_credit", "retained_gain"],
+        )
+
+    @staticmethod
+    def _stable_strategy_fingerprint(payload: dict[str, object]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+    def _normalized_strategy_candidate(
+        self,
+        *,
+        candidate_subsystem: str,
+        strategy_candidate: dict[str, object] | None,
+    ) -> dict[str, object]:
+        candidate = dict(strategy_candidate or {})
+        base_subsystem = self._base_subsystem(candidate_subsystem)
+        strategy_candidate_id = str(
+            candidate.get("strategy_candidate_id", "") or candidate.get("strategy_id", "")
+        ).strip()
+        if not strategy_candidate_id:
+            strategy_candidate_id = f"strategy:subsystem:{base_subsystem or candidate_subsystem}"
+        strategy_candidate_kind = str(
+            candidate.get("strategy_candidate_kind", "") or candidate.get("strategy_kind", "")
+        ).strip()
+        if not strategy_candidate_kind:
+            strategy_candidate_kind = "subsystem_direct"
+        origin = str(candidate.get("origin", "")).strip()
+        if not origin:
+            origin = "discovered_strategy" if strategy_candidate_kind not in {"subsystem_direct", "retrieval_direct_iteration"} else "authored_strategy"
+        generation_basis = dict(candidate.get("generation_basis", {})) if isinstance(candidate.get("generation_basis", {}), dict) else {}
+        generation_basis.setdefault("repeated_failure_motifs", [])
+        generation_basis.setdefault("transfer_gaps", [])
+        generation_basis.setdefault("repo_signals", [])
+        return {
+            "strategy_id": strategy_candidate_id,
+            "strategy_candidate_id": strategy_candidate_id,
+            "strategy_kind": strategy_candidate_kind,
+            "strategy_candidate_kind": strategy_candidate_kind,
+            "origin": origin,
+            "strategy_label": str(candidate.get("strategy_label", "")).strip()
+            or strategy_candidate_id.rsplit(":", 1)[-1],
+            "target_subsystem": str(candidate.get("target_subsystem", "")).strip() or candidate_subsystem,
+            "rationale": str(candidate.get("rationale", "")).strip()
+            or "candidate selected directly from planner-scored subsystem portfolio",
+            "generation_basis": generation_basis,
+            "target_conditions": dict(candidate.get("target_conditions", {}))
+            if isinstance(candidate.get("target_conditions", {}), dict)
+            else {},
+            "controls": dict(candidate.get("controls", {}))
+            if isinstance(candidate.get("controls", {}), dict)
+            else {},
+            "expected_signals": normalized_control_mapping(
+                {"items": list(candidate.get("expected_signals", []))},
+                list_fields=("items",),
+            ).get("items", []),
+            "parent_strategy_node_ids": list(candidate.get("parent_strategy_node_ids", []) or []),
+            "retention_inputs": dict(candidate.get("retention_inputs", {}))
+            if isinstance(candidate.get("retention_inputs", {}), dict)
+            else {},
+            "selection_bonus": round(float(candidate.get("selection_bonus", 0.0) or 0.0), 4),
+            "portfolio_reasons": normalized_control_mapping(
+                {"items": list(candidate.get("portfolio_reasons", []))},
+                list_fields=("items",),
+            ).get("items", []),
+            "source": str(candidate.get("source", "runtime_synthesized")).strip() or "runtime_synthesized",
+        }
+
+    def _synthesized_strategy_candidate(
+        self,
+        candidate: ImprovementExperiment,
+        *,
+        metrics: EvalMetrics,
+        recent_activity: dict[str, object] | None = None,
+        broad_observe_signal: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        base_subsystem = self._base_subsystem(candidate.subsystem)
+        recent = recent_activity if isinstance(recent_activity, dict) else {}
+        broad_signal = broad_observe_signal if isinstance(broad_observe_signal, dict) else {}
+        signal_basis = self._strategy_signal_basis(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+        if (
+            bool(broad_signal.get("active", False))
+            and not bool(broad_signal.get("retrieval_emergency", False))
+            and base_subsystem not in {"retrieval", "tolbert_model", "qwen_adapter"}
+        ):
+            return self._build_strategy_candidate(
+                strategy_candidate_id="strategy:broad_observe_diversification",
+                strategy_candidate_kind="broad_observe_diversification",
+                origin="discovered_strategy",
+                strategy_label="broad_observe_diversification",
+                target_subsystem=candidate.subsystem,
+                rationale="clean broad observe preferred a non-retrieval intervention lane",
+                generation_basis={**signal_basis, "selection_basis": "repo_signal_diversification"},
+                target_conditions={
+                    "target_subsystem": candidate.subsystem,
+                    "base_subsystem": base_subsystem,
+                    "required_repo_signals": list(signal_basis.get("repo_signals", [])),
+                    "disallowed_base_subsystems": ["retrieval", "tolbert_model", "qwen_adapter"],
+                },
+                controls={
+                    "selection_mode": "prefer_non_retrieval_first",
+                    "avoid_base_subsystems": ["retrieval", "tolbert_model", "qwen_adapter"],
+                },
+                expected_signals=["required_family_breadth", "decision_credit", "non_retrieval_first_pick"],
+                selection_bonus=0.02,
+                portfolio_reasons=["strategy_origin=discovered_strategy", "strategy_basis=repo_signals"],
+            )
+        if base_subsystem == "retrieval":
+            if int(recent.get("no_yield_cycles", 0) or 0) > 0 or int(recent.get("rejected_cycles", 0) or 0) > 0:
+                low_yield_total = int(recent.get("no_yield_cycles", 0) or 0) + int(recent.get("rejected_cycles", 0) or 0)
+                return self._build_strategy_candidate(
+                    strategy_candidate_id="strategy:retrieval_support_rebalance",
+                    strategy_candidate_kind="retrieval_support_rebalance",
+                    origin="discovered_strategy",
+                    strategy_label="retrieval_support_rebalance",
+                    target_subsystem=candidate.subsystem,
+                    rationale="retrieval remains active but recent history shows low-yield or reject-heavy behavior",
+                    generation_basis={**signal_basis, "selection_basis": "transfer_gap_rebalance"},
+                    target_conditions={
+                        "target_subsystem": candidate.subsystem,
+                        "base_subsystem": base_subsystem,
+                        "required_transfer_gaps": list(signal_basis.get("transfer_gaps", [])),
+                        "required_failure_motifs": list(signal_basis.get("repeated_failure_motifs", [])),
+                    },
+                    controls={
+                        "selection_mode": "rebalanced_iteration",
+                        "prefer_preview_yield": True,
+                    },
+                    expected_signals=["decision_credit", "retained_gain", "preview_yield"],
+                    selection_bonus=min(0.03, 0.01 * max(1, low_yield_total)),
+                    portfolio_reasons=["strategy_origin=discovered_strategy", "strategy_basis=transfer_gaps"],
+                )
+        low_yield_candidate = (
+            int(recent.get("no_yield_cycles", 0) or 0) > 0
+            or int(recent.get("rejected_cycles", 0) or 0) > 0
+            or int(recent.get("recent_incomplete_cycles", 0) or 0) > 0
+        )
+        signal_count = sum(len(list(signal_basis.get(key, []))) for key in ("repeated_failure_motifs", "transfer_gaps", "repo_signals"))
+        if low_yield_candidate and signal_count > 0:
+            fingerprint = self._stable_strategy_fingerprint(
+                {
+                    "base_subsystem": base_subsystem,
+                    "generation_basis": signal_basis,
+                    "target_subsystem": candidate.subsystem,
+                }
+            )
+            return self._build_strategy_candidate(
+                strategy_candidate_id=f"strategy:adaptive_countermeasure:{base_subsystem}:{fingerprint}",
+                strategy_candidate_kind="adaptive_countermeasure",
+                origin="discovered_strategy",
+                strategy_label=f"{base_subsystem}_adaptive_countermeasure",
+                target_subsystem=candidate.subsystem,
+                rationale="repeated low-yield history plus runtime signals justify a discovered composite intervention",
+                generation_basis={**signal_basis, "selection_basis": "failure_motif_countermeasure"},
+                target_conditions={
+                    "target_subsystem": candidate.subsystem,
+                    "base_subsystem": base_subsystem,
+                    "required_failure_motifs": list(signal_basis.get("repeated_failure_motifs", [])),
+                    "required_transfer_gaps": list(signal_basis.get("transfer_gaps", [])),
+                    "required_repo_signals": list(signal_basis.get("repo_signals", [])),
+                },
+                controls={
+                    "selection_mode": "adaptive_countermeasure",
+                    "prefer_composite_intervention": True,
+                },
+                expected_signals=["decision_credit", "retained_gain", "failure_motif_clearance"],
+                selection_bonus=min(0.03, signal_count * 0.005),
+                portfolio_reasons=[
+                    "strategy_origin=discovered_strategy",
+                    "strategy_basis=repeated_failure_motifs",
+                ],
+            )
+        return self._authored_strategy_candidate(
+            candidate,
+            metrics=metrics,
+            recent_activity=recent_activity,
+            broad_observe_signal=broad_observe_signal,
+        )
+
+    def recent_strategy_activity_summary(
+        self,
+        *,
+        strategy_candidate_id: str,
+        output_path: Path | None = None,
+        recent_cycle_window: int = 6,
+    ) -> dict[str, object]:
+        strategy_id = str(strategy_candidate_id).strip()
+        if not strategy_id:
+            return {"selected_cycles": 0, "retained_cycles": 0, "rejected_cycles": 0}
+        resolved = self._resolve_cycles_path(output_path)
+        if resolved is None:
+            return {"selected_cycles": 0, "retained_cycles": 0, "rejected_cycles": 0}
+        records = [record for record in self.load_cycle_records(resolved) if _record_strategy_candidate_id(record) == strategy_id]
+        recent = records[-max(1, recent_cycle_window) :]
+        return {
+            "selected_cycles": len(
+                {
+                    str(record.get("cycle_id", "")).strip()
+                    for record in recent
+                    if str(record.get("state", "")).strip() in {"observe", "select", "generate", "evaluate"}
+                }
+            ),
+            "retained_cycles": len(
+                {str(record.get("cycle_id", "")).strip() for record in recent if str(record.get("state", "")).strip() == "retain"}
+            ),
+            "rejected_cycles": len(
+                {str(record.get("cycle_id", "")).strip() for record in recent if str(record.get("state", "")).strip() == "reject"}
+            ),
+        }
+
+    @staticmethod
+    def _strategy_history_score_delta(
+        strategy_candidate: dict[str, object] | None,
+        *,
+        recent_activity: dict[str, object] | None,
+    ) -> float:
+        strategy = strategy_candidate if isinstance(strategy_candidate, dict) else {}
+        if not str(strategy.get("strategy_candidate_id", "")).strip():
+            return 0.0
+        recent = recent_activity if isinstance(recent_activity, dict) else {}
+        retained_cycles = int(recent.get("retained_cycles", 0) or 0)
+        rejected_cycles = int(recent.get("rejected_cycles", 0) or 0)
+        if retained_cycles > 0:
+            return round(min(0.03, 0.01 * retained_cycles), 4)
+        if rejected_cycles > 0:
+            return round(-min(0.03, 0.01 * rejected_cycles), 4)
+        return 0.0
+
+    def _strategy_memory_summary(
+        self,
+        *,
+        candidate_subsystem: str,
+        strategy_candidate: dict[str, object] | None,
+    ) -> dict[str, object]:
+        if self.runtime_config is None:
+            return {
+                "selected_parent_strategy_node_ids": [],
+                "best_retained_strategy_node_id": "",
+                "continuation_parent_node_id": "",
+                "continuation_artifact_path": "",
+                "continuation_workspace_ref": "",
+                "continuation_branch": "",
+                "score_delta": 0.0,
+                "avoid_reselection": False,
+                "recent_rejects": 0,
+                "recent_retains": 0,
+            }
+        strategy = strategy_candidate if isinstance(strategy_candidate, dict) else {}
+        nodes = load_strategy_nodes(self.runtime_config)
+        return summarize_strategy_priors(
+            nodes,
+            subsystem=str(candidate_subsystem).strip(),
+            strategy_candidate_id=str(strategy.get("strategy_candidate_id", "")).strip(),
+        )
 
     def rank_variants(self, experiment: ImprovementExperiment, metrics: EvalMetrics) -> list[ImprovementVariant]:
         planner_controls = self._improvement_planner_controls()
@@ -1066,7 +1789,7 @@ class ImprovementPlanner:
             )
         top_score = float(ranked[0].score)
         selected_ids = [ranked[0].subsystem]
-        selected_surfaces = {self._base_subsystem(ranked[0].subsystem)}
+        selected_surfaces = {self._campaign_surface_key(ranked[0].subsystem)}
         reasons = [f"top subsystem {ranked[0].subsystem} score={top_score:.4f}"]
         if resolved_max_width <= 1 or len(ranked) == 1:
             return ImprovementSearchBudget(
@@ -1110,14 +1833,14 @@ class ImprovementPlanner:
         for candidate in ranked[1:]:
             if len(selected_ids) >= resolved_max_width:
                 break
-            if self._base_subsystem(candidate.subsystem) in selected_surfaces:
+            if self._campaign_surface_key(candidate.subsystem) in selected_surfaces:
                 continue
             relative_score = 0.0 if top_score <= 0.0 else float(candidate.score) / top_score
             score_margin = top_score - float(candidate.score)
             if relative_score < candidate_relative_floor and score_margin > close_margin_threshold:
                 continue
             selected_ids.append(candidate.subsystem)
-            selected_surfaces.add(self._base_subsystem(candidate.subsystem))
+            selected_surfaces.add(self._campaign_surface_key(candidate.subsystem))
             reasons.append(
                 f"added {candidate.subsystem} due to scored breadth eligibility (relative={relative_score:.3f}, margin={score_margin:.4f})"
             )
@@ -2649,6 +3372,8 @@ class ImprovementPlanner:
             "record_count": len(records),
             "states": [str(record.get("state", "")).strip() for record in records],
             "selected_variant_id": selected_variant_id,
+            "strategy_candidate_id": _record_strategy_candidate_id(decision_record),
+            "strategy_candidate_kind": _record_strategy_candidate_kind(decision_record),
             "prior_retained_cycle_id": prior_retained_cycle_id,
             "candidate_artifact_path": candidate_artifact_path,
             "active_artifact_path": active_artifact_path,
@@ -2780,6 +3505,12 @@ class ImprovementPlanner:
                     "selected_variant_id": _record_selected_variant_id(latest_record)
                     or _record_selected_variant_id(select_record or {})
                     or _record_selected_variant_id(generate_record or {}),
+                    "strategy_candidate_id": _record_strategy_candidate_id(latest_record)
+                    or _record_strategy_candidate_id(select_record or {})
+                    or _record_strategy_candidate_id(generate_record or {}),
+                    "strategy_candidate_kind": _record_strategy_candidate_kind(latest_record)
+                    or _record_strategy_candidate_kind(select_record or {})
+                    or _record_strategy_candidate_kind(generate_record or {}),
                     "prior_retained_cycle_id": _record_prior_retained_cycle_id(latest_record)
                     or _record_prior_retained_cycle_id(generate_record or {}),
                     "selected_cycles": len(
@@ -4174,6 +4905,7 @@ def evaluate_artifact_retention(
         subsystem=subsystem,
         gate=gate,
         evidence=evidence,
+        artifact_update=dict(artifact_payload) if isinstance(artifact_payload, dict) else {},
         baseline_metrics=baseline_metrics,
         candidate_metrics=candidate_metrics,
         pass_rate_delta=candidate_metrics.pass_rate - baseline_metrics.pass_rate,
@@ -4439,6 +5171,65 @@ def _evaluate_transition_model_retention(context: RetentionDecisionContext) -> t
     )
 
 
+def _broad_coding_retrieval_support_signal(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+) -> dict[str, object]:
+    coding_families = ("project", "repository", "integration", "repo_chore")
+
+    def _family_counts(metrics: EvalMetrics) -> tuple[dict[str, int], dict[str, int]]:
+        total_counts: dict[str, int] = {}
+        passed_counts: dict[str, int] = {}
+        for family in coding_families:
+            total = max(
+                int(metrics.total_by_benchmark_family.get(family, 0) or 0),
+                int(metrics.total_by_origin_benchmark_family.get(family, 0) or 0),
+            )
+            passed = max(
+                int(metrics.passed_by_benchmark_family.get(family, 0) or 0),
+                int(metrics.passed_by_origin_benchmark_family.get(family, 0) or 0),
+            )
+            if total > 0:
+                total_counts[family] = total
+                passed_counts[family] = min(total, max(0, passed))
+        return total_counts, passed_counts
+
+    baseline_total_counts, baseline_passed_counts = _family_counts(baseline_metrics)
+    candidate_total_counts, candidate_passed_counts = _family_counts(candidate_metrics)
+    baseline_total = sum(baseline_total_counts.values())
+    candidate_total = sum(candidate_total_counts.values())
+    baseline_passed = sum(baseline_passed_counts.values())
+    candidate_passed = sum(candidate_passed_counts.values())
+    baseline_pass_rate = 0.0 if baseline_total <= 0 else baseline_passed / float(baseline_total)
+    candidate_pass_rate = 0.0 if candidate_total <= 0 else candidate_passed / float(candidate_total)
+    baseline_observed_families = sorted(baseline_total_counts)
+    candidate_observed_families = sorted(candidate_total_counts)
+    supports_broad_coding_non_regression = (
+        len(candidate_observed_families) >= min(3, max(1, len(coding_families)))
+        and len(candidate_observed_families) >= len(baseline_observed_families)
+        and candidate_total >= baseline_total
+        and candidate_pass_rate >= baseline_pass_rate
+    )
+    supports_broad_coding_gain = supports_broad_coding_non_regression and (
+        len(candidate_observed_families) > len(baseline_observed_families)
+        or candidate_total > baseline_total
+        or candidate_pass_rate > baseline_pass_rate
+    )
+    return {
+        "coding_families": list(coding_families),
+        "baseline_observed_families": baseline_observed_families,
+        "candidate_observed_families": candidate_observed_families,
+        "baseline_observed_family_count": len(baseline_observed_families),
+        "candidate_observed_family_count": len(candidate_observed_families),
+        "baseline_total": baseline_total,
+        "candidate_total": candidate_total,
+        "baseline_pass_rate": baseline_pass_rate,
+        "candidate_pass_rate": candidate_pass_rate,
+        "supports_broad_coding_non_regression": supports_broad_coding_non_regression,
+        "supports_broad_coding_gain": supports_broad_coding_gain,
+    }
+
+
 def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[str, str]:
     if context.regressed_family_count > int(context.gate.get("max_regressed_families", 0)):
         return ("reject", "retrieval candidate regressed one or more benchmark families")
@@ -4452,12 +5243,71 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
         not bool(context.gate.get("require_family_discrimination", True))
         or float(context.evidence.get("family_discrimination_gain", 0.0)) > 0.0
     )
+    false_failure_rate = float(context.evidence.get("false_failure_rate", 0.0))
+    low_confidence_non_regression = (
+        int(context.evidence.get("low_confidence_episode_delta", 0) or 0)
+        <= int(context.gate.get("max_low_confidence_episode_regression", 0))
+    )
+    broad_coding_support = _broad_coding_retrieval_support_signal(
+        context.baseline_metrics,
+        context.candidate_metrics,
+    )
+    trusted_retrieval_delta = int(context.evidence.get("trusted_retrieval_delta", 0) or 0)
+    trusted_carryover_repair_rate_delta = float(context.evidence.get("trusted_carryover_repair_rate_delta", 0.0))
+    retrieval_support_gain = (
+        trusted_retrieval_delta > 0
+        or trusted_carryover_repair_rate_delta > 0.0
+        or int(context.evidence.get("low_confidence_episode_delta", 0) or 0) < 0
+        or float(context.evidence.get("family_discrimination_gain", 0.0)) > 0.0
+    )
+    retrieval_support_non_regression = (
+        context.candidate_metrics.trusted_retrieval_steps >= context.baseline_metrics.trusted_retrieval_steps
+        or context.candidate_metrics.retrieval_influenced_steps >= context.baseline_metrics.retrieval_influenced_steps
+        or context.candidate_metrics.retrieval_selected_steps >= context.baseline_metrics.retrieval_selected_steps
+    )
     if (
         context.pass_rate_delta >= float(context.gate.get("min_pass_rate_delta_abs", 0.02))
         and context.average_step_delta <= 0.0
         and discrimination_satisfied
     ):
         return ("retain", "retrieval candidate improved pass rate and family discrimination without increasing steps")
+    if (
+        context.pass_rate_delta >= float(context.gate.get("min_pass_rate_delta_abs", 0.02))
+        and context.average_step_delta <= 0.0
+        and retrieval_support_non_regression
+        and low_confidence_non_regression
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and bool(broad_coding_support.get("supports_broad_coding_non_regression", False))
+    ):
+        return (
+            "retain",
+            "retrieval candidate improved broad coding-family support without regressing the base lane",
+        )
+    if (
+        context.pass_rate_delta >= 0.0
+        and context.average_step_delta <= 0.0
+        and retrieval_support_non_regression
+        and low_confidence_non_regression
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and bool(broad_coding_support.get("supports_broad_coding_gain", False))
+    ):
+        return (
+            "retain",
+            "retrieval candidate broadened coding-family support without regressing the base lane",
+        )
+    if (
+        context.pass_rate_delta >= 0.0
+        and context.average_step_delta <= 0.0
+        and retrieval_support_non_regression
+        and retrieval_support_gain
+        and low_confidence_non_regression
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and bool(broad_coding_support.get("supports_broad_coding_non_regression", False))
+    ):
+        return (
+            "retain",
+            "retrieval candidate strengthened complementary retrieval support without regressing the base lane",
+        )
     min_trusted_carryover_repair_rate = float(context.gate.get("min_trusted_carryover_repair_rate", 0.0))
     min_trusted_carryover_verified_step_delta = int(
         context.gate.get("min_trusted_carryover_verified_step_delta", 1)
@@ -4473,14 +5323,26 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
     trusted_carryover_verified_step_delta = int(
         context.evidence.get("trusted_carryover_verified_step_delta", 0) or 0
     )
+    candidate_artifact_sha256 = str(context.artifact_update.get("artifact_sha256", "")).strip()
+    previous_artifact_sha256 = str(context.artifact_update.get("previous_artifact_sha256", "")).strip()
+    zero_yield_retrieval_change = (
+        candidate_artifact_sha256
+        and previous_artifact_sha256
+        and candidate_artifact_sha256 == previous_artifact_sha256
+        and context.pass_rate_delta == 0.0
+        and context.average_step_delta == 0.0
+        and int(context.evidence.get("proposal_selected_steps_delta", 0) or 0) == 0
+        and int(context.evidence.get("trusted_retrieval_delta", 0) or 0) == 0
+        and trusted_carryover_repair_rate == baseline_trusted_carryover_repair_rate
+        and trusted_carryover_verified_step_delta == 0
+    )
+    if zero_yield_retrieval_change:
+        return ("reject", "retrieval candidate produced no material change from the retained artifact")
     if bool(context.gate.get("require_trusted_carryover_repair_improvement", False)) and (
         context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
         and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
-        and int(context.evidence.get("low_confidence_episode_delta", 0)) <= int(
-            context.gate.get("max_low_confidence_episode_regression", 0)
-        )
-        and float(context.evidence.get("false_failure_rate", 0.0))
-        <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and low_confidence_non_regression
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
         and trusted_carryover_repair_rate >= min_trusted_carryover_repair_rate
         and trusted_carryover_verified_step_delta >= min_trusted_carryover_verified_step_delta
     ):
@@ -4491,11 +5353,8 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
     if bool(context.gate.get("require_trusted_carryover_repair_improvement", False)) and (
         context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
         and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
-        and int(context.evidence.get("low_confidence_episode_delta", 0)) <= int(
-            context.gate.get("max_low_confidence_episode_regression", 0)
-        )
-        and float(context.evidence.get("false_failure_rate", 0.0))
-        <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and low_confidence_non_regression
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
         and baseline_trusted_carryover_repair_rate >= min_trusted_carryover_repair_rate
         and trusted_carryover_repair_rate >= baseline_trusted_carryover_repair_rate
         and trusted_carryover_verified_steps >= baseline_trusted_carryover_verified_steps
@@ -4509,7 +5368,7 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
         and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
         and context.candidate_metrics.trusted_retrieval_steps > context.baseline_metrics.trusted_retrieval_steps
         and context.candidate_metrics.low_confidence_episodes <= context.baseline_metrics.low_confidence_episodes
-        and float(context.evidence.get("false_failure_rate", 0.0)) <= float(context.gate.get("max_false_failure_rate", 0.02))
+        and false_failure_rate <= float(context.gate.get("max_false_failure_rate", 0.02))
         and discrimination_satisfied
     ):
         return ("retain", "retrieval candidate increased trusted retrieval usage without regressing the base lane")
@@ -4542,10 +5401,15 @@ def _evaluate_tolbert_model_retention(context: RetentionDecisionContext) -> tupl
         return ("reject", "Tolbert model candidate regressed first-step path confidence")
     if int(context.evidence.get("trusted_retrieval_delta", 0)) < int(context.gate.get("min_trusted_retrieval_delta", 0)):
         return ("reject", "Tolbert model candidate did not improve trusted retrieval usage")
+    if bool(context.gate.get("require_primary_routing_signal", False)) and int(
+        context.candidate_metrics.tolbert_primary_episodes
+    ) < int(context.gate.get("min_primary_episodes", 0) or 0):
+        return ("reject", "Tolbert model candidate never entered retained Tolbert primary routing")
     if bool(context.gate.get("require_novel_command_signal", False)) and int(
         context.candidate_metrics.proposal_selected_steps
     ) <= 0:
-        return ("reject", "Tolbert model candidate produced no proposal-selected commands")
+        if not _tolbert_selection_signal_fallback_satisfied(context):
+            return ("reject", "Tolbert model candidate produced no proposal-selected commands or measurable retrieval-selection gain")
     if int(context.evidence.get("proposal_selected_steps_delta", 0)) < int(
         context.gate.get("min_proposal_selected_steps_delta", 0)
     ):
@@ -5070,9 +5934,18 @@ def proposal_gate_failure_reasons_by_benchmark_family(
             continue
         if int(metrics.get("baseline_task_count", 0) or 0) + int(metrics.get("candidate_task_count", 0) or 0) <= 0:
             continue
+        if bool(family_gate.get("allow_primary_routing_signal", False)) and int(
+            metrics.get("candidate_primary_episodes", 0) or 0
+        ) < int(family_gate.get("min_primary_episodes", 0) or 0):
+            reasons[family] = f"{subject} never entered retained Tolbert primary routing on {family} tasks"
+            continue
         if bool(family_gate.get("require_novel_command_signal", False)) and int(
             metrics.get("candidate_proposal_selected_steps", 0) or 0
         ) <= 0:
+            if bool(family_gate.get("allow_primary_routing_signal", False)) and int(
+                metrics.get("candidate_primary_episodes", 0) or 0
+            ) >= int(family_gate.get("min_primary_episodes", 0) or 0):
+                continue
             reasons[family] = f"{subject} produced no proposal-selected commands on {family} tasks"
             continue
         if int(metrics.get("proposal_selected_steps_delta", 0) or 0) < int(
@@ -5090,6 +5963,19 @@ def proposal_gate_failure_reasons_by_benchmark_family(
         ):
             reasons[family] = f"{subject} regressed verifier-valid novel-command rate on {family} tasks"
     return reasons
+
+
+def _tolbert_selection_signal_fallback_satisfied(context: RetentionDecisionContext) -> bool:
+    if not bool(context.gate.get("allow_selection_signal_fallback", False)):
+        return False
+    if context.candidate_metrics.pass_rate < context.baseline_metrics.pass_rate:
+        return False
+    selection_deltas = (
+        int(context.evidence.get("trusted_retrieval_delta", 0) or 0),
+        int(context.candidate_metrics.retrieval_selected_steps - context.baseline_metrics.retrieval_selected_steps),
+        int(context.evidence.get("tolbert_primary_episodes_delta", 0) or 0),
+    )
+    return any(delta > 0 for delta in selection_deltas)
 
 
 def _generated_kind_pass_rate(metrics: EvalMetrics, kind: str) -> float:
@@ -6828,7 +7714,10 @@ def assess_artifact_compatibility(
         violations.append("artifact must contain a lifecycle_state")
     else:
         allowed_lifecycle_states = _allowed_artifact_lifecycle_states(subsystem)
-        if allowed_lifecycle_states and lifecycle_state not in allowed_lifecycle_states:
+        normalized_lifecycle_state = lifecycle_state
+        if lifecycle_state == "proposed" and "candidate" in allowed_lifecycle_states:
+            normalized_lifecycle_state = "candidate"
+        if allowed_lifecycle_states and normalized_lifecycle_state not in allowed_lifecycle_states:
             allowed_text = ", ".join(sorted(allowed_lifecycle_states))
             violations.append(f"artifact lifecycle_state must be one of: {allowed_text}")
     checks.append("lifecycle_state")
@@ -6934,14 +7823,18 @@ def assess_artifact_compatibility(
         if not isinstance(runtime_policy, dict) or not runtime_policy:
             violations.append("Tolbert model artifact must contain runtime_policy")
         else:
+            extra_runtime_policy_keys = {
+                "allow_trusted_primary_without_min_confidence",
+                "trusted_primary_min_confidence",
+            }
             for key, value in runtime_policy.items():
-                if key not in _TOLBERT_RUNTIME_POLICY_KEYS:
+                if key not in _TOLBERT_RUNTIME_POLICY_KEYS and key not in extra_runtime_policy_keys:
                     violations.append(f"Tolbert runtime policy is unsupported: {key}")
                     continue
                 if key in {"shadow_benchmark_families", "primary_benchmark_families"}:
                     if not isinstance(value, list):
                         violations.append(f"Tolbert runtime policy {key} must be a list")
-                elif key in {"min_path_confidence"}:
+                elif key in {"min_path_confidence", "trusted_primary_min_confidence"}:
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         violations.append(f"Tolbert runtime policy {key} must be numeric")
                 elif key in {"primary_min_command_score"}:
@@ -7028,8 +7921,13 @@ def assess_artifact_compatibility(
         if not isinstance(liftoff_gate, dict) or not liftoff_gate:
             violations.append("Tolbert model artifact must contain liftoff_gate")
         else:
+            extra_liftoff_gate_keys = {
+                "require_primary_routing_signal",
+                "min_primary_episodes",
+                "allow_selection_signal_fallback",
+            }
             for key, value in liftoff_gate.items():
-                if key not in _TOLBERT_LIFTOFF_GATE_KEYS:
+                if key not in _TOLBERT_LIFTOFF_GATE_KEYS and key not in extra_liftoff_gate_keys:
                     violations.append(f"Tolbert liftoff gate is unsupported: {key}")
                     continue
                 if key == "proposal_gate_by_benchmark_family":
@@ -7052,15 +7950,17 @@ def assess_artifact_compatibility(
                                 "min_proposal_selected_steps_delta",
                                 "min_novel_valid_command_steps",
                                 "min_novel_valid_command_rate_delta",
+                                "allow_primary_routing_signal",
+                                "min_primary_episodes",
                             }:
                                 violations.append(
                                     f"Tolbert liftoff family proposal gate is unsupported: {family_key}"
                                 )
                                 continue
-                            if family_key == "require_novel_command_signal":
+                            if family_key in {"require_novel_command_signal", "allow_primary_routing_signal"}:
                                 if not isinstance(family_value, bool):
                                     violations.append(
-                                        "Tolbert liftoff family proposal gate require_novel_command_signal must be boolean"
+                                        f"Tolbert liftoff family proposal gate {family_key} must be boolean"
                                     )
                             elif family_key == "min_novel_valid_command_rate_delta":
                                 if isinstance(family_value, bool) or not isinstance(family_value, (int, float)):
@@ -7085,6 +7985,7 @@ def assess_artifact_compatibility(
                 elif key in {
                     "max_regressed_families",
                     "min_shadow_episodes_per_promoted_family",
+                    "min_primary_episodes",
                     "takeover_drift_step_budget",
                     "takeover_drift_wave_task_limit",
                     "takeover_drift_max_waves",
@@ -7325,6 +8226,49 @@ def materialize_replay_verified_tool_payload(payload: Any) -> dict[str, object]:
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
+        procedure = candidate.get("procedure", {})
+        if not isinstance(procedure, dict):
+            procedure = {}
+        commands = [str(value).strip() for value in procedure.get("commands", []) if str(value).strip()]
+        if commands:
+            candidate["procedure"] = {"commands": list(commands)}
+        task_contract = candidate.get("task_contract", {})
+        if not isinstance(task_contract, dict):
+            task_contract = {}
+        task_metadata = task_contract.get("metadata", {})
+        if not isinstance(task_metadata, dict):
+            task_metadata = {}
+        source_task_id = str(candidate.get("source_task_id", "")).strip()
+        tool_id = str(candidate.get("tool_id", "")).strip()
+        script_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_task_id or tool_id or "tool_candidate").strip("._")
+        script_name = str(candidate.get("script_name", "")).strip()
+        if not script_name and script_stem:
+            script_name = f"{script_stem}_tool.sh"
+        script_body = str(candidate.get("script_body", "")).strip()
+        if not script_body and commands:
+            script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(commands) + "\n"
+        quality = candidate.get("quality")
+        if isinstance(quality, bool) or not isinstance(quality, (int, float)):
+            quality = 0.0
+        benchmark_family = str(
+            candidate.get("benchmark_family")
+            or task_metadata.get("benchmark_family")
+            or task_contract.get("benchmark_family", "")
+        ).strip()
+        verifier = candidate.get("verifier", {})
+        if not isinstance(verifier, dict):
+            verifier = {}
+        if not verifier:
+            verifier = {"termination_reason": "success"}
+        candidate["kind"] = "local_shell_procedure"
+        if benchmark_family:
+            candidate["benchmark_family"] = benchmark_family
+        if script_name:
+            candidate["script_name"] = script_name
+        if script_body:
+            candidate["script_body"] = script_body
+        candidate["quality"] = float(quality)
+        candidate["verifier"] = verifier
         candidate["promotion_stage"] = "replay_verified"
         candidate["lifecycle_state"] = "replay_verified"
     return clone
@@ -8011,6 +8955,56 @@ def _record_selected_variant_id(record: dict[str, object] | ImprovementCycleReco
     return ""
 
 
+def _record_strategy_candidate_id(record: dict[str, object] | ImprovementCycleRecord) -> str:
+    if isinstance(record, ImprovementCycleRecord):
+        direct = str(record.strategy_candidate_id).strip()
+        if direct:
+            return direct
+    else:
+        direct = str(record.get("strategy_candidate_id", "")).strip()
+        if direct:
+            return direct
+    metrics_summary = _record_metrics_summary(record)
+    direct = str(metrics_summary.get("strategy_candidate_id", "")).strip()
+    if direct:
+        return direct
+    direct = str(metrics_summary.get("strategy_id", "")).strip()
+    if direct:
+        return direct
+    strategy_candidate = metrics_summary.get("strategy_candidate", {})
+    if isinstance(strategy_candidate, dict):
+        return str(
+            strategy_candidate.get("strategy_candidate_id", "")
+            or strategy_candidate.get("strategy_id", "")
+        ).strip()
+    return ""
+
+
+def _record_strategy_candidate_kind(record: dict[str, object] | ImprovementCycleRecord) -> str:
+    if isinstance(record, ImprovementCycleRecord):
+        direct = str(record.strategy_candidate_kind).strip()
+        if direct:
+            return direct
+    else:
+        direct = str(record.get("strategy_candidate_kind", "")).strip()
+        if direct:
+            return direct
+    metrics_summary = _record_metrics_summary(record)
+    direct = str(metrics_summary.get("strategy_candidate_kind", "")).strip()
+    if direct:
+        return direct
+    direct = str(metrics_summary.get("strategy_kind", "")).strip()
+    if direct:
+        return direct
+    strategy_candidate = metrics_summary.get("strategy_candidate", {})
+    if isinstance(strategy_candidate, dict):
+        return str(
+            strategy_candidate.get("strategy_candidate_kind", "")
+            or strategy_candidate.get("strategy_kind", "")
+        ).strip()
+    return ""
+
+
 def _record_prior_retained_cycle_id(record: dict[str, object] | ImprovementCycleRecord) -> str:
     if isinstance(record, ImprovementCycleRecord):
         if str(record.prior_retained_cycle_id).strip():
@@ -8141,6 +9135,8 @@ def _normalized_cycle_record(record: ImprovementCycleRecord) -> ImprovementCycle
         rollback_artifact_path=record.rollback_artifact_path,
         artifact_snapshot_path=record.artifact_snapshot_path,
         selected_variant_id=record.selected_variant_id or _record_selected_variant_id(record),
+        strategy_candidate_id=record.strategy_candidate_id or _record_strategy_candidate_id(record),
+        strategy_candidate_kind=record.strategy_candidate_kind or _record_strategy_candidate_kind(record),
         prior_retained_cycle_id=record.prior_retained_cycle_id or _record_prior_retained_cycle_id(record),
         baseline_pass_rate=record.baseline_pass_rate
         if record.baseline_pass_rate is not None

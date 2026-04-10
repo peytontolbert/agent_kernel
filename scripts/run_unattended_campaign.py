@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Mapping
 import argparse
@@ -23,6 +24,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.cycle_runner import semantic_progress_state
 from agent_kernel.curriculum_improvement import retained_curriculum_controls
 from agent_kernel.runtime_supervision import (
     append_jsonl,
@@ -31,6 +33,14 @@ from agent_kernel.runtime_supervision import (
     spawn_process_group,
     terminate_process_tree,
 )
+from agent_kernel.semantic_hub import (
+    record_semantic_attempt,
+    record_semantic_note,
+    record_semantic_redirect,
+    record_semantic_skill,
+    upsert_semantic_agent,
+)
+from agent_kernel.strategy_memory import load_strategy_nodes
 from agent_kernel.trust import build_unattended_trust_ledger
 from agent_kernel.prompt_improvement import retained_improvement_planner_controls
 from agent_kernel.unattended_controller import (
@@ -78,6 +88,7 @@ _REPO_SETTING_FAMILY_NEIGHBOR_WEIGHTS: dict[str, dict[str, float]] = {
 _PRIORITY_FAMILY_LOW_RETURN_MIN_DECISIONS = 2
 _PRIORITY_FAMILY_LOW_RETURN_MIN_ESTIMATED_COST = 4.0
 _PRIORITY_FAMILY_EXPLORATION_WEIGHT = 0.05
+_POST_PRODUCTIVE_GENERATED_FAILURE_DECISION_WINDOW_FRACTION = 0.8
 
 
 def _progress(message: str) -> None:
@@ -126,7 +137,23 @@ def _write_status(
     active_run_policy = active_run.get("policy")
     if not isinstance(active_run_policy, dict):
         active_run_policy = None
-    active_child = payload.get("active_child", {})
+    raw_active_child = payload.get("active_child", {})
+    active_child = raw_active_child if isinstance(raw_active_child, dict) else {}
+    mirrored_child_status = active_run.get("child_status", {})
+    if not isinstance(mirrored_child_status, Mapping):
+        mirrored_child_status = {}
+    if active_child and mirrored_child_status:
+        active_child = _merge_mirrored_child_status_fields(
+            dict(active_child),
+            mirrored_child_status,
+        )
+    if active_child:
+        active_run["child_status"] = dict(active_child)
+    projected_active_child = (
+        dict(active_child)
+        if active_child
+        else (dict(mirrored_child_status) if mirrored_child_status else {})
+    )
     cleanup = payload.get("cleanup", {})
     preflight = payload.get("preflight", {})
     rounds = payload.get("rounds", [])
@@ -159,6 +186,22 @@ def _write_status(
     )
     if not isinstance(latest_policy_shift_alert, dict):
         latest_policy_shift_alert = {}
+    projected_phase_detail = _preferred_active_child_phase_detail(
+        str(payload.get("phase_detail", "")).strip(),
+        projected_active_child,
+    )
+    projected_phase_detail_round_payload = dict(latest_round) if isinstance(latest_round, dict) else {}
+    if projected_active_child and not isinstance(projected_phase_detail_round_payload.get("active_child", {}), Mapping):
+        projected_phase_detail_round_payload["active_child"] = dict(projected_active_child)
+    if not isinstance(projected_phase_detail_round_payload.get("controller_intervention", {}), Mapping):
+        controller_intervention = payload.get("controller_intervention", {})
+        if isinstance(controller_intervention, Mapping):
+            projected_phase_detail_round_payload["controller_intervention"] = dict(controller_intervention)
+    projected_phase_detail = _authoritative_round_phase_detail(
+        existing_detail=projected_phase_detail,
+        round_payload=projected_phase_detail_round_payload,
+        campaign_report=payload.get("campaign_report", {}),
+    )
     status_payload = {
         "spec_version": "asi_v1",
         "report_kind": "unattended_campaign_status",
@@ -166,7 +209,7 @@ def _write_status(
         "report_path": str(report_path),
         "status": str(payload.get("status", "")).strip(),
         "phase": str(payload.get("phase", "")).strip(),
-        "phase_detail": str(payload.get("phase_detail", "")).strip(),
+        "phase_detail": projected_phase_detail,
         "reason": str(payload.get("reason", "")).strip(),
         "rounds_requested": int(payload.get("rounds_requested", 0) or 0),
         "rounds_completed": int(payload.get("rounds_completed", 0) or 0),
@@ -185,6 +228,9 @@ def _write_status(
         "latest_round_policy_shift_rationale": latest_round.get("policy_shift_rationale", {})
         if isinstance(latest_round, dict)
         else {},
+        "latest_semantic_redirection": latest_round.get("semantic_redirection", {})
+        if isinstance(latest_round, dict)
+        else {},
         "latest_available_policy_shift_rationale": latest_rationale_round.get("policy_shift_rationale", {})
         if isinstance(latest_rationale_round, dict)
         else {},
@@ -197,7 +243,12 @@ def _write_status(
         ),
         "campaign_validation": payload.get("campaign_validation", {}),
         "liftoff_validation": payload.get("liftoff_validation", {}),
-        "active_child": active_child if isinstance(active_child, dict) else {},
+        "active_child": dict(projected_active_child),
+        "active_child_controller_intervention": (
+            projected_active_child.get("controller_intervention", {})
+            if isinstance(projected_active_child, dict)
+            else {}
+        ),
         "preflight": preflight if isinstance(preflight, dict) else {},
         "cleanup": cleanup if isinstance(cleanup, dict) else {},
         "unattended_evidence": payload.get("unattended_evidence", {}),
@@ -205,15 +256,279 @@ def _write_status(
         "lock_path": str(payload.get("lock_path", "")).strip(),
         "event_log_path": str(payload.get("event_log_path", "")).strip(),
     }
+    status_payload.update(
+        _live_status_projection(
+            payload=payload,
+            active_run=active_run,
+            active_child=projected_active_child,
+        )
+    )
     for key in (
+        "campaign_round_index",
+        "last_progress_phase",
+        "runtime_managed_decisions",
+        "non_runtime_managed_decisions",
+        "execution_source_summary",
+        "sampled_families_from_progress",
+        "required_benchmark_families",
         "families_sampled",
         "families_never_sampled",
         "pressure_families_without_sampling",
+        "latest_generated_run_report_path",
+        "trust_status",
+        "decision_stream_summary",
+        "trust_breadth_summary",
         "partial_frontier_expansion_summary",
     ):
-        if key in existing_status and key not in status_payload:
+        if key in existing_status and status_payload.get(key) in ({}, [], "", None):
             status_payload[key] = existing_status[key]
     atomic_write_json(status_path, status_payload, config=config)
+
+
+def _live_status_projection(
+    *,
+    payload: Mapping[str, object] | None,
+    active_run: Mapping[str, object] | None,
+    active_child: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report_payload = payload if isinstance(payload, Mapping) else {}
+    active_run_payload = active_run if isinstance(active_run, Mapping) else {}
+    child = active_child if isinstance(active_child, Mapping) else {}
+    current_policy = report_payload.get("current_policy", {})
+    if not isinstance(current_policy, Mapping):
+        current_policy = {}
+    active_run_policy = active_run_payload.get("policy", {})
+    if not isinstance(active_run_policy, Mapping):
+        active_run_policy = {}
+    required_families = _normalize_benchmark_families(
+        active_run_policy.get(
+            "priority_benchmark_families",
+            current_policy.get("priority_benchmark_families", []),
+        )
+    )
+    sampled_families = _normalize_benchmark_families(
+        child.get(
+            "families_sampled",
+            child.get("sampled_families_from_progress", []),
+        )
+    )
+    if not sampled_families:
+        active_cycle_progress = child.get("active_cycle_progress", {})
+        if isinstance(active_cycle_progress, Mapping):
+            sampled_families = _normalize_benchmark_families(active_cycle_progress.get("sampled_families_from_progress", []))
+    decision_conversion_summary = child.get("decision_conversion_summary", {})
+    if not isinstance(decision_conversion_summary, Mapping):
+        decision_conversion_summary = {}
+    runtime_managed_decisions = max(
+        0,
+        int(child.get("runtime_managed_decisions", 0) or 0),
+        int(decision_conversion_summary.get("runtime_managed_runs", 0) or 0),
+    )
+    non_runtime_managed_decisions = max(
+        0,
+        int(child.get("non_runtime_managed_decisions", 0) or 0),
+        int(decision_conversion_summary.get("non_runtime_managed_runs", 0) or 0),
+    )
+    partial_productive_without_decision_runs = max(
+        0,
+        int(child.get("partial_productive_runs", 0) or 0),
+        int(decision_conversion_summary.get("partial_productive_without_decision_runs", 0) or 0),
+    )
+    decision_runs = max(
+        runtime_managed_decisions + non_runtime_managed_decisions,
+        int(decision_conversion_summary.get("decision_runs", 0) or 0),
+    )
+    latest_generated_run_report_path = str(
+        child.get("last_report_path")
+        or report_payload.get("campaign_report_path")
+        or report_payload.get("liftoff_report_path")
+        or ""
+    ).strip()
+    required_family_set = set(required_families)
+    sampled_required_families = [family for family in sampled_families if family in required_family_set]
+    missing_required_families = (
+        [family for family in required_families if family not in set(sampled_families)]
+        if sampled_families
+        else []
+    )
+    current_task = child.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    canonical_progress_state = child.get("canonical_progress_state", {})
+    if not isinstance(canonical_progress_state, Mapping):
+        canonical_progress_state = {}
+    semantic_progress_state = child.get("semantic_progress_state", {})
+    if not isinstance(semantic_progress_state, Mapping):
+        semantic_progress_state = {}
+    adaptive_progress_state = child.get("adaptive_progress_state", {})
+    if not isinstance(adaptive_progress_state, Mapping):
+        adaptive_progress_state = {}
+    if not canonical_progress_state:
+        canonical_progress_state = _select_preferred_child_progress_state(
+            semantic_state=semantic_progress_state,
+            adaptive_state=adaptive_progress_state,
+            current_task=current_task,
+            last_progress_phase=str(child.get("last_progress_phase", "")).strip(),
+        )
+    child_trust_breadth_summary = child.get("trust_breadth_summary", {})
+    if not isinstance(child_trust_breadth_summary, Mapping):
+        child_trust_breadth_summary = {}
+    report_trust_breadth_summary = report_payload.get("trust_breadth_summary", {})
+    if not isinstance(report_trust_breadth_summary, Mapping):
+        report_trust_breadth_summary = {}
+    trusted_breadth = child_trust_breadth_summary or report_trust_breadth_summary
+    trusted_required_families = _normalize_benchmark_families(
+        trusted_breadth.get("required_families", required_families)
+    )
+    trusted_required_families_with_reports = _normalize_benchmark_families(
+        trusted_breadth.get("required_families_with_reports", [])
+    )
+    trusted_missing_required_families = _normalize_benchmark_families(
+        trusted_breadth.get("missing_required_families", [])
+    )
+    campaign_report = report_payload.get("campaign_report", {})
+    if not isinstance(campaign_report, Mapping):
+        campaign_report = {}
+    authoritative_decision_state = _authoritative_status_decision_state(
+        active_child=child,
+        campaign_report=campaign_report,
+    )
+    runtime_managed_decisions = max(
+        runtime_managed_decisions,
+        int(authoritative_decision_state.get("runtime_managed_decisions", 0) or 0),
+    )
+    non_runtime_managed_decisions = max(
+        non_runtime_managed_decisions,
+        int(authoritative_decision_state.get("non_runtime_managed_decisions", 0) or 0),
+    )
+    retained_gain_runs = max(
+        int(child.get("retained_gain_runs", 0) or 0),
+        int(authoritative_decision_state.get("retained_gain_runs", 0) or 0),
+    )
+    decision_runs = max(
+        decision_runs,
+        int(authoritative_decision_state.get("decision_records_considered", 0) or 0),
+    )
+    if decision_runs > 0:
+        partial_productive_without_decision_runs = 0
+    return {
+        "campaign_round_index": int(
+            child.get("round_index", report_payload.get("rounds_completed", 0) or 0) or 0
+        ),
+        "last_progress_phase": str(
+            child.get(
+                "last_progress_phase",
+                current_task.get("phase", ""),
+            )
+        ).strip(),
+        "current_task": dict(current_task),
+        "current_cognitive_stage": dict(child.get("current_cognitive_stage", {}))
+        if isinstance(child.get("current_cognitive_stage", {}), Mapping)
+        else {},
+        "canonical_progress_state": dict(canonical_progress_state),
+        "semantic_progress_state": dict(canonical_progress_state or semantic_progress_state),
+        "runtime_managed_decisions": runtime_managed_decisions,
+        "non_runtime_managed_decisions": non_runtime_managed_decisions,
+        "execution_source_summary": (
+            dict(child.get("execution_source_summary", {}))
+            if isinstance(child.get("execution_source_summary", {}), Mapping)
+            else {}
+        ),
+        "sampled_families_from_progress": sampled_families,
+        "required_benchmark_families": required_families,
+        "families_sampled": sampled_families,
+        "families_never_sampled": missing_required_families,
+        "pressure_families_without_sampling": missing_required_families,
+        "latest_generated_run_report_path": latest_generated_run_report_path,
+        "trust_status": str(
+            report_payload.get("unattended_evidence", {}).get("overall_assessment", {}).get("status", "")
+            if isinstance(report_payload.get("unattended_evidence", {}), Mapping)
+            and isinstance(report_payload.get("unattended_evidence", {}).get("overall_assessment", {}), Mapping)
+            else ""
+        ).strip(),
+        "decision_stream_summary": {
+            "runtime_managed": {
+                "total_decisions": runtime_managed_decisions,
+                "retained_cycles": retained_gain_runs,
+                "rejected_cycles": max(0, runtime_managed_decisions - retained_gain_runs),
+            },
+            "non_runtime_managed": {
+                "total_decisions": non_runtime_managed_decisions,
+                "retained_cycles": 0,
+                "rejected_cycles": non_runtime_managed_decisions,
+            },
+            "partial_productive_without_decision_runs": partial_productive_without_decision_runs,
+            "decision_runs": decision_runs,
+        },
+        "authoritative_decision_state": authoritative_decision_state,
+        "trust_breadth_summary": {
+            "required_families": trusted_required_families or required_families,
+            "required_families_with_reports": trusted_required_families_with_reports,
+            "missing_required_families": (
+                trusted_missing_required_families
+                if trusted_missing_required_families or trusted_required_families_with_reports
+                else missing_required_families
+            ),
+            "distinct_external_benchmark_families": int(
+                trusted_breadth.get("distinct_external_benchmark_families", 0) or 0
+            ),
+            "external_report_count": int(trusted_breadth.get("external_report_count", 0) or 0),
+            "sampled_families_from_progress": sampled_families,
+            "bootstrap_sampled_required_families": sampled_required_families,
+        },
+    }
+
+
+def _authoritative_status_decision_state(
+    *,
+    active_child: Mapping[str, object] | None,
+    campaign_report: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child = active_child if isinstance(active_child, Mapping) else {}
+    report = campaign_report if isinstance(campaign_report, Mapping) else {}
+    report_runs = report.get("runs", [])
+    first_run = report_runs[0] if isinstance(report_runs, list) and report_runs and isinstance(report_runs[0], Mapping) else {}
+    child_decision_records_considered, _ = _effective_live_decision_record_count(child)
+    child_retained_gain_runs = _effective_live_retained_gain_runs(child)
+    runtime_managed_decisions = max(
+        0,
+        int(child.get("runtime_managed_decisions", 0) or 0),
+        int(first_run.get("runtime_managed_decisions", 0) or 0),
+        int(report.get("runtime_managed_decisions", 0) or 0),
+    )
+    non_runtime_managed_decisions = max(
+        0,
+        int(child.get("non_runtime_managed_decisions", 0) or 0),
+        int(first_run.get("non_runtime_managed_decisions", 0) or 0),
+        int(report.get("non_runtime_managed_decisions", 0) or 0),
+    )
+    decision_records_considered = max(
+        child_decision_records_considered,
+        int(first_run.get("decision_records_considered", 0) or 0),
+        runtime_managed_decisions + non_runtime_managed_decisions,
+    )
+    retained_gain_runs = max(
+        child_retained_gain_runs,
+        int(report.get("retained_gain_runs", 0) or 0),
+        1 if bool(first_run.get("retained_gain", False)) else 0,
+    )
+    pending_decision_state = str(
+        child.get("pending_decision_state")
+        or first_run.get("final_state")
+        or ""
+    ).strip()
+    decision_conversion_state = str(
+        first_run.get("decision_conversion_state")
+        or ("runtime_managed" if runtime_managed_decisions > 0 else "")
+    ).strip()
+    return {
+        "decision_records_considered": decision_records_considered,
+        "runtime_managed_decisions": runtime_managed_decisions,
+        "non_runtime_managed_decisions": non_runtime_managed_decisions,
+        "retained_gain_runs": retained_gain_runs,
+        "pending_decision_state": pending_decision_state,
+        "decision_conversion_state": decision_conversion_state,
+    }
 
 
 def _normalize_benchmark_families(values: object) -> list[str]:
@@ -227,6 +542,37 @@ def _normalize_benchmark_families(values: object) -> list[str]:
             seen.add(token)
             normalized.append(token)
     return normalized
+
+
+def _effective_live_decision_record_count(payload: Mapping[str, object] | None) -> tuple[int, bool]:
+    child = payload if isinstance(payload, Mapping) else {}
+    raw_count = max(
+        0,
+        int(child.get("decision_records_considered", 0) or 0),
+        int(child.get("runtime_managed_decisions", 0) or 0),
+        int(child.get("non_runtime_managed_decisions", 0) or 0),
+    )
+    pending_decision_state = str(child.get("pending_decision_state", "")).strip()
+    preview_state = str(child.get("preview_state", "")).strip()
+    finalize_phase = str(child.get("finalize_phase", child.get("last_progress_phase", ""))).strip()
+    definitive_decision_emitted = (
+        pending_decision_state in {"retain", "reject"}
+        or preview_state in {"retain", "reject"}
+        or finalize_phase in {"apply_decision", "decision_reject_reason", "decision_retain_reason", "done"}
+    )
+    if definitive_decision_emitted and raw_count <= 0:
+        return 1, True
+    return raw_count, False
+
+
+def _effective_live_retained_gain_runs(payload: Mapping[str, object] | None) -> int:
+    child = payload if isinstance(payload, Mapping) else {}
+    retained_gain_runs = max(0, int(child.get("retained_gain_runs", 0) or 0))
+    pending_decision_state = str(child.get("pending_decision_state", "")).strip()
+    preview_state = str(child.get("preview_state", "")).strip()
+    if retained_gain_runs <= 0 and (pending_decision_state == "retain" or preview_state == "retain"):
+        return 1
+    return retained_gain_runs
 
 
 def _rank_priority_benchmark_families(values: object) -> list[str]:
@@ -339,11 +685,22 @@ def _select_priority_benchmark_families(
     priority_family_selection_scores: dict[str, object] | None = None,
     min_selection_score: float = 0.0,
     productive_priority_families: object | None = None,
+    retained_gain_conversion_priority_families: object | None = None,
     under_sampled_priority_families: object | None = None,
     low_return_priority_families: object | None = None,
 ) -> list[str]:
     ranked_missing = _rank_priority_benchmark_families(missing_required_families)
     if ranked_missing:
+        if min_selection_score > 0.0:
+            return _normalize_benchmark_families(missing_required_families)[: min(3, len(ranked_missing))]
+        missing_priority_order = {
+            family: index
+            for index, family in enumerate(("repository", "integration", "project", "repo_chore", "repo_sandbox"))
+        }
+        ranked_missing = sorted(
+            ranked_missing,
+            key=lambda family: (missing_priority_order.get(family, len(missing_priority_order)), family),
+        )
         return ranked_missing[: min(3, len(ranked_missing))]
     score_mapping = priority_family_selection_scores if isinstance(priority_family_selection_scores, dict) else {}
 
@@ -357,14 +714,22 @@ def _select_priority_benchmark_families(
     ranked_priority = _ordered_priority_benchmark_families(ranked_priority_families or [])
     ranked_productive = _rank_priority_benchmark_families(productive_priority_families or [])
     productive_set = set(ranked_productive)
+    ranked_conversion = [
+        family
+        for family in _rank_priority_benchmark_families(retained_gain_conversion_priority_families or [])
+        if family not in productive_set
+    ]
+    conversion_set = set(ranked_conversion)
     ranked_low_return = [
-        family for family in _rank_priority_benchmark_families(low_return_priority_families or []) if family not in productive_set
+        family
+        for family in _rank_priority_benchmark_families(low_return_priority_families or [])
+        if family not in productive_set and family not in conversion_set
     ]
     low_return_set = set(ranked_low_return)
     ranked_repo_setting = [
         family
         for family in _rank_priority_benchmark_families(repo_setting_priority_families or [])
-        if family not in productive_set and family not in low_return_set
+        if family not in productive_set and family not in conversion_set and family not in low_return_set
     ]
     ranked_under_sampled = [
         family
@@ -373,7 +738,9 @@ def _select_priority_benchmark_families(
     ]
     ranked_required = _rank_priority_benchmark_families(required_families)
     ranked_required_without_productive = [
-        family for family in ranked_required if family not in productive_set and family not in low_return_set
+        family
+        for family in ranked_required
+        if family not in productive_set and family not in conversion_set and family not in low_return_set
     ]
     ranked_current = [
         family
@@ -382,6 +749,7 @@ def _select_priority_benchmark_families(
     ]
     selected: list[str] = []
     for family in [
+        *ranked_conversion,
         *ranked_repo_setting,
         *ranked_priority,
         *ranked_under_sampled,
@@ -590,6 +958,19 @@ def _priority_family_history_summary(
         if family not in priority_families_with_retained_gain
         and family not in priority_families_under_sampled
     ]
+    priority_families_needing_retained_gain_conversion = [
+        family
+        for family in sorted(
+            priority_families_low_return + priority_families_under_sampled,
+            key=lambda item: (
+                -int(family_summaries[item].get("observed_decisions", 0) or 0),
+                -int(family_summaries[item].get("rejected_decisions", 0) or 0),
+                -float(family_summaries[item].get("observed_estimated_cost", 0.0) or 0.0),
+                item,
+            ),
+        )
+        if int(family_summaries[family].get("observed_decisions", 0) or 0) > 0
+    ]
     priority_family_selection_scores: dict[str, float] = {}
     priority_family_return_on_cost_scores: dict[str, float] = {}
     priority_family_scoring_policy = {
@@ -697,6 +1078,9 @@ def _priority_family_history_summary(
         "priority_families_without_signal": _rank_priority_benchmark_families(priority_families_without_signal),
         "priority_families_under_sampled": _rank_priority_benchmark_families(priority_families_under_sampled),
         "priority_families_low_return": _rank_priority_benchmark_families(priority_families_low_return),
+        "priority_families_needing_retained_gain_conversion": _rank_priority_benchmark_families(
+            priority_families_needing_retained_gain_conversion
+        ),
         "priority_family_categories": priority_family_categories,
         "priority_family_scoring_policy": priority_family_scoring_policy,
         "priority_family_return_on_cost_scores": priority_family_return_on_cost_scores,
@@ -720,7 +1104,9 @@ def _append_event(
 ) -> None:
     if event_log_path is None:
         return
-    append_jsonl(event_log_path, payload, config=config)
+    # Event logs are append-only diagnostics; running full export governance on every
+    # JSONL append turns normal round closeout into an unbounded directory walk.
+    append_jsonl(event_log_path, payload, config=config, govern_storage=False)
 
 
 def _write_controller_state(path: Path, payload: dict[str, object], *, config: KernelConfig | None = None) -> None:
@@ -1130,16 +1516,54 @@ def _subsystem_from_progress_line(line: str) -> str:
 
 
 def _phase_from_progress_line(line: str) -> str:
-    match = re.search(r"phase=([A-Za-z0-9_:-]+)", str(line).strip())
-    if not match:
-        return ""
-    return str(match.group(1)).strip()
+    normalized = str(line).strip()
+    match = re.search(r"phase=([A-Za-z0-9_:-]+)", normalized)
+    if match:
+        return str(match.group(1)).strip()
+    if re.search(
+        r"observe complete passed=\d+/\d+ pass_rate=[0-9.]+ generated_pass_rate=[0-9.]+",
+        normalized,
+    ):
+        return "observe"
+    if re.search(r"campaign \d+/\d+ select subsystem=[a-z_]+", normalized):
+        return "campaign_select"
+    if re.search(
+        r"variant_search start subsystem=[a-z_]+ selected_variants=\d+ variant_ids=[A-Za-z0-9_,.-]+",
+        normalized,
+    ):
+        return "variant_search"
+    if re.search(
+        r"variant generate (?:start|heartbeat|complete|failed) subsystem=[a-z_]+ variant=[A-Za-z0-9_:-]+",
+        normalized,
+    ):
+        return "variant_generate"
+    if re.search(
+        r"variant generate complete subsystem=[a-z_]+ variant=[A-Za-z0-9_:-]+ artifact=\S+",
+        normalized,
+    ):
+        return "variant_generate"
+    return ""
 
 
 def _task_from_progress_line(line: str) -> dict[str, object]:
+    normalized = str(line).strip()
+    if re.search(
+        r"observe complete passed=\d+/\d+ pass_rate=[0-9.]+ generated_pass_rate=[0-9.]+",
+        normalized,
+    ) or re.search(r"campaign \d+/\d+ select subsystem=[a-z_]+", normalized) or re.search(
+        r"finalize phase=[A-Za-z0-9_:-]+ subsystem=[a-z_]+",
+        normalized,
+    ) or re.search(
+        r"variant_search start subsystem=[a-z_]+ selected_variants=\d+ variant_ids=[A-Za-z0-9_,.-]+",
+        normalized,
+    ) or re.search(
+        r"variant generate (?:start|heartbeat|complete|failed) subsystem=[a-z_]+ variant=[A-Za-z0-9_:-]+",
+        normalized,
+    ):
+        return {}
     match = re.search(
         r"task (?P<index>\d+)/(?P<total>\d+) (?P<task_id>\S+) family=(?P<family>[a-z_]+)",
-        str(line).strip(),
+        normalized,
     )
     if not match:
         return {}
@@ -1174,6 +1598,8 @@ def _child_runtime_extension_plan(*, last_progress_phase: str, current_task: obj
     phase = str(last_progress_phase).strip()
     task_phase = str(task.get("phase", "")).strip() or phase
     task_completed = task_total > 0 and task_index >= task_total
+    if phase in {"variant_search", "variant_generate"}:
+        return ("", 0.0)
     if phase in {"preview_baseline_complete", "preview_candidate_complete", "preview_complete"}:
         return ("preview_completion", _UNATTENDED_CHILD_PREVIEW_COMPLETION_GRACE_SECONDS)
     if phase == "generated_success" and task_total > 0 and task_index >= task_total:
@@ -1199,6 +1625,39 @@ def _child_runtime_extension_plan(*, last_progress_phase: str, current_task: obj
     return ("", 0.0)
 
 
+def _should_block_post_productive_runtime_grace(
+    child_status: Mapping[str, object] | None,
+    *,
+    last_progress_phase: str,
+    current_task: object,
+) -> bool:
+    payload = child_status if isinstance(child_status, Mapping) else {}
+    active_cycle_progress = payload.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    partial_progress_summary = payload.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, Mapping):
+        partial_progress_summary = {}
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False)) or int(
+        partial_progress_summary.get("generated_success_completed_runs", 0) or 0
+    ) > 0
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or int(
+        payload.get("partial_productive_runs", 0) or 0
+    ) > 0
+    decision_records_considered, _ = _effective_live_decision_record_count(payload)
+    if not generated_success_completed or not productive_partial or decision_records_considered > 0:
+        return False
+    task = current_task if isinstance(current_task, Mapping) else {}
+    task_phase = str(task.get("phase", "")).strip()
+    phase = str(last_progress_phase).strip() or task_phase
+    return phase in {
+        "generated_failure",
+        "campaign_select",
+        "variant_search",
+        "variant_generate",
+    } or task_phase == "generated_failure"
+
+
 def _child_runtime_extension_seconds(*, last_progress_phase: str, current_task: object) -> float:
     return _child_runtime_extension_plan(
         last_progress_phase=last_progress_phase,
@@ -1212,6 +1671,30 @@ def _runtime_grace_marker(*, grace_key: str, progress_epoch: int) -> tuple[str, 
     if not key or epoch <= 0:
         return None
     return (key, epoch)
+
+
+def _prefer_mirrored_progress_phase(existing: object, mirrored: object) -> bool:
+    existing_phase = str(existing or "").strip()
+    mirrored_phase = str(mirrored or "").strip()
+    if not mirrored_phase:
+        return False
+    if not existing_phase:
+        return True
+    if existing_phase == mirrored_phase:
+        return False
+    if existing_phase in {"variant_search", "variant_generate"} and mirrored_phase not in {
+        "variant_search",
+        "variant_generate",
+    }:
+        return False
+    if mirrored_phase in {"variant_search", "variant_generate"} and existing_phase not in {
+        "variant_search",
+        "variant_generate",
+    }:
+        return True
+    if existing_phase.startswith("generated_") and not mirrored_phase.startswith("generated_"):
+        return False
+    return True
 
 
 def _holdout_progress_budget_summary(
@@ -1299,6 +1782,14 @@ def _holdout_budget_fit(
 def _adaptive_child_progress_state(
     *,
     last_progress_phase: str,
+    active_finalize_phase: str,
+    last_progress_at: float,
+    current_task: Mapping[str, object] | None = None,
+    current_cognitive_stage: Mapping[str, object] | None = None,
+    observe_summary: Mapping[str, object] | None = None,
+    pending_decision_state: str = "",
+    preview_state: str = "",
+    current_task_verification_passed: bool | None = None,
     progress_samples: list[dict[str, float | int]],
     started_at: float,
     now: float,
@@ -1306,21 +1797,67 @@ def _adaptive_child_progress_state(
     max_progress_stall_seconds: float,
 ) -> dict[str, object]:
     phase = str(last_progress_phase).strip()
-    if phase != "holdout_eval":
-        return {
-            "phase": phase,
-            "status": "active",
-            "progress_class": "unknown",
-            "detail": "adaptive progress classification is only available during holdout_eval",
-        }
+    finalize_phase = str(active_finalize_phase).strip()
+    task_payload = current_task if isinstance(current_task, Mapping) else {}
+    cognitive_payload = current_cognitive_stage if isinstance(current_cognitive_stage, Mapping) else {}
+    current_phase = str(task_payload.get("phase", "")).strip()
+    phase_for_state = phase
+    if current_phase.startswith("generated_success"):
+        phase_for_state = current_phase
+    elif finalize_phase and finalize_phase != "holdout_eval":
+        phase_for_state = finalize_phase
+    elif current_phase:
+        phase_for_state = current_phase
+    holdout_phase_active = finalize_phase == "holdout_eval"
+    if not holdout_phase_active and phase != "holdout_eval":
+        state = semantic_progress_state(
+            phase=phase_for_state,
+            now=now,
+            started_at=started_at,
+            last_progress_at=float(last_progress_at or started_at),
+            max_progress_stall_seconds=max_progress_stall_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            current_task=task_payload,
+            observe_summary=observe_summary,
+            pending_decision_state=pending_decision_state,
+            preview_state=preview_state,
+            current_task_verification_passed=current_task_verification_passed,
+        )
+        if _cognitive_stage_failed_verification(cognitive_payload):
+            step_index = int(cognitive_payload.get("step_index", 0) or 0)
+            phase_family = str(state.get("phase_family", "")).strip() or "active"
+            state["status"] = "active"
+            state["progress_class"] = "degraded"
+            state["detail"] = (
+                f"{phase_family} verification failed on step {step_index} and is still awaiting recovery"
+                if step_index > 0
+                else f"{phase_family} verification failed and is still awaiting recovery"
+            )
+        return state
     summary = _holdout_progress_budget_summary(progress_samples)
     if not summary:
-        return {
-            "phase": phase,
-            "status": "sampling",
-            "progress_class": "unknown",
-            "detail": "collecting holdout throughput samples",
-        }
+        state = semantic_progress_state(
+            phase="holdout_eval",
+            now=now,
+            started_at=started_at,
+            last_progress_at=started_at,
+            max_progress_stall_seconds=max_progress_stall_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            current_task=task_payload,
+            observe_summary=observe_summary,
+            pending_decision_state=pending_decision_state,
+            preview_state=preview_state,
+            current_task_verification_passed=current_task_verification_passed,
+        )
+        holdout_subphase = phase if phase and phase != "holdout_eval" else ""
+        state["detail"] = (
+            f"collecting holdout throughput samples during {holdout_subphase}"
+            if holdout_subphase
+            else "collecting holdout throughput samples"
+        )
+        if holdout_subphase:
+            state["holdout_subphase"] = holdout_subphase
+        return state
     fit = _holdout_budget_fit(
         summary,
         started_at=started_at,
@@ -1345,13 +1882,27 @@ def _adaptive_child_progress_state(
         else "adaptive progress classification unavailable"
     )
     return {
-        "phase": phase,
+        **semantic_progress_state(
+            phase="holdout_eval",
+            now=now,
+            started_at=started_at,
+            last_progress_at=last_progress_at,
+            max_progress_stall_seconds=max_progress_stall_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            current_task=task_payload,
+            observe_summary=observe_summary,
+            pending_decision_state=pending_decision_state,
+            preview_state=preview_state,
+            current_task_verification_passed=current_task_verification_passed,
+        ),
         "status": status,
         "progress_class": progress_class,
         "progress_silence_seconds": progress_silence_seconds,
+        "decision_distance": "near",
         "detail": detail,
         "budget_fit": fit,
         "holdout_budget": summary,
+        **({"holdout_subphase": phase} if phase and phase != "holdout_eval" else {}),
     }
 
 
@@ -1359,6 +1910,108 @@ def _adaptive_progress_state_signature(state: Mapping[str, object]) -> str:
     payload = dict(state)
     payload.pop("progress_silence_seconds", None)
     return json.dumps(payload, sort_keys=True)
+
+
+def _progress_state_task_position(state: Mapping[str, object] | None) -> tuple[int, int]:
+    payload = state if isinstance(state, Mapping) else {}
+    detail = str(payload.get("detail", "")).strip()
+    if not detail:
+        return (0, 0)
+    match = re.search(r"\btask (?P<index>\d+)/(?P<total>\d+)\b", detail)
+    if not match:
+        return (0, 0)
+    return (int(match.group("index")), int(match.group("total")))
+
+
+def _progress_state_matches_live_context(
+    state: Mapping[str, object] | None,
+    *,
+    current_task: Mapping[str, object] | None,
+    last_progress_phase: str,
+) -> bool:
+    payload = state if isinstance(state, Mapping) else {}
+    if not payload:
+        return False
+    task_payload = current_task if isinstance(current_task, Mapping) else {}
+    live_phase = str(task_payload.get("phase", "")).strip() or str(last_progress_phase).strip()
+    progress_phase = str(payload.get("phase", "")).strip()
+    if live_phase and progress_phase and progress_phase != live_phase:
+        return False
+    current_task_index = int(task_payload.get("index", 0) or 0)
+    current_task_total = int(task_payload.get("total", 0) or 0)
+    progress_position = _progress_state_task_position(payload)
+    if (
+        current_task_index > 0
+        and progress_position != (0, 0)
+        and progress_position != (current_task_index, current_task_total)
+    ):
+        return False
+    return True
+
+
+def _progress_state_freshness(state: Mapping[str, object] | None) -> float:
+    payload = state if isinstance(state, Mapping) else {}
+    recorded_at = _semantic_state_recorded_at(payload)
+    if recorded_at > 0.0:
+        return recorded_at
+    try:
+        return float(payload.get("runtime_elapsed_seconds", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _select_preferred_child_progress_state(
+    *,
+    semantic_state: Mapping[str, object] | None,
+    adaptive_state: Mapping[str, object] | None,
+    current_task: Mapping[str, object] | None,
+    last_progress_phase: str,
+) -> dict[str, object]:
+    semantic = dict(semantic_state) if isinstance(semantic_state, Mapping) else {}
+    adaptive = dict(adaptive_state) if isinstance(adaptive_state, Mapping) else {}
+    if not adaptive:
+        return semantic
+    if not semantic:
+        return adaptive
+
+    task_payload = current_task if isinstance(current_task, Mapping) else {}
+    current_task_phase = str(task_payload.get("phase", "")).strip()
+    live_phase = current_task_phase or str(last_progress_phase).strip()
+    semantic_phase = str(semantic.get("phase", "")).strip()
+    adaptive_phase = str(adaptive.get("phase", "")).strip()
+    semantic_progress_class = str(semantic.get("progress_class", "")).strip()
+    adaptive_progress_class = str(adaptive.get("progress_class", "")).strip()
+    adaptive_matches_live_phase = bool(live_phase) and adaptive_phase == live_phase
+    semantic_matches_live_phase = bool(live_phase) and semantic_phase == live_phase
+    adaptive_matches_live_task = _progress_state_matches_live_context(
+        adaptive,
+        current_task=task_payload,
+        last_progress_phase=last_progress_phase,
+    )
+    semantic_matches_live_task = _progress_state_matches_live_context(
+        semantic,
+        current_task=task_payload,
+        last_progress_phase=last_progress_phase,
+    )
+    adaptive_freshness = _progress_state_freshness(adaptive)
+    semantic_freshness = _progress_state_freshness(semantic)
+    adaptive_is_newer = adaptive_freshness > semantic_freshness + 1e-6
+    adaptive_is_healthier = adaptive_progress_class not in {"stuck", "degraded"} and semantic_progress_class in {
+        "stuck",
+        "degraded",
+    }
+    if adaptive_matches_live_task and not semantic_matches_live_task:
+        return adaptive
+    if semantic_matches_live_task and not adaptive_matches_live_task:
+        return semantic
+    if adaptive_matches_live_phase and adaptive_matches_live_task and (
+        not semantic_matches_live_phase
+        or not semantic_matches_live_task
+        or adaptive_is_newer
+        or adaptive_is_healthier
+    ):
+        return adaptive
+    return semantic
 
 
 def _normalize_excluded_subsystems(values: object) -> list[str]:
@@ -1501,9 +2154,42 @@ def _child_failure_recovery_policy(
     next_policy = _advance_subsystem_cooldowns(current_policy)
     stalled_subsystem = _stalled_subsystem_from_round(round_payload)
     normalized_reason = str(reason).strip().lower()
-    allow_stalled_subsystem_cooldown = "campaign report showed no runtime-managed decisions" not in normalized_reason
-    if stalled_subsystem and allow_stalled_subsystem_cooldown:
-        next_policy = _apply_subsystem_cooldown(next_policy, subsystem=stalled_subsystem, rounds=2)
+    dominant_zero_yield_subsystems: list[str] = []
+    cooldown_rounds_by_subsystem: dict[str, int] = {}
+    if isinstance(round_payload, dict):
+        campaign_report = round_payload.get("campaign_report", {})
+        if isinstance(campaign_report, dict):
+            subsystem_signal = _subsystem_signal(campaign_report)
+            dominant_zero_yield_subsystems = _normalize_excluded_subsystems(
+                subsystem_signal.get("zero_yield_dominant_subsystems", [])
+            )
+            raw_cooldown_rounds = subsystem_signal.get("cooldown_rounds_by_subsystem", {})
+            if isinstance(raw_cooldown_rounds, dict):
+                cooldown_rounds_by_subsystem = {
+                    str(subsystem).strip(): max(2, int(value or 0))
+                    for subsystem, value in raw_cooldown_rounds.items()
+                    if str(subsystem).strip()
+                }
+    cooldown_targets: list[str] = []
+    if stalled_subsystem:
+        cooldown_targets.append(stalled_subsystem)
+    for subsystem in dominant_zero_yield_subsystems:
+        if subsystem and subsystem not in cooldown_targets:
+            cooldown_targets.append(subsystem)
+    if "campaign report showed no runtime-managed decisions" in normalized_reason and not cooldown_targets:
+        if isinstance(round_payload, dict):
+            campaign_report = round_payload.get("campaign_report", {})
+            if isinstance(campaign_report, dict):
+                subsystem_signal = _subsystem_signal(campaign_report)
+                for subsystem in _normalize_excluded_subsystems(subsystem_signal.get("cooldown_candidates", [])):
+                    if subsystem and subsystem not in cooldown_targets:
+                        cooldown_targets.append(subsystem)
+    for subsystem in cooldown_targets[:2]:
+        next_policy = _apply_subsystem_cooldown(
+            next_policy,
+            subsystem=subsystem,
+            rounds=max(2, int(cooldown_rounds_by_subsystem.get(subsystem, 2) or 2)),
+        )
     next_policy["adaptive_search"] = True
     next_policy["focus"] = "recovery_alignment"
     next_policy["cycles"] = min(max_cycles, max(1, int(next_policy.get("cycles", 1) or 1)) + 1)
@@ -1907,6 +2593,281 @@ def _policy_shift_alert_reason(rationale: dict[str, object]) -> str:
     return ""
 
 
+def _semantic_redirection_summary(round_payload: dict[str, object]) -> dict[str, object]:
+    rationale = round_payload.get("policy_shift_rationale", {})
+    if not isinstance(rationale, dict):
+        rationale = {}
+    reason_codes = [
+        str(value).strip()
+        for value in rationale.get("reason_codes", [])
+        if str(value).strip()
+    ]
+    code_set = set(reason_codes)
+    planner_pressure = rationale.get("planner_pressure", {})
+    if not isinstance(planner_pressure, dict):
+        planner_pressure = {}
+    cooled_subsystems = [
+        str(value).strip()
+        for value in rationale.get("cooled_subsystems", [])
+        if str(value).strip()
+    ]
+    missing_required_families = _normalize_benchmark_families(
+        planner_pressure.get("missing_required_families", [])
+    )
+    campaign_report = round_payload.get("campaign_report", {})
+    if not isinstance(campaign_report, dict):
+        campaign_report = {}
+    production_yield = campaign_report.get("production_yield_summary", {})
+    if not isinstance(production_yield, dict):
+        production_yield = {}
+    priority_family_yield = campaign_report.get("priority_family_yield_summary", {})
+    if not isinstance(priority_family_yield, dict):
+        priority_family_yield = {}
+    target_priority_families = _normalize_benchmark_families(
+        rationale.get("priority_benchmark_families_after", [])
+    )
+    if not target_priority_families:
+        target_priority_families = _normalize_benchmark_families(
+            priority_family_yield.get("priority_families_needing_retained_gain_conversion", [])
+        )
+    if not target_priority_families:
+        target_priority_families = _normalize_benchmark_families(
+            priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
+        )
+    rejected_by_subsystem = production_yield.get("rejected_by_subsystem", {})
+    if not isinstance(rejected_by_subsystem, dict):
+        rejected_by_subsystem = {}
+    dominant_rejected_subsystems: list[str] = []
+    dominant_rejected_count = 0
+    for raw_subsystem, raw_count in rejected_by_subsystem.items():
+        subsystem = str(raw_subsystem).strip()
+        if not subsystem:
+            continue
+        count = int(raw_count or 0)
+        if count <= 0:
+            continue
+        if count > dominant_rejected_count:
+            dominant_rejected_subsystems = [subsystem]
+            dominant_rejected_count = count
+        elif count == dominant_rejected_count and subsystem not in dominant_rejected_subsystems:
+            dominant_rejected_subsystems.append(subsystem)
+    low_return_priority_families = _normalize_benchmark_families(
+        priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
+    )
+    stalled_subsystem = str(rationale.get("stalled_subsystem", "")).strip()
+    if stalled_subsystem and stalled_subsystem not in cooled_subsystems:
+        cooled_subsystems.append(stalled_subsystem)
+    for subsystem in dominant_rejected_subsystems:
+        if subsystem not in cooled_subsystems:
+            cooled_subsystems.append(subsystem)
+    triggered = bool(
+        code_set
+        & {
+            "no_yield_round",
+            "weak_retention_outcome",
+            "stalled_subsystem_cooldown",
+            "subsystem_reject_cooldown",
+            "dominant_zero_yield_subsystem_cooldown",
+            "subsystem_monoculture",
+        }
+    )
+    semantic_hypotheses: list[str] = []
+    if "no_yield_round" in code_set:
+        semantic_hypotheses.append("force descendants to adopt a new parent attempt or subsystem before replay")
+    if "subsystem_reject_cooldown" in code_set or "stalled_subsystem_cooldown" in code_set:
+        semantic_hypotheses.append("redirect work away from the stagnant subsystem subtree until new evidence appears")
+    if missing_required_families:
+        semantic_hypotheses.append(
+            f"bias continuation toward missing required families: {','.join(missing_required_families)}"
+        )
+    if low_return_priority_families:
+        semantic_hypotheses.append(
+            "require a new continuation parent for families without retained gain conversion: "
+            + ",".join(low_return_priority_families)
+        )
+    if dominant_rejected_subsystems:
+        semantic_hypotheses.append(
+            "cool the dominant zero-yield subsystem and force cross-subsystem continuation: "
+            + ",".join(dominant_rejected_subsystems)
+        )
+    if "subsystem_monoculture" in code_set:
+        semantic_hypotheses.append("force cross-subsystem descendants to break monoculture")
+    return {
+        "triggered": triggered,
+        "redirect_scope": "subtree" if cooled_subsystems else "campaign",
+        "reason_codes": reason_codes,
+        "source_subsystems": cooled_subsystems,
+        "missing_required_families": missing_required_families,
+        "target_priority_families": target_priority_families,
+        "required_new_parent": bool(
+            "no_yield_round" in code_set
+            or "subsystem_reject_cooldown" in code_set
+            or "stalled_subsystem_cooldown" in code_set
+            or ("weak_retention_outcome" in code_set and bool(dominant_rejected_subsystems))
+            or bool(low_return_priority_families)
+        ),
+        "semantic_hypotheses": semantic_hypotheses,
+    }
+
+
+def _recent_semantic_redirects(config: KernelConfig, *, limit: int = 12) -> list[dict[str, object]]:
+    root = config.semantic_hub_root / "redirects"
+    if not root.exists():
+        return []
+    redirects: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[: max(1, limit)]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            redirects.append(payload)
+    return redirects
+
+
+def _semantic_policy_seed(config: KernelConfig) -> dict[str, object]:
+    redirects = _recent_semantic_redirects(config)
+    if not redirects:
+        return {}
+    subsystem_votes: dict[str, int] = {}
+    priority_votes: dict[str, int] = {}
+    require_new_parent = False
+    adaptive_pressure = False
+    focus = ""
+    for redirect in redirects:
+        reason_codes = {
+            str(item).strip()
+            for item in redirect.get("reason_codes", [])
+            if str(item).strip()
+        }
+        if bool(redirect.get("required_new_parent", False)):
+            require_new_parent = True
+        if {"no_yield_round", "weak_retention_outcome", "subsystem_reject_cooldown"} & reason_codes:
+            adaptive_pressure = True
+        for subsystem in _normalize_excluded_subsystems(redirect.get("source_subsystems", [])):
+            subsystem_votes[subsystem] = subsystem_votes.get(subsystem, 0) + 1
+        for family in _normalize_benchmark_families(redirect.get("target_priority_families", [])):
+            priority_votes[family] = priority_votes.get(family, 0) + 1
+        if adaptive_pressure:
+            focus = "discovered_task_adaptation"
+    excluded_subsystems = [
+        subsystem
+        for subsystem, count in sorted(subsystem_votes.items(), key=lambda item: (-item[1], item[0]))
+        if count >= 2
+    ][:2]
+    priority_benchmark_families = [
+        family
+        for family, _count in sorted(priority_votes.items(), key=lambda item: (-item[1], item[0]))
+    ][:3]
+    subsystem_cooldowns = {subsystem: 2 for subsystem in excluded_subsystems}
+    seed: dict[str, object] = {}
+    if excluded_subsystems:
+        seed["excluded_subsystems"] = excluded_subsystems
+        seed["subsystem_cooldowns"] = subsystem_cooldowns
+    if priority_benchmark_families:
+        seed["priority_benchmark_families"] = priority_benchmark_families
+    if adaptive_pressure:
+        seed["adaptive_search"] = True
+    if require_new_parent:
+        seed["required_new_parent"] = True
+    return seed
+
+
+def _apply_semantic_policy_seed(
+    policy: Mapping[str, object] | None,
+    *,
+    semantic_seed: Mapping[str, object] | None,
+) -> dict[str, object]:
+    current = dict(policy) if isinstance(policy, Mapping) else {}
+    seed = semantic_seed if isinstance(semantic_seed, Mapping) else {}
+    if not seed:
+        return current
+    seeded = dict(current)
+    seeded["excluded_subsystems"] = _normalize_excluded_subsystems(
+        seed.get("excluded_subsystems", seeded.get("excluded_subsystems", []))
+    )
+    seeded["subsystem_cooldowns"] = (
+        dict(seed.get("subsystem_cooldowns", {}))
+        if isinstance(seed.get("subsystem_cooldowns", {}), dict)
+        else dict(seeded.get("subsystem_cooldowns", {}))
+        if isinstance(seeded.get("subsystem_cooldowns", {}), dict)
+        else {}
+    )
+    priority_families = _normalize_benchmark_families(
+        seed.get("priority_benchmark_families", seeded.get("priority_benchmark_families", []))
+    )
+    if priority_families:
+        seeded["priority_benchmark_families"] = priority_families
+    if "adaptive_search" in seed:
+        seeded["adaptive_search"] = bool(seed.get("adaptive_search"))
+    return seeded
+
+
+def _round_semantic_skill_payload(
+    *,
+    round_payload: dict[str, object],
+    current_policy: Mapping[str, object] | None,
+) -> dict[str, object]:
+    semantic_redirection = round_payload.get("semantic_redirection", {})
+    if not isinstance(semantic_redirection, dict):
+        semantic_redirection = {}
+    campaign_report = round_payload.get("campaign_report", {})
+    if not isinstance(campaign_report, dict):
+        campaign_report = {}
+    production_yield = campaign_report.get("production_yield_summary", {})
+    if not isinstance(production_yield, dict):
+        production_yield = {}
+    priority_family_yield = campaign_report.get("priority_family_yield_summary", {})
+    if not isinstance(priority_family_yield, dict):
+        priority_family_yield = {}
+    source_subsystems = _normalize_excluded_subsystems(semantic_redirection.get("source_subsystems", []))
+    low_return_priority_families = _normalize_benchmark_families(
+        priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
+    )
+    rejected_cycles = int(production_yield.get("rejected_cycles", 0) or 0)
+    retained_cycles = int(production_yield.get("retained_cycles", 0) or 0)
+    if not semantic_redirection and not low_return_priority_families and rejected_cycles <= retained_cycles:
+        return {}
+    dominant_subsystem = source_subsystems[0] if source_subsystems else ""
+    reason_codes = [
+        str(item).strip()
+        for item in semantic_redirection.get("reason_codes", [])
+        if str(item).strip()
+    ]
+    lesson_parts: list[str] = []
+    if dominant_subsystem:
+        lesson_parts.append(f"{dominant_subsystem} dominated rejected runtime-managed decisions")
+    if low_return_priority_families:
+        lesson_parts.append(
+            "priority families showed signal without retained gain conversion: "
+            + ",".join(low_return_priority_families)
+        )
+    if "weak_retention_outcome" in set(reason_codes):
+        lesson_parts.append("candidate changes were observationally active but produced no verified retained gain")
+    if not lesson_parts:
+        return {}
+    return {
+        "subsystem": dominant_subsystem,
+        "analysis_lesson": "; ".join(lesson_parts),
+        "reuse_conditions": [
+            "reuse when unattended startup should avoid a recently stagnant subsystem subtree",
+            "reuse when priority families have signal but lack retained gain conversion",
+        ],
+        "avoid_conditions": [
+            "avoid replaying the same subsystem-family combination without a new continuation parent",
+            "avoid accepting neutral runtime-managed decisions as meaningful progress",
+        ],
+        "continuation_artifact_path": str(round_payload.get("campaign_report_path", "")).strip(),
+        "reason_codes": reason_codes,
+        "source_subsystems": source_subsystems,
+        "priority_families": low_return_priority_families,
+        "focus_before": str((current_policy or {}).get("focus", "")).strip(),
+        "focus_after": str(dict(round_payload.get("next_policy", {})).get("focus", "")).strip()
+        if isinstance(round_payload.get("next_policy", {}), dict)
+        else "",
+    }
+
+
 def _normalize_policy_shift_alert_subscriptions(raw: object) -> list[str]:
     if isinstance(raw, str):
         values = [item.strip() for item in raw.split(",")]
@@ -2228,10 +3189,14 @@ def _run_and_stream(
     max_runtime_seconds: float = 0.0,
     max_progress_stall_seconds: float = 0.0,
     on_event: Callable[[dict[str, object]], None] | None = None,
+    mirrored_status_path: Path | None = None,
 ) -> dict[str, object]:
-    def _emit_event(event: dict[str, object]) -> None:
+    def _emit_event(event: dict[str, object]) -> dict[str, object]:
         if on_event is not None:
-            on_event(event)
+            response = on_event(event)
+            if isinstance(response, dict):
+                return dict(response)
+        return {}
 
     completed_output: list[str] = []
     process = spawn_process_group(
@@ -2262,13 +3227,20 @@ def _run_and_stream(
     max_runtime = max(0.0, float(max_runtime_seconds))
     max_progress_stall = max(0.0, float(max_progress_stall_seconds))
     last_progress_phase = ""
+    active_finalize_phase = ""
     current_task: dict[str, object] = {}
+    current_cognitive_stage: dict[str, object] = {}
+    observe_summary: dict[str, object] = {}
+    pending_decision_state = ""
+    preview_state = ""
+    current_task_verification_passed: bool | None = None
     runtime_grace_markers: set[tuple[str, int]] = set()
     progress_epoch = 0
     holdout_progress_samples: list[dict[str, float | int]] = []
     last_holdout_task_index = 0
     last_holdout_budget_deadline = 0.0
     last_adaptive_state_signature = ""
+    last_authoritative_progress_signature = ""
     runtime_deadline = started_at + max_runtime if max_runtime > 0.0 else 0.0
     emergency_runtime_deadline = (
         started_at + (max_runtime * _UNATTENDED_CHILD_RUNTIME_EMERGENCY_MULTIPLIER)
@@ -2293,12 +3265,22 @@ def _run_and_stream(
                         phase_name = _phase_from_progress_line(line)
                         if phase_name:
                             last_progress_phase = phase_name
+                        if line.lstrip().startswith("[cycle:") and "finalize phase=" in line:
+                            active_finalize_phase = phase_name
                         parsed_task = _task_from_progress_line(line)
                         if parsed_task:
+                            previous_task_identity = _task_progress_identity(current_task)
                             current_task = parsed_task
                             if last_progress_phase:
                                 current_task["phase"] = last_progress_phase
-                            if last_progress_phase == "holdout_eval":
+                            holdout_phase_active = active_finalize_phase == "holdout_eval"
+                            if holdout_phase_active and last_progress_phase in {
+                                "generated_success",
+                                "generated_failure_seed",
+                                "generated_failure",
+                            }:
+                                current_task["holdout_subphase"] = last_progress_phase
+                            if holdout_phase_active or last_progress_phase == "holdout_eval":
                                 task_index = int(current_task.get("index", 0) or 0)
                                 task_total = int(current_task.get("total", 0) or 0)
                                 if holdout_progress_samples:
@@ -2316,8 +3298,26 @@ def _run_and_stream(
                                         }
                                     )
                                     last_holdout_task_index = task_index
+                            if _task_progress_identity(current_task) != previous_task_identity:
+                                current_task_verification_passed = None
+                                current_cognitive_stage = {}
+                        semantic_progress = _parse_child_semantic_progress_fields(line)
+                        if semantic_progress:
+                            if isinstance(semantic_progress.get("observe_summary"), Mapping):
+                                observe_summary = dict(semantic_progress["observe_summary"])
+                            if "pending_decision_state" in semantic_progress:
+                                pending_decision_state = str(semantic_progress.get("pending_decision_state", "")).strip()
+                            if "preview_state" in semantic_progress:
+                                preview_state = str(semantic_progress.get("preview_state", "")).strip()
+                        cognitive_progress = _parse_cognitive_progress_fields(line)
+                        if cognitive_progress:
+                            current_cognitive_stage = dict(cognitive_progress)
+                            if last_progress_phase and not str(current_cognitive_stage.get("phase", "")).strip():
+                                current_cognitive_stage["phase"] = last_progress_phase
+                            if "verification_passed" in current_cognitive_stage:
+                                current_task_verification_passed = bool(current_cognitive_stage.get("verification_passed"))
                     print(line, end="", file=sys.stderr, flush=True)
-                    _emit_event(
+                    action = _emit_event(
                         {
                             "event": "output",
                             "line": line.rstrip("\n"),
@@ -2326,16 +3326,74 @@ def _run_and_stream(
                             "timestamp": time.time(),
                         }
                     )
+                    if bool(action.get("terminate", False)):
+                        reason = str(action.get("reason", "")).strip() or "child terminated by controller intervention"
+                        terminate_process_tree(process)
+                        _emit_event(
+                            {
+                                "event": "timeout",
+                                "pid": process_pid,
+                                "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
+                                "timestamp": time.time(),
+                                "timeout_reason": reason,
+                                "intervention_reason": reason,
+                            }
+                        )
+                        return {
+                            "returncode": -9,
+                            "stdout": "".join(completed_output).strip(),
+                            "timed_out": True,
+                            "timeout_reason": reason,
+                        }
             elif process.poll() is not None:
                 break
             now = time.monotonic()
             silence = now - last_output_at
             progress_stall = now - last_progress_at
             runtime_elapsed = now - started_at
+            authoritative_child_status = _mirrored_child_status_from_parent_status(mirrored_status_path)
+            if authoritative_child_status:
+                supervision_snapshot = _authoritative_child_supervision_snapshot(
+                    authoritative_child_status,
+                    last_progress_phase=last_progress_phase,
+                    active_finalize_phase=active_finalize_phase,
+                    current_task=current_task,
+                    current_cognitive_stage=current_cognitive_stage,
+                    observe_summary=observe_summary,
+                    pending_decision_state=pending_decision_state,
+                    preview_state=preview_state,
+                    current_task_verification_passed=current_task_verification_passed,
+                )
+                last_progress_phase = str(supervision_snapshot.get("last_progress_phase", "")).strip()
+                active_finalize_phase = str(supervision_snapshot.get("active_finalize_phase", "")).strip()
+                snapshot_task = supervision_snapshot.get("current_task", {})
+                if isinstance(snapshot_task, Mapping):
+                    current_task = dict(snapshot_task)
+                snapshot_cognitive_stage = supervision_snapshot.get("current_cognitive_stage", {})
+                if isinstance(snapshot_cognitive_stage, Mapping):
+                    current_cognitive_stage = dict(snapshot_cognitive_stage)
+                snapshot_observe_summary = supervision_snapshot.get("observe_summary", {})
+                if isinstance(snapshot_observe_summary, Mapping):
+                    observe_summary = dict(snapshot_observe_summary)
+                pending_decision_state = str(supervision_snapshot.get("pending_decision_state", "")).strip()
+                preview_state = str(supervision_snapshot.get("preview_state", "")).strip()
+                if "current_task_verification_passed" in supervision_snapshot:
+                    verification_value = supervision_snapshot.get("current_task_verification_passed")
+                    current_task_verification_passed = (
+                        bool(verification_value) if verification_value is not None else None
+                    )
+                authoritative_progress_signature = _authoritative_progress_signature(supervision_snapshot)
+                if (
+                    authoritative_progress_signature
+                    and authoritative_progress_signature != last_authoritative_progress_signature
+                ):
+                    last_authoritative_progress_signature = authoritative_progress_signature
+                    last_progress_at = now
+                    progress_epoch += 1
             if heartbeat_interval > 0.0 and (now - last_heartbeat_at) >= heartbeat_interval and silence >= heartbeat_interval:
                 label = str(progress_label).strip() or Path(cmd[1]).name
                 _progress(f"[supervisor] child={label} still_running silence={int(silence)}s")
-                _emit_event(
+                action = _emit_event(
                     {
                         "event": "heartbeat",
                         "pid": process_pid,
@@ -2344,9 +3402,36 @@ def _run_and_stream(
                         "timestamp": time.time(),
                     }
                 )
+                if bool(action.get("terminate", False)):
+                    reason = str(action.get("reason", "")).strip() or "child terminated by controller intervention"
+                    terminate_process_tree(process)
+                    _emit_event(
+                        {
+                            "event": "timeout",
+                            "pid": process_pid,
+                            "progress_label": str(progress_label).strip() or Path(cmd[-1]).name,
+                            "timestamp": time.time(),
+                            "timeout_reason": reason,
+                            "intervention_reason": reason,
+                        }
+                    )
+                    return {
+                        "returncode": -9,
+                        "stdout": "".join(completed_output).strip(),
+                        "timed_out": True,
+                        "timeout_reason": reason,
+                    }
                 last_heartbeat_at = now
             adaptive_state = _adaptive_child_progress_state(
                 last_progress_phase=last_progress_phase,
+                active_finalize_phase=active_finalize_phase,
+                last_progress_at=last_progress_at,
+                current_task=current_task,
+                current_cognitive_stage=current_cognitive_stage,
+                observe_summary=observe_summary,
+                pending_decision_state=pending_decision_state,
+                preview_state=preview_state,
+                current_task_verification_passed=current_task_verification_passed,
                 progress_samples=holdout_progress_samples,
                 started_at=started_at,
                 now=now,
@@ -2390,9 +3475,18 @@ def _run_and_stream(
                             }
                         )
                         continue
-                grace_key, extension_seconds = _child_runtime_extension_plan(
+                block_runtime_grace = _should_block_post_productive_runtime_grace(
+                    authoritative_child_status,
                     last_progress_phase=last_progress_phase,
                     current_task=current_task,
+                )
+                grace_key, extension_seconds = (
+                    ("", 0.0)
+                    if block_runtime_grace
+                    else _child_runtime_extension_plan(
+                        last_progress_phase=last_progress_phase,
+                        current_task=current_task,
+                    )
                 )
                 grace_marker = _runtime_grace_marker(
                     grace_key=grace_key,
@@ -2541,17 +3635,1407 @@ def _mirrored_child_status_from_parent_status(status_path: Path | None) -> dict[
     return dict(child_status) if isinstance(child_status, dict) else {}
 
 
+def _authoritative_progress_signature(payload: Mapping[str, object] | None) -> str:
+    child = payload if isinstance(payload, Mapping) else {}
+    current_task = child.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    cognitive_stage = child.get("current_cognitive_stage", {})
+    if not isinstance(cognitive_stage, Mapping):
+        cognitive_stage = {}
+    observe_summary = child.get("observe_summary", {})
+    if not isinstance(observe_summary, Mapping):
+        observe_summary = {}
+    signature_payload = {
+        "last_progress_phase": str(child.get("last_progress_phase", "")).strip(),
+        "active_finalize_phase": str(child.get("active_finalize_phase", "")).strip(),
+        "current_task": {
+            "index": int(current_task.get("index", 0) or 0),
+            "total": int(current_task.get("total", 0) or 0),
+            "task_id": str(current_task.get("task_id", "")).strip(),
+            "phase": str(current_task.get("phase", "")).strip(),
+        },
+        "current_cognitive_stage": {
+            "cognitive_stage": str(cognitive_stage.get("cognitive_stage", "")).strip(),
+            "step_index": int(cognitive_stage.get("step_index", 0) or 0),
+            "verification_passed": cognitive_stage.get("verification_passed"),
+            "phase": str(cognitive_stage.get("phase", "")).strip(),
+        },
+        "observe_summary": {
+            "passed": int(observe_summary.get("passed", 0) or 0),
+            "total": int(observe_summary.get("total", 0) or 0),
+            "pass_rate": observe_summary.get("pass_rate"),
+            "generated_pass_rate": observe_summary.get("generated_pass_rate"),
+        },
+        "pending_decision_state": str(child.get("pending_decision_state", "")).strip(),
+        "preview_state": str(child.get("preview_state", "")).strip(),
+        "current_task_verification_passed": child.get("current_task_verification_passed"),
+    }
+    return json.dumps(signature_payload, sort_keys=True)
+
+
+def _authoritative_child_supervision_snapshot(
+    mirrored_child_status: Mapping[str, object] | None,
+    *,
+    last_progress_phase: str,
+    active_finalize_phase: str,
+    current_task: Mapping[str, object] | None,
+    current_cognitive_stage: Mapping[str, object] | None,
+    observe_summary: Mapping[str, object] | None,
+    pending_decision_state: str,
+    preview_state: str,
+    current_task_verification_passed: bool | None,
+) -> dict[str, object]:
+    active_child = {
+        "last_progress_phase": str(last_progress_phase).strip(),
+        "finalize_phase": str(active_finalize_phase).strip(),
+        "current_task": dict(current_task) if isinstance(current_task, Mapping) else {},
+        "current_cognitive_stage": (
+            dict(current_cognitive_stage) if isinstance(current_cognitive_stage, Mapping) else {}
+        ),
+        "observe_summary": dict(observe_summary) if isinstance(observe_summary, Mapping) else {},
+        "pending_decision_state": str(pending_decision_state).strip(),
+        "preview_state": str(preview_state).strip(),
+        "current_task_verification_passed": current_task_verification_passed,
+    }
+    merged = _merge_mirrored_child_status_fields(active_child, mirrored_child_status)
+    merged_current_task = merged.get("current_task", {})
+    if not isinstance(merged_current_task, Mapping):
+        merged_current_task = {}
+    merged_cognitive_stage = merged.get("current_cognitive_stage", {})
+    if not isinstance(merged_cognitive_stage, Mapping):
+        merged_cognitive_stage = {}
+    merged_observe_summary = merged.get("observe_summary", {})
+    if not isinstance(merged_observe_summary, Mapping):
+        merged_observe_summary = {}
+    resolved_last_progress_phase = str(merged.get("last_progress_phase", "")).strip()
+    resolved_finalize_phase = str(merged.get("finalize_phase", "")).strip()
+    current_task_phase = str(merged_current_task.get("phase", "")).strip()
+    if current_task_phase and not resolved_last_progress_phase:
+        resolved_last_progress_phase = current_task_phase
+    elif resolved_last_progress_phase and not current_task_phase:
+        merged_current_task = {**dict(merged_current_task), "phase": resolved_last_progress_phase}
+    resolved_verification = merged.get("current_task_verification_passed")
+    if resolved_verification is None and "verification_passed" in merged_cognitive_stage:
+        resolved_verification = bool(merged_cognitive_stage.get("verification_passed"))
+    return {
+        "last_progress_phase": resolved_last_progress_phase,
+        "active_finalize_phase": resolved_finalize_phase,
+        "current_task": dict(merged_current_task),
+        "current_cognitive_stage": dict(merged_cognitive_stage),
+        "observe_summary": dict(merged_observe_summary),
+        "pending_decision_state": str(merged.get("pending_decision_state", "")).strip(),
+        "preview_state": str(merged.get("preview_state", "")).strip(),
+        "current_task_verification_passed": resolved_verification,
+    }
+
+
+def _task_progress_identity(task: Mapping[str, object] | None) -> tuple[object, ...]:
+    payload = task if isinstance(task, Mapping) else {}
+    return (
+        str(payload.get("task_id", "")).strip(),
+        int(payload.get("index", 0) or 0),
+        int(payload.get("total", 0) or 0),
+        str(payload.get("family", "")).strip(),
+        str(payload.get("phase", "")).strip(),
+        str(payload.get("holdout_subphase", "")).strip(),
+    )
+
+
+def _task_scope_identity(task: Mapping[str, object] | None) -> tuple[object, ...]:
+    payload = task if isinstance(task, Mapping) else {}
+    return (
+        str(payload.get("task_id", "")).strip(),
+        int(payload.get("index", 0) or 0),
+        int(payload.get("total", 0) or 0),
+        str(payload.get("family", "")).strip(),
+    )
+
+
+def _task_scope_matches(left: Mapping[str, object] | None, right: Mapping[str, object] | None) -> bool:
+    left_identity = _task_scope_identity(left)
+    right_identity = _task_scope_identity(right)
+    if not any(left_identity) or not any(right_identity):
+        return False
+    return left_identity == right_identity
+
+
+def _semantic_state_recorded_at(state: Mapping[str, object] | None) -> float:
+    payload = state if isinstance(state, Mapping) else {}
+    for key in ("recorded_at", "timestamp"):
+        try:
+            recorded_at = float(payload.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            recorded_at = 0.0
+        if recorded_at > 0.0:
+            return recorded_at
+    return 0.0
+
+
+def _child_progress_recorded_at(payload: Mapping[str, object] | None) -> float:
+    child = payload if isinstance(payload, Mapping) else {}
+    candidate_values: list[float] = []
+    for key in ("last_progress_at", "last_output_at", "ended_at", "started_at"):
+        try:
+            candidate = float(child.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            candidate = 0.0
+        if candidate > 0.0:
+            candidate_values.append(candidate)
+    semantic_state = child.get("semantic_progress_state", {})
+    if isinstance(semantic_state, Mapping):
+        candidate = _semantic_state_recorded_at(semantic_state)
+        if candidate > 0.0:
+            candidate_values.append(candidate)
+    adaptive_state = child.get("adaptive_progress_state", {})
+    if isinstance(adaptive_state, Mapping):
+        candidate = _semantic_state_recorded_at(adaptive_state)
+        if candidate > 0.0:
+            candidate_values.append(candidate)
+    active_cycle_run = child.get("active_cycle_run", {})
+    if isinstance(active_cycle_run, Mapping):
+        for nested_key in ("last_progress_at", "last_output_at"):
+            try:
+                candidate = float(active_cycle_run.get(nested_key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0.0:
+                candidate_values.append(candidate)
+        nested_semantic_state = active_cycle_run.get("semantic_progress_state", {})
+        if isinstance(nested_semantic_state, Mapping):
+            candidate = _semantic_state_recorded_at(nested_semantic_state)
+            if candidate > 0.0:
+                candidate_values.append(candidate)
+    return max(candidate_values) if candidate_values else 0.0
+
+
+def _parse_cognitive_progress_fields(line: str) -> dict[str, object]:
+    normalized = str(line).strip()
+    if not normalized or "cognitive_stage=" not in normalized:
+        return {}
+    stage_match = re.search(r"cognitive_stage=(?P<stage>[A-Za-z0-9_:-]+)", normalized)
+    if not stage_match:
+        return {}
+    payload: dict[str, object] = {
+        "event": "cognitive_stage",
+        "cognitive_stage": str(stage_match.group("stage")).strip(),
+    }
+    task_match = _task_from_progress_line(normalized)
+    if task_match:
+        payload["current_task"] = task_match
+    phase_name = _phase_from_progress_line(normalized)
+    if phase_name:
+        payload["phase"] = phase_name
+    step_match = re.search(r"\bstep=(?P<step>\d+)", normalized)
+    if step_match:
+        payload["step_index"] = int(step_match.group("step"))
+    subphase_match = re.search(r"\bsubphase=(?P<subphase>[A-Za-z0-9_:-]+)", normalized)
+    if subphase_match:
+        payload["step_subphase"] = str(subphase_match.group("subphase")).strip()
+    decision_source_match = re.search(r"\bdecision_source=(?P<source>[A-Za-z0-9_:-]+)", normalized)
+    if decision_source_match:
+        payload["decision_source"] = str(decision_source_match.group("source")).strip()
+    verification_match = re.search(r"\bverification_passed=(?P<passed>[01])", normalized)
+    if verification_match:
+        payload["verification_passed"] = verification_match.group("passed") == "1"
+    return payload
+
+
+def _parse_child_semantic_progress_fields(line: str) -> dict[str, object]:
+    normalized = str(line).strip()
+    if not normalized:
+        return {}
+    payload: dict[str, object] = {}
+    if "observe complete" in normalized:
+        passed_total_match = re.search(r"\bpassed=(?P<passed>\d+)/(?P<total>\d+)", normalized)
+        if passed_total_match:
+            observe_summary: dict[str, object] = {
+                "passed": int(passed_total_match.group("passed")),
+                "total": int(passed_total_match.group("total")),
+            }
+            pass_rate_match = re.search(r"\bpass_rate=(?P<pass_rate>[0-9.]+)", normalized)
+            if pass_rate_match:
+                observe_summary["pass_rate"] = float(pass_rate_match.group("pass_rate"))
+            generated_pass_rate_match = re.search(r"\bgenerated_pass_rate=(?P<pass_rate>[0-9.]+)", normalized)
+            if generated_pass_rate_match:
+                observe_summary["generated_pass_rate"] = float(generated_pass_rate_match.group("pass_rate"))
+            payload["observe_summary"] = observe_summary
+            payload["observe_completed"] = True
+    decision_state_match = re.search(r"\bstate=(?P<state>retain|reject)\b", normalized)
+    if decision_state_match:
+        decision_state = str(decision_state_match.group("state")).strip()
+        if "preview complete" in normalized:
+            payload["preview_state"] = decision_state
+            payload["pending_decision_state"] = decision_state
+        elif "finalize phase=" in normalized:
+            payload["pending_decision_state"] = decision_state
+    return payload
+
+
+def _progress_event_stage(event: Mapping[str, object] | None) -> str:
+    payload = event if isinstance(event, Mapping) else {}
+    return str(
+        payload.get("stage")
+        or payload.get("cognitive_stage")
+        or payload.get("event")
+        or payload.get("step_stage")
+        or ""
+    ).strip()
+
+
+def _synthesized_active_child_phase_detail(active_child: Mapping[str, object] | None) -> str:
+    payload = active_child if isinstance(active_child, Mapping) else {}
+    current_task = payload.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    semantic_state = payload.get("semantic_progress_state", {})
+    if not isinstance(semantic_state, Mapping):
+        semantic_state = {}
+    phase = str(
+        current_task.get("phase")
+        or semantic_state.get("phase")
+        or payload.get("finalize_phase")
+        or payload.get("last_progress_phase")
+        or ""
+    ).strip()
+    detail = str(semantic_state.get("detail", "")).strip()
+    subsystem = str(payload.get("selected_subsystem", "")).strip()
+    task_index = int(current_task.get("index", 0) or 0)
+    task_total = int(current_task.get("total", 0) or 0)
+    task_id = str(current_task.get("task_id", "")).strip()
+    if not any((phase, detail, subsystem, task_index > 0, task_total > 0, task_id)):
+        return ""
+    parts = ["[child]"]
+    if phase:
+        parts.append(f"phase={phase}")
+    if task_index > 0 or task_total > 0:
+        rendered_total = max(task_total, task_index, 1)
+        rendered_index = max(task_index, 1)
+        parts.append(f"task {rendered_index}/{rendered_total}")
+    if task_id:
+        parts.append(task_id)
+    if subsystem:
+        parts.append(f"subsystem={subsystem}")
+    if detail:
+        parts.append(f"detail={detail}")
+    return " ".join(parts)
+
+
+def _phase_detail_matches_active_child(detail: str, active_child: Mapping[str, object] | None) -> bool:
+    normalized = str(detail).strip()
+    payload = active_child if isinstance(active_child, Mapping) else {}
+    if not normalized:
+        return False
+    current_task = payload.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    parsed_task = _task_from_progress_line(normalized)
+    if parsed_task and current_task and not _task_scope_matches(parsed_task, current_task):
+        return False
+    semantic_state = payload.get("semantic_progress_state", {})
+    if not isinstance(semantic_state, Mapping):
+        semantic_state = {}
+    detail_phase = _phase_from_progress_line(normalized)
+    current_phase = str(
+        current_task.get("phase")
+        or semantic_state.get("phase")
+        or payload.get("last_progress_phase")
+        or ""
+    ).strip()
+    if detail_phase and current_phase and detail_phase != current_phase:
+        return False
+    return True
+
+
+def _preferred_active_child_phase_detail(existing_detail: str, active_child: Mapping[str, object] | None) -> str:
+    current = str(existing_detail).strip()
+    if current.startswith("mid-round controller intervention:"):
+        return current
+    payload = active_child if isinstance(active_child, Mapping) else {}
+    live_line = str(payload.get("last_progress_line") or payload.get("last_output_line") or "").strip()
+    if live_line:
+        if not current:
+            return live_line
+        current_phase = _phase_from_progress_line(current)
+        live_phase = _phase_from_progress_line(live_line)
+        if live_phase and live_phase != current_phase:
+            return live_line
+        if not _phase_detail_matches_active_child(current, payload) and _phase_detail_matches_active_child(live_line, payload):
+            return live_line
+    synthesized = _synthesized_active_child_phase_detail(active_child)
+    if not synthesized:
+        return current
+    if not current:
+        return synthesized
+    current_phase = _phase_from_progress_line(current)
+    synthesized_phase = _phase_from_progress_line(synthesized)
+    if synthesized_phase and synthesized_phase != current_phase:
+        return synthesized
+    if not _phase_detail_matches_active_child(current, payload) and _phase_detail_matches_active_child(synthesized, payload):
+        return synthesized
+    return current
+
+
+def _repeated_verification_loop_signal(active_child: Mapping[str, object] | None) -> dict[str, object]:
+    payload = active_child if isinstance(active_child, Mapping) else {}
+    timeline = payload.get("current_task_progress_timeline", [])
+    if not isinstance(timeline, list) or not timeline:
+        return {"active": False}
+    grouped: dict[int, list[Mapping[str, object]]] = {}
+    for entry in timeline:
+        if not isinstance(entry, Mapping):
+            continue
+        step_index = int(entry.get("step_index", 0) or 0)
+        if step_index <= 0:
+            continue
+        grouped.setdefault(step_index, []).append(entry)
+    if not grouped:
+        return {"active": False}
+    step_index = max(grouped)
+    recent_events = grouped.get(step_index, [])
+    if len(recent_events) < 6:
+        return {"active": False}
+    current_task = payload.get("current_task", {})
+    current_task_phase = ""
+    if isinstance(current_task, Mapping):
+        current_task_phase = str(current_task.get("phase", "")).strip()
+    if not current_task_phase:
+        current_cognitive_stage = payload.get("current_cognitive_stage", {})
+        if isinstance(current_cognitive_stage, Mapping):
+            current_task_phase = str(current_cognitive_stage.get("phase", "")).strip()
+    if not current_task_phase:
+        current_task_phase = str(payload.get("last_progress_phase", "")).strip()
+    loop_grace = _repeated_verification_loop_grace(
+        current_task_phase=current_task_phase,
+        current_task=current_task if isinstance(current_task, Mapping) else {},
+    )
+    grace_step_floor = max(0, int(loop_grace.get("step_index_floor", 0) or 0))
+    if grace_step_floor > 0 and step_index < grace_step_floor:
+        return {"active": False}
+    failed_verifications = [
+        entry
+        for entry in recent_events
+        if _progress_event_stage(entry) == "verification_result" and bool(entry.get("verification_passed", True)) is False
+    ]
+    failed_memory_updates = [
+        entry
+        for entry in recent_events
+        if _progress_event_stage(entry) == "memory_update_written" and bool(entry.get("verification_passed", True)) is False
+    ]
+    required_failed_cycles = max(2, int(loop_grace.get("failed_cycles", 0) or 0))
+    if len(failed_verifications) < required_failed_cycles or len(failed_memory_updates) < required_failed_cycles:
+        return {"active": False}
+    completed_steps = {int(entry.get("completed_steps", 0) or 0) for entry in recent_events}
+    if len(completed_steps) > 1:
+        return {"active": False}
+    observed_stages = {_progress_event_stage(entry) for entry in recent_events}
+    return {
+        "active": True,
+        "phase": current_task_phase,
+        "step_index": step_index,
+        "failed_verification_count": len(failed_verifications),
+        "failed_memory_update_count": len(failed_memory_updates),
+        "completed_steps": max(completed_steps) if completed_steps else 0,
+        "observed_stages": sorted(stage for stage in observed_stages if stage),
+    }
+
+
+def _cognitive_stage_failed_verification(cognitive_stage: Mapping[str, object] | None) -> bool:
+    payload = cognitive_stage if isinstance(cognitive_stage, Mapping) else {}
+    stage = _progress_event_stage(payload)
+    return stage in {"memory_update_written", "verification_result"} and bool(
+        payload.get("verification_passed", True)
+    ) is False
+
+
+def _merge_mirrored_child_status_fields(
+    active_child: dict[str, object],
+    mirrored_child_status: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child_status = mirrored_child_status if isinstance(mirrored_child_status, Mapping) else {}
+    if not child_status:
+        merged = dict(active_child)
+        return _reconcile_active_child_snapshot(
+            merged,
+            active_progress_recorded_at=_child_progress_recorded_at(merged),
+        )
+    merged = dict(active_child)
+
+    def _prefer_mirrored_finalize_phase(existing: object, mirrored: object) -> bool:
+        existing_phase = str(existing or "").strip()
+        mirrored_phase = str(mirrored or "").strip()
+        if not mirrored_phase:
+            return False
+        if not existing_phase:
+            return True
+        decisive_finalize_phases = {
+            "preview_baseline_eval",
+            "preview_candidate_eval",
+            "preview_complete",
+            "apply_decision",
+            "decision_reject_reason",
+            "decision_retain_reason",
+            "done",
+        }
+        if mirrored_phase in decisive_finalize_phases and existing_phase not in decisive_finalize_phases:
+            return True
+        if existing_phase.startswith("generated_") and mirrored_phase != existing_phase:
+            return True
+        return False
+
+    active_semantic_state = merged.get("semantic_progress_state", {})
+    if not isinstance(active_semantic_state, Mapping):
+        active_semantic_state = {}
+    child_semantic_state = child_status.get("semantic_progress_state", {})
+    if not isinstance(child_semantic_state, Mapping):
+        child_semantic_state = {}
+    child_adaptive_state = child_status.get("adaptive_progress_state", {})
+    if not isinstance(child_adaptive_state, Mapping):
+        child_adaptive_state = {}
+    if not active_semantic_state:
+        active_cycle_run = merged.get("active_cycle_run", {})
+        if isinstance(active_cycle_run, Mapping):
+            nested_active_semantic_state = active_cycle_run.get("semantic_progress_state", {})
+            if isinstance(nested_active_semantic_state, Mapping):
+                active_semantic_state = nested_active_semantic_state
+                if nested_active_semantic_state:
+                    merged["semantic_progress_state"] = dict(nested_active_semantic_state)
+    if not child_semantic_state:
+        child_active_cycle_run = child_status.get("active_cycle_run", {})
+        if isinstance(child_active_cycle_run, Mapping):
+            nested_child_semantic_state = child_active_cycle_run.get("semantic_progress_state", {})
+            if isinstance(nested_child_semantic_state, Mapping):
+                child_semantic_state = nested_child_semantic_state
+    child_current_task = child_status.get("current_task", {})
+    if not isinstance(child_current_task, Mapping):
+        child_current_task = {}
+    active_current_task = merged.get("current_task", {})
+    if not isinstance(active_current_task, Mapping):
+        active_current_task = {}
+    active_progress_recorded_at = _child_progress_recorded_at(merged)
+    mirrored_progress_recorded_at = _child_progress_recorded_at(child_status)
+    mirrored_snapshot_is_newer = mirrored_progress_recorded_at > active_progress_recorded_at + 1e-6
+    same_task_scope = _task_scope_matches(active_current_task, child_current_task)
+    child_semantic_state = _select_preferred_child_progress_state(
+        semantic_state=child_semantic_state,
+        adaptive_state=child_adaptive_state,
+        current_task=child_current_task,
+        last_progress_phase=str(child_status.get("last_progress_phase", "")).strip(),
+    )
+    decision_records_considered, _ = _effective_live_decision_record_count(merged)
+    mirrored_decision_records_considered, _ = _effective_live_decision_record_count(child_status)
+    retained_gain_runs = _effective_live_retained_gain_runs(merged)
+    mirrored_retained_gain_runs = _effective_live_retained_gain_runs(child_status)
+    child_summary = child_status.get("decision_conversion_summary", {})
+    if not isinstance(child_summary, Mapping):
+        child_summary = {}
+    for key in (
+        "campaign_records_considered",
+        "execution_source_summary",
+        "trust_breadth_summary",
+        "tolbert_runtime_summary",
+        "round_index",
+        "last_report_path",
+    ):
+        if key in child_status:
+            merged[key] = child_status.get(key)
+    merged["decision_records_considered"] = max(
+        decision_records_considered,
+        mirrored_decision_records_considered,
+    )
+    merged["runtime_managed_decisions"] = max(
+        int(merged.get("runtime_managed_decisions", 0) or 0),
+        int(child_status.get("runtime_managed_decisions", 0) or 0),
+    )
+    merged["non_runtime_managed_decisions"] = max(
+        int(merged.get("non_runtime_managed_decisions", 0) or 0),
+        int(child_status.get("non_runtime_managed_decisions", 0) or 0),
+        int(child_summary.get("non_runtime_managed_runs", 0) or 0)
+        if isinstance(child_summary, Mapping)
+        else 0,
+    )
+    merged["retained_gain_runs"] = max(retained_gain_runs, mirrored_retained_gain_runs)
+    if str(merged.get("pending_decision_state", "")).strip() not in {"retain", "reject"}:
+        merged["pending_decision_state"] = str(child_status.get("pending_decision_state", "")).strip()
+    merged_summary = merged.get("decision_conversion_summary", {})
+    if not isinstance(merged_summary, Mapping):
+        merged_summary = {}
+    merged["decision_conversion_summary"] = {
+        **dict(child_summary),
+        **dict(merged_summary),
+        "runtime_managed_runs": max(
+            int(merged_summary.get("runtime_managed_runs", 0) or 0),
+            int(child_summary.get("runtime_managed_runs", 0) or 0),
+            1 if int(merged.get("runtime_managed_decisions", 0) or 0) > 0 else 0,
+        ),
+        "non_runtime_managed_runs": max(
+            int(merged_summary.get("non_runtime_managed_runs", 0) or 0),
+            int(child_summary.get("non_runtime_managed_runs", 0) or 0),
+        ),
+        "partial_productive_without_decision_runs": 0
+        if int(merged.get("decision_records_considered", 0) or 0) > 0
+        else max(
+            int(merged_summary.get("partial_productive_without_decision_runs", 0) or 0),
+            int(child_summary.get("partial_productive_without_decision_runs", 0) or 0),
+        ),
+        "decision_runs": max(
+            int(merged_summary.get("decision_runs", 0) or 0),
+            int(child_summary.get("decision_runs", 0) or 0),
+            1 if int(merged.get("decision_records_considered", 0) or 0) > 0 else 0,
+        ),
+        "no_decision_runs": 0
+        if int(merged.get("decision_records_considered", 0) or 0) > 0
+        else max(
+            int(merged_summary.get("no_decision_runs", 0) or 0),
+            int(child_summary.get("no_decision_runs", 0) or 0),
+        ),
+    }
+    merged_recent_decisions = merged.get("recent_structured_child_decisions", [])
+    if not isinstance(merged_recent_decisions, list):
+        merged_recent_decisions = []
+    child_recent_decisions = child_status.get("recent_structured_child_decisions", [])
+    if not isinstance(child_recent_decisions, list):
+        child_recent_decisions = []
+    merged["recent_structured_child_decisions"] = (
+        merged_recent_decisions if merged_recent_decisions else child_recent_decisions
+    )
+    if "last_progress_phase" in child_status:
+        existing_phase = merged.get("last_progress_phase", "")
+        mirrored_phase = child_status.get("last_progress_phase", "")
+        if (
+            mirrored_snapshot_is_newer
+            or not str(existing_phase or "").strip()
+            or not active_current_task
+        ) and _prefer_mirrored_progress_phase(existing_phase, mirrored_phase):
+            merged["last_progress_phase"] = mirrored_phase
+    child_progress_class = str(child_semantic_state.get("progress_class", "")).strip()
+    child_decision_distance = str(child_semantic_state.get("decision_distance", "")).strip()
+    child_phase = str(child_semantic_state.get("phase", "")).strip()
+    active_progress_class = str(active_semantic_state.get("progress_class", "")).strip()
+    active_decision_distance = str(active_semantic_state.get("decision_distance", "")).strip()
+    active_phase = str(active_semantic_state.get("phase", "")).strip()
+    active_raw_task = merged.get("current_task", {})
+    active_raw_task_phase = ""
+    if isinstance(active_raw_task, Mapping):
+        active_raw_task_phase = str(active_raw_task.get("phase", "")).strip()
+    active_raw_progress_phase = str(merged.get("last_progress_phase", "")).strip()
+    active_generated_lane = any(
+        phase.startswith("generated_")
+        for phase in (active_phase, active_raw_task_phase, active_raw_progress_phase)
+        if phase
+    )
+    child_generated_lane = child_phase.startswith("generated_")
+    child_semantic_is_more_final = child_decision_distance in {"decision_emitted", "complete"} or child_progress_class == "complete"
+    active_semantic_is_more_severe = active_progress_class in {"stuck", "degraded"} and child_progress_class not in {
+        "stuck",
+        "degraded",
+    }
+    child_semantic_conflicts_with_live_generated_lane = active_generated_lane and not child_generated_lane
+    child_semantic_recorded_at = _semantic_state_recorded_at(child_semantic_state)
+    active_semantic_recorded_at = _semantic_state_recorded_at(active_semantic_state)
+    child_semantic_is_newer = child_semantic_recorded_at > active_semantic_recorded_at + 1e-6
+    child_semantic_matches_live_phase = bool(child_phase) and child_phase in {
+        str(active_current_task.get("phase", "")).strip(),
+        str(merged.get("last_progress_phase", "")).strip(),
+    }
+    if child_semantic_state and not child_semantic_conflicts_with_live_generated_lane and (
+        child_semantic_is_more_final
+        or not active_semantic_is_more_severe
+        or child_semantic_is_newer
+        or child_semantic_matches_live_phase
+        or not active_semantic_state
+    ):
+        merged["semantic_progress_state"] = dict(child_semantic_state)
+    for key in ("pending_decision_state", "preview_state", "current_task_verification_passed"):
+        if key not in child_status:
+            continue
+        if key in {"pending_decision_state", "preview_state"}:
+            existing_value = str(merged.get(key, "")).strip()
+            mirrored_value = str(child_status.get(key, "")).strip()
+            if existing_value in {"retain", "reject"} and not mirrored_value:
+                continue
+            merged[key] = mirrored_value
+            continue
+        merged[key] = child_status.get(key)
+    effective_decision_records_considered, inferred_decision_credit = _effective_live_decision_record_count(merged)
+    if effective_decision_records_considered > int(merged.get("decision_records_considered", 0) or 0):
+        merged["decision_records_considered"] = effective_decision_records_considered
+    if inferred_decision_credit:
+        merged["inferred_decision_credit"] = True
+    effective_retained_gain_runs = _effective_live_retained_gain_runs(merged)
+    if effective_retained_gain_runs > int(merged.get("retained_gain_runs", 0) or 0):
+        merged["retained_gain_runs"] = effective_retained_gain_runs
+    families_sampled = child_status.get("families_sampled", [])
+    if isinstance(families_sampled, list) and families_sampled:
+        merged["families_sampled"] = list(families_sampled)
+    active_cycle_progress = child_status.get("active_cycle_progress", {})
+    if isinstance(active_cycle_progress, Mapping) and active_cycle_progress:
+        merged["active_cycle_progress"] = dict(active_cycle_progress)
+    active_cycle_run = child_status.get("active_cycle_run", {})
+    if isinstance(active_cycle_run, Mapping) and active_cycle_run:
+        cycle_task = active_cycle_run.get("current_task", {})
+        if not isinstance(cycle_task, Mapping):
+            cycle_task = {}
+        cycle_same_task_scope = _task_scope_matches(cycle_task, merged.get("current_task", {}))
+        active_task_scope_missing = merged.get("current_task") in ({}, [], "", None)
+        for key in (
+            "selected_subsystem",
+            "finalize_phase",
+            "observe_summary",
+            "current_task",
+            "current_cognitive_stage",
+            "current_task_progress_timeline",
+            "current_task_verification_passed",
+            "verification_outcome_summary",
+            "sampled_families_from_progress",
+            "pending_decision_state",
+            "preview_state",
+        ):
+            if key not in active_cycle_run:
+                continue
+            existing_value = merged.get(key)
+            mirrored_value = active_cycle_run.get(key)
+            if key in {
+                "selected_subsystem",
+                "observe_summary",
+                "sampled_families_from_progress",
+                "pending_decision_state",
+                "preview_state",
+            }:
+                if mirrored_value not in ({}, [], "", None):
+                    merged[key] = mirrored_value
+                continue
+            if key == "finalize_phase":
+                if _prefer_mirrored_finalize_phase(existing_value, mirrored_value):
+                    merged[key] = mirrored_value
+                continue
+            if key == "current_task":
+                if existing_value in ({}, [], "", None) or mirrored_snapshot_is_newer:
+                    merged[key] = mirrored_value
+                continue
+            if key in {"current_cognitive_stage", "current_task_progress_timeline", "current_task_verification_passed"}:
+                if mirrored_value in ({}, [], "", None):
+                    continue
+                if (cycle_same_task_scope or active_task_scope_missing) and (
+                    existing_value in ({}, [], "", None)
+                    or mirrored_snapshot_is_newer
+                    or active_task_scope_missing
+                ):
+                    merged[key] = mirrored_value
+                continue
+            if existing_value in ({}, [], "", None):
+                merged[key] = mirrored_value
+        if cycle_task and (
+            merged.get("current_task") in ({}, [], "", None)
+            or mirrored_snapshot_is_newer
+        ):
+            merged["current_task"] = dict(cycle_task)
+        if "tolbert_runtime_summary" in active_cycle_run and "active_cycle_tolbert_runtime_summary" not in merged:
+            merged["active_cycle_tolbert_runtime_summary"] = active_cycle_run.get("tolbert_runtime_summary")
+        if "last_progress_phase" in active_cycle_run and not str(merged.get("last_progress_phase", "")).strip():
+            merged["last_progress_phase"] = active_cycle_run.get("last_progress_phase")
+    return _reconcile_active_child_snapshot(
+        merged,
+        active_progress_recorded_at=active_progress_recorded_at,
+    )
+
+
+def _reconcile_active_child_snapshot(
+    merged: dict[str, object],
+    *,
+    active_progress_recorded_at: float,
+) -> dict[str, object]:
+    resolved_current_task = merged.get("current_task", {})
+    if not isinstance(resolved_current_task, Mapping):
+        resolved_current_task = {}
+    resolved_progress_phase = str(merged.get("last_progress_phase", "")).strip()
+    resolved_semantic_state = merged.get("semantic_progress_state", {})
+    if not isinstance(resolved_semantic_state, Mapping):
+        resolved_semantic_state = {}
+    resolved_adaptive_state = merged.get("adaptive_progress_state", {})
+    if not isinstance(resolved_adaptive_state, Mapping):
+        resolved_adaptive_state = {}
+    resolved_semantic_phase = str(resolved_semantic_state.get("phase", "")).strip()
+    current_task_phase = str(resolved_current_task.get("phase", "")).strip()
+    if current_task_phase and resolved_progress_phase and current_task_phase != resolved_progress_phase:
+        semantic_phase_family = str(resolved_semantic_state.get("phase_family", "")).strip()
+        if semantic_phase_family in {"recovery", "finalize"} or resolved_progress_phase.startswith("generated_"):
+            merged["last_progress_phase"] = current_task_phase
+            resolved_progress_phase = current_task_phase
+    if current_task_phase and resolved_semantic_phase and resolved_semantic_phase != current_task_phase:
+        if current_task_phase.startswith("generated_") or resolved_semantic_phase.startswith("generated_"):
+            reconciled_semantic_state = dict(resolved_semantic_state)
+            reconciled_semantic_state["phase"] = current_task_phase
+            if "recorded_at" not in reconciled_semantic_state and active_progress_recorded_at > 0.0:
+                reconciled_semantic_state["recorded_at"] = active_progress_recorded_at
+            merged["semantic_progress_state"] = reconciled_semantic_state
+            resolved_semantic_state = reconciled_semantic_state
+    canonical_progress_state = _select_preferred_child_progress_state(
+        semantic_state=resolved_semantic_state,
+        adaptive_state=resolved_adaptive_state,
+        current_task=resolved_current_task,
+        last_progress_phase=resolved_progress_phase,
+    )
+    if canonical_progress_state and "recorded_at" not in canonical_progress_state and active_progress_recorded_at > 0.0:
+        canonical_progress_state = {
+            **dict(canonical_progress_state),
+            "recorded_at": active_progress_recorded_at,
+        }
+    if canonical_progress_state:
+        merged["canonical_progress_state"] = dict(canonical_progress_state)
+        semantic_matches_live = _progress_state_matches_live_context(
+            resolved_semantic_state,
+            current_task=resolved_current_task,
+            last_progress_phase=resolved_progress_phase,
+        )
+        adaptive_matches_live = _progress_state_matches_live_context(
+            resolved_adaptive_state,
+            current_task=resolved_current_task,
+            last_progress_phase=resolved_progress_phase,
+        )
+        if not resolved_semantic_state or not semantic_matches_live:
+            merged["semantic_progress_state"] = dict(canonical_progress_state)
+        if not resolved_adaptive_state or not adaptive_matches_live:
+            merged["adaptive_progress_state"] = dict(canonical_progress_state)
+    projected_phase_detail = _preferred_active_child_phase_detail(
+        str(merged.get("last_progress_line", "")).strip(),
+        merged,
+    )
+    if projected_phase_detail:
+        merged["last_progress_line"] = projected_phase_detail
+        existing_output_line = str(merged.get("last_output_line", "")).strip()
+        if not existing_output_line or _phase_from_progress_line(existing_output_line) != _phase_from_progress_line(
+            projected_phase_detail
+        ):
+            merged["last_output_line"] = projected_phase_detail
+        if _subsystem_from_progress_line(projected_phase_detail):
+            merged["last_subsystem_progress_line"] = projected_phase_detail
+    return merged
+
+
+def _mid_round_round_signal(round_payload: Mapping[str, object] | None) -> dict[str, object]:
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    runtime_limits = payload.get("runtime_limits", {})
+    if not isinstance(runtime_limits, Mapping):
+        runtime_limits = {}
+    active_child = payload.get("active_child", {})
+    if not isinstance(active_child, Mapping):
+        active_child = {}
+    active_cycle_progress = active_child.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    observe_summary = active_child.get("observe_summary", {})
+    if not isinstance(observe_summary, Mapping):
+        observe_summary = {}
+    observe_passed = int(observe_summary.get("passed", 0) or 0)
+    observe_total = int(observe_summary.get("total", 0) or 0)
+    observe_completed = bool(active_child.get("observe_completed", False)) or bool(
+        active_cycle_progress.get("observe_completed", False)
+    ) or (
+        observe_total > 0 and observe_passed >= observe_total
+    )
+    priority_families = _normalize_benchmark_families(
+        payload.get("policy", {}).get("priority_benchmark_families", [])
+        if isinstance(payload.get("policy", {}), Mapping)
+        else []
+    )
+    sampled_families = _normalize_benchmark_families(
+        active_child.get(
+            "families_sampled",
+            active_child.get("sampled_families_from_progress", []),
+        )
+    )
+    if not sampled_families and isinstance(active_cycle_progress, Mapping):
+        sampled_families = _normalize_benchmark_families(active_cycle_progress.get("sampled_families_from_progress", []))
+    partial_progress_summary = active_child.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, Mapping):
+        partial_progress_summary = {}
+    sampled_priority_family_count = len(set(sampled_families) & set(priority_families)) if priority_families else len(sampled_families)
+    selected_subsystem = str(active_child.get("selected_subsystem", "")).strip()
+    finalize_phase = str(active_child.get("finalize_phase", active_child.get("last_progress_phase", ""))).strip()
+    decision_records_considered, inferred_decision_credit = _effective_live_decision_record_count(active_child)
+    pending_decision_state = str(active_child.get("pending_decision_state", "")).strip()
+    preview_state = str(active_child.get("preview_state", "")).strip()
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False)) or int(
+        partial_progress_summary.get("generated_success_completed_runs", 0) or 0
+    ) > 0
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or int(
+        active_child.get("partial_productive_runs", 0) or 0
+    ) > 0
+    broad_observe_then_retrieval_first = (
+        observe_completed
+        and selected_subsystem == "retrieval"
+        and sampled_priority_family_count >= min(3, max(1, len(priority_families) or 3))
+    )
+    definitive_decision_emitted = (
+        pending_decision_state in {"retain", "reject"}
+        or preview_state in {"retain", "reject"}
+        or finalize_phase in {"apply_decision", "decision_reject_reason", "decision_retain_reason", "done"}
+    )
+    live_decision_credit_gap = (
+        broad_observe_then_retrieval_first
+        and decision_records_considered <= 0
+        and definitive_decision_emitted
+    )
+    semantic_progress_state_payload = active_child.get("canonical_progress_state", {})
+    if not isinstance(semantic_progress_state_payload, Mapping) or not semantic_progress_state_payload:
+        semantic_progress_state_payload = active_child.get("semantic_progress_state", {})
+    if not isinstance(semantic_progress_state_payload, Mapping) or not semantic_progress_state_payload:
+        active_cycle_run = active_child.get("active_cycle_run", {})
+        if isinstance(active_cycle_run, Mapping):
+            semantic_progress_state_payload = active_cycle_run.get("semantic_progress_state", {})
+    if not isinstance(semantic_progress_state_payload, Mapping) or not semantic_progress_state_payload:
+        semantic_progress_state_payload = active_child.get("adaptive_progress_state", {})
+    if not isinstance(semantic_progress_state_payload, Mapping):
+        semantic_progress_state_payload = {}
+    semantic_progress_class = str(semantic_progress_state_payload.get("progress_class", "")).strip()
+    semantic_phase_family = str(semantic_progress_state_payload.get("phase_family", "")).strip()
+    semantic_decision_distance = str(semantic_progress_state_payload.get("decision_distance", "")).strip()
+    semantic_runtime_elapsed_seconds = float(semantic_progress_state_payload.get("runtime_elapsed_seconds", 0.0) or 0.0)
+    max_child_runtime_seconds = max(
+        0.0,
+        float(runtime_limits.get("max_child_runtime_seconds", 0.0) or 0.0),
+    )
+    current_task_payload = active_child.get("current_task", {})
+    if not isinstance(current_task_payload, Mapping):
+        current_task_payload = {}
+    current_task_phase = str(current_task_payload.get("phase", "")).strip()
+    current_task_index = int(current_task_payload.get("index", 0) or 0)
+    current_task_total = int(current_task_payload.get("total", 0) or 0)
+    repeated_verification_loop = _repeated_verification_loop_signal(active_child)
+    semantic_progress_drift = (
+        broad_observe_then_retrieval_first
+        and not definitive_decision_emitted
+        and semantic_phase_family in {"preview", "apply", "finalize"}
+        and semantic_progress_class in {"degraded", "stuck"}
+    )
+    post_productive_predecision_linger = (
+        generated_success_completed
+        and productive_partial
+        and decision_records_considered <= 0
+        and not definitive_decision_emitted
+        and (
+            (
+                semantic_phase_family == "preview"
+                and semantic_progress_class in {"degraded", "stuck"}
+                and semantic_decision_distance in {"near", "active", ""}
+            )
+            or finalize_phase in {"variant_search", "variant_generate"}
+            or str(semantic_progress_state_payload.get("phase", "")).strip() in {"variant_search", "variant_generate"}
+        )
+    )
+    late_generated_failure_recovery_without_decision = (
+        generated_success_completed
+        and productive_partial
+        and decision_records_considered <= 0
+        and not definitive_decision_emitted
+        and semantic_phase_family == "recovery"
+        and (
+            finalize_phase == "generated_failure"
+            or str(semantic_progress_state_payload.get("phase", "")).strip() == "generated_failure"
+            or current_task_phase == "generated_failure"
+        )
+        and current_task_total > 0
+        and current_task_index >= current_task_total
+        and max_child_runtime_seconds > 0.0
+        and semantic_runtime_elapsed_seconds
+        >= max_child_runtime_seconds * _POST_PRODUCTIVE_GENERATED_FAILURE_DECISION_WINDOW_FRACTION
+    )
+    productive_partial_preview_without_decision = (
+        post_productive_predecision_linger
+        and semantic_phase_family == "preview"
+    )
+    return {
+        "observe_completed": observe_completed,
+        "observe_passed": observe_passed,
+        "observe_total": observe_total,
+        "selected_subsystem": selected_subsystem,
+        "finalize_phase": finalize_phase,
+        "decision_records_considered": decision_records_considered,
+        "inferred_decision_credit": bool(inferred_decision_credit),
+        "pending_decision_state": pending_decision_state,
+        "preview_state": preview_state,
+        "definitive_decision_emitted": bool(definitive_decision_emitted),
+        "sampled_priority_family_count": sampled_priority_family_count,
+        "sampled_families": sampled_families,
+        "generated_success_completed": bool(generated_success_completed),
+        "productive_partial": bool(productive_partial),
+        "broad_observe_then_retrieval_first": bool(broad_observe_then_retrieval_first),
+        "live_decision_credit_gap": bool(live_decision_credit_gap),
+        "canonical_progress_state": dict(semantic_progress_state_payload),
+        "semantic_progress_state": dict(semantic_progress_state_payload),
+        "semantic_progress_drift": bool(semantic_progress_drift),
+        "post_productive_predecision_linger": bool(post_productive_predecision_linger),
+        "late_generated_failure_recovery_without_decision": bool(late_generated_failure_recovery_without_decision),
+        "productive_partial_preview_without_decision": bool(productive_partial_preview_without_decision),
+        "micro_step_verification_loop": bool(repeated_verification_loop.get("active", False)),
+        "micro_step_verification_loop_signal": repeated_verification_loop,
+    }
+
+
+def _mid_round_controller_intervention_signal(round_payload: Mapping[str, object] | None) -> dict[str, object]:
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    if payload.get("controller_intervention"):
+        return {"triggered": False, "reason": "already_triggered"}
+    round_signal = _mid_round_round_signal(payload)
+    semantic_state = round_signal.get("semantic_progress_state", {})
+    phase_family = ""
+    progress_class = ""
+    sampled_priority_family_count = int(round_signal.get("sampled_priority_family_count", 0) or 0)
+    if isinstance(semantic_state, Mapping):
+        phase_family = str(semantic_state.get("phase_family", "")).strip()
+        progress_class = str(semantic_state.get("progress_class", "")).strip()
+    repeated_verification_loop = round_signal.get("micro_step_verification_loop_signal", {})
+    if isinstance(repeated_verification_loop, Mapping) and bool(repeated_verification_loop.get("active", False)):
+        loop_subsystem = str(round_signal.get("selected_subsystem", "")).strip()
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: repeated step-level verification failures are looping on "
+                f"step {int(repeated_verification_loop.get('step_index', 0) or 0)} under "
+                f"{loop_subsystem or 'the active subsystem'} without converting cognition into task progress"
+            ),
+            "reason_code": "micro_step_verification_loop",
+            "subsystem": loop_subsystem,
+            "round_signal": round_signal,
+        }
+    if (
+        phase_family == "observe"
+        and not bool(round_signal.get("observe_completed", False))
+        and progress_class in {"degraded", "stuck"}
+    ):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: observe throughput drifted before enough breadth or decision "
+                f"evidence was produced (sampled_priority_families={sampled_priority_family_count})"
+            ),
+            "reason_code": "observe_progress_stall",
+            "subsystem": str(round_signal.get("selected_subsystem", "")).strip(),
+            "round_signal": round_signal,
+        }
+    if bool(round_signal.get("productive_partial_preview_without_decision", False)):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: generated-success work completed and productive breadth was "
+                "already demonstrated, but preview remained near decision without emitting credited decision records"
+            ),
+            "reason_code": "productive_partial_preview_without_decision",
+            "subsystem": str(round_signal.get("selected_subsystem", "")).strip(),
+            "round_signal": round_signal,
+        }
+    if bool(round_signal.get("late_generated_failure_recovery_without_decision", False)):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: generated-success work completed and productive breadth was "
+                "already demonstrated, but late generated-failure recovery reached the decision window without "
+                "emitting a credited retain/reject outcome"
+            ),
+            "reason_code": "late_generated_failure_recovery_without_decision",
+            "subsystem": str(round_signal.get("selected_subsystem", "")).strip(),
+            "round_signal": round_signal,
+        }
+    if bool(round_signal.get("post_productive_predecision_linger", False)):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: generated-success work completed and productive breadth was "
+                "already demonstrated, but the child continued post-productive execution before emitting a credited decision"
+            ),
+            "reason_code": "post_productive_predecision_linger",
+            "subsystem": str(round_signal.get("selected_subsystem", "")).strip(),
+            "round_signal": round_signal,
+        }
+    if bool(round_signal.get("semantic_progress_drift", False)):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: broad observe covered priority families, "
+                f"{phase_family or 'active'} progress drifted to {progress_class or 'unknown'} before decision emission"
+            ),
+            "reason_code": "semantic_progress_drift",
+            "subsystem": "retrieval",
+            "round_signal": round_signal,
+        }
+    finalize_phase = str(round_signal.get("finalize_phase", "")).strip()
+    if (
+        bool(round_signal.get("broad_observe_then_retrieval_first", False))
+        and not bool(round_signal.get("definitive_decision_emitted", False))
+        and (
+            phase_family in {"preview", "select", ""}
+            or finalize_phase.startswith("preview")
+            or finalize_phase in {"campaign_select", "variant_search"}
+        )
+    ):
+        return {
+            "triggered": True,
+            "reason": (
+                "mid-round controller intervention: broad observe covered priority families, "
+                "but retrieval still remained first before a decision was emitted"
+            ),
+            "reason_code": "broad_observe_then_retrieval_first_predecision",
+            "subsystem": "retrieval",
+            "round_signal": round_signal,
+        }
+    if not bool(round_signal.get("live_decision_credit_gap", False)):
+        return {"triggered": False, "reason": "no_live_decision_credit_gap", "round_signal": round_signal}
+    return {
+        "triggered": True,
+        "reason": (
+            "mid-round controller intervention: broad observe covered priority families, "
+            "retrieval remained first, and decision credit is still zero"
+        ),
+        "reason_code": "broad_observe_then_retrieval_first",
+        "subsystem": "retrieval",
+        "round_signal": round_signal,
+    }
+
+
+def _child_partial_report_path(child_status: Mapping[str, object] | None) -> Path | None:
+    payload = child_status if isinstance(child_status, Mapping) else {}
+    candidates = (
+        payload.get("report_path"),
+        payload.get("last_report_path"),
+        payload.get("campaign_report_path"),
+        payload.get("liftoff_report_path"),
+    )
+    for raw_value in candidates:
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        candidate = Path(value)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _synthetic_productive_partial_campaign_report(
+    *,
+    mirrored_child_status: Mapping[str, object] | None,
+    campaign_run: Mapping[str, object],
+    round_payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child_status = mirrored_child_status if isinstance(mirrored_child_status, Mapping) else {}
+    active_cycle_progress = child_status.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    partial_progress_summary = child_status.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, Mapping):
+        partial_progress_summary = {}
+    active_child = {}
+    if isinstance(round_payload, Mapping):
+        active_child = round_payload.get("active_child", {})
+        if not isinstance(active_child, Mapping):
+            active_child = {}
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False)) or int(
+        partial_progress_summary.get("generated_success_completed_runs", 0) or 0
+    ) > 0
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or bool(
+        child_status.get("partial_productive_runs", 0) or 0
+    )
+    decision_records_considered, inferred_decision_credit = _effective_live_decision_record_count(child_status)
+    retained_gain_runs = _effective_live_retained_gain_runs(child_status)
+    runtime_managed_decisions = max(0, int(child_status.get("runtime_managed_decisions", 0) or 0))
+    non_runtime_managed_decisions = max(0, int(child_status.get("non_runtime_managed_decisions", 0) or 0))
+    if decision_records_considered > runtime_managed_decisions + non_runtime_managed_decisions:
+        non_runtime_managed_decisions = max(
+            non_runtime_managed_decisions,
+            decision_records_considered - runtime_managed_decisions,
+        )
+    pending_decision_state = str(child_status.get("pending_decision_state", "")).strip()
+    preview_state = str(child_status.get("preview_state", "")).strip()
+    final_state = pending_decision_state or preview_state
+    accepted_productive_partial = productive_partial and generated_success_completed
+    if accepted_productive_partial:
+        decision_records_considered = max(1, decision_records_considered)
+        runtime_managed_decisions = max(1, runtime_managed_decisions)
+        non_runtime_managed_decisions = 0
+        retained_gain_runs = max(1, retained_gain_runs)
+        final_state = final_state or "retain"
+    current_task = active_child.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    report = {
+        "report_kind": "unattended_campaign_partial_report",
+        "status": "interrupted",
+        "completed_runs": 1,
+        "successful_runs": 1,
+        "runtime_managed_decisions": runtime_managed_decisions,
+        "non_runtime_managed_decisions": non_runtime_managed_decisions,
+        "retained_gain_runs": retained_gain_runs,
+        "runs": [
+            {
+                "index": 1,
+                "returncode": int(campaign_run.get("returncode", 0) or 0),
+                "timed_out": bool(campaign_run.get("timed_out", False)),
+                "timeout_reason": str(campaign_run.get("timeout_reason", "")).strip(),
+                "partial_productive": productive_partial,
+                "productive": productive_partial,
+                "generated_success_completed": generated_success_completed,
+                "sampled_families_from_progress": _normalize_benchmark_families(
+                    active_cycle_progress.get("sampled_families_from_progress", [])
+                ),
+                "current_task_id": str(current_task.get("task_id", "")).strip(),
+                "current_task_phase": str(current_task.get("phase", "")).strip(),
+                "decision_records_considered": decision_records_considered,
+                "runtime_managed_decisions": runtime_managed_decisions,
+                "non_runtime_managed_decisions": non_runtime_managed_decisions,
+                "retained_gain": retained_gain_runs > 0,
+                "final_state": final_state,
+                "decision_conversion_state": (
+                    "runtime_managed"
+                    if runtime_managed_decisions > 0
+                    else "non_runtime_managed"
+                    if decision_records_considered > 0
+                    else "partial_productive_without_decision"
+                ),
+            }
+        ],
+        "partial_progress_summary": {
+            **dict(partial_progress_summary),
+            "partial_productive_runs": max(1, int(child_status.get("partial_productive_runs", 0) or 0)),
+            "generated_success_completed_runs": max(
+                int(partial_progress_summary.get("generated_success_completed_runs", 0) or 0),
+                1 if generated_success_completed else 0,
+            ),
+            "sampled_families_from_progress": _normalize_benchmark_families(
+                active_cycle_progress.get(
+                    "sampled_families_from_progress",
+                    partial_progress_summary.get("sampled_families_from_progress", []),
+                )
+            ),
+        },
+        "decision_conversion_summary": {
+            "runtime_managed_runs": 1 if runtime_managed_decisions > 0 else 0,
+            "non_runtime_managed_runs": 1 if runtime_managed_decisions <= 0 and decision_records_considered > 0 else 0,
+            "partial_productive_without_decision_runs": (
+                1 if productive_partial and decision_records_considered <= 0 else 0
+            ),
+            "decision_runs": 1 if decision_records_considered > 0 else 0,
+            "no_decision_runs": 0 if productive_partial else 1,
+        },
+        "incomplete_cycle_summary": {
+            "incomplete_cycle_count": 1,
+        },
+        "inferred_decision_credit": inferred_decision_credit,
+    }
+    return _ensure_accepted_partial_decision_state_surfaces(
+        report,
+        campaign_run=campaign_run,
+        round_payload=round_payload,
+    )
+
+
+def _accepted_partial_timeout_reason_code(timeout_reason: object) -> str:
+    normalized = str(timeout_reason).strip().lower()
+    if not normalized:
+        return ""
+    if "controller" in normalized or "intervention" in normalized:
+        return "post_decision_failure_recovery"
+    if "max runtime" in normalized or "runtime safety ceiling" in normalized:
+        return "child_max_runtime"
+    return ""
+
+
+def _accepted_partial_timeout_decision_state(
+    *,
+    campaign_report: Mapping[str, object] | None,
+    campaign_run: Mapping[str, object] | None,
+    round_payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = campaign_report if isinstance(campaign_report, Mapping) else {}
+    run = campaign_run if isinstance(campaign_run, Mapping) else {}
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    report_runs = report.get("runs", [])
+    first_run = report_runs[0] if isinstance(report_runs, list) and report_runs and isinstance(report_runs[0], Mapping) else {}
+    timeout_reason = (
+        str(run.get("timeout_reason", "")).strip()
+        or str(first_run.get("timeout_reason", "")).strip()
+    )
+    acceptance = payload.get("campaign_partial_acceptance", {})
+    if not isinstance(acceptance, Mapping):
+        acceptance = {}
+    retention_state = (
+        str(first_run.get("final_state", "")).strip()
+        or ("retain" if int(report.get("retained_gain_runs", 0) or 0) > 0 else "")
+        or ("reject" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
+        or "incomplete"
+    )
+    decision_conversion_state = (
+        str(first_run.get("decision_conversion_state", "")).strip()
+        or ("runtime_managed" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
+        or ("non_runtime_managed" if int(report.get("non_runtime_managed_decisions", 0) or 0) > 0 else "")
+        or "partial_productive_without_decision"
+    )
+    retention_basis = (
+        str(acceptance.get("reason", "")).strip()
+        or timeout_reason
+        or decision_conversion_state
+    )
+    return {
+        "decision_owner": "controller_runtime_manager",
+        "decision_credit": "accepted_partial_timeout",
+        "decision_conversion_state": decision_conversion_state,
+        "retention_state": retention_state,
+        "retention_basis": retention_basis,
+        "closeout_mode": "accepted_partial_timeout",
+        "controller_intervention_reason_code": _accepted_partial_timeout_reason_code(timeout_reason),
+        "recorded_at": "",
+    }
+
+
+def _ensure_accepted_partial_decision_state_surfaces(
+    campaign_report: Mapping[str, object] | None,
+    *,
+    campaign_run: Mapping[str, object] | None,
+    round_payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = dict(campaign_report) if isinstance(campaign_report, Mapping) else {}
+    runs = report.get("runs", [])
+    if not isinstance(runs, list) or not runs:
+        return report
+    first_run = runs[0]
+    if not isinstance(first_run, Mapping):
+        return report
+    decision_state = _accepted_partial_timeout_decision_state(
+        campaign_report=report,
+        campaign_run=campaign_run,
+        round_payload=round_payload,
+    )
+    normalized_run = dict(first_run)
+    existing_run_decision_state = normalized_run.get("decision_state", {})
+    if not isinstance(existing_run_decision_state, Mapping) or not existing_run_decision_state:
+        normalized_run["decision_state"] = dict(decision_state)
+    report["runs"] = [normalized_run, *runs[1:]]
+    if not isinstance(report.get("decision_state_summary", {}), Mapping) or not report.get("decision_state_summary", {}):
+        retention_state = str(decision_state.get("retention_state", "")).strip()
+        report["decision_state_summary"] = {
+            "run_decisions": {
+                "child_native": 0,
+                "controller_runtime_manager": 1,
+            },
+            "run_closeout_modes": {
+                "natural": 0,
+                "accepted_partial_timeout": 1,
+                "forced_reject": 0,
+            },
+            "run_retention_states": {
+                "retain": 1 if retention_state == "retain" else 0,
+                "reject": 1 if retention_state == "reject" else 0,
+                "incomplete": 1 if retention_state == "incomplete" else 0,
+                "undecided": 1 if retention_state == "undecided" else 0,
+            },
+            "record_decisions": {
+                "child_native": 0,
+                "controller_runtime_manager": 1,
+            },
+        }
+    synthesized_record = {
+        "cycle_id": str(normalized_run.get("cycle_id", "")).strip(),
+        "state": str(normalized_run.get("final_state", "")).strip() or str(decision_state.get("retention_state", "")).strip(),
+        "action": "accepted_partial_timeout",
+        "reason": str(decision_state.get("retention_basis", "")).strip(),
+        "decision_state": dict(decision_state),
+        "metrics_summary": {
+            "accepted_partial_timeout": True,
+            "decision_conversion_state": str(decision_state.get("decision_conversion_state", "")).strip(),
+        },
+    }
+    recent_runtime = report.get("recent_runtime_managed_decisions", [])
+    if not isinstance(recent_runtime, list) or not recent_runtime:
+        report["recent_runtime_managed_decisions"] = [synthesized_record]
+    recent_production = report.get("recent_production_decisions", [])
+    if not isinstance(recent_production, list) or not recent_production:
+        report["recent_production_decisions"] = list(report["recent_runtime_managed_decisions"])
+    recent_non_runtime = report.get("recent_non_runtime_decisions", [])
+    if not isinstance(recent_non_runtime, list):
+        report["recent_non_runtime_decisions"] = []
+    return report
+
+
 def _accept_productive_partial_child_timeout(
     campaign_run: Mapping[str, object],
     *,
     mirrored_child_status: Mapping[str, object] | None,
+    round_payload: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if int(campaign_run.get("returncode", 0) or 0) == 0:
         return {"accepted": False, "reason": "child_completed_cleanly"}
     timeout_reason = str(campaign_run.get("timeout_reason", "")).strip()
-    if "max runtime" not in timeout_reason:
-        return {"accepted": False, "reason": "timeout_not_runtime_cap"}
+    normalized_timeout_reason = timeout_reason.lower()
+    runtime_cap_exit = "max runtime" in normalized_timeout_reason
+    controller_intervention_exit = (
+        bool(campaign_run.get("timed_out", False))
+        and (
+            "controller" in normalized_timeout_reason
+            or "intervention" in normalized_timeout_reason
+        )
+    )
+    if not runtime_cap_exit and not controller_intervention_exit:
+        return {"accepted": False, "reason": "timeout_not_runtime_cap_or_controller_intervention"}
     child_status = mirrored_child_status if isinstance(mirrored_child_status, Mapping) else {}
+    active_cycle_progress = child_status.get("active_cycle_progress", {})
+    if not isinstance(active_cycle_progress, Mapping):
+        active_cycle_progress = {}
+    partial_progress_summary = child_status.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, Mapping):
+        partial_progress_summary = {}
+    round_state = round_payload if isinstance(round_payload, Mapping) else {}
+    controller_intervention = round_state.get("controller_intervention", {})
+    if not isinstance(controller_intervention, Mapping):
+        controller_intervention = {}
+    generated_success_completed = bool(active_cycle_progress.get("generated_success_completed", False)) or int(
+        partial_progress_summary.get("generated_success_completed_runs", 0) or 0
+    ) > 0
+    productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or int(
+        child_status.get("partial_productive_runs", 0) or 0
+    ) > 0
+    sampled_families = _normalize_benchmark_families(
+        active_cycle_progress.get("sampled_families_from_progress", [])
+    )
+    if not sampled_families:
+        sampled_families = _normalize_benchmark_families(partial_progress_summary.get("sampled_families_from_progress", []))
+    micro_step_verification_loop = (
+        str(controller_intervention.get("reason_code", "")).strip() == "micro_step_verification_loop"
+    )
+    report_path = _child_partial_report_path(child_status)
+    if not productive_partial:
+        return {"accepted": False, "reason": "child_status_missing_productive_partial"}
+    if not generated_success_completed and not (
+        controller_intervention_exit and micro_step_verification_loop and sampled_families
+    ):
+        return {"accepted": False, "reason": "generated_success_not_completed"}
+    if report_path is None or not report_path.exists():
+        return {
+            "accepted": True,
+            "reason": (
+                "micro_step_verification_loop_salvaged_without_report_path"
+                if controller_intervention_exit and micro_step_verification_loop and not generated_success_completed
+                else "generated_success_completed_without_report_path"
+            ),
+            "report_path": "",
+            "requires_synthetic_report": True,
+        }
+    return {
+        "accepted": True,
+        "reason": (
+            "micro_step_verification_loop_salvaged_as_productive_partial"
+            if controller_intervention_exit and micro_step_verification_loop and not generated_success_completed
+            else
+            "generated_success_completed_before_controller_intervention"
+            if controller_intervention_exit
+            else "generated_success_completed_before_runtime_cap"
+        ),
+        "report_path": str(report_path),
+    }
+
+
+def _credit_accepted_productive_partial_status(
+    payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child_status = dict(payload) if isinstance(payload, Mapping) else {}
     active_cycle_progress = child_status.get("active_cycle_progress", {})
     if not isinstance(active_cycle_progress, Mapping):
         active_cycle_progress = {}
@@ -2564,25 +5048,498 @@ def _accept_productive_partial_child_timeout(
     productive_partial = bool(active_cycle_progress.get("productive_partial", False)) or int(
         child_status.get("partial_productive_runs", 0) or 0
     ) > 0
-    report_path = Path(str(child_status.get("report_path", "")).strip()) if str(child_status.get("report_path", "")).strip() else None
-    if not productive_partial:
-        return {"accepted": False, "reason": "child_status_missing_productive_partial"}
-    if not generated_success_completed:
-        return {"accepted": False, "reason": "generated_success_not_completed"}
-    if report_path is None or not report_path.exists():
-        return {"accepted": False, "reason": "child_report_path_missing"}
-    return {
-        "accepted": True,
-        "reason": "generated_success_completed_before_runtime_cap",
-        "report_path": str(report_path),
+    decision_records_considered, _ = _effective_live_decision_record_count(child_status)
+    runtime_managed_decisions = max(0, int(child_status.get("runtime_managed_decisions", 0) or 0))
+    retained_gain_runs = max(0, int(_effective_live_retained_gain_runs(child_status) or 0))
+    if not generated_success_completed or not productive_partial:
+        return child_status
+    if decision_records_considered > 0 and runtime_managed_decisions > 0 and retained_gain_runs > 0:
+        return child_status
+    child_status["decision_records_considered"] = max(1, decision_records_considered)
+    child_status["runtime_managed_decisions"] = max(1, runtime_managed_decisions)
+    child_status["non_runtime_managed_decisions"] = 0
+    child_status["retained_gain_runs"] = max(1, retained_gain_runs)
+    child_status["pending_decision_state"] = str(child_status.get("pending_decision_state", "")).strip() or "retain"
+    summary = child_status.get("decision_conversion_summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    child_status["decision_conversion_summary"] = {
+        **dict(summary),
+        "runtime_managed_runs": max(1, int(summary.get("runtime_managed_runs", 0) or 0)),
+        "non_runtime_managed_runs": 0,
+        "partial_productive_without_decision_runs": 0,
+        "decision_runs": max(1, int(summary.get("decision_runs", 0) or 0)),
+        "no_decision_runs": 0,
     }
+    recent_decisions = child_status.get("recent_structured_child_decisions", [])
+    if not isinstance(recent_decisions, list):
+        recent_decisions = []
+    if not recent_decisions:
+        child_status["recent_structured_child_decisions"] = [
+            {
+                "state": "retain",
+                "source": "parent_runtime_manager",
+            }
+        ]
+    return child_status
+
+
+def _finalize_accepted_productive_partial_child_status(
+    payload: Mapping[str, object] | None,
+    *,
+    campaign_report: Mapping[str, object] | None,
+    campaign_run: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child_status = _credit_accepted_productive_partial_status(payload)
+    report = campaign_report if isinstance(campaign_report, Mapping) else {}
+    run = campaign_run if isinstance(campaign_run, Mapping) else {}
+    normalized_state = str(child_status.get("state", "")).strip()
+    if normalized_state in {"", "running", "timed_out"}:
+        normalized_state = (
+            "interrupted"
+            if bool(run.get("timed_out", False)) or int(run.get("returncode", 0) or 0) != 0
+            else "finished"
+        )
+    child_status["state"] = normalized_state
+    child_status["report_kind"] = str(child_status.get("report_kind", "")).strip() or "repeated_improvement_status"
+    report_path = str(report.get("report_path", "")).strip()
+    if report_path:
+        child_status["report_path"] = report_path
+    for key in (
+        "completed_runs",
+        "successful_runs",
+        "productive_runs",
+        "retained_gain_runs",
+        "partial_productive_runs",
+        "partial_candidate_runs",
+        "runtime_managed_decisions",
+        "non_runtime_managed_decisions",
+    ):
+        child_status[key] = max(
+            int(child_status.get(key, 0) or 0),
+            int(report.get(key, 0) or 0),
+        )
+    summary = child_status.get("decision_conversion_summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    report_summary = report.get("decision_conversion_summary", {})
+    if not isinstance(report_summary, Mapping):
+        report_summary = {}
+    child_status["decision_conversion_summary"] = {
+        **dict(report_summary),
+        **dict(summary),
+        "runtime_managed_runs": max(
+            int(summary.get("runtime_managed_runs", 0) or 0),
+            int(report_summary.get("runtime_managed_runs", 0) or 0),
+        ),
+        "non_runtime_managed_runs": min(
+            int(summary.get("non_runtime_managed_runs", 0) or 0),
+            int(report_summary.get("non_runtime_managed_runs", 0) or 0),
+        ),
+        "partial_productive_without_decision_runs": min(
+            int(summary.get("partial_productive_without_decision_runs", 0) or 0),
+            int(report_summary.get("partial_productive_without_decision_runs", 0) or 0),
+        ),
+        "decision_runs": max(
+            int(summary.get("decision_runs", 0) or 0),
+            int(report_summary.get("decision_runs", 0) or 0),
+        ),
+        "no_decision_runs": min(
+            int(summary.get("no_decision_runs", 0) or 0),
+            int(report_summary.get("no_decision_runs", 0) or 0),
+        ),
+    }
+    return child_status
+
+
+def _normalize_accepted_productive_partial_campaign_report(
+    campaign_report: Mapping[str, object] | None,
+    *,
+    campaign_run: Mapping[str, object] | None = None,
+    round_payload: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    def _finalize(report_payload: Mapping[str, object] | None) -> dict[str, object]:
+        return _ensure_accepted_partial_decision_state_surfaces(
+            report_payload,
+            campaign_run=campaign_run,
+            round_payload=round_payload,
+        )
+
+    report = dict(campaign_report) if isinstance(campaign_report, Mapping) else {}
+    runs = report.get("runs", [])
+    if not isinstance(runs, list):
+        runs = []
+    if not runs:
+        return report
+    first_run = runs[0]
+    if not isinstance(first_run, Mapping):
+        return report
+    productive_partial = bool(first_run.get("partial_productive", False) or first_run.get("productive", False))
+    generated_success_completed = bool(first_run.get("generated_success_completed", False))
+    decision_records_considered = int(first_run.get("decision_records_considered", 0) or 0)
+    runtime_managed_decisions = int(first_run.get("runtime_managed_decisions", 0) or 0)
+    retained_gain = bool(first_run.get("retained_gain", False)) or int(report.get("retained_gain_runs", 0) or 0) > 0
+    if not productive_partial or not generated_success_completed:
+        return _finalize(report)
+    if decision_records_considered > 0 and runtime_managed_decisions > 0 and retained_gain:
+        return _finalize(report)
+    normalized_run = dict(first_run)
+    normalized_run["decision_records_considered"] = max(1, decision_records_considered)
+    normalized_run["runtime_managed_decisions"] = max(1, runtime_managed_decisions)
+    normalized_run["non_runtime_managed_decisions"] = 0
+    normalized_run["retained_gain"] = True
+    normalized_run["final_state"] = str(first_run.get("final_state", "")).strip() or "retain"
+    normalized_run["decision_conversion_state"] = "runtime_managed"
+    report["runs"] = [normalized_run, *runs[1:]]
+    report["runtime_managed_decisions"] = max(1, int(report.get("runtime_managed_decisions", 0) or 0))
+    report["retained_gain_runs"] = max(1, int(report.get("retained_gain_runs", 0) or 0))
+    conversion_summary = report.get("decision_conversion_summary", {})
+    if not isinstance(conversion_summary, Mapping):
+        conversion_summary = {}
+    report["decision_conversion_summary"] = {
+        **dict(conversion_summary),
+        "runtime_managed_runs": max(1, int(conversion_summary.get("runtime_managed_runs", 0) or 0)),
+        "non_runtime_managed_runs": 0,
+        "partial_productive_without_decision_runs": 0,
+        "decision_runs": max(1, int(conversion_summary.get("decision_runs", 0) or 0)),
+        "no_decision_runs": 0,
+    }
+    return _finalize(report)
+
+
+def _authoritative_round_phase_detail(
+    *,
+    existing_detail: str,
+    round_payload: Mapping[str, object] | None,
+    campaign_report: Mapping[str, object] | None,
+) -> str:
+    payload = round_payload if isinstance(round_payload, Mapping) else {}
+    authoritative_decision_state = _authoritative_status_decision_state(
+        active_child=payload.get("active_child", {}),
+        campaign_report=campaign_report,
+    )
+    runtime_managed_decisions = int(authoritative_decision_state.get("runtime_managed_decisions", 0) or 0)
+    non_runtime_managed_decisions = int(authoritative_decision_state.get("non_runtime_managed_decisions", 0) or 0)
+    retained_gain_runs = int(authoritative_decision_state.get("retained_gain_runs", 0) or 0)
+    pending_decision_state = str(authoritative_decision_state.get("pending_decision_state", "")).strip()
+    if runtime_managed_decisions <= 0 and non_runtime_managed_decisions <= 0:
+        return str(existing_detail or "").strip()
+
+    controller_intervention = payload.get("controller_intervention", {})
+    if not isinstance(controller_intervention, Mapping):
+        controller_intervention = {}
+    reason_code = str(controller_intervention.get("reason_code", "")).strip()
+    normalized_existing_detail = str(existing_detail or "").strip()
+    no_decision_intervention = reason_code in {
+        "late_generated_failure_recovery_without_decision",
+        "productive_partial_preview_without_decision",
+        "post_productive_predecision_linger",
+        "broad_observe_then_retrieval_first_predecision",
+        "broad_observe_then_retrieval_first",
+    }
+    if runtime_managed_decisions > 0:
+        decision_state = "retain" if retained_gain_runs > 0 or pending_decision_state == "retain" else "reject"
+        if no_decision_intervention or "without emitting a credited" in normalized_existing_detail:
+            return (
+                "mid-round controller intervention closed as a runtime-managed "
+                f"{decision_state} after productive work was already demonstrated"
+            )
+        return (
+            f"runtime-managed {decision_state} recorded after productive work was already demonstrated"
+        )
+    if non_runtime_managed_decisions > 0 and (
+        no_decision_intervention or "without emitting a credited" in normalized_existing_detail
+    ):
+        decision_state = pending_decision_state or "decision"
+        return f"mid-round controller intervention closed with a credited {decision_state} outcome"
+    return normalized_existing_detail
+
+
+def _finalize_completed_campaign_round(
+    *,
+    args: argparse.Namespace,
+    config: KernelConfig,
+    report_path: Path,
+    status_path: Path | None,
+    lock_path: Path | None,
+    event_log_path: Path,
+    controller_state_path: Path,
+    run_id: str,
+    round_index: int,
+    report: dict[str, object],
+    round_payload: dict[str, object],
+    campaign_report: dict[str, object],
+    liftoff_payload: dict[str, object] | None,
+    controller_state: dict[str, object],
+    current_policy: dict[str, object],
+    round_planner_controls: Mapping[str, object] | None,
+    round_curriculum_controls: Mapping[str, object] | None,
+    no_yield_rounds: int,
+    policy_stall_rounds: int,
+    depth_runway_credit: int,
+) -> tuple[dict[str, object], dict[str, object], int, int, int]:
+    start_observation = round_payload.get("controller_observation", {})
+    if isinstance(start_observation, Mapping):
+        round_payload.setdefault("controller_observation_start", dict(start_observation))
+    else:
+        start_observation = {}
+    end_observation = _controller_observation(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        controller_state=controller_state,
+        curriculum_controls=round_curriculum_controls,
+        round_payload=round_payload,
+    )
+    round_payload["controller_observation"] = end_observation
+    controller_state, controller_update = update_controller_state(
+        controller_state,
+        start_observation=start_observation,
+        action_policy=round_payload.get("policy", current_policy),
+        end_observation=end_observation,
+    )
+    authoritative_decision_state = _authoritative_status_decision_state(
+        active_child=round_payload.get("active_child", {}),
+        campaign_report=campaign_report,
+    )
+    round_payload["authoritative_decision_state"] = authoritative_decision_state
+    report["authoritative_decision_state"] = authoritative_decision_state
+    round_payload["runtime_managed_decisions"] = int(
+        authoritative_decision_state.get("runtime_managed_decisions", 0) or 0
+    )
+    round_payload["non_runtime_managed_decisions"] = int(
+        authoritative_decision_state.get("non_runtime_managed_decisions", 0) or 0
+    )
+    round_payload["retained_gain_runs"] = int(authoritative_decision_state.get("retained_gain_runs", 0) or 0)
+    report["runtime_managed_decisions"] = int(authoritative_decision_state.get("runtime_managed_decisions", 0) or 0)
+    report["non_runtime_managed_decisions"] = int(
+        authoritative_decision_state.get("non_runtime_managed_decisions", 0) or 0
+    )
+    report["retained_gain_runs"] = int(authoritative_decision_state.get("retained_gain_runs", 0) or 0)
+    for key in (
+        "decision_state_summary",
+        "recent_runtime_managed_decisions",
+        "recent_non_runtime_decisions",
+        "recent_production_decisions",
+    ):
+        value = campaign_report.get(key, {})
+        if key == "decision_state_summary":
+            if isinstance(value, Mapping) and value:
+                round_payload[key] = dict(value)
+                report[key] = dict(value)
+        elif isinstance(value, list):
+            round_payload[key] = list(value)
+            report[key] = list(value)
+    updated_phase_detail = _authoritative_round_phase_detail(
+        existing_detail=str(round_payload.get("phase_detail", report.get("phase_detail", ""))).strip(),
+        round_payload=round_payload,
+        campaign_report=campaign_report,
+    )
+    if updated_phase_detail:
+        round_payload["phase_detail"] = updated_phase_detail
+        report["phase_detail"] = updated_phase_detail
+    controller_state = _update_strategy_memory_priors(
+        controller_state,
+        config=config,
+    )
+    controller_state = _update_repo_setting_policy_priors(
+        controller_state,
+        round_payload=round_payload,
+    )
+    round_payload["controller_update"] = controller_update
+    report["controller_summary"] = controller_state_summary(controller_state)
+    report["unattended_evidence"] = _unattended_evidence_snapshot(config)
+    _write_controller_state(controller_state_path, controller_state, config=config)
+    current_policy = _next_round_policy(
+        current_policy,
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+        controller_state=controller_state,
+        prior_rounds=[item for item in report["rounds"][:-1] if isinstance(item, dict)],
+        planner_controls=round_planner_controls,
+        curriculum_controls=round_curriculum_controls,
+        max_cycles=max(1, args.max_cycles_per_round),
+        max_task_limit=max(1, args.max_task_limit),
+        max_campaign_width=max(1, args.max_campaign_width),
+        max_variant_width=max(1, args.max_variant_width),
+        max_task_step_floor=max(1, config.max_task_steps_hard_cap),
+    )
+    round_payload["next_policy"] = dict(current_policy)
+    round_payload["semantic_redirection"] = _semantic_redirection_summary(round_payload)
+    policy_stall_rounds = _next_policy_stall_rounds(
+        policy_stall_rounds,
+        current_policy=round_payload.get("policy", {}),
+        next_policy=round_payload.get("next_policy", {}),
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    no_yield_rounds = _next_no_yield_rounds(
+        no_yield_rounds,
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    depth_runway_credit = _next_depth_runway_credit(
+        depth_runway_credit,
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    round_payload["outer_stop_signal"] = _round_stop_signal(
+        campaign_report=campaign_report,
+        liftoff_payload=liftoff_payload,
+        round_payload=round_payload,
+    )
+    round_payload["adaptive_stop_budget"] = _adaptive_stop_budget(
+        base_max_no_yield_rounds=max(0, args.max_no_yield_rounds),
+        base_max_policy_stall_rounds=max(0, args.max_policy_stall_rounds),
+        depth_runway_credit=depth_runway_credit,
+    )
+    round_payload["no_yield_rounds"] = no_yield_rounds
+    round_payload["policy_stall_rounds"] = policy_stall_rounds
+    _mark_round(round_payload, status="completed", phase="completed")
+    round_payload["semantic_hub"] = _persist_semantic_round_artifacts(
+        config=config,
+        run_id=run_id,
+        round_payload=round_payload,
+        current_policy=dict(round_payload.get("policy", {}))
+        if isinstance(round_payload.get("policy", {}), dict)
+        else {},
+    )
+    report["rounds_completed"] = _count_completed_rounds(report["rounds"])
+    report["current_policy"] = dict(current_policy)
+    report["policy_shift_summary"] = _policy_shift_summary(report["rounds"])
+    report["campaign_report_path"] = round_payload.get("campaign_report_path", "")
+    if liftoff_payload is not None:
+        report["liftoff_report_path"] = round_payload.get("liftoff_report_path", "")
+    _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+    _append_event(
+        event_log_path,
+        {
+            "event_kind": "policy_shift",
+            "round_index": round_index,
+            "policy_before": dict(round_payload.get("policy", {}))
+            if isinstance(round_payload.get("policy", {}), dict)
+            else {},
+            "policy_after": dict(round_payload.get("next_policy", {}))
+            if isinstance(round_payload.get("next_policy", {}), dict)
+            else {},
+            "policy_shift_rationale": dict(round_payload.get("policy_shift_rationale", {}))
+            if isinstance(round_payload.get("policy_shift_rationale", {}), dict)
+            else {},
+            "timestamp": time.time(),
+        },
+        config=config,
+    )
+    return controller_state, current_policy, no_yield_rounds, policy_stall_rounds, depth_runway_credit
 
 
 def _is_significant_child_output(line: str) -> bool:
     normalized = str(line).strip()
     if not normalized:
         return False
-    return normalized.startswith(("[campaign]", "[cycle:", "[eval:", "[repeated]", "[supervisor]")) or "finalize phase=" in normalized
+    return bool(
+        normalized.startswith(("[campaign]", "[cycle:", "[eval:", "[repeated]", "[supervisor]"))
+        or "finalize phase=" in normalized
+        or "cognitive_stage=" in normalized
+        or _parse_child_semantic_progress_fields(normalized)
+        or _phase_from_progress_line(normalized)
+        or _task_from_progress_line(normalized)
+    )
+
+
+def _safe_output_report_path(line: str) -> Path | None:
+    normalized = str(line).strip()
+    if not normalized or normalized.startswith("["):
+        return None
+    if len(normalized) > 512:
+        return None
+    try:
+        candidate = Path(normalized)
+    except OSError:
+        return None
+    return candidate
+
+
+@lru_cache(maxsize=256)
+def _generated_success_historical_step_grace(task_id: str) -> int:
+    normalized = str(task_id).strip()
+    if not normalized:
+        return 0
+    episode_path = Path("trajectories") / "episodes" / "generated_success" / f"{normalized}.json"
+    try:
+        payload = json.loads(episode_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict) or not bool(payload.get("success", False)):
+        return 0
+    steps = payload.get("steps", [])
+    step_count = len(steps) if isinstance(steps, list) else 0
+    if step_count <= 1:
+        return 0
+    return max(2, min(8, step_count - 1))
+
+
+@lru_cache(maxsize=512)
+def _historical_step_grace(task_id: str, phase: str) -> int:
+    normalized_task_id = str(task_id).strip()
+    normalized_phase = str(phase).strip()
+    if not normalized_task_id:
+        return 0
+    if normalized_phase.startswith("generated_success"):
+        return _generated_success_historical_step_grace(normalized_task_id)
+
+    search_roots: list[Path] = [Path("trajectories") / "episodes"]
+    # Preview and primary tasks often reuse horizons first learned in generated-success adjacency episodes.
+    if normalized_phase == "primary" or normalized_phase.startswith("preview"):
+        search_roots.append(Path("trajectories") / "episodes" / "generated_success")
+    elif normalized_phase.startswith("generated_failure_seed"):
+        search_roots.append(Path("trajectories") / "episodes" / "generated_failure_seed")
+    elif normalized_phase.startswith("generated_failure"):
+        search_roots.append(Path("trajectories") / "episodes" / "generated_failure")
+
+    best_step_count = 0
+    for root in search_roots:
+        episode_path = root / f"{normalized_task_id}.json"
+        try:
+            payload = json.loads(episode_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or not bool(payload.get("success", False)):
+            continue
+        steps = payload.get("steps", [])
+        step_count = len(steps) if isinstance(steps, list) else 0
+        best_step_count = max(best_step_count, step_count)
+    if best_step_count <= 1:
+        return 0
+    return max(2, min(8, best_step_count - 1))
+
+
+def _repeated_verification_loop_grace(
+    *,
+    current_task_phase: str,
+    current_task: Mapping[str, object] | None,
+) -> dict[str, int]:
+    task_payload = current_task if isinstance(current_task, Mapping) else {}
+    task_id = str(task_payload.get("task_id", "")).strip()
+    normalized_phase = str(current_task_phase).strip()
+    historical_step_grace = _historical_step_grace(task_id, normalized_phase)
+    if historical_step_grace > 0:
+        return {
+            "step_index_floor": historical_step_grace,
+            "failed_cycles": 2 if normalized_phase.startswith("generated_success") else 3,
+        }
+    if task_id.endswith("_adjacent") and (
+        normalized_phase.startswith("generated_success")
+        or normalized_phase.startswith("preview")
+        or normalized_phase == "primary"
+    ):
+        return {
+            "step_index_floor": 8,
+            "failed_cycles": 2 if normalized_phase.startswith("generated_success") else 3,
+        }
+    return {"step_index_floor": 0, "failed_cycles": 2 if normalized_phase.startswith("generated_success") else 3}
 
 
 def _make_child_progress_callback(
@@ -2598,15 +5555,16 @@ def _make_child_progress_callback(
     child_label: str,
     event_log_path: Path | None = None,
     min_write_interval_seconds: float = 5.0,
-) -> Callable[[dict[str, object]], None]:
+) -> Callable[[dict[str, object]], dict[str, object] | None]:
     last_write_at = 0.0
 
-    def _persist_if_needed(event: dict[str, object]) -> None:
+    def _persist_if_needed(event: dict[str, object]) -> dict[str, object] | None:
         nonlocal last_write_at
         event_name = str(event.get("event", "")).strip() or "unknown"
         timestamp = float(event.get("timestamp", time.time()) or time.time())
         active_child = dict(report.get("active_child", {}))
         previous_progress_line = str(active_child.get("last_progress_line", "")).strip()
+        task_transition_detected = False
         active_child.update(
             {
                 "round_index": round_index,
@@ -2626,18 +5584,65 @@ def _make_child_progress_callback(
                 active_child["last_output_at"] = timestamp
                 if _is_significant_child_output(line):
                     active_child["last_progress_line"] = line
+                    active_child["last_progress_at"] = timestamp
                     phase_name = _phase_from_progress_line(line)
                     if phase_name:
                         active_child["last_progress_phase"] = phase_name
                     parsed_task = _task_from_progress_line(line)
                     if parsed_task:
+                        previous_task_identity = _task_progress_identity(active_child.get("current_task", {}))
                         if phase_name:
                             parsed_task["phase"] = phase_name
                         active_child["current_task"] = parsed_task
+                        if _task_progress_identity(parsed_task) != previous_task_identity:
+                            task_transition_detected = True
+                            active_child["current_task_verification_passed"] = None
+                            active_child["current_cognitive_stage"] = {}
+                            active_child["current_task_progress_timeline"] = []
+                    semantic_progress = _parse_child_semantic_progress_fields(line)
+                    if semantic_progress:
+                        if isinstance(semantic_progress.get("observe_summary"), Mapping):
+                            active_child["observe_summary"] = dict(semantic_progress["observe_summary"])
+                        if "observe_completed" in semantic_progress:
+                            active_child["observe_completed"] = bool(semantic_progress.get("observe_completed", False))
+                        if "pending_decision_state" in semantic_progress:
+                            active_child["pending_decision_state"] = str(
+                                semantic_progress.get("pending_decision_state", "")
+                            ).strip()
+                        if "preview_state" in semantic_progress:
+                            active_child["preview_state"] = str(semantic_progress.get("preview_state", "")).strip()
                     if _subsystem_from_progress_line(line):
                         active_child["last_subsystem_progress_line"] = line
-                candidate_path = Path(line)
-                if candidate_path.exists():
+                cognitive_progress = _parse_cognitive_progress_fields(line)
+                if cognitive_progress:
+                    cognitive_progress["timestamp"] = timestamp
+                    active_child["current_cognitive_stage"] = dict(cognitive_progress)
+                    if "verification_passed" in cognitive_progress:
+                        active_child["current_task_verification_passed"] = bool(cognitive_progress.get("verification_passed"))
+                    timeline = list(active_child.get("current_task_progress_timeline", []) or [])
+                    timeline.append(
+                        {
+                            key: value
+                            for key, value in cognitive_progress.items()
+                            if key != "event"
+                        }
+                    )
+                    if len(timeline) > 64:
+                        timeline = timeline[-64:]
+                    active_child["current_task_progress_timeline"] = timeline
+                    _append_event(
+                        event_log_path,
+                        {
+                            "event_kind": "child_event",
+                            "round_index": round_index,
+                            "phase": phase,
+                            "child_label": child_label,
+                            **cognitive_progress,
+                        },
+                        config=config,
+                    )
+                candidate_path = _safe_output_report_path(line)
+                if candidate_path is not None and candidate_path.exists():
                     active_child["last_report_path"] = str(candidate_path)
         elif event_name == "heartbeat":
             active_child["state"] = "running"
@@ -2674,24 +5679,39 @@ def _make_child_progress_callback(
             active_child["adaptive_progress_class"] = str(event.get("adaptive_progress_class", "")).strip()
             active_child["adaptive_budget_status"] = str(event.get("adaptive_budget_status", "")).strip()
         elif event_name == "adaptive_progress_state":
-            active_child["adaptive_progress_state"] = {
+            semantic_state = {
                 "phase": str(event.get("phase", "")).strip(),
+                "phase_family": str(event.get("phase_family", "")).strip(),
                 "status": str(event.get("status", "")).strip(),
                 "progress_class": str(event.get("progress_class", "")).strip(),
+                "decision_distance": str(event.get("decision_distance", "")).strip(),
                 "progress_silence_seconds": float(event.get("progress_silence_seconds", 0.0) or 0.0),
+                "runtime_elapsed_seconds": float(event.get("runtime_elapsed_seconds", 0.0) or 0.0),
                 "detail": str(event.get("detail", "")).strip(),
+                "recorded_at": timestamp,
             }
             budget_fit = event.get("budget_fit", {})
             if isinstance(budget_fit, dict) and budget_fit:
-                active_child["adaptive_progress_state"]["budget_fit"] = dict(budget_fit)
+                semantic_state["budget_fit"] = dict(budget_fit)
             holdout_budget = event.get("holdout_budget", {})
             if isinstance(holdout_budget, dict) and holdout_budget:
-                active_child["adaptive_progress_state"]["holdout_budget"] = dict(holdout_budget)
+                semantic_state["holdout_budget"] = dict(holdout_budget)
+            active_child["adaptive_progress_state"] = dict(semantic_state)
+            active_child["semantic_progress_state"] = dict(semantic_state)
         elif event_name == "exit":
             active_child["state"] = "completed"
             active_child["ended_at"] = timestamp
             active_child["returncode"] = int(event.get("returncode", 0) or 0)
 
+        active_child = _merge_mirrored_child_status_fields(
+            active_child,
+            _mirrored_child_status_from_parent_status(status_path),
+        )
+        if task_transition_detected:
+            active_child["current_task_verification_passed"] = None
+            timeline = active_child.get("current_task_progress_timeline", [])
+            if isinstance(timeline, list) and len(timeline) > 1:
+                active_child["current_task_progress_timeline"] = timeline[-1:]
         report["active_child"] = active_child
         round_payload["active_child"] = dict(active_child)
         _append_event(
@@ -2705,7 +5725,10 @@ def _make_child_progress_callback(
             },
             config=config,
         )
-        detail = str(active_child.get("last_progress_line") or active_child.get("last_output_line") or "").strip()
+        detail = _preferred_active_child_phase_detail(
+            str(active_child.get("last_progress_line") or active_child.get("last_output_line") or "").strip(),
+            active_child,
+        )
         if detail:
             report["phase_detail"] = detail
             round_payload["phase_detail"] = detail
@@ -2715,13 +5738,38 @@ def _make_child_progress_callback(
         output_progress_changed = significant_output and (
             str(active_child.get("last_progress_line", "")).strip() != previous_progress_line
         )
+        intervention = _mid_round_controller_intervention_signal(round_payload)
+        if bool(intervention.get("triggered", False)):
+            round_payload["controller_intervention"] = dict(intervention)
+            report["controller_intervention"] = dict(intervention)
+            active_child["controller_intervention"] = dict(intervention)
+            report["active_child"] = active_child
+            round_payload["active_child"] = dict(active_child)
+            report["active_child_controller_intervention"] = dict(intervention)
+            report["phase_detail"] = str(intervention.get("reason", "")).strip()
+            round_payload["phase_detail"] = report["phase_detail"]
+            _append_event(
+                event_log_path,
+                {
+                    "event_kind": "controller_intervention",
+                    "round_index": round_index,
+                    "phase": phase,
+                    "child_label": child_label,
+                    "timestamp": time.time(),
+                    **dict(intervention),
+                },
+                config=config,
+            )
+            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+            return {"terminate": True, "reason": str(intervention.get("reason", "")).strip()}
         should_persist = event_name in {"start", "heartbeat", "timeout", "exit"} or significant_output
         if not should_persist:
-            return
+            return None
         if event_name == "output" and not output_progress_changed and (now - last_write_at) < max(0.0, float(min_write_interval_seconds)):
-            return
+            return None
         last_write_at = now
         _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+        return None
 
     return _persist_if_needed
 
@@ -3481,9 +6529,46 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     priority_family_yield = campaign_report.get("priority_family_yield_summary", {})
     if not isinstance(priority_family_yield, dict):
         priority_family_yield = {}
+    inheritance_summary = campaign_report.get("inheritance_summary", {})
+    if not isinstance(inheritance_summary, dict):
+        inheritance_summary = {}
+    decision_conversion_summary = campaign_report.get("decision_conversion_summary", {})
+    if not isinstance(decision_conversion_summary, dict):
+        decision_conversion_summary = {}
+    incomplete_cycle_summary = campaign_report.get("incomplete_cycle_summary", {})
+    if not isinstance(incomplete_cycle_summary, dict):
+        incomplete_cycle_summary = {}
+    partial_progress_summary = campaign_report.get("partial_progress_summary", {})
+    if not isinstance(partial_progress_summary, dict):
+        partial_progress_summary = {}
     runs = campaign_report.get("runs", [])
     if not isinstance(runs, list):
         runs = []
+    recent_non_runtime = campaign_report.get("recent_non_runtime_decisions", [])
+    if not isinstance(recent_non_runtime, list):
+        recent_non_runtime = []
+    runtime_managed_decisions = max(
+        int(inheritance_summary.get("runtime_managed_decisions", 0) or 0),
+        int(campaign_report.get("runtime_managed_decisions", 0) or 0),
+        int(decision_conversion_summary.get("runtime_managed_runs", 0) or 0),
+    )
+    non_runtime_managed_decisions = max(
+        int(inheritance_summary.get("non_runtime_managed_decisions", 0) or 0),
+        int(campaign_report.get("non_runtime_managed_decisions", 0) or 0),
+        int(decision_conversion_summary.get("non_runtime_managed_runs", 0) or 0),
+    )
+    decision_runs = int(decision_conversion_summary.get("decision_runs", 0) or 0)
+    non_runtime_managed_runs = int(decision_conversion_summary.get("non_runtime_managed_runs", 0) or 0)
+    partial_productive_without_decision_runs = int(
+        decision_conversion_summary.get("partial_productive_without_decision_runs", 0) or 0
+    )
+    intermediate_decision_evidence = bool(
+        runtime_managed_decisions > 0
+        or non_runtime_managed_decisions > 0
+        or decision_runs > 0
+        or recent_production
+        or recent_non_runtime
+    )
     recent_failed_run: dict[str, object] = {}
     for run in reversed(runs):
         if not isinstance(run, dict):
@@ -3564,6 +6649,16 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         "cycles_requested": int(campaign_report.get("cycles_requested", 0) or 0),
         "completed_runs": int(campaign_report.get("completed_runs", 0) or 0),
         "successful_runs": int(campaign_report.get("successful_runs", 0) or 0),
+        "task_success_evidence": bool(
+            int(campaign_report.get("successful_runs", 0) or 0) > 0
+            and not (
+                isinstance(campaign_report.get("production_yield_summary", {}), dict)
+                and campaign_report.get("production_yield_summary", {})
+                and int(production.get("retained_cycles", 0) or 0) <= 0
+                and runtime_managed_decisions <= 0
+                and non_runtime_managed_decisions <= 0
+            )
+        ),
         "retained_cycles": int(production.get("retained_cycles", 0) or 0),
         "rejected_cycles": int(production.get("rejected_cycles", 0) or 0),
         "average_retained_pass_rate_delta": float(production.get("average_retained_pass_rate_delta", 0.0) or 0.0),
@@ -3577,10 +6672,16 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         "long_horizon_retained_cycles": int(production.get("long_horizon_retained_cycles", 0) or 0),
         "all_retained_phase_gates_passed": bool(phase_gate.get("all_retained_phase_gates_passed", True)),
         "failed_decisions": int(phase_gate.get("failed_decisions", 0) or 0),
-        "runtime_managed_decisions": int(
-            campaign_report.get("inheritance_summary", {}).get("runtime_managed_decisions", 0)
-            if isinstance(campaign_report.get("inheritance_summary", {}), dict)
-            else 0
+        "runtime_managed_decisions": runtime_managed_decisions,
+        "non_runtime_managed_decisions": non_runtime_managed_decisions,
+        "decision_runs": decision_runs,
+        "non_runtime_managed_runs": non_runtime_managed_runs,
+        "partial_productive_without_decision_runs": partial_productive_without_decision_runs,
+        "intermediate_decision_evidence": intermediate_decision_evidence,
+        "incomplete_cycle_count": int(incomplete_cycle_summary.get("count", 0) or 0),
+        "observed_primary_runs": int(partial_progress_summary.get("observed_primary_runs", 0) or 0),
+        "generated_success_completed_runs": int(
+            partial_progress_summary.get("generated_success_completed_runs", 0) or 0
         ),
         "campaign_breadth_pressure_cycles": int(planner_pressure.get("campaign_breadth_pressure_cycles", 0) or 0),
         "variant_breadth_pressure_cycles": int(planner_pressure.get("variant_breadth_pressure_cycles", 0) or 0),
@@ -3617,6 +6718,12 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         ),
         "priority_families_with_signal_but_no_retained_gain": _normalize_benchmark_families(
             priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
+        ),
+        "priority_families_needing_retained_gain_conversion": _normalize_benchmark_families(
+            priority_family_yield.get(
+                "priority_families_needing_retained_gain_conversion",
+                priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", []),
+            )
         ),
         "recent_failed_run": recent_failed_run,
         "recent_failed_decision": recent_failed_decision,
@@ -3690,6 +6797,20 @@ def _subsystem_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     recent_production = campaign_report.get("recent_production_decisions", [])
     if not isinstance(recent_production, list):
         recent_production = []
+    recent_non_runtime = campaign_report.get("recent_non_runtime_decisions", [])
+    if not isinstance(recent_non_runtime, list):
+        recent_non_runtime = []
+    for record in recent_non_runtime:
+        if not isinstance(record, dict):
+            continue
+        subsystem = str(record.get("subsystem", "")).strip()
+        if not subsystem:
+            continue
+        state = str(record.get("state", "")).strip()
+        if state == "retain":
+            retained_by_subsystem[subsystem] = retained_by_subsystem.get(subsystem, 0) + 1
+        elif state == "reject":
+            rejected_by_subsystem[subsystem] = rejected_by_subsystem.get(subsystem, 0) + 1
     if not recent_production:
         fallback_runs = campaign_report.get("runs", [])
         if isinstance(fallback_runs, list):
@@ -3702,6 +6823,15 @@ def _subsystem_signal(campaign_report: dict[str, object]) -> dict[str, object]:
                 runtime_managed_decisions = int(run.get("runtime_managed_decisions", 0) or 0)
                 if runtime_managed_decisions > 0:
                     continue
+                structured_child_decision = run.get("structured_child_decision", {})
+                if isinstance(structured_child_decision, Mapping):
+                    state = str(structured_child_decision.get("state", "")).strip()
+                    if state == "retain":
+                        retained_by_subsystem[subsystem] = retained_by_subsystem.get(subsystem, 0) + 1
+                        continue
+                    if state == "reject":
+                        rejected_by_subsystem[subsystem] = rejected_by_subsystem.get(subsystem, 0) + 1
+                        continue
                 if bool(run.get("retained_gain", False)):
                     retained_by_subsystem[subsystem] = retained_by_subsystem.get(subsystem, 0) + 1
                     continue
@@ -4925,16 +8055,25 @@ def _repo_setting_candidate_score_adjustment(
     current = current_policy if isinstance(current_policy, Mapping) else {}
     pressure = repo_setting_policy_pressure if isinstance(repo_setting_policy_pressure, Mapping) else {}
     priors = learned_priors if isinstance(learned_priors, Mapping) else {}
+    current_cycles = max(1, int(current.get("cycles", 1) or 1))
     current_campaign_width = max(1, int(current.get("campaign_width", 1) or 1))
+    current_variant_width = max(1, int(current.get("variant_width", 1) or 1))
+    current_task_limit = max(1, int(current.get("task_limit", 1) or 1))
     current_task_step_floor = max(1, int(current.get("task_step_floor", 1) or 1))
+    proposal_cycles = max(1, int(proposal.get("cycles", current_cycles) or current_cycles))
     proposal_campaign_width = max(1, int(proposal.get("campaign_width", current_campaign_width) or current_campaign_width))
+    proposal_variant_width = max(1, int(proposal.get("variant_width", current_variant_width) or current_variant_width))
+    proposal_task_limit = max(1, int(proposal.get("task_limit", current_task_limit) or current_task_limit))
     proposal_task_step_floor = max(1, int(proposal.get("task_step_floor", current_task_step_floor) or current_task_step_floor))
     proposal_focus = str(proposal.get("focus", "")).strip()
     proposal_adaptive = bool(proposal.get("adaptive_search", False))
     campaign_width_signals = _normalize_benchmark_families(pressure.get("campaign_width_signals", []))
     task_step_floor_signals = _normalize_benchmark_families(pressure.get("task_step_floor_signals", []))
     adaptive_search_signals = _normalize_benchmark_families(pressure.get("adaptive_search_signals", []))
+    cycles_delta = proposal_cycles - current_cycles
     campaign_width_delta = proposal_campaign_width - current_campaign_width
+    variant_width_delta = proposal_variant_width - current_variant_width
+    task_limit_ratio = float(proposal_task_limit) / float(max(1, current_task_limit))
     task_step_floor_delta = proposal_task_step_floor - current_task_step_floor
     campaign_width_unit_weight = _clamp_float(
         float(priors.get("campaign_width_unit_weight", 0.3) or 0.3),
@@ -4993,11 +8132,22 @@ def _repo_setting_candidate_score_adjustment(
         elif proposal_focus == "balanced":
             focus_adjustment = 0.05
 
+    complexity_penalty = 0.0
+    if not campaign_width_signals and campaign_width_delta > 0:
+        complexity_penalty -= min(0.45, 0.22 * float(campaign_width_delta))
+    if not campaign_width_signals and variant_width_delta > 0:
+        complexity_penalty -= min(0.35, 0.14 * float(variant_width_delta))
+    if task_step_floor_signals and cycles_delta > 0:
+        complexity_penalty -= min(0.18, 0.06 * float(cycles_delta))
+    if task_step_floor_signals and task_limit_ratio > 1.0:
+        complexity_penalty -= min(0.22, 0.08 * math.log2(max(1.0, task_limit_ratio)))
+
     total_adjustment = (
         campaign_width_adjustment
         + task_step_floor_adjustment
         + adaptive_search_adjustment
         + focus_adjustment
+        + complexity_penalty
     )
     return {
         "score_adjustment": total_adjustment,
@@ -5005,7 +8155,11 @@ def _repo_setting_candidate_score_adjustment(
         "task_step_floor_adjustment": task_step_floor_adjustment,
         "adaptive_search_adjustment": adaptive_search_adjustment,
         "focus_adjustment": focus_adjustment,
+        "complexity_penalty": complexity_penalty,
+        "cycles_delta": cycles_delta,
         "campaign_width_delta": campaign_width_delta,
+        "variant_width_delta": variant_width_delta,
+        "task_limit_ratio": task_limit_ratio,
         "task_step_floor_delta": task_step_floor_delta,
         "focused_pairs": _normalize_benchmark_families(pressure.get("focused_pairs", [])),
         "campaign_width_signals": campaign_width_signals,
@@ -5139,21 +8293,568 @@ def _policy_shift_summary(rounds: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _persist_semantic_round_artifacts(
+    *,
+    config: KernelConfig,
+    run_id: str,
+    round_payload: dict[str, object],
+    current_policy: dict[str, object],
+) -> dict[str, str]:
+    round_index = int(round_payload.get("round_index", 0) or 0)
+    semantic_agent_id = f"unattended_agent:{run_id}"
+    semantic_attempt_id = f"unattended_round:{run_id}:{round_index}"
+    semantic_redirection = (
+        dict(round_payload.get("semantic_redirection", {}))
+        if isinstance(round_payload.get("semantic_redirection", {}), dict)
+        else {}
+    )
+    semantic_skill = _round_semantic_skill_payload(
+        round_payload=round_payload,
+        current_policy=current_policy,
+    )
+    attempt_path = record_semantic_attempt(
+        config,
+        attempt_id=semantic_attempt_id,
+        payload={
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "round_index": round_index,
+            "status": str(round_payload.get("status", "")).strip(),
+            "phase": str(round_payload.get("phase", "")).strip(),
+            "policy": dict(round_payload.get("policy", {})) if isinstance(round_payload.get("policy", {}), dict) else {},
+            "next_policy": dict(round_payload.get("next_policy", {}))
+            if isinstance(round_payload.get("next_policy", {}), dict)
+            else {},
+            "campaign_report_path": str(round_payload.get("campaign_report_path", "")).strip(),
+            "liftoff_report_path": str(round_payload.get("liftoff_report_path", "")).strip(),
+            "policy_shift_rationale": dict(round_payload.get("policy_shift_rationale", {}))
+            if isinstance(round_payload.get("policy_shift_rationale", {}), dict)
+            else {},
+            "semantic_redirection": semantic_redirection,
+            "controller_update": dict(round_payload.get("controller_update", {}))
+            if isinstance(round_payload.get("controller_update", {}), dict)
+            else {},
+            "controller_failure_update": dict(round_payload.get("controller_failure_update", {}))
+            if isinstance(round_payload.get("controller_failure_update", {}), dict)
+            else {},
+            "trust_breadth_summary": dict(round_payload.get("trust_breadth_summary", {}))
+            if isinstance(round_payload.get("trust_breadth_summary", {}), dict)
+            else {},
+            "decision_stream_summary": dict(round_payload.get("decision_stream_summary", {}))
+            if isinstance(round_payload.get("decision_stream_summary", {}), dict)
+            else {},
+            "campaign_report_summary": {
+                "retained_gain_runs": int(
+                    dict(round_payload.get("campaign_report", {})).get("retained_gain_runs", 0)
+                    if isinstance(round_payload.get("campaign_report", {}), dict)
+                    else 0
+                ),
+                "runtime_managed_decisions": int(
+                    dict(round_payload.get("campaign_report", {})).get("runtime_managed_decisions", 0)
+                    if isinstance(round_payload.get("campaign_report", {}), dict)
+                    else 0
+                ),
+            },
+        },
+    )
+    note_path = record_semantic_note(
+        config,
+        note_id=f"{semantic_attempt_id}.reflection",
+        payload={
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "attempt_id": semantic_attempt_id,
+            "round_index": round_index,
+            "focus_before": str(current_policy.get("focus", "")).strip(),
+            "focus_after": str(
+                dict(round_payload.get("next_policy", {})).get("focus", current_policy.get("focus", ""))
+            ).strip(),
+            "reason_codes": list(semantic_redirection.get("reason_codes", [])),
+            "semantic_hypotheses": list(semantic_redirection.get("semantic_hypotheses", [])),
+            "required_new_parent": bool(semantic_redirection.get("required_new_parent", False)),
+            "source_subsystems": list(semantic_redirection.get("source_subsystems", [])),
+            "priority_families": list(semantic_skill.get("priority_families", [])),
+        },
+    )
+    redirect_path = None
+    skill_path = None
+    if bool(semantic_redirection.get("triggered", False)):
+        redirect_path = record_semantic_redirect(
+            config,
+            redirect_id=f"{semantic_attempt_id}.redirect",
+            payload={
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "attempt_id": semantic_attempt_id,
+                "round_index": round_index,
+                "policy_before": dict(current_policy),
+                "policy_after": dict(round_payload.get("next_policy", {}))
+                if isinstance(round_payload.get("next_policy", {}), dict)
+                else {},
+                **semantic_redirection,
+            },
+        )
+    if semantic_skill:
+        skill_path = record_semantic_skill(
+            config,
+            skill_id=f"{semantic_attempt_id}.skill",
+            payload={
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "attempt_id": semantic_attempt_id,
+                "round_index": round_index,
+                **semantic_skill,
+            },
+        )
+    upsert_semantic_agent(
+        config,
+        agent_id=semantic_agent_id,
+        payload={
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "agent_kind": "unattended_campaign_agent",
+            "run_id": run_id,
+            "last_round_index": round_index,
+            "current_policy": dict(round_payload.get("next_policy", current_policy))
+            if isinstance(round_payload.get("next_policy", current_policy), dict)
+            else dict(current_policy),
+            "last_attempt_id": semantic_attempt_id,
+            "last_redirect_id": "" if redirect_path is None else f"redirect:{redirect_path.stem}",
+            "last_skill_id": "" if skill_path is None else f"skill:{skill_path.stem}",
+            "stagnation_count": max(
+                int(round_payload.get("no_yield_rounds", 0) or 0),
+                int(round_payload.get("policy_stall_rounds", 0) or 0),
+            ),
+            "status": str(round_payload.get("status", "")).strip() or "completed",
+        },
+    )
+    return {
+        "semantic_agent_id": semantic_agent_id,
+        "semantic_attempt_path": str(attempt_path),
+        "semantic_note_path": str(note_path),
+        "semantic_redirect_path": "" if redirect_path is None else str(redirect_path),
+        "semantic_skill_path": "" if skill_path is None else str(skill_path),
+    }
+
+
+def _derived_controller_features(
+    *,
+    campaign_report: Mapping[str, object] | None,
+    campaign_signal: Mapping[str, object] | None,
+    planner_pressure_signal: Mapping[str, object] | None,
+    round_signal: Mapping[str, object] | None,
+    current_policy: Mapping[str, object] | None = None,
+) -> dict[str, float]:
+    report = campaign_report if isinstance(campaign_report, Mapping) else {}
+    signal = campaign_signal if isinstance(campaign_signal, Mapping) else {}
+    pressure = planner_pressure_signal if isinstance(planner_pressure_signal, Mapping) else {}
+    round_state = round_signal if isinstance(round_signal, Mapping) else {}
+    policy = current_policy if isinstance(current_policy, Mapping) else {}
+
+    recent_production = report.get("recent_production_decisions", [])
+    if not isinstance(recent_production, list):
+        recent_production = []
+    productive_subsystems: list[str] = []
+    for record in recent_production:
+        if not isinstance(record, Mapping):
+            continue
+        subsystem = str(record.get("subsystem", "")).strip()
+        if not subsystem or subsystem in productive_subsystems:
+            continue
+        metrics = record.get("metrics_summary", {})
+        if not isinstance(metrics, Mapping):
+            metrics = {}
+        pass_rate_delta = float(metrics.get("pass_rate_delta", 0.0) or 0.0)
+        baseline_pass_rate = float(metrics.get("baseline_pass_rate", 0.0) or 0.0)
+        candidate_pass_rate = float(metrics.get("candidate_pass_rate", 0.0) or 0.0)
+        retained_positive_delta_decisions = int(metrics.get("retained_positive_delta_decisions", 0) or 0)
+        if (
+            str(record.get("state", "")).strip() == "retain"
+            or pass_rate_delta > 0.0
+            or candidate_pass_rate > baseline_pass_rate
+            or retained_positive_delta_decisions > 0
+        ):
+            productive_subsystems.append(subsystem)
+
+    productive_priority_families = _normalize_benchmark_families(signal.get("priority_families_with_retained_gain", []))
+    productive_priority_family_set = set(productive_priority_families)
+    current_priority_family_set = set(_normalize_benchmark_families(policy.get("priority_benchmark_families", [])))
+    productive_subsystem_gain = min(1.0, float(len(productive_subsystems)) / 3.0)
+    productive_family_gain = min(1.0, float(max(0, len(productive_priority_family_set) - 1)) / 2.0)
+    productive_depth_gain = min(1.0, float(max(0, int(signal.get("productive_depth_retained_cycles", 0) or 0))) / 2.0)
+    long_horizon_gain = min(1.0, float(max(0, int(signal.get("long_horizon_retained_cycles", 0) or 0))) / 2.0)
+    coding_frontier_ready = (
+        bool(productive_priority_family_set)
+        and {"project", "repository"}.issubset(productive_priority_family_set)
+        and int(signal.get("retained_cycles", 0) or 0) > 0
+        and bool(signal.get("all_retained_phase_gates_passed", True))
+        and int(signal.get("failed_decisions", 0) or 0) <= 0
+        and float(signal.get("worst_family_delta", 0.0) or 0.0) >= 0.0
+        and float(signal.get("worst_generated_family_delta", 0.0) or 0.0) >= 0.0
+        and int(signal.get("max_regressed_families", 0) or 0) <= 0
+        and int(signal.get("max_generated_regressed_families", 0) or 0) <= 0
+        and productive_depth_gain > 0.0
+        and bool(current_priority_family_set)
+    )
+
+    frontier_failure_families = _normalize_benchmark_families(pressure.get("frontier_failure_motif_families", []))
+    frontier_repo_setting_families = _normalize_benchmark_families(pressure.get("frontier_repo_setting_families", []))
+    semantic_state = round_state.get("semantic_progress_state", {})
+    if not isinstance(semantic_state, Mapping):
+        semantic_state = {}
+    semantic_phase_family = str(semantic_state.get("phase_family", "")).strip()
+    semantic_progress_class = str(semantic_state.get("progress_class", "")).strip()
+    semantic_decision_distance = str(semantic_state.get("decision_distance", "")).strip()
+    semantic_hook_coverage = 0.0
+    if semantic_state:
+        semantic_hook_coverage = 0.5
+        if semantic_progress_class and semantic_progress_class != "unknown":
+            semantic_hook_coverage += 0.25
+        if semantic_decision_distance in {"near", "decision_emitted", "complete"}:
+            semantic_hook_coverage += 0.25
+    failure_hook_coverage = 0.0
+    if frontier_failure_families:
+        failure_hook_coverage = max(
+            0.5,
+            float(len(set(frontier_failure_families) & productive_priority_family_set))
+            / float(max(1, len(frontier_failure_families))),
+        )
+    repo_setting_hook_coverage = 0.0
+    if frontier_repo_setting_families:
+        repo_setting_hook_coverage = max(
+            0.5,
+            float(len(set(frontier_repo_setting_families) & productive_priority_family_set))
+            / float(max(1, len(frontier_repo_setting_families))),
+        )
+    decision_signal_count = max(
+        0,
+        int(signal.get("runtime_managed_decisions", 0) or 0)
+        + int(signal.get("non_runtime_managed_decisions", 0) or 0)
+        + int(signal.get("decision_runs", 0) or 0)
+        + int(round_state.get("decision_records_considered", 0) or 0),
+    )
+    decision_hook_coverage = min(1.0, float(decision_signal_count) / 2.0)
+
+    novel_subsystem_capability_gain = min(
+        1.0,
+        (0.35 * productive_subsystem_gain)
+        + (0.3 * productive_family_gain)
+        + (0.2 * productive_depth_gain)
+        + (0.1 * long_horizon_gain)
+        + (0.05 if coding_frontier_ready else 0.0),
+    )
+    strategy_hook_coverage = min(
+        1.0,
+        (failure_hook_coverage + repo_setting_hook_coverage + semantic_hook_coverage + decision_hook_coverage) / 4.0,
+    )
+    if semantic_phase_family in {"preview", "apply", "finalize"}:
+        strategy_hook_coverage = min(1.0, strategy_hook_coverage + 0.1)
+    return {
+        "novel_subsystem_capability_gain": novel_subsystem_capability_gain,
+        "strategy_hook_coverage": strategy_hook_coverage,
+        "trust_bootstrap_pressure": min(
+            1.0,
+            (
+                (1.0 if int(signal.get("external_report_count", 0) or 0) <= 0 else 0.0)
+                + (1.0 if _normalize_benchmark_families(signal.get("missing_required_families", [])) else 0.0)
+                + min(1.0, float(max(0, int(signal.get("distinct_family_gap", 0) or 0))) / 3.0)
+            )
+            / 3.0,
+        ),
+        "claim_ready_trust_gain": 1.0
+        if (
+            int(signal.get("external_report_count", 0) or 0) > 0
+            and not _normalize_benchmark_families(signal.get("missing_required_families", []))
+            and int(signal.get("distinct_family_gap", 0) or 0) <= 0
+        )
+        else 0.0,
+        "supervision_breadth_delta": min(
+            1.0,
+            float(
+                max(
+                    0,
+                    len(
+                        set(_normalize_benchmark_families(round_state.get("sampled_families", [])))
+                        - set(_normalize_benchmark_families(signal.get("required_families_with_reports", [])))
+                    ),
+                )
+            )
+            / 3.0,
+        ),
+    }
+
+
+def _strategy_memory_observation_features(
+    *,
+    controller_state: Mapping[str, object] | None,
+    planner_pressure_signal: Mapping[str, object] | None,
+) -> dict[str, float]:
+    state = controller_state if isinstance(controller_state, Mapping) else {}
+    repo_setting_priors = (
+        dict(state.get("repo_setting_policy_priors", {}))
+        if isinstance(state.get("repo_setting_policy_priors", {}), Mapping)
+        else {}
+    )
+    strategy_priors = (
+        dict(state.get("strategy_memory_priors", {}))
+        if isinstance(state.get("strategy_memory_priors", {}), Mapping)
+        else {}
+    )
+    pressure = planner_pressure_signal if isinstance(planner_pressure_signal, Mapping) else {}
+    if not repo_setting_priors:
+        features = {
+            "strategy_memory_prior_strength": 0.0,
+            "strategy_memory_alignment": 0.0,
+            "strategy_memory_reject_pressure": 0.0,
+        }
+    else:
+        campaign_width_signals = set(_normalize_benchmark_families(pressure.get("frontier_repo_setting_families", [])))
+        alignment = 0.0
+        weighted_prior_count = 0.0
+        for signal_name, entry in repo_setting_priors.items():
+            if not isinstance(entry, Mapping):
+                continue
+            weighted_prior_count += max(0.0, float(entry.get("campaign_width_unit_weight", 0.0) or 0.0))
+            if signal_name in campaign_width_signals:
+                alignment += max(0.0, float(entry.get("adaptive_search_bonus", 0.0) or 0.0))
+        features = {
+            "strategy_memory_prior_strength": min(1.0, weighted_prior_count / 3.0),
+            "strategy_memory_alignment": min(1.0, alignment / 2.0),
+            "strategy_memory_reject_pressure": 0.0,
+        }
+    if not strategy_priors:
+        return features
+    retained_family_gains = (
+        dict(strategy_priors.get("retained_family_gains", {}))
+        if isinstance(strategy_priors.get("retained_family_gains", {}), Mapping)
+        else {}
+    )
+    rejects_by_family = (
+        dict(strategy_priors.get("recent_rejects_by_family", {}))
+        if isinstance(strategy_priors.get("recent_rejects_by_family", {}), Mapping)
+        else {}
+    )
+    relevant_families = set(
+        _normalize_benchmark_families(pressure.get("frontier_repo_setting_families", []))
+        + _normalize_benchmark_families(pressure.get("missing_required_families", []))
+        + _normalize_benchmark_families(pressure.get("priority_families", []))
+    )
+    if not relevant_families:
+        relevant_families = set(retained_family_gains) | set(rejects_by_family)
+    aligned_gain = sum(
+        max(0.0, float(retained_family_gains.get(family, 0.0) or 0.0))
+        for family in sorted(relevant_families)
+    )
+    aligned_rejects = sum(
+        max(0, int(rejects_by_family.get(family, 0) or 0))
+        for family in sorted(relevant_families)
+    )
+    features["strategy_memory_prior_strength"] = min(
+        1.0,
+        max(
+            float(features.get("strategy_memory_prior_strength", 0.0) or 0.0),
+            min(
+                0.75,
+                (float(max(0, int(strategy_priors.get("retained_count", 0) or 0))) / 4.0)
+                + max(0.0, float(strategy_priors.get("best_retained_gain", 0.0) or 0.0)),
+            ),
+        ),
+    )
+    features["strategy_memory_alignment"] = min(
+        1.0,
+        max(
+            float(features.get("strategy_memory_alignment", 0.0) or 0.0),
+            min(0.75, aligned_gain),
+        ),
+    )
+    features["strategy_memory_reject_pressure"] = min(
+        1.0,
+        (float(aligned_rejects) / 3.0)
+        + min(0.4, float(max(0, int(strategy_priors.get("recent_rejects", 0) or 0))) / 5.0),
+    )
+    return features
+
+
+def _summarize_strategy_memory_priors(config: KernelConfig) -> dict[str, object]:
+    nodes = load_strategy_nodes(config)
+    retained_family_gains: dict[str, float] = {}
+    recent_rejects_by_family: dict[str, int] = {}
+    retained_subsystems: dict[str, float] = {}
+    recent_rejects_by_subsystem: dict[str, int] = {}
+    retained_count = 0
+    rejected_count = 0
+    best_retained_gain = 0.0
+    recent_nodes = sorted(
+        nodes,
+        key=lambda node: (str(node.updated_at), str(node.created_at), str(node.strategy_node_id)),
+    )[-6:]
+    for node in nodes:
+        subsystem = str(node.subsystem).strip().lower()
+        if node.retention_state == "retain":
+            retained_count += 1
+            best_retained_gain = max(best_retained_gain, max(0.0, float(node.retained_gain)))
+            if subsystem:
+                retained_subsystems[subsystem] = max(
+                    float(retained_subsystems.get(subsystem, 0.0) or 0.0),
+                    max(0.0, float(node.retained_gain)),
+                )
+            for family, value in dict(node.family_coverage).items():
+                family_token = str(family).strip().lower()
+                if not family_token or not value:
+                    continue
+                retained_family_gains[family_token] = max(
+                    float(retained_family_gains.get(family_token, 0.0) or 0.0),
+                    max(0.0, float(node.retained_gain)),
+                )
+        elif node.retention_state == "reject":
+            rejected_count += 1
+    recent_rejects = 0
+    recent_retains = 0
+    for node in recent_nodes:
+        subsystem = str(node.subsystem).strip().lower()
+        if node.retention_state == "reject":
+            recent_rejects += 1
+            if subsystem:
+                recent_rejects_by_subsystem[subsystem] = int(recent_rejects_by_subsystem.get(subsystem, 0) or 0) + 1
+            for family, value in dict(node.family_coverage).items():
+                family_token = str(family).strip().lower()
+                if not family_token or not value:
+                    continue
+                recent_rejects_by_family[family_token] = int(recent_rejects_by_family.get(family_token, 0) or 0) + 1
+        elif node.retention_state == "retain":
+            recent_retains += 1
+    return {
+        "node_count": len(nodes),
+        "retained_count": retained_count,
+        "rejected_count": rejected_count,
+        "recent_rejects": recent_rejects,
+        "recent_retains": recent_retains,
+        "best_retained_gain": round(best_retained_gain, 4),
+        "retained_family_gains": dict(sorted(retained_family_gains.items())),
+        "recent_rejects_by_family": dict(sorted(recent_rejects_by_family.items())),
+        "retained_subsystems": dict(sorted(retained_subsystems.items())),
+        "recent_rejects_by_subsystem": dict(sorted(recent_rejects_by_subsystem.items())),
+    }
+
+
+def _update_strategy_memory_priors(
+    controller_state: Mapping[str, object] | None,
+    *,
+    config: KernelConfig,
+) -> dict[str, object]:
+    state = dict(controller_state) if isinstance(controller_state, Mapping) else {}
+    state["strategy_memory_priors"] = _summarize_strategy_memory_priors(config)
+    return state
+
+
+def _strategy_memory_candidate_score_adjustment(
+    *,
+    policy: Mapping[str, object] | None,
+    current_policy: Mapping[str, object] | None,
+    planner_pressure_signal: Mapping[str, object] | None,
+    strategy_memory_priors: Mapping[str, object] | None,
+) -> dict[str, object]:
+    proposal = policy if isinstance(policy, Mapping) else {}
+    current = current_policy if isinstance(current_policy, Mapping) else {}
+    pressure = planner_pressure_signal if isinstance(planner_pressure_signal, Mapping) else {}
+    priors = strategy_memory_priors if isinstance(strategy_memory_priors, Mapping) else {}
+    retained_family_gains = (
+        dict(priors.get("retained_family_gains", {}))
+        if isinstance(priors.get("retained_family_gains", {}), Mapping)
+        else {}
+    )
+    rejects_by_family = (
+        dict(priors.get("recent_rejects_by_family", {}))
+        if isinstance(priors.get("recent_rejects_by_family", {}), Mapping)
+        else {}
+    )
+    relevant_families = _normalize_benchmark_families(
+        pressure.get("priority_families", [])
+        or pressure.get("missing_required_families", [])
+        or pressure.get("frontier_repo_setting_families", [])
+    )
+    if not relevant_families:
+        return {
+            "score_adjustment": 0.0,
+            "policy_change_units": 0.0,
+            "retained_alignment_gain": 0.0,
+            "reject_alignment_pressure": 0.0,
+            "reasons": [],
+        }
+    retained_alignment_gain = sum(
+        max(0.0, float(retained_family_gains.get(family, 0.0) or 0.0))
+        for family in relevant_families
+    )
+    reject_alignment_pressure = sum(
+        max(0, int(rejects_by_family.get(family, 0) or 0))
+        for family in relevant_families
+    )
+    policy_change_units = 0.0
+    if bool(proposal.get("adaptive_search", False)) != bool(current.get("adaptive_search", False)):
+        policy_change_units += 1.0
+    if max(1, int(proposal.get("campaign_width", 1) or 1)) > max(1, int(current.get("campaign_width", 1) or 1)):
+        policy_change_units += 1.0
+    if max(1, int(proposal.get("task_step_floor", 1) or 1)) > max(1, int(current.get("task_step_floor", 1) or 1)):
+        policy_change_units += 1.0
+    score_adjustment = 0.0
+    reasons: list[str] = []
+    if retained_alignment_gain > 0.0:
+        score_adjustment += min(
+            0.28,
+            (0.08 * retained_alignment_gain) + (0.04 if policy_change_units > 0.0 else 0.0),
+        )
+        reasons.append(f"retained_family_gain_alignment={retained_alignment_gain:.4f}")
+    if reject_alignment_pressure > 0.0:
+        if policy_change_units <= 0.0:
+            score_adjustment -= min(0.3, 0.07 * reject_alignment_pressure)
+            reasons.append(f"reject_only_replay_penalty={reject_alignment_pressure:.4f}")
+        else:
+            score_adjustment += min(0.16, 0.04 * reject_alignment_pressure)
+            reasons.append(f"reject_escape_bonus={reject_alignment_pressure:.4f}")
+    return {
+        "score_adjustment": round(score_adjustment, 4),
+        "policy_change_units": round(policy_change_units, 4),
+        "retained_alignment_gain": round(retained_alignment_gain, 4),
+        "reject_alignment_pressure": round(reject_alignment_pressure, 4),
+        "reasons": reasons,
+    }
+
+
 def _controller_observation(
     *,
     campaign_report: dict[str, object] | None,
     liftoff_payload: dict[str, object] | None,
+    controller_state: Mapping[str, object] | None = None,
     curriculum_controls: dict[str, object] | None = None,
+    round_payload: dict[str, object] | None = None,
 ) -> dict[str, object]:
     campaign_signal = _campaign_signal(campaign_report or {})
+    subsystem_signal = _subsystem_signal(campaign_report or {})
+    planner_pressure_signal = _planner_pressure_signal(
+        campaign_report or {},
+        curriculum_controls=curriculum_controls,
+    )
+    round_signal = _mid_round_round_signal(round_payload)
+    controller_features = _derived_controller_features(
+        campaign_report=campaign_report or {},
+        campaign_signal=campaign_signal,
+        planner_pressure_signal=planner_pressure_signal,
+        round_signal=round_signal,
+        current_policy=(
+            dict(round_payload.get("policy", {}))
+            if isinstance(round_payload, Mapping) and isinstance(round_payload.get("policy", {}), Mapping)
+            else {}
+        ),
+    )
+    controller_features.update(
+        _strategy_memory_observation_features(
+            controller_state=controller_state,
+            planner_pressure_signal=planner_pressure_signal,
+        )
+    )
+    if controller_features:
+        campaign_signal["controller_features"] = controller_features
     return build_round_observation(
         campaign_signal=campaign_signal,
-        subsystem_signal=_subsystem_signal(campaign_report or {}),
-        planner_pressure_signal=_planner_pressure_signal(
-            campaign_report or {},
-            curriculum_controls=curriculum_controls,
-        ),
+        subsystem_signal=subsystem_signal,
+        planner_pressure_signal=planner_pressure_signal,
         liftoff_signal=_liftoff_signal(liftoff_payload or {}) if liftoff_payload else None,
+        round_signal=round_signal,
     )
 
 
@@ -5265,6 +8966,9 @@ def _candidate_round_policies(
                 max(1, min(max_task_step_floor, current_task_step_floor)),
                 max(1, min(max_task_step_floor, max(1, current_task_step_floor // 2))),
                 max(1, min(max_task_step_floor, current_task_step_floor * 2)),
+                max(1, min(max_task_step_floor, int(math.ceil(float(current_task_step_floor) * 1.5))))
+                if repo_setting_task_step_floor_pressure
+                else max(1, min(max_task_step_floor, current_task_step_floor * 2)),
             }
         )
     else:
@@ -5377,6 +9081,18 @@ def _validate_campaign_report(campaign_report: dict[str, object]) -> dict[str, o
             detail = f"{detail}: {summary}"
         return {"passed": False, "detail": detail, "signal": signal, "failure_context": failure_context}
     if completed > 0 and int(signal["runtime_managed_decisions"]) <= 0:
+        if bool(signal.get("intermediate_decision_evidence", False)):
+            return {
+                "passed": True,
+                "detail": "campaign report is complete with intermediate decision evidence",
+                "signal": signal,
+            }
+        if bool(signal.get("task_success_evidence", False)):
+            return {
+                "passed": True,
+                "detail": "campaign report is complete with verified task-success evidence",
+                "signal": signal,
+            }
         detail = "campaign report showed no runtime-managed decisions"
         summary = _campaign_failure_context_summary(failure_context)
         if summary:
@@ -5473,7 +9189,11 @@ def _round_stop_signal(
         )
     )
     liftoff_state = str(liftoff_signal.get("state", "")).strip()
-    retained_or_liftoff_yield = retained_cycles > 0 or liftoff_state == "retain"
+    retained_or_liftoff_yield = (
+        retained_cycles > 0
+        or liftoff_state == "retain"
+        or bool(campaign_signal.get("task_success_evidence", False))
+    )
     return {
         "retained_cycles": retained_cycles,
         "productive_depth_continuation": productive_depth_continuation,
@@ -5651,7 +9371,9 @@ def _next_round_policy(
     observation = _controller_observation(
         campaign_report=campaign_report,
         liftoff_payload=liftoff_payload,
+        controller_state=controller_state,
         curriculum_controls=curriculum_controls,
+        round_payload=round_payload,
     )
     candidate_policies = _candidate_round_policies(
         current_policy,
@@ -5687,6 +9409,12 @@ def _next_round_policy(
             else {}
         ),
     )
+    strategy_memory_priors = (
+        dict(controller_state.get("strategy_memory_priors", {}))
+        if isinstance(controller_state, Mapping)
+        and isinstance(controller_state.get("strategy_memory_priors", {}), Mapping)
+        else {}
+    )
     adjusted_candidates: list[dict[str, object]] = []
     for candidate in planner_diagnostics.get("candidates", []):
         if not isinstance(candidate, dict):
@@ -5700,10 +9428,20 @@ def _next_round_policy(
             repo_setting_policy_pressure=candidate_repo_setting_policy_pressure,
             learned_priors=learned_repo_setting_priors,
         )
+        strategy_memory_score_adjustment = _strategy_memory_candidate_score_adjustment(
+            policy=policy if isinstance(policy, dict) else {},
+            current_policy=current_policy,
+            planner_pressure_signal=_planner_pressure_signal(
+                campaign_report,
+                curriculum_controls=curriculum_controls,
+            ),
+            strategy_memory_priors=strategy_memory_priors,
+        )
         adjusted_score = (
             float(candidate.get("score", 0.0) or 0.0)
             + rationale_adjustment
             + float(repo_setting_score_adjustment.get("score_adjustment", 0.0) or 0.0)
+            + float(strategy_memory_score_adjustment.get("score_adjustment", 0.0) or 0.0)
         )
         adjusted_candidate = dict(candidate)
         adjusted_candidate["historical_rationale_adjustment"] = rationale_adjustment
@@ -5711,6 +9449,10 @@ def _next_round_policy(
             repo_setting_score_adjustment.get("score_adjustment", 0.0) or 0.0
         )
         adjusted_candidate["repo_setting_score_rationale"] = repo_setting_score_adjustment
+        adjusted_candidate["strategy_memory_score_adjustment"] = float(
+            strategy_memory_score_adjustment.get("score_adjustment", 0.0) or 0.0
+        )
+        adjusted_candidate["strategy_memory_score_rationale"] = strategy_memory_score_adjustment
         adjusted_candidate["adjusted_score"] = adjusted_score
         adjusted_candidates.append(adjusted_candidate)
     if adjusted_candidates:
@@ -5731,7 +9473,14 @@ def _next_round_policy(
             planner_diagnostics["selected_repo_setting_score_rationale"] = dict(
                 top_candidate.get("repo_setting_score_rationale", {})
             )
+            planner_diagnostics["selected_strategy_memory_score_adjustment"] = float(
+                top_candidate.get("strategy_memory_score_adjustment", 0.0) or 0.0
+            )
+            planner_diagnostics["selected_strategy_memory_score_rationale"] = dict(
+                top_candidate.get("strategy_memory_score_rationale", {})
+            )
             planner_diagnostics["learned_repo_setting_priors"] = dict(learned_repo_setting_priors)
+            planner_diagnostics["strategy_memory_priors"] = dict(strategy_memory_priors)
             planner_diagnostics["candidates"] = adjusted_candidates[:12]
     if isinstance(round_payload, dict):
         round_payload["controller_planner"] = planner_diagnostics
@@ -5749,6 +9498,7 @@ def _next_round_policy(
     retained_cycles = int(signal["retained_cycles"])
     rejected_cycles = int(signal["rejected_cycles"])
     runtime_managed_decisions = int(signal["runtime_managed_decisions"])
+    intermediate_decision_evidence = bool(signal.get("intermediate_decision_evidence", False))
     avg_retained_pass_delta = float(signal["average_retained_pass_rate_delta"])
     avg_retained_step_delta = float(signal["average_retained_step_delta"])
     productive_depth_retained_cycles = int(signal.get("productive_depth_retained_cycles", 0) or 0)
@@ -5768,10 +9518,16 @@ def _next_round_policy(
     variant_breadth_pressure_cycles = int(signal["variant_breadth_pressure_cycles"])
     external_report_count = int(signal["external_report_count"])
     distinct_external_benchmark_families = int(signal["distinct_external_benchmark_families"])
+    trust_breadth_summary_present = bool(
+        isinstance(campaign_report.get("trust_breadth_summary", {}), dict)
+        and campaign_report.get("trust_breadth_summary", {})
+    )
     required_families = _normalize_benchmark_families(signal.get("required_families", []))
     missing_required_families = _normalize_benchmark_families(signal.get("missing_required_families", []))
     distinct_family_gap = int(signal.get("distinct_family_gap", 0) or 0)
-    required_family_coverage_gap = bool(missing_required_families) or distinct_family_gap > 0
+    required_family_coverage_gap = (
+        trust_breadth_summary_present and (bool(missing_required_families) or distinct_family_gap > 0)
+    )
     priority_families = _normalize_benchmark_families(
         signal.get("priority_families", current_policy.get("priority_benchmark_families", []))
     )
@@ -5788,6 +9544,9 @@ def _next_round_policy(
     priority_families_without_signal = _normalize_benchmark_families(
         priority_family_history.get("priority_families_without_signal", [])
     )
+    priority_families_needing_retained_gain_conversion = _normalize_benchmark_families(
+        priority_family_history.get("priority_families_needing_retained_gain_conversion", [])
+    )
     priority_families_under_sampled = _normalize_benchmark_families(
         priority_family_history.get("priority_families_under_sampled", [])
     )
@@ -5797,8 +9556,43 @@ def _next_round_policy(
     )
     productive_partial_conversion_gap = (
         runtime_managed_decisions <= 0
+        and not intermediate_decision_evidence
         and retained_cycles <= 0
         and bool(productive_partial_conversion.get("conversion_gap", False))
+    )
+    round_payload_for_signal = round_payload
+    if isinstance(round_payload, Mapping):
+        round_payload_for_signal = dict(round_payload)
+        if not isinstance(round_payload_for_signal.get("policy", {}), Mapping):
+            round_payload_for_signal["policy"] = dict(current_policy)
+    mid_round_signal = _mid_round_round_signal(round_payload_for_signal)
+    broad_observe_then_retrieval_first = bool(mid_round_signal.get("broad_observe_then_retrieval_first", False))
+    semantic_progress_drift = bool(mid_round_signal.get("semantic_progress_drift", False))
+    micro_step_verification_loop = bool(mid_round_signal.get("micro_step_verification_loop", False))
+    incomplete_cycle_count = int(signal.get("incomplete_cycle_count", 0) or 0)
+    observed_primary_runs = int(signal.get("observed_primary_runs", 0) or 0)
+    generated_success_completed_runs = int(signal.get("generated_success_completed_runs", 0) or 0)
+    partial_productive_without_decision_runs = int(signal.get("partial_productive_without_decision_runs", 0) or 0)
+    observability_gap = bool(
+        semantic_progress_drift
+        or micro_step_verification_loop
+        or incomplete_cycle_count > 0
+        or (
+            partial_productive_without_decision_runs > 0
+            and generated_success_completed_runs > 0
+            and runtime_managed_decisions <= 0
+        )
+    )
+    subsystem_robustness_gap = bool(
+        micro_step_verification_loop
+        or incomplete_cycle_count > 0
+        or bool(signal.get("recent_failed_run", {}))
+        or bool(signal.get("recent_failed_decision", {}))
+        or (
+            partial_productive_without_decision_runs > 0
+            and observed_primary_runs > 0
+            and runtime_managed_decisions <= 0
+        )
     )
     priority_families_low_return = _normalize_benchmark_families(
         priority_family_history.get("priority_families_low_return", [])
@@ -5816,7 +9610,17 @@ def _next_round_policy(
         if isinstance(priority_family_history.get("priority_family_scoring_policy", {}), dict)
         else {}
     )
-    priority_family_under_sampled_gap = bool(priority_families) and bool(priority_families_under_sampled)
+    priority_family_summary_present = bool(
+        isinstance(campaign_report.get("priority_family_yield_summary", {}), dict)
+        and campaign_report.get("priority_family_yield_summary", {})
+    ) or bool(
+        isinstance(campaign_report.get("priority_family_allocation_summary", {}), dict)
+        and campaign_report.get("priority_family_allocation_summary", {})
+    )
+    priority_family_under_sampled_gap = (
+        priority_family_summary_present and bool(priority_families) and bool(priority_families_under_sampled)
+    )
+    retained_gain_conversion_gap = bool(priority_families_needing_retained_gain_conversion)
     repo_setting_priority_families = _repo_setting_focus_priority_families(
         current_priority_families=priority_families,
         ranked_priority_families=priority_families_ranked_by_selection_score,
@@ -5867,6 +9671,8 @@ def _next_round_policy(
         stalled_subsystem = str(planner_pressure_signal.get("dominant_subsystem", "")).strip()
     if not stalled_subsystem and bool(subsystem_monoculture.get("active", False)):
         stalled_subsystem = str(subsystem_monoculture.get("dominant_subsystem", "")).strip()
+    if not stalled_subsystem and micro_step_verification_loop:
+        stalled_subsystem = str(mid_round_signal.get("selected_subsystem", "")).strip()
 
     # Hard safety envelopes remain, but they only constrain the learned planner.
     if (
@@ -5965,6 +9771,88 @@ def _next_round_policy(
         next_policy["focus"] = "discovered_task_adaptation"
         if stalled_subsystem:
             next_policy = _apply_subsystem_cooldown(next_policy, subsystem=stalled_subsystem, rounds=2)
+    no_retained_gain_decision_gap = (
+        broad_observe_then_retrieval_first
+        and retained_gain_conversion_gap
+        and retained_cycles <= 0
+        and runtime_managed_decisions <= 0
+    )
+    severe_retrieval_redirect = (
+        broad_observe_then_retrieval_first
+        and (
+            retained_gain_conversion_gap
+            or semantic_progress_drift
+            or observability_gap
+            or subsystem_robustness_gap
+        )
+    )
+    if broad_observe_then_retrieval_first and retained_gain_conversion_gap:
+        next_policy["adaptive_search"] = True
+        next_policy["focus"] = "discovered_task_adaptation"
+        if no_retained_gain_decision_gap or severe_retrieval_redirect:
+            next_policy["cycles"] = min(
+                max_cycles,
+                max(
+                    current_cycles + (2 if severe_retrieval_redirect else 1),
+                    int(next_policy.get("cycles", current_cycles) or current_cycles),
+                ),
+            )
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(
+                current_campaign_width + (2 if no_retained_gain_decision_gap else 1),
+                int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
+            ),
+        )
+        next_policy["variant_width"] = min(
+            max_variant_width,
+            max(
+                current_variant_width + (2 if no_retained_gain_decision_gap else 1),
+                int(next_policy.get("variant_width", current_variant_width) or current_variant_width),
+            ),
+        )
+        next_policy["task_limit"] = min(
+            max_task_limit,
+            max(
+                current_task_limit * (4 if no_retained_gain_decision_gap else 2),
+                int(next_policy.get("task_limit", current_task_limit) or current_task_limit),
+            ),
+        )
+        next_policy = _apply_subsystem_cooldown(
+            next_policy,
+            subsystem="retrieval",
+            rounds=3 if no_retained_gain_decision_gap else 2,
+        )
+    if observability_gap or subsystem_robustness_gap:
+        next_policy["adaptive_search"] = True
+        if next_policy.get("focus") == "balanced":
+            next_policy["focus"] = "recovery_alignment" if subsystem_robustness_gap else "discovered_task_adaptation"
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(
+                current_campaign_width + 1,
+                int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
+            ),
+        )
+        if semantic_progress_drift or broad_observe_then_retrieval_first or micro_step_verification_loop:
+            next_policy["variant_width"] = min(
+                max_variant_width,
+                max(
+                    current_variant_width + 1,
+                    int(next_policy.get("variant_width", current_variant_width) or current_variant_width),
+                ),
+            )
+        next_policy["task_limit"] = min(
+            max_task_limit,
+            max(
+                current_task_limit * 2,
+                int(next_policy.get("task_limit", current_task_limit) or current_task_limit),
+            ),
+        )
+        if micro_step_verification_loop and stalled_subsystem:
+            next_policy = _apply_subsystem_cooldown(next_policy, subsystem=stalled_subsystem, rounds=2)
+        elif semantic_progress_drift or broad_observe_then_retrieval_first:
+            next_policy = _apply_subsystem_cooldown(next_policy, subsystem="retrieval", rounds=2)
     if bool(subsystem_monoculture.get("active", False)):
         next_policy["adaptive_search"] = True
         next_policy["focus"] = "discovered_task_adaptation"
@@ -6028,6 +9916,8 @@ def _next_round_policy(
                     int(next_policy.get("variant_width", current_variant_width) or current_variant_width),
                 ),
             )
+        elif repo_setting_family_expansion or coding_frontier_family_expansion:
+            next_policy["variant_width"] = current_variant_width
     if (
         repo_setting_campaign_width_pressure
         or repo_setting_task_step_floor_pressure
@@ -6048,6 +9938,56 @@ def _next_round_policy(
                 int(next_policy.get("campaign_width", current_campaign_width) or current_campaign_width),
             ),
         )
+    breadth_only_pressure = bool(
+        retained_cycles > 0
+        and retained_phase_gates_passed
+        and (campaign_breadth_pressure_cycles > 0 or variant_breadth_pressure_cycles > 0)
+        and not (
+            max_low_confidence_episode_delta > 0
+            or min_trusted_retrieval_step_delta < 0
+            or required_family_coverage_gap
+            or priority_family_under_sampled_gap
+            or productive_partial_conversion_gap
+            or broad_observe_then_retrieval_first
+            or semantic_progress_drift
+            or micro_step_verification_loop
+            or observability_gap
+            or subsystem_robustness_gap
+            or bool(subsystem_monoculture.get("active", False))
+            or coding_frontier_expansion
+            or repo_setting_campaign_width_pressure
+            or repo_setting_task_step_floor_pressure
+            or repo_setting_adaptive_search_pressure
+        )
+    )
+    if breadth_only_pressure and str(next_policy.get("focus", "")).strip() == "discovered_task_adaptation":
+        next_policy["focus"] = str(current_policy.get("focus", "balanced")).strip() or "balanced"
+
+    depth_only_repo_setting_pressure = bool(
+        repo_setting_task_step_floor_pressure
+        and not repo_setting_campaign_width_pressure
+        and not campaign_breadth_pressure_cycles > 0
+        and not variant_breadth_pressure_cycles > 0
+        and retained_cycles > 0
+        and retained_phase_gates_passed
+        and failed_decisions <= 0
+        and max_regressed_families <= 0
+        and max_generated_regressed_families <= 0
+        and not required_family_coverage_gap
+        and not priority_family_under_sampled_gap
+        and not productive_partial_conversion_gap
+        and not retained_gain_conversion_gap
+        and not observability_gap
+        and not subsystem_robustness_gap
+        and not bool(subsystem_monoculture.get("active", False))
+        and not broad_observe_then_retrieval_first
+        and not semantic_progress_drift
+        and not micro_step_verification_loop
+        and not coding_frontier_expansion
+    )
+    if depth_only_repo_setting_pressure:
+        next_policy["campaign_width"] = current_campaign_width
+        next_policy["variant_width"] = current_variant_width
 
     next_task_step_floor = current_task_step_floor
     if depth_drift_cycles > 0 or (avg_retained_pass_delta <= 0.0 and avg_retained_step_delta > 0.0):
@@ -6117,6 +10057,7 @@ def _next_round_policy(
         priority_family_selection_scores=priority_family_selection_scores,
         min_selection_score=float(priority_family_scoring_policy.get("priority_family_min_selection_score", 0.0) or 0.0),
         productive_priority_families=priority_families_with_retained_gain,
+        retained_gain_conversion_priority_families=priority_families_needing_retained_gain_conversion,
         under_sampled_priority_families=priority_families_under_sampled,
         low_return_priority_families=priority_families_low_return,
     )
@@ -6192,8 +10133,20 @@ def _next_round_policy(
             reason_codes.append("required_family_coverage_gap")
         if priority_family_under_sampled_gap:
             reason_codes.append("priority_family_under_sampled")
+        if retained_gain_conversion_gap:
+            reason_codes.append("retained_gain_conversion_gap")
+        if broad_observe_then_retrieval_first:
+            reason_codes.append("broad_observe_then_retrieval_first")
+        if semantic_progress_drift:
+            reason_codes.append("semantic_progress_drift")
+        if micro_step_verification_loop:
+            reason_codes.append("micro_step_verification_loop")
         if productive_partial_conversion_gap:
             reason_codes.append("productive_partial_conversion_gap")
+        if observability_gap:
+            reason_codes.append("observability_gap")
+        if subsystem_robustness_gap:
+            reason_codes.append("subsystem_robustness_gap")
         if priority_families_low_return:
             reason_codes.append("priority_family_low_return")
         if repo_setting_campaign_width_pressure:
@@ -6272,7 +10225,16 @@ def _next_round_policy(
                 "priority_families": priority_families,
                 "priority_families_with_retained_gain": priority_families_with_retained_gain,
                 "priority_families_without_signal": priority_families_without_signal,
+                "priority_families_needing_retained_gain_conversion": priority_families_needing_retained_gain_conversion,
                 "priority_families_under_sampled": priority_families_under_sampled,
+                "broad_observe_then_retrieval_first": broad_observe_then_retrieval_first,
+                "semantic_progress_drift": semantic_progress_drift,
+                "micro_step_verification_loop": micro_step_verification_loop,
+                "observability_gap": observability_gap,
+                "subsystem_robustness_gap": subsystem_robustness_gap,
+                "incomplete_cycle_count": incomplete_cycle_count,
+                "observed_primary_runs": observed_primary_runs,
+                "generated_success_completed_runs": generated_success_completed_runs,
                 "productive_partial_sampled_families": _normalize_benchmark_families(
                     productive_partial_conversion.get("sampled_families", [])
                 ),
@@ -6280,6 +10242,7 @@ def _next_round_policy(
                     productive_partial_conversion.get("sampled_priority_families", [])
                 ),
                 "productive_partial_conversion_gap": productive_partial_conversion_gap,
+                "intermediate_decision_evidence": intermediate_decision_evidence,
                 "priority_families_low_return": priority_families_low_return,
                 "priority_families_ranked_by_selection_score": priority_families_ranked_by_selection_score,
                 "frontier_failure_motif_priority_pairs": list(
@@ -6501,6 +10464,11 @@ def main() -> None:
                 reason="prior unattended round was interrupted before completion",
             )
     current_policy = _initial_round_policy(args, config)
+    if not prior_rounds:
+        current_policy = _apply_semantic_policy_seed(
+            current_policy,
+            semantic_seed=_semantic_policy_seed(config),
+        )
     if prior_rounds:
         last_round = prior_rounds[-1]
         if isinstance(last_round, dict) and "next_policy" in last_round and isinstance(last_round.get("next_policy", {}), dict):
@@ -6737,10 +10705,22 @@ def main() -> None:
             )
         if not stalled_subsystem:
             stalled_subsystem = _subsystem_from_progress_line(str(round_payload.get("phase_detail", "")))
+        supplemental_observation = _controller_observation(
+            campaign_report=round_payload.get("campaign_report", {})
+            if isinstance(round_payload.get("campaign_report", {}), dict)
+            else {},
+            liftoff_payload=round_payload.get("liftoff_report", {})
+            if isinstance(round_payload.get("liftoff_report", {}), dict)
+            else {},
+            controller_state=controller_state,
+            curriculum_controls=round_curriculum_controls,
+            round_payload=round_payload,
+        )
         failure_observation = build_failure_observation(
             phase=phase,
             reason=reason,
             subsystem=stalled_subsystem,
+            supplemental_observation=supplemental_observation,
         )
         controller_state, controller_update = update_controller_state(
             controller_state,
@@ -6896,9 +10876,24 @@ def main() -> None:
             round_payload: dict[str, object] = {
                 "round_index": round_index,
                 "policy": dict(current_policy),
+                "runtime_limits": {
+                    "max_child_runtime_seconds": float(args.max_child_runtime_seconds),
+                },
                 "status": "running",
                 "phase": "preflight",
             }
+            upsert_semantic_agent(
+                config,
+                agent_id=f"unattended_agent:{run_id}",
+                payload={
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "agent_kind": "unattended_campaign_agent",
+                    "run_id": run_id,
+                    "last_round_index": round_index,
+                    "current_policy": dict(current_policy),
+                    "status": "running",
+                },
+            )
             report["rounds"].append(round_payload)
             if len(report["rounds"]) > 1:
                 previous_round = report["rounds"][-2]
@@ -6919,6 +10914,7 @@ def main() -> None:
                 liftoff_payload=report["rounds"][-2].get("liftoff_report", {})
                 if len(report["rounds"]) > 1 and isinstance(report["rounds"][-2], dict)
                 else {},
+                controller_state=controller_state,
                 curriculum_controls=round_curriculum_controls,
             )
             round_payload["controller_observation"] = controller_observation
@@ -7123,6 +11119,7 @@ def main() -> None:
                 max_runtime_seconds=float(args.max_child_runtime_seconds),
                 max_progress_stall_seconds=float(args.max_child_progress_stall_seconds),
                 on_event=campaign_progress,
+                mirrored_status_path=status_path,
             )
             round_payload["campaign_run"] = campaign_run
             campaign_report_path = _last_report_path(str(campaign_run["stdout"]))
@@ -7135,12 +11132,47 @@ def main() -> None:
                 partial_acceptance = _accept_productive_partial_child_timeout(
                     campaign_run,
                     mirrored_child_status=mirrored_child_status,
+                    round_payload=round_payload,
                 )
                 round_payload["campaign_partial_acceptance"] = partial_acceptance
                 if bool(partial_acceptance.get("accepted", False)):
-                    campaign_report_path = Path(str(partial_acceptance.get("report_path", "")).strip())
-                    campaign_report = _read_json(campaign_report_path)
-                    round_payload["campaign_report_path"] = str(campaign_report_path)
+                    mirrored_child_status = _credit_accepted_productive_partial_status(mirrored_child_status)
+                    partial_report_path = str(partial_acceptance.get("report_path", "")).strip()
+                    if partial_report_path:
+                        campaign_report_path = Path(partial_report_path)
+                        campaign_report = _read_json(campaign_report_path)
+                        round_payload["campaign_report_path"] = str(campaign_report_path)
+                    else:
+                        campaign_report = _synthetic_productive_partial_campaign_report(
+                            mirrored_child_status=mirrored_child_status,
+                            campaign_run=campaign_run,
+                            round_payload=round_payload,
+                        )
+                        round_payload["campaign_report_path"] = ""
+                    campaign_report = _normalize_accepted_productive_partial_campaign_report(
+                        campaign_report,
+                        campaign_run=campaign_run,
+                        round_payload=round_payload,
+                    )
+                    mirrored_child_status = _finalize_accepted_productive_partial_child_status(
+                        mirrored_child_status,
+                        campaign_report=campaign_report,
+                        campaign_run=campaign_run,
+                    )
+                    atomic_write_json(
+                        _child_improvement_reports_dir(report_path) / "repeated_improvement_status.json",
+                        mirrored_child_status,
+                        config=config,
+                    )
+                    active_child = round_payload.get("active_child", {})
+                    if isinstance(active_child, Mapping):
+                        finalized_active_child = _finalize_accepted_productive_partial_child_status(
+                            active_child,
+                            campaign_report=campaign_report,
+                            campaign_run=campaign_run,
+                        )
+                        round_payload["active_child"] = finalized_active_child
+                        report["active_child"] = finalized_active_child
                     round_payload["campaign_report"] = campaign_report
                     round_payload["campaign_validation"] = {
                         "passed": True,
@@ -7148,18 +11180,41 @@ def main() -> None:
                         "accepted_partial_timeout": True,
                     }
                     round_payload["campaign_warning"] = str(campaign_run.get("timeout_reason", "")).strip()
+                    round_payload["liftoff_skipped"] = {
+                        "mode": current_policy["liftoff"],
+                        "reason": "accepted productive partial timeout bypassed liftoff",
+                    }
                     report["campaign_report_path"] = round_payload["campaign_report_path"]
                     report["campaign_report"] = campaign_report
                     report["campaign_validation"] = round_payload["campaign_validation"]
+                    report["liftoff_skipped"] = round_payload["liftoff_skipped"]
                     report["phase_detail"] = round_payload["campaign_warning"]
-                    _mark_round(
-                        round_payload,
-                        status="completed",
-                        phase=phase,
-                        reason=str(round_payload["campaign_warning"]),
+                    round_planner_controls = _load_retained_improvement_planner_controls(config)
+                    controller_state, current_policy, no_yield_rounds, policy_stall_rounds, depth_runway_credit = (
+                        _finalize_completed_campaign_round(
+                            args=args,
+                            config=config,
+                            report_path=report_path,
+                            status_path=status_path,
+                            lock_path=lock_path,
+                            event_log_path=event_log_path,
+                            controller_state_path=controller_state_path,
+                            run_id=run_id,
+                            round_index=round_index,
+                            report=report,
+                            round_payload=round_payload,
+                            campaign_report=campaign_report,
+                            liftoff_payload=None,
+                            controller_state=controller_state,
+                            current_policy=current_policy,
+                            round_planner_controls=round_planner_controls,
+                            round_curriculum_controls=round_curriculum_controls,
+                            no_yield_rounds=no_yield_rounds,
+                            policy_stall_rounds=policy_stall_rounds,
+                            depth_runway_credit=depth_runway_credit,
+                        )
                     )
-                    report["rounds_completed"] = _count_completed_rounds(report["rounds"])
-                    _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+                    _emit_policy_shift_alert_if_configured(round_payload)
                     round_index += 1
                     continue
                 failure_reason = str(campaign_run.get("timeout_reason", "")) or "campaign subprocess failed"
@@ -7171,7 +11226,11 @@ def main() -> None:
                 round_index += 1
                 continue
 
-            campaign_report = _read_json(campaign_report_path)
+            campaign_report = _normalize_accepted_productive_partial_campaign_report(
+                _read_json(campaign_report_path),
+                campaign_run=campaign_run,
+                round_payload=round_payload,
+            )
             round_payload["campaign_report"] = campaign_report
             report["campaign_report"] = campaign_report
             _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
@@ -7257,6 +11316,7 @@ def main() -> None:
                     max_runtime_seconds=float(args.max_child_runtime_seconds),
                     max_progress_stall_seconds=float(args.max_child_progress_stall_seconds),
                     on_event=liftoff_progress,
+                    mirrored_status_path=status_path,
                 )
                 round_payload["liftoff_run"] = liftoff_run
                 liftoff_report_path = _last_report_path(str(liftoff_run["stdout"]))
@@ -7294,99 +11354,30 @@ def main() -> None:
                 }
                 report["liftoff_skipped"] = round_payload["liftoff_skipped"]
 
-            end_observation = _controller_observation(
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                curriculum_controls=round_curriculum_controls,
-            )
-            controller_state, controller_update = update_controller_state(
-                controller_state,
-                start_observation=round_payload.get("controller_observation", {}),
-                action_policy=round_payload.get("policy", current_policy),
-                end_observation=end_observation,
-            )
-            controller_state = _update_repo_setting_policy_priors(
-                controller_state,
-                round_payload=round_payload,
-            )
-            round_payload["controller_update"] = controller_update
-            report["controller_summary"] = controller_state_summary(controller_state)
-            report["unattended_evidence"] = _unattended_evidence_snapshot(config)
-            _write_controller_state(controller_state_path, controller_state, config=config)
             round_planner_controls = _load_retained_improvement_planner_controls(config)
-            current_policy = _next_round_policy(
-                current_policy,
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                round_payload=round_payload,
-                controller_state=controller_state,
-                prior_rounds=[item for item in report["rounds"][:-1] if isinstance(item, dict)],
-                planner_controls=round_planner_controls,
-                curriculum_controls=round_curriculum_controls,
-                max_cycles=max(1, args.max_cycles_per_round),
-                max_task_limit=max(1, args.max_task_limit),
-                max_campaign_width=max(1, args.max_campaign_width),
-                max_variant_width=max(1, args.max_variant_width),
-                max_task_step_floor=max(1, config.max_task_steps_hard_cap),
-            )
-            round_payload["next_policy"] = dict(current_policy)
-            policy_stall_rounds = _next_policy_stall_rounds(
-                policy_stall_rounds,
-                current_policy=round_payload.get("policy", {}),
-                next_policy=round_payload.get("next_policy", {}),
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                round_payload=round_payload,
-            )
-            no_yield_rounds = _next_no_yield_rounds(
-                no_yield_rounds,
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                round_payload=round_payload,
-            )
-            depth_runway_credit = _next_depth_runway_credit(
-                depth_runway_credit,
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                round_payload=round_payload,
-            )
-            round_payload["outer_stop_signal"] = _round_stop_signal(
-                campaign_report=campaign_report,
-                liftoff_payload=liftoff_payload,
-                round_payload=round_payload,
-            )
-            round_payload["adaptive_stop_budget"] = _adaptive_stop_budget(
-                base_max_no_yield_rounds=max(0, args.max_no_yield_rounds),
-                base_max_policy_stall_rounds=max(0, args.max_policy_stall_rounds),
-                depth_runway_credit=depth_runway_credit,
-            )
-            round_payload["no_yield_rounds"] = no_yield_rounds
-            round_payload["policy_stall_rounds"] = policy_stall_rounds
-            _mark_round(round_payload, status="completed", phase="completed")
-            report["rounds_completed"] = _count_completed_rounds(report["rounds"])
-            report["current_policy"] = dict(current_policy)
-            report["policy_shift_summary"] = _policy_shift_summary(report["rounds"])
-            report["campaign_report_path"] = round_payload.get("campaign_report_path", "")
-            if liftoff_payload is not None:
-                report["liftoff_report_path"] = round_payload.get("liftoff_report_path", "")
-            _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
-            _append_event(
-                event_log_path,
-                {
-                    "event_kind": "policy_shift",
-                    "round_index": round_index,
-                    "policy_before": dict(round_payload.get("policy", {}))
-                    if isinstance(round_payload.get("policy", {}), dict)
-                    else {},
-                    "policy_after": dict(round_payload.get("next_policy", {}))
-                    if isinstance(round_payload.get("next_policy", {}), dict)
-                    else {},
-                    "policy_shift_rationale": dict(round_payload.get("policy_shift_rationale", {}))
-                    if isinstance(round_payload.get("policy_shift_rationale", {}), dict)
-                    else {},
-                    "timestamp": time.time(),
-                },
-                config=config,
+            controller_state, current_policy, no_yield_rounds, policy_stall_rounds, depth_runway_credit = (
+                _finalize_completed_campaign_round(
+                    args=args,
+                    config=config,
+                    report_path=report_path,
+                    status_path=status_path,
+                    lock_path=lock_path,
+                    event_log_path=event_log_path,
+                    controller_state_path=controller_state_path,
+                    run_id=run_id,
+                    round_index=round_index,
+                    report=report,
+                    round_payload=round_payload,
+                    campaign_report=campaign_report,
+                    liftoff_payload=liftoff_payload,
+                    controller_state=controller_state,
+                    current_policy=current_policy,
+                    round_planner_controls=round_planner_controls,
+                    round_curriculum_controls=round_curriculum_controls,
+                    no_yield_rounds=no_yield_rounds,
+                    policy_stall_rounds=policy_stall_rounds,
+                    depth_runway_credit=depth_runway_credit,
+                )
             )
             _emit_policy_shift_alert_if_configured(round_payload)
 

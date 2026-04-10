@@ -100,6 +100,7 @@ def build_liftoff_gate_report(
             failure_reason = _family_proposal_gate_failure(
                 family=family,
                 gate=gate,
+                candidate_eval_metrics=candidate_metrics,
                 candidate_proposal_metrics=candidate_proposal_metrics,
                 baseline_proposal_metrics=baseline_proposal_metrics,
             )
@@ -1179,6 +1180,7 @@ def _family_proposal_gate_failure(
     *,
     family: str,
     gate: dict[str, object],
+    candidate_eval_metrics: EvalMetrics,
     candidate_proposal_metrics: dict[str, dict[str, object]],
     baseline_proposal_metrics: dict[str, dict[str, object]],
 ) -> str | None:
@@ -1195,7 +1197,18 @@ def _family_proposal_gate_failure(
     candidate_novel_valid_steps = int(candidate_metrics.get("novel_valid_command_steps", 0) or 0)
     candidate_novel_valid_rate = float(candidate_metrics.get("novel_valid_command_rate", 0.0) or 0.0)
     baseline_novel_valid_rate = float(baseline_metrics.get("novel_valid_command_rate", 0.0) or 0.0)
+    candidate_primary_episodes = int(
+        candidate_eval_metrics.tolbert_primary_episodes_by_benchmark_family.get(family, 0) or 0
+    )
+    if bool(family_gate.get("allow_primary_routing_signal", False)) and candidate_primary_episodes < int(
+        family_gate.get("min_primary_episodes", 0) or 0
+    ):
+        return "never entered retained Tolbert primary routing"
     if bool(family_gate.get("require_novel_command_signal", False)) and candidate_proposal_steps <= 0:
+        if bool(family_gate.get("allow_primary_routing_signal", False)) and candidate_primary_episodes >= int(
+            family_gate.get("min_primary_episodes", 0) or 0
+        ):
+            return None
         return "missing proposal-selected commands"
     if candidate_proposal_steps - baseline_proposal_steps < int(
         family_gate.get("min_proposal_selected_steps_delta", 0) or 0

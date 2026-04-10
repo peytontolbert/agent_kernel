@@ -68,6 +68,52 @@ def _retained_trust_controls(config: KernelConfig) -> dict[str, object]:
     return retained_trust_controls(payload)
 
 
+def _required_family_counted_evidence_summary(
+    required_families: list[str],
+    *,
+    sampled_progress_counts: dict[str, int] | None = None,
+    runtime_managed_signal_counts: dict[str, int] | None = None,
+    runtime_managed_retained_decision_counts: dict[str, int] | None = None,
+    runtime_managed_decision_yield_counts: dict[str, int] | None = None,
+    clean_task_root_counts: dict[str, int] | None = None,
+) -> dict[str, dict[str, object]]:
+    sampled_progress_counts = sampled_progress_counts or {}
+    runtime_managed_signal_counts = runtime_managed_signal_counts or {}
+    runtime_managed_retained_decision_counts = runtime_managed_retained_decision_counts or {}
+    runtime_managed_decision_yield_counts = runtime_managed_decision_yield_counts or {}
+    clean_task_root_counts = clean_task_root_counts or {}
+    summary: dict[str, dict[str, object]] = {}
+    for family in sorted({str(value).strip() for value in required_families if str(value).strip()}):
+        sampled_progress_count = max(0, int(sampled_progress_counts.get(family, 0) or 0))
+        verified_signal_count = max(0, int(runtime_managed_signal_counts.get(family, 0) or 0))
+        retained_decision_count = max(0, int(runtime_managed_retained_decision_counts.get(family, 0) or 0))
+        decision_yield_count = max(0, int(runtime_managed_decision_yield_counts.get(family, 0) or 0))
+        clean_task_root_count = max(0, int(clean_task_root_counts.get(family, 0) or 0))
+        highest_confirmed_stage = "none"
+        if sampled_progress_count > 0:
+            highest_confirmed_stage = "sampled"
+        if verified_signal_count > 0:
+            highest_confirmed_stage = "verified"
+        if retained_decision_count > 0:
+            highest_confirmed_stage = "retained"
+        if decision_yield_count > 0:
+            highest_confirmed_stage = "yielded"
+        if clean_task_root_count > 0:
+            highest_confirmed_stage = "clean_root"
+        summary[family] = {
+            "sampled_progress_count": sampled_progress_count,
+            "verified_signal_count": verified_signal_count,
+            "retained_decision_count": retained_decision_count,
+            "decision_yield_count": decision_yield_count,
+            "clean_task_root_count": clean_task_root_count,
+            "highest_confirmed_stage": highest_confirmed_stage,
+            "missing_decision_yield_after_sampling": (
+                sampled_progress_count > 0 and decision_yield_count <= 0
+            ),
+        }
+    return summary
+
+
 def load_unattended_reports(
     reports_dir: Path,
     *,
@@ -129,6 +175,7 @@ def summarize_improvement_campaign_reports(reports: list[dict[str, Any]]) -> dic
     runtime_managed_signal_counts: dict[str, int] = {}
     runtime_managed_retained_decision_counts: dict[str, int] = {}
     runtime_managed_decision_yield_counts: dict[str, int] = {}
+    required_family_clean_task_root_counts: dict[str, int] = {}
     runtime_managed_decisions = 0
     retained_cycles = 0
     rejected_cycles = 0
@@ -145,6 +192,16 @@ def summarize_improvement_campaign_reports(reports: list[dict[str, Any]]) -> dic
                 for value in list(trust_breadth_summary.get("required_families_with_reports", []) or [])
                 if str(value).strip()
             )
+            clean_task_root_counts = trust_breadth_summary.get("required_family_clean_task_root_counts", {})
+            if isinstance(clean_task_root_counts, dict):
+                for family, count in clean_task_root_counts.items():
+                    normalized_family = str(family).strip()
+                    if not normalized_family:
+                        continue
+                    required_family_clean_task_root_counts[normalized_family] = max(
+                        required_family_clean_task_root_counts.get(normalized_family, 0),
+                        max(0, int(count or 0)),
+                    )
         priority_family_yield_summary = report.get("priority_family_yield_summary", {})
         if isinstance(priority_family_yield_summary, dict):
             priority_families.update(
@@ -239,6 +296,9 @@ def summarize_improvement_campaign_reports(reports: list[dict[str, Any]]) -> dic
         for family, count in sampled_progress_counts.items()
         if family in required_families and max(0, int(count)) > 0
     )
+    sampled_progress_without_decision_yield_families = sorted(
+        family for family in sampled_progress_families if family not in set(decision_yield_families)
+    )
     missing_sampled_progress_families = sorted(required_families - set(sampled_progress_families))
     signal_counts = {
         family: max(0, int(runtime_managed_signal_counts.get(family, 0)))
@@ -264,6 +324,13 @@ def summarize_improvement_campaign_reports(reports: list[dict[str, Any]]) -> dic
         "required_families_with_sampled_progress": sampled_progress_families,
         "required_families_missing_sampled_progress": missing_sampled_progress_families,
         "required_family_sampled_progress_counts": sampled_progress_credit_counts,
+        "required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield": (
+            sampled_progress_without_decision_yield_families
+        ),
+        "required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts": {
+            family: sampled_progress_credit_counts.get(family, 0)
+            for family in sorted(required_families)
+        },
         "priority_families": sorted(priority_families),
         "runtime_managed_decisions": runtime_managed_decisions,
         "retained_cycles": retained_cycles,
@@ -276,6 +343,18 @@ def summarize_improvement_campaign_reports(reports: list[dict[str, Any]]) -> dic
         "required_family_runtime_managed_signal_counts": signal_counts,
         "required_family_runtime_managed_retained_decision_counts": retained_decision_counts,
         "required_family_runtime_managed_decision_yield_counts": decision_yield_counts,
+        "required_family_clean_task_root_counts": {
+            family: max(0, int(required_family_clean_task_root_counts.get(family, 0)))
+            for family in sorted(required_families)
+        },
+        "required_family_counted_evidence_summary": _required_family_counted_evidence_summary(
+            sorted(required_families),
+            sampled_progress_counts=sampled_progress_credit_counts,
+            runtime_managed_signal_counts=signal_counts,
+            runtime_managed_retained_decision_counts=retained_decision_counts,
+            runtime_managed_decision_yield_counts=decision_yield_counts,
+            clean_task_root_counts=required_family_clean_task_root_counts,
+        ),
     }
 
 
@@ -302,6 +381,7 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
     clean_success_task_roots: set[str] = set()
     task_origins: dict[str, int] = {}
     supervision_modes: dict[str, int] = {}
+    repo_semantic_cluster_counts: dict[str, int] = {}
     external_report_count = 0
 
     for report in reports:
@@ -312,6 +392,8 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
             task_roots.add(task_root)
         task_origin = _task_origin(report)
         task_origins[task_origin] = task_origins.get(task_origin, 0) + 1
+        for cluster in _repo_semantic_clusters(report):
+            repo_semantic_cluster_counts[cluster] = repo_semantic_cluster_counts.get(cluster, 0) + 1
         supervision_mode = _supervision_mode(report)
         supervision_modes[supervision_mode] = supervision_modes.get(supervision_mode, 0) + 1
         if task_origin == "external_manifest":
@@ -395,6 +477,9 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
         "external_report_count": external_report_count,
         "distinct_external_benchmark_families": len(external_benchmark_families),
         "external_benchmark_families": sorted(external_benchmark_families),
+        "distinct_repo_semantic_clusters": len(repo_semantic_cluster_counts),
+        "repo_semantic_clusters": sorted(repo_semantic_cluster_counts),
+        "repo_semantic_cluster_counts": dict(sorted(repo_semantic_cluster_counts.items())),
         "task_origins": dict(sorted(task_origins.items())),
         "supervision_modes": dict(sorted(supervision_modes.items())),
         "independent_execution_count": independent_execution_count,
@@ -618,6 +703,11 @@ def build_unattended_trust_ledger(
         counted_gated_family_summaries=counted_gated_family_summaries,
         family_assessments=family_assessments,
     )
+    coverage_summary["observed_repo_semantic_clusters"] = list(overall_summary.get("repo_semantic_clusters", []))
+    coverage_summary["distinct_repo_semantic_clusters"] = int(
+        overall_summary.get("distinct_repo_semantic_clusters", 0) or 0
+    )
+    coverage_summary["repo_semantic_cluster_counts"] = dict(overall_summary.get("repo_semantic_cluster_counts", {}))
     coverage_summary["required_family_runtime_managed_signal_counts"] = {
         family: 0 for family in coverage_summary.get("required_families", [])
     }
@@ -642,8 +732,16 @@ def build_unattended_trust_ledger(
     coverage_summary["required_families_missing_sampled_progress"] = list(
         coverage_summary.get("required_families", [])
     )
+    coverage_summary["required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield"] = []
+    coverage_summary["required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts"] = {
+        family: 0 for family in coverage_summary.get("required_families", [])
+    }
+    campaign_clean_task_root_counts = {
+        str(family).strip(): max(0, _int_value(campaign_summary.get("required_family_clean_task_root_counts", {}), (family,)))
+        for family in coverage_summary.get("required_families", [])
+        if str(family).strip()
+    }
     if combined_sampled_progress_families or combined_signal_families or combined_decision_yield_families:
-        combined_family_report_counts = dict(coverage_summary.get("required_family_report_counts", {}))
         combined_sampled_progress_counts = dict(campaign_summary.get("required_family_sampled_progress_counts", {}))
         combined_signal_counts = dict(campaign_summary.get("required_family_runtime_managed_signal_counts", {}))
         combined_retained_decision_counts = dict(
@@ -652,35 +750,6 @@ def build_unattended_trust_ledger(
         combined_decision_yield_counts = dict(
             campaign_summary.get("required_family_runtime_managed_decision_yield_counts", {})
         )
-        coverage_credit_family_set = (
-            combined_sampled_progress_family_set | combined_signal_family_set | combined_decision_yield_family_set
-        )
-        for family in sorted(coverage_credit_family_set):
-            combined_family_report_counts[family] = max(1, int(combined_family_report_counts.get(family, 0) or 0))
-        coverage_summary["required_family_report_counts"] = combined_family_report_counts
-        coverage_summary["required_families_with_reports"] = sorted(
-            set(coverage_summary.get("required_families_with_reports", []))
-            | combined_sampled_progress_family_set
-            | combined_signal_family_set
-            | combined_decision_yield_family_set
-        )
-        coverage_summary["required_families_with_gated_reports"] = sorted(
-            set(coverage_summary.get("required_families_with_gated_reports", []))
-            | combined_signal_family_set
-            | combined_decision_yield_family_set
-        )
-        observed_required_families = coverage_credit_family_set
-        observed_required_gated_families = (
-            set(coverage_summary.get("required_families_with_gated_reports", []))
-            | combined_signal_family_set
-            | combined_decision_yield_family_set
-        )
-        coverage_summary["missing_required_families"] = [
-            family for family in coverage_summary["required_families"] if family not in observed_required_families
-        ]
-        coverage_summary["missing_required_gated_families"] = [
-            family for family in coverage_summary["required_families"] if family not in observed_required_gated_families
-        ]
         coverage_summary["required_family_sampled_progress_counts"] = {
             family: max(0, _int_value(combined_sampled_progress_counts, (family,)))
             for family in coverage_summary["required_families"]
@@ -713,6 +782,69 @@ def build_unattended_trust_ledger(
             for family in coverage_summary["required_families"]
             if family not in combined_decision_yield_family_set
         ]
+        sampled_progress_without_decision_yield = sorted(
+            family
+            for family in combined_sampled_progress_families
+            if family not in combined_decision_yield_family_set
+        )
+        coverage_summary["required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield"] = (
+            sampled_progress_without_decision_yield
+        )
+        coverage_summary["required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts"] = {
+            family: (
+                max(0, _int_value(combined_sampled_progress_counts, (family,)))
+                if family in sampled_progress_without_decision_yield
+                else 0
+            )
+            for family in coverage_summary["required_families"]
+        }
+    if campaign_clean_task_root_counts:
+        merged_clean_task_root_counts = dict(coverage_summary.get("required_family_clean_task_root_counts", {}))
+        for family, count in campaign_clean_task_root_counts.items():
+            merged_clean_task_root_counts[family] = max(
+                int(merged_clean_task_root_counts.get(family, 0) or 0),
+                count,
+            )
+        coverage_summary["required_family_clean_task_root_counts"] = merged_clean_task_root_counts
+        family_breadth_min_distinct_task_roots = int(
+            coverage_summary.get("family_breadth_min_distinct_task_roots", 0) or 0
+        )
+        if family_breadth_min_distinct_task_roots > 0:
+            coverage_summary["required_families_missing_clean_task_root_breadth"] = [
+                family
+                for family in coverage_summary.get("required_families", [])
+                if int(merged_clean_task_root_counts.get(family, 0) or 0) < family_breadth_min_distinct_task_roots
+            ]
+    coverage_summary["required_family_counted_evidence_summary"] = _required_family_counted_evidence_summary(
+        list(coverage_summary.get("required_families", []))
+        if isinstance(coverage_summary.get("required_families", []), list)
+        else [],
+        sampled_progress_counts=(
+            dict(coverage_summary.get("required_family_sampled_progress_counts", {}))
+            if isinstance(coverage_summary.get("required_family_sampled_progress_counts", {}), dict)
+            else {}
+        ),
+        runtime_managed_signal_counts=(
+            dict(coverage_summary.get("required_family_runtime_managed_signal_counts", {}))
+            if isinstance(coverage_summary.get("required_family_runtime_managed_signal_counts", {}), dict)
+            else {}
+        ),
+        runtime_managed_retained_decision_counts=(
+            dict(coverage_summary.get("required_family_runtime_managed_retained_decision_counts", {}))
+            if isinstance(coverage_summary.get("required_family_runtime_managed_retained_decision_counts", {}), dict)
+            else {}
+        ),
+        runtime_managed_decision_yield_counts=(
+            dict(coverage_summary.get("required_family_runtime_managed_decision_yield_counts", {}))
+            if isinstance(coverage_summary.get("required_family_runtime_managed_decision_yield_counts", {}), dict)
+            else {}
+        ),
+        clean_task_root_counts=(
+            dict(coverage_summary.get("required_family_clean_task_root_counts", {}))
+            if isinstance(coverage_summary.get("required_family_clean_task_root_counts", {}), dict)
+            else {}
+        ),
+    )
     return {
         "ledger_kind": "unattended_trust_ledger",
         "generated_at": datetime.now(UTC).isoformat(),
@@ -861,6 +993,19 @@ def _report_timestamp(payload: dict[str, Any], path: Path) -> datetime:
 
 def _benchmark_family(payload: dict[str, Any]) -> str:
     return str(payload.get("benchmark_family", "bounded")).strip() or "bounded"
+
+
+def _repo_semantic_clusters(payload: dict[str, Any]) -> list[str]:
+    task_metadata = payload.get("task_metadata", {})
+    values = task_metadata.get("repo_semantics", []) if isinstance(task_metadata, dict) else []
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    for value in values:
+        label = str(value).strip().lower()
+        if label and label not in normalized:
+            normalized.append(label)
+    return normalized
 
 
 def _task_origin(payload: dict[str, Any]) -> str:
@@ -1158,6 +1303,10 @@ def _coverage_summary(
         "required_families_missing_runtime_managed_signal": list(required_families),
         "required_families_with_runtime_managed_decision_yield": [],
         "required_families_missing_runtime_managed_decision_yield": list(required_families),
+        "required_families_with_sampled_progress_but_missing_runtime_managed_decision_yield": [],
+        "required_family_sampled_progress_but_missing_runtime_managed_decision_yield_counts": {
+            family: 0 for family in required_families
+        },
         "required_families_with_reports": required_families_with_reports,
         "required_families_with_gated_reports": required_families_with_gated_reports,
         "required_families_with_counted_gated_reports": required_families_with_counted_gated_reports,

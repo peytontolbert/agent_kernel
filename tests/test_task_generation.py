@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -233,6 +234,20 @@ def test_task_bank_frontier_includes_harder_bundled_long_horizon_tasks():
     assert bank.get("integration_failover_drill_task").max_steps >= 24
     assert bank.get("git_release_train_acceptance_task").max_steps >= 28
     assert bank.get("git_release_train_conflict_acceptance_task").max_steps >= 32
+
+
+def test_priority_long_horizon_tasks_first_suggestion_satisfies_contract(tmp_path):
+    bank = TaskBank()
+
+    for task_id in ("project_release_cutover_task", "repository_migration_wave_task"):
+        task = bank.get(task_id)
+        workspace = tmp_path / task_id
+        workspace.mkdir()
+        for command in task.setup_commands:
+            subprocess.run(command, shell=True, cwd=workspace, check=True)
+
+        subprocess.run(task.suggested_commands[0], shell=True, cwd=workspace, check=True)
+        subprocess.run(task.success_command, shell=True, cwd=workspace, check=True)
 
 
 def test_task_bank_loads_external_manifest_tasks_from_directory_and_glob(tmp_path):

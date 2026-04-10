@@ -19,6 +19,88 @@ def _load_script(name: str):
     return module
 
 
+def _claim_gate_result(
+    *,
+    run_index: int,
+    carryover_metrics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "run_match_id": f"autonomous:{run_index}",
+        "run_index": run_index,
+        "returncode": 0,
+        "production_yield_summary": {
+            "retained_cycles": 2,
+            "rejected_cycles": 0,
+            "average_retained_pass_rate_delta": 0.08,
+            "average_retained_step_delta": -0.1,
+            "worst_family_delta": 0.0,
+            "worst_generated_family_delta": 0.0,
+            "worst_failure_recovery_delta": 0.0,
+            "average_retained_estimated_cost": 3.0,
+        },
+        "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+        "report_payload": {
+            "record_scope": {
+                "protocol": "autonomous",
+                "campaign_match_id": f"autonomous:{run_index}",
+                "records_considered": 4,
+                "decision_records_considered": 2,
+                "cycle_ids": [f"cycle:policy:{run_index}", f"cycle:retrieval:{run_index}"],
+            },
+            "decision_stream_summary": {
+                "runtime_managed": {"total_decisions": 2},
+                "non_runtime_managed": {"total_decisions": 0},
+            },
+            "trust_breadth_summary": {
+                "required_families_with_reports": ["workflow", "project"],
+                "external_benchmark_families": ["workflow", "project"],
+                "family_breadth_min_distinct_task_roots": 2,
+                "required_family_clean_task_root_counts": {"workflow": 2, "project": 2},
+                "missing_required_family_clean_task_root_breadth": [],
+            },
+            "priority_family_yield_summary": {
+                "family_summaries": {
+                    "workflow": {
+                        "observed_decisions": 1,
+                        "retained_positive_delta_decisions": 1,
+                        "retained_negative_delta_decisions": 0,
+                        "retained_positive_pass_rate_delta_sum": 0.08,
+                        "retained_estimated_cost": 4.0,
+                    },
+                    "project": {
+                        "observed_decisions": 1,
+                        "retained_positive_delta_decisions": 1,
+                        "retained_negative_delta_decisions": 0,
+                        "retained_positive_pass_rate_delta_sum": 0.05,
+                        "retained_estimated_cost": 4.0,
+                    },
+                }
+            },
+            "priority_family_allocation_summary": {
+                "aggregated_task_counts": {"workflow": 3, "project": 2},
+            },
+            "recent_runtime_managed_decisions": [
+                {
+                    "cycle_id": f"cycle:retrieval:{run_index}",
+                    "state": "retain",
+                    "subsystem": "retrieval",
+                    "metrics_summary": dict(carryover_metrics or {}),
+                }
+            ],
+            "inheritance_summary": {
+                "runtime_managed_decisions": 2,
+            },
+        },
+        "seed_fingerprint": "seed-shared",
+        "retention_criteria_fingerprint": "criteria-shared",
+        "retention_criteria_manifest": {
+            "run_parameters": {
+                "priority_benchmark_families": ["workflow", "project"],
+            }
+        },
+    }
+
+
 def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
     module = _load_script("run_autonomous_compounding_check.py")
     cycles_path = tmp_path / "improvement" / "cycles.jsonl"
@@ -1480,7 +1562,7 @@ def test_run_autonomous_compounding_check_compensates_under_sampled_prior_family
     payload = json.loads(report_path.read_text(encoding="utf-8"))
 
     assert payload["priority_benchmark_family_weight_source"] == (
-        "prior_compounding_investment_score_plus_rank_weight_and_allocation_compensation_and_normalization"
+        "prior_compounding_investment_score_plus_rank_weight_and_allocation_compensation_and_normalization_and_autonomous_frontier_pressure"
     )
     assert payload["priority_benchmark_family_allocation_compensation"]["gap_source"] == "latest_allocation_summary"
     assert payload["priority_benchmark_family_allocation_compensation"]["positive_gap_families"] == ["workflow"]
@@ -2517,7 +2599,7 @@ def test_run_autonomous_compounding_check_strengthens_compensation_for_repeated_
             for index, token in enumerate(cmd[:-1])
             if token == "--priority-benchmark-family-weight"
         }
-        assert forwarded_weights["workflow"] == 12.04
+        assert forwarded_weights["workflow"] == 13.54
         assert forwarded_weights["workflow"] > forwarded_weights["repository"]
         report_path = reports_dir / "campaign_report_repeated_bonus.json"
         report_path.write_text(
@@ -2596,14 +2678,14 @@ def test_run_autonomous_compounding_check_strengthens_compensation_for_repeated_
     payload = json.loads(report_path.read_text(encoding="utf-8"))
 
     assert payload["priority_benchmark_family_weight_source"] == (
-        "prior_compounding_investment_score_plus_rank_weight_and_allocation_compensation_and_normalization"
+        "prior_compounding_investment_score_plus_rank_weight_and_allocation_compensation_and_normalization_and_autonomous_frontier_pressure"
     )
     assert payload["priority_benchmark_family_allocation_compensation"]["positive_gap_families"] == ["workflow"]
     assert payload["priority_benchmark_family_allocation_compensation"]["compensation_streak_by_family"]["workflow"] == 3
     assert payload["priority_benchmark_family_allocation_compensation"]["compensation_multiplier_by_family"]["workflow"] == 2.0
     assert payload["priority_benchmark_family_allocation_compensation"]["weight_bonus_by_family"]["workflow"] == 8.0
     assert payload["priority_benchmark_family_allocation_compensation"]["net_weight_adjustment_by_family"]["workflow"] == 8.0
-    assert payload["priority_benchmark_family_weights"]["workflow"] == 12.04
+    assert payload["priority_benchmark_family_weights"]["workflow"] == 13.54
 
 
 def test_run_autonomous_compounding_check_dampens_adjustments_when_allocation_confidence_is_low(tmp_path, monkeypatch):
@@ -2741,7 +2823,7 @@ def test_run_autonomous_compounding_check_dampens_adjustments_when_allocation_co
             if token == "--priority-benchmark-family-weight"
         }
         assert forwarded_weights["repository"] == 4.756667
-        assert forwarded_weights["workflow"] == 6.706664
+        assert forwarded_weights["workflow"] == 8.206664
         report_path = reports_dir / "campaign_report_low_confidence.json"
         report_path.write_text(
             json.dumps(
@@ -2823,7 +2905,7 @@ def test_run_autonomous_compounding_check_dampens_adjustments_when_allocation_co
     assert payload["priority_benchmark_family_allocation_compensation"]["weight_normalization_by_family"]["repository"] == 0.333333
     assert payload["priority_benchmark_family_allocation_compensation"]["net_weight_adjustment_by_family"]["workflow"] == 2.666664
     assert payload["priority_benchmark_family_allocation_compensation"]["net_weight_adjustment_by_family"]["repository"] == -0.333333
-    assert payload["priority_benchmark_family_weights"]["workflow"] == 6.706664
+    assert payload["priority_benchmark_family_weights"]["workflow"] == 8.206664
     assert payload["priority_benchmark_family_weights"]["repository"] == 4.756667
 
 
@@ -2968,7 +3050,7 @@ def test_run_autonomous_compounding_check_uses_family_specific_allocation_confid
             for index, token in enumerate(cmd[:-1])
             if token == "--priority-benchmark-family-weight"
         }
-        assert forwarded_weights["workflow"] == 9.373336
+        assert forwarded_weights["workflow"] == 10.873336
         assert forwarded_weights["repository"] == 4.645556
         report_path = reports_dir / "campaign_report_family_confidence.json"
         report_path.write_text(
@@ -3059,7 +3141,7 @@ def test_run_autonomous_compounding_check_uses_family_specific_allocation_confid
     assert payload["priority_benchmark_family_allocation_compensation"]["applied_normalization_allocation_confidence_by_family"]["repository"] == 0.444444
     assert payload["priority_benchmark_family_allocation_compensation"]["weight_bonus_by_family"]["workflow"] == 5.333336
     assert payload["priority_benchmark_family_allocation_compensation"]["weight_normalization_by_family"]["repository"] == 0.444444
-    assert payload["priority_benchmark_family_weights"]["workflow"] == 9.373336
+    assert payload["priority_benchmark_family_weights"]["workflow"] == 10.873336
     assert payload["priority_benchmark_family_weights"]["repository"] == 4.645556
 
 
@@ -3739,6 +3821,117 @@ def test_claim_gate_blocks_when_transfer_gain_declines_over_time_despite_breadth
         "project",
         "repository",
     ]
+
+
+def test_claim_gate_blocks_when_retrieval_carryover_metrics_do_not_prove_later_repair_reuse():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    results = [
+        _claim_gate_result(
+            run_index=1,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.25,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 0,
+                "trusted_carryover_verified_step_delta": 0,
+            },
+        ),
+        _claim_gate_result(
+            run_index=2,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.25,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 0,
+                "trusted_carryover_verified_step_delta": 0,
+            },
+        ),
+    ]
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert claim_gate["autonomous_compounding_claim_ready"] is False
+    assert "trusted_retrieval_carryover_not_proven" in claim_gate["blockers"]
+    assert claim_gate["retrieval_carryover_summary"] == {
+        "runs_checked": 2,
+        "observed_retrieval_decision_count": 2,
+        "runs_with_retrieval_carryover_metrics": [1, 2],
+        "runs_with_verified_carryover_improvement": [],
+        "runs_with_verified_carryover_non_regression": [],
+        "runs_missing_verified_carryover_non_regression": [1, 2],
+        "best_trusted_carryover_repair_rate": 0.25,
+        "best_trusted_carryover_verified_steps": 0,
+        "carryover_pressure": True,
+    }
+
+
+def test_claim_gate_accepts_verified_retrieval_carryover_non_regression():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    results = [
+        _claim_gate_result(
+            run_index=1,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.5,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 2,
+                "trusted_carryover_verified_step_delta": 1,
+            },
+        ),
+        _claim_gate_result(
+            run_index=2,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.5,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_step_delta": 0,
+            },
+        ),
+    ]
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert "trusted_retrieval_carryover_not_proven" not in claim_gate["blockers"]
+    assert claim_gate["retrieval_carryover_summary"]["runs_with_verified_carryover_improvement"] == [1, 2]
+    assert claim_gate["retrieval_carryover_summary"]["runs_with_verified_carryover_non_regression"] == [1, 2]
+    assert claim_gate["retrieval_carryover_summary"]["carryover_pressure"] is False
+
+
+def test_claim_gate_blocks_when_any_run_lacks_verified_retrieval_carryover_non_regression():
+    module = _load_script("run_autonomous_compounding_check.py")
+
+    results = [
+        _claim_gate_result(
+            run_index=1,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.5,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 2,
+                "trusted_carryover_verified_step_delta": 1,
+            },
+        ),
+        _claim_gate_result(
+            run_index=2,
+            carryover_metrics={
+                "baseline_trusted_carryover_repair_rate": 0.25,
+                "trusted_carryover_repair_rate": 0.25,
+                "baseline_trusted_carryover_verified_steps": 1,
+                "trusted_carryover_verified_steps": 0,
+                "trusted_carryover_verified_step_delta": 0,
+            },
+        ),
+    ]
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert "trusted_retrieval_carryover_not_proven" in claim_gate["blockers"]
+    assert claim_gate["retrieval_carryover_summary"]["runs_with_verified_carryover_non_regression"] == [1]
+    assert claim_gate["retrieval_carryover_summary"]["runs_missing_verified_carryover_non_regression"] == [2]
+    assert claim_gate["retrieval_carryover_summary"]["carryover_pressure"] is True
 
 
 def test_claim_gate_blocks_when_transfer_is_persistent_but_too_expensive():

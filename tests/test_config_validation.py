@@ -14,6 +14,17 @@ def test_kernel_rejects_unknown_provider_at_startup(tmp_path):
         AgentKernel(config=config)
 
 
+def test_kernel_rejects_tolbert_provider_alias_at_startup(tmp_path):
+    config = KernelConfig(
+        provider="tolbert",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    with pytest.raises(ValueError, match="unsupported provider"):
+        AgentKernel(config=config)
+
+
 def test_kernel_rejects_nonpositive_timeout_at_startup(tmp_path):
     config = KernelConfig(
         provider="mock",

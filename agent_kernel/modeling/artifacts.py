@@ -11,6 +11,8 @@ _DEFAULT_TOLBERT_RUNTIME_POLICY: dict[str, object] = {
     "shadow_benchmark_families": [],
     "primary_benchmark_families": [],
     "min_path_confidence": 0.75,
+    "allow_trusted_primary_without_min_confidence": False,
+    "trusted_primary_min_confidence": 0.0,
     "require_trusted_retrieval": True,
     "fallback_to_vllm_on_low_confidence": True,
     "allow_direct_command_primary": True,
@@ -153,6 +155,9 @@ _DEFAULT_TOLBERT_LIFTOFF_GATE: dict[str, object] = {
     "require_trust_success_hidden_side_effect_non_regression": True,
     "require_shadow_signal": True,
     "min_shadow_episodes_per_promoted_family": 1,
+    "require_primary_routing_signal": False,
+    "min_primary_episodes": 0,
+    "allow_selection_signal_fallback": False,
     "require_family_novel_command_evidence": False,
     "proposal_gate_by_benchmark_family": {},
     "require_takeover_drift_eval": True,
@@ -227,12 +232,17 @@ def retained_tolbert_runtime_policy(payload: object) -> dict[str, object]:
         normalized.get("min_path_confidence"),
         float(_DEFAULT_TOLBERT_RUNTIME_POLICY["min_path_confidence"]),
     )
+    normalized["trusted_primary_min_confidence"] = _float_value(
+        normalized.get("trusted_primary_min_confidence"),
+        float(_DEFAULT_TOLBERT_RUNTIME_POLICY["trusted_primary_min_confidence"]),
+    )
     normalized["primary_min_command_score"] = _int_value(
         normalized.get("primary_min_command_score"),
         int(_DEFAULT_TOLBERT_RUNTIME_POLICY["primary_min_command_score"]),
     )
     for key in (
         "require_trusted_retrieval",
+        "allow_trusted_primary_without_min_confidence",
         "fallback_to_vllm_on_low_confidence",
         "allow_direct_command_primary",
         "allow_skill_primary",
@@ -422,6 +432,22 @@ def retained_tolbert_liftoff_gate(payload: object) -> dict[str, object]:
         normalized.get("min_shadow_episodes_per_promoted_family"),
         int(_DEFAULT_TOLBERT_LIFTOFF_GATE["min_shadow_episodes_per_promoted_family"]),
     )
+    normalized["require_primary_routing_signal"] = bool(
+        normalized.get(
+            "require_primary_routing_signal",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_primary_routing_signal"],
+        )
+    )
+    normalized["min_primary_episodes"] = _int_value(
+        normalized.get("min_primary_episodes"),
+        int(_DEFAULT_TOLBERT_LIFTOFF_GATE["min_primary_episodes"]),
+    )
+    normalized["allow_selection_signal_fallback"] = bool(
+        normalized.get(
+            "allow_selection_signal_fallback",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["allow_selection_signal_fallback"],
+        )
+    )
     normalized["require_family_novel_command_evidence"] = bool(
         normalized.get(
             "require_family_novel_command_evidence",
@@ -476,6 +502,8 @@ def _normalized_family_proposal_gate(value: object) -> dict[str, dict[str, objec
                 raw_gate.get("min_novel_valid_command_rate_delta"),
                 0.0,
             ),
+            "allow_primary_routing_signal": bool(raw_gate.get("allow_primary_routing_signal", False)),
+            "min_primary_episodes": _int_value(raw_gate.get("min_primary_episodes"), 0),
         }
     return normalized
 

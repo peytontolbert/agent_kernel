@@ -20,6 +20,7 @@ from agent_kernel.memory import EpisodeMemory
 from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
 from agent_kernel.task_bank import (
+    TaskBank,
     load_benchmark_candidate_tasks,
     load_discovered_tasks,
     load_episode_replay_tasks,
@@ -1566,12 +1567,14 @@ def test_skill_extractor_uses_successful_recovery_case_via_source_task_alias(tmp
     output = tmp_path / "skills.json"
     extract_successful_command_skills(episodes_root, output)
     payload = json.loads(output.read_text(encoding="utf-8"))
+    source_task = TaskBank().get("service_release_task")
 
     assert [skill["skill_id"] for skill in payload["skills"]] == ["skill:service_release_task:postrun"]
     assert payload["skills"][0]["source_task_id"] == "service_release_task"
     assert payload["skills"][0]["procedure"]["commands"] == [
         "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
     ]
+    assert payload["skills"][0]["task_contract"]["expected_files"] == source_task.expected_files
     assert payload["skills"][0]["task_contract"]["metadata"]["source_task"] == "service_release_task"
     assert payload["skills"][0]["known_failure_types"] == []
 
@@ -2568,12 +2571,78 @@ def test_tool_candidate_extractor_uses_successful_recovery_case_via_source_task_
     output = tmp_path / "tools.json"
     extract_tool_candidates(episodes_root, output)
     payload = json.loads(output.read_text(encoding="utf-8"))
+    source_task = TaskBank().get("service_release_task")
 
     assert [candidate["tool_id"] for candidate in payload["candidates"]] == ["tool:service_release_task:primary"]
     assert payload["candidates"][0]["procedure"]["commands"] == [
         "mkdir -p app config tests && printf 'service release ready\\n' > app/release.txt"
     ]
-    assert payload["candidates"][0]["summary"] == "Prepare release outputs."
+    assert payload["candidates"][0]["task_contract"]["expected_files"] == source_task.expected_files
+    assert payload["candidates"][0]["summary"] == source_task.prompt
+
+
+def test_tool_candidate_extractor_skips_recovery_case_not_aligned_with_aliased_source_task(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    learning_root = tmp_path / "learning"
+    learning_root.mkdir()
+    (learning_root / "run_learning_artifacts.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "run_learning_candidate_set",
+                "lifecycle_state": "candidate",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:recovery_case:api_contract_task_tool_recovery",
+                        "artifact_kind": "recovery_case",
+                        "source_task_id": "api_contract_task_tool_recovery",
+                        "parent_task": "api_contract_task",
+                        "benchmark_family": "tooling",
+                        "success": True,
+                        "quality": 0.82,
+                        "recovery_commands": [
+                            "mkdir -p tool && printf 'tool recovery complete\\n' > tool/recovery.txt && printf 'tool recovery verified\\n' > tool/check.txt && printf 'tool recovered\\n' > tool/status.txt"
+                        ],
+                        "task_contract": {
+                            "prompt": "Recover the tool workspace.",
+                            "workspace_subdir": "api_contract_task_tool_recovery",
+                            "setup_commands": [],
+                            "success_command": "test -f tool/recovery.txt",
+                            "suggested_commands": [],
+                            "expected_files": [
+                                "tool/recovery.txt",
+                                "tool/check.txt",
+                                "tool/status.txt",
+                            ],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {
+                                "tool/recovery.txt": "tool recovery complete\n",
+                                "tool/check.txt": "tool recovery verified\n",
+                                "tool/status.txt": "tool recovered\n",
+                            },
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "tooling", "source_task": "api_contract_task"},
+                        },
+                        "task_metadata": {
+                            "benchmark_family": "tooling",
+                            "source_task": "api_contract_task",
+                            "curriculum_kind": "failure_recovery",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "tools.json"
+    extract_tool_candidates(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["candidates"] == []
 
 
 def test_tool_candidate_extractor_dedupes_equivalent_command_variants_and_populates_metadata(tmp_path):
@@ -3041,6 +3110,50 @@ def test_tool_replay_tasks_skip_rejected_retention_decision(tmp_path):
     assert tasks == []
 
 
+def test_tool_replay_tasks_skip_contract_mismatch_against_source_task(tmp_path):
+    tools_path = tmp_path / "tools.json"
+    tools_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tool_candidate_set",
+                "lifecycle_state": "replay_verified",
+                "candidates": [
+                    {
+                        "tool_id": "tool:api_contract_task:primary",
+                        "source_task_id": "api_contract_task",
+                        "promotion_stage": "replay_verified",
+                        "lifecycle_state": "replay_verified",
+                        "procedure": {
+                            "commands": [
+                                "mkdir -p tool && printf 'tool recovery complete\\n' > tool/recovery.txt"
+                            ]
+                        },
+                        "task_contract": {
+                            "prompt": "Recover the tool workspace.",
+                            "workspace_subdir": "api_contract_task_tool_recovery",
+                            "setup_commands": [],
+                            "success_command": "test -f tool/recovery.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["tool/recovery.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"tool/recovery.txt": "tool recovery complete\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "tooling", "capability": "tool_environment"},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_tool_replay_tasks(tools_path)
+
+    assert tasks == []
+
+
 def test_tool_replay_tasks_skip_candidate_top_level_artifact(tmp_path):
     tools_path = tmp_path / "tools.json"
     tools_path.write_text(
@@ -3104,6 +3217,44 @@ def test_skill_replay_tasks_skip_rejected_artifact(tmp_path):
                             "forbidden_files": [],
                             "forbidden_output_substrings": [],
                             "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                            "max_steps": 5,
+                            "metadata": {"benchmark_family": "micro", "capability": "file_write"},
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_skill_replay_tasks(skills_path)
+
+    assert tasks == []
+
+
+def test_skill_replay_tasks_skip_contract_mismatch_against_source_task(tmp_path):
+    skills_path = tmp_path / "skills.json"
+    skills_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "skill_set",
+                "lifecycle_state": "retained",
+                "skills": [
+                    {
+                        "skill_id": "skill:hello_task:primary",
+                        "source_task_id": "hello_task",
+                        "procedure": {"commands": ["printf 'wrong\\n' > wrong.txt"]},
+                        "task_contract": {
+                            "prompt": "Create wrong.txt.",
+                            "workspace_subdir": "hello_task_bad",
+                            "setup_commands": [],
+                            "success_command": "test -f wrong.txt",
+                            "suggested_commands": [],
+                            "expected_files": ["wrong.txt"],
+                            "expected_output_substrings": [],
+                            "forbidden_files": [],
+                            "forbidden_output_substrings": [],
+                            "expected_file_contents": {"wrong.txt": "wrong\n"},
                             "max_steps": 5,
                             "metadata": {"benchmark_family": "micro", "capability": "file_write"},
                         },

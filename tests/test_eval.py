@@ -23,6 +23,42 @@ from evals.harness import (
 from evals.metrics import EvalMetrics
 
 
+def test_forced_failure_policy_uses_contract_probe_for_expected_file():
+    task = TaskSpec(
+        task_id="archive_command_seed_task",
+        prompt="Create archive/out.txt containing archived using a single command.",
+        workspace_subdir="archive_command_seed_task",
+        expected_files=["archive/out.txt"],
+        suggested_commands=["mkdir -p archive && printf 'archived\\n' > archive/out.txt"],
+        success_command="test -f archive/out.txt && grep -q '^archived$' archive/out.txt",
+        metadata={"benchmark_family": "bounded"},
+    )
+    decision = harness_module._ForcedFailurePolicy().decide(type("State", (), {"task": task})())
+
+    assert decision.action == "code_execute"
+    assert decision.content == "test -f archive/out.txt"
+    assert decision.content != "false"
+    assert decision.decision_source == "failure_seed_contract_probe"
+
+
+def test_forced_failure_policy_uses_forbidden_probe_when_available():
+    task = TaskSpec(
+        task_id="deployment_manifest_task",
+        prompt="Prepare deployment workspace.",
+        workspace_subdir="deployment_manifest_task",
+        forbidden_files=["staging/draft.txt"],
+        expected_files=["deploy/manifest.txt"],
+        success_command="test ! -f staging/draft.txt && test -f deploy/manifest.txt",
+        metadata={"benchmark_family": "project"},
+    )
+    decision = harness_module._ForcedFailurePolicy().decide(type("State", (), {"task": task})())
+
+    assert decision.action == "code_execute"
+    assert decision.content == "test ! -f staging/draft.txt"
+    assert decision.content != "false"
+    assert decision.decision_source == "failure_seed_contract_probe"
+
+
 def _write_hello_skill(config: KernelConfig) -> None:
     config.skills_path.parent.mkdir(parents=True, exist_ok=True)
     config.skills_path.write_text(
@@ -211,7 +247,17 @@ def test_run_tasks_with_progress_flushes_callbacks_before_unattended_report_writ
                 prompt=task.prompt,
                 workspace=str(tmp_path / "workspace" / task.workspace_subdir),
                 success=True,
-                steps=[],
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="complete",
+                        action="shell",
+                        content=str(task.suggested_commands[0]),
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                    )
+                ],
                 task_metadata=dict(task.metadata),
                 task_contract={"metadata": dict(task.metadata)},
                 termination_reason="success",
@@ -442,6 +488,100 @@ def test_run_eval_task_limit_prioritizes_requested_benchmark_families(tmp_path):
     assert set(metrics.total_by_benchmark_family) == {"project", "repository", "integration"}
 
 
+def test_run_eval_can_restrict_to_requested_priority_benchmark_families(monkeypatch, tmp_path):
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="project_priority_task",
+                    prompt="project",
+                    workspace_subdir="project_priority_task",
+                    suggested_commands=["printf 'project\\n' > out.txt"],
+                    success_command="test -f out.txt && grep -q '^project$' out.txt",
+                    metadata={"benchmark_family": "project"},
+                ),
+                TaskSpec(
+                    task_id="repository_priority_task",
+                    prompt="repository",
+                    workspace_subdir="repository_priority_task",
+                    suggested_commands=["printf 'repository\\n' > out.txt"],
+                    success_command="test -f out.txt && grep -q '^repository$' out.txt",
+                    metadata={"benchmark_family": "repository"},
+                ),
+                TaskSpec(
+                    task_id="repository_priority_retrieval_task",
+                    prompt="repository retrieval companion",
+                    workspace_subdir="repository_priority_retrieval_task",
+                    suggested_commands=["printf 'repository\\n' > out.txt"],
+                    success_command="test -f out.txt && grep -q '^repository$' out.txt",
+                    metadata={
+                        "benchmark_family": "repository",
+                        "requires_retrieval": True,
+                        "source_task": "repository_priority_task",
+                    },
+                ),
+                TaskSpec(
+                    task_id="bounded_backfill_task",
+                    prompt="bounded",
+                    workspace_subdir="bounded_backfill_task",
+                    suggested_commands=["printf 'bounded\\n' > out.txt"],
+                    success_command="test -f out.txt && grep -q '^bounded$' out.txt",
+                    metadata={"benchmark_family": "bounded"},
+                ),
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="complete",
+                        action="shell",
+                        content=str(task.suggested_commands[0]),
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories",
+        ),
+        task_limit=10,
+        priority_benchmark_families=["project", "repository"],
+        restrict_to_priority_benchmark_families=True,
+    )
+
+    assert metrics.total == 2
+    assert set(metrics.total_by_benchmark_family) == {"project", "repository"}
+
+
 def test_run_eval_task_limit_allocates_more_budget_to_higher_weight_priority_families(monkeypatch, tmp_path):
     class FakeTaskBank:
         def __init__(self, config=None):
@@ -550,6 +690,41 @@ def test_limit_tasks_for_compare_can_prefer_low_cost_tasks_within_family():
     )
 
     assert [task.task_id for task in selected] == ["a_cheap_seed"]
+
+
+def test_limit_tasks_for_compare_demotes_long_horizon_metadata_even_when_difficulty_is_generic():
+    long_horizon = TaskSpec(
+        task_id="a_long_horizon",
+        prompt="Coordinate a long integration drill.",
+        workspace_subdir="a_long_horizon",
+        suggested_commands=["true"],
+        success_command="true",
+        max_steps=1,
+        metadata={
+            "benchmark_family": "integration",
+            "difficulty": "multi_system",
+            "horizon": "long_horizon",
+        },
+    )
+    bounded_primary = TaskSpec(
+        task_id="z_bounded_primary",
+        prompt="Write a bounded integration artifact.",
+        workspace_subdir="z_bounded_primary",
+        suggested_commands=["true"],
+        success_command="true",
+        max_steps=5,
+        metadata={"benchmark_family": "integration", "difficulty": "multi_system"},
+    )
+
+    selected = _limit_tasks_for_compare(
+        [long_horizon, bounded_primary],
+        1,
+        priority_families=["integration"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["integration"],
+    )
+
+    assert [task.task_id for task in selected] == ["z_bounded_primary"]
 
 
 def test_limit_tasks_for_compare_prefers_light_supervision_contract_tasks_before_retrieval_tails():
@@ -719,6 +894,25 @@ def test_limit_tasks_for_compare_prefers_executable_required_integration_tasks_o
         "incident_matrix_task",
         "queue_failover_task",
     }
+    assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+
+
+def test_limit_tasks_for_compare_excludes_retrieval_companions_for_required_executable_family():
+    tasks = [
+        task
+        for task in TaskBank().list()
+        if str(task.metadata.get("benchmark_family", "")) == "integration"
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        128,
+        priority_families=["integration"],
+        prefer_low_cost_tasks=True,
+        required_executable_families=["integration"],
+    )
+
+    assert selected
     assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
 
 
@@ -2131,8 +2325,8 @@ def test_compare_tolbert_feature_modes_limits_real_provider_task_count(tmp_path,
     _write_success_episode(config)
     task_limits = []
 
-    def fake_run_eval(*, config, include_discovered_tasks=False, include_episode_memory=False, include_skill_memory=False, include_skill_transfer=False, include_operator_memory=False, include_tool_memory=False, include_verifier_memory=False, include_benchmark_candidates=False, include_verifier_candidates=False, include_generated=False, include_failure_generated=False, task_limit=None, progress_label=None):
-        del config, include_discovered_tasks, include_episode_memory, include_skill_memory, include_skill_transfer, include_operator_memory, include_tool_memory, include_verifier_memory, include_benchmark_candidates, include_verifier_candidates, include_generated, include_failure_generated, progress_label
+    def fake_run_eval(*, config, include_discovered_tasks=False, include_episode_memory=False, include_skill_memory=False, include_skill_transfer=False, include_operator_memory=False, include_tool_memory=False, include_verifier_memory=False, include_benchmark_candidates=False, include_verifier_candidates=False, include_generated=False, include_failure_generated=False, task_limit=None, progress_label=None, **kwargs):
+        del config, include_discovered_tasks, include_episode_memory, include_skill_memory, include_skill_transfer, include_operator_memory, include_tool_memory, include_verifier_memory, include_benchmark_candidates, include_verifier_candidates, include_generated, include_failure_generated, progress_label, kwargs
         task_limits.append(task_limit)
         return EvalMetrics(total=task_limit or 0, passed=task_limit or 0)
 
@@ -7394,10 +7588,56 @@ def test_eval_emits_progress_for_generated_curriculum_phases(tmp_path, monkeypat
     assert "[eval:generated-progress] phase=generated_success_schedule" in output
     assert "[eval:generated-progress] phase=generated_success total=" in output
     assert "[eval:generated-progress] phase=generated_success task 1/" in output
+    assert "[eval:generated-progress] phase=generated_success complete total=" in output
     assert "family=" in output
     assert "[eval:generated-progress] phase=generated_failure_seed total=" in output
     assert "[eval:generated-progress] phase=generated_failure_seed task 1/" in output
+    assert "[eval:generated-progress] phase=generated_failure_seed complete total=" in output
     assert "[eval:generated-progress] phase=generated_failure total=" in output
     assert "[eval:generated-progress] phase=generated_failure task 1/" in output
+    assert "[eval:generated-progress] phase=generated_failure complete total=" in output
     assert "[eval:generated-progress] phase=metrics_finalize start" in output
     assert "[eval:generated-progress] phase=metrics_finalize complete" in output
+
+
+def test_run_kernel_task_attaches_coding_actor_summary_for_light_supervision_candidate():
+    class FakeKernel:
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=task.workspace_subdir,
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="inspect",
+                        action="shell",
+                        content="pytest -q tests/test_eval.py",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                    )
+                ],
+                termination_reason="completed",
+            )
+
+    task = TaskSpec(
+        task_id="repo_sync_matrix_task",
+        prompt="Sync repo matrix",
+        workspace_subdir="repo_sync_matrix_task",
+        expected_files=["reports/matrix.txt"],
+        metadata={
+            "benchmark_family": "repository",
+            "light_supervision_candidate": True,
+            "workflow_guard": {"required_capabilities": ["workspace_fs"]},
+        },
+    )
+
+    episode = harness_module._run_kernel_task(FakeKernel(), task)
+
+    assert episode.task_metadata["actor_type"] == "coding"
+    assert episode.task_metadata["actor_summary"]["actor_type"] == "coding"
+    assert episode.task_metadata["actor_summary"]["decision_ready"] is True
+    assert episode.task_contract["metadata"]["actor_type"] == "coding"

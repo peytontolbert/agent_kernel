@@ -359,11 +359,11 @@ def _preview_controls(metrics: EvalMetrics, *, focus: str) -> dict[str, object]:
     if not low_signal_preview and carryover_repair_rate < 0.1:
         return {}
 
-    comparison_task_limit_floor = 12 if low_signal_preview else 8
+    comparison_task_limit_floor = 8 if low_signal_preview else 6
     if carryover_repair_rate >= 0.1:
-        comparison_task_limit_floor = max(comparison_task_limit_floor, 24)
+        comparison_task_limit_floor = max(comparison_task_limit_floor, 8)
     elif focus == "confidence":
-        comparison_task_limit_floor = max(comparison_task_limit_floor, 16)
+        comparison_task_limit_floor = max(comparison_task_limit_floor, 8)
 
     priority_families: list[str] = []
     priority_weights: dict[str, float] = {}

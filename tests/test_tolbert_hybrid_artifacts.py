@@ -72,6 +72,21 @@ def test_tolbert_model_candidate_artifact_includes_hybrid_runtime(monkeypatch, t
             "value_examples": 4,
             "stop_examples": 2,
             "benchmark_families": ["micro", "repository"],
+            "action_generation_summary": {
+                "example_count": 4,
+                "positive_example_count": 2,
+                "template_preferences": {
+                    "repository": [
+                        {
+                            "template_kind": "structured_edit",
+                            "support": 2,
+                            "success_count": 1,
+                            "pass_rate": 0.5,
+                            "provenance": ["repository_audit_packet_task"],
+                        }
+                    ]
+                },
+            },
         },
     )
     monkeypatch.setattr(
@@ -142,14 +157,21 @@ def test_tolbert_model_candidate_artifact_includes_hybrid_runtime(monkeypatch, t
     assert artifact["model_surfaces"]["universal_runtime"] is True
     assert artifact["action_generation_policy"]["enabled"] is True
     assert artifact["retention_gate"]["require_novel_command_signal"] is True
+    assert artifact["retention_gate"]["allow_selection_signal_fallback"] is True
+    assert artifact["retention_gate"]["require_primary_routing_signal"] is True
     assert artifact["retention_gate"]["min_novel_valid_command_steps"] == 1
     assert artifact["retention_gate"]["proposal_gate_by_benchmark_family"]["micro"]["require_novel_command_signal"] is False
     assert artifact["retention_gate"]["proposal_gate_by_benchmark_family"]["repository"]["require_novel_command_signal"] is True
+    assert artifact["retention_gate"]["proposal_gate_by_benchmark_family"]["repository"]["allow_primary_routing_signal"] is True
     assert artifact["retention_gate"]["proposal_gate_by_benchmark_family"]["repository"]["min_proposal_selected_steps_delta"] == 1
     assert artifact["liftoff_gate"]["require_family_novel_command_evidence"] is True
+    assert artifact["liftoff_gate"]["require_primary_routing_signal"] is True
     assert artifact["liftoff_gate"]["proposal_gate_by_benchmark_family"]["repository"]["min_proposal_selected_steps_delta"] == 1
+    assert artifact["runtime_policy"]["allow_trusted_primary_without_min_confidence"] is True
+    assert artifact["runtime_policy"]["trusted_primary_min_confidence"] <= artifact["runtime_policy"]["min_path_confidence"]
     assert artifact["hybrid_runtime"]["model_family"] == "tolbert_ssm_v1"
     assert artifact["hybrid_runtime"]["shadow_enabled"] is True
+    assert artifact["hybrid_runtime"]["primary_enabled"] is True
     assert artifact["hybrid_runtime"]["supports_universal_runtime"] is True
     assert artifact["universal_dataset_manifest"]["artifact_kind"] == "tolbert_universal_decoder_dataset"
     assert artifact["universal_decoder_runtime"]["materialized"] is True
@@ -351,6 +373,50 @@ def test_tolbert_build_policy_requires_long_horizon_head_coverage_when_present()
     assert insufficient["ready_long_horizon_policy_examples"] == 2
     assert insufficient["min_long_horizon_policy_examples"] == 4
     assert sufficient["allow_kernel_autobuild"] is True
+
+
+def test_tolbert_generic_only_action_generation_surface_disables_primary_and_novel_gate() -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    dataset_manifest = {
+        "policy_examples": 4,
+        "transition_examples": 4,
+        "value_examples": 4,
+        "stop_examples": 4,
+        "benchmark_families": ["project", "repository"],
+        "action_generation_summary": {
+            "example_count": 8,
+            "positive_example_count": 0,
+            "template_preferences": {
+                "project": [
+                    {
+                        "template_kind": "generic_command",
+                        "support": 4,
+                        "success_count": 0,
+                        "pass_rate": 0.0,
+                        "provenance": ["deployment_manifest_task"],
+                    }
+                ]
+            },
+        },
+    }
+
+    policy = module._tolbert_action_generation_policy(dataset_manifest, current_payload=None)
+    gate = module._tolbert_retention_gate(dataset_manifest, current_payload=None)
+    runtime_policy = module._tolbert_runtime_policy(dataset_manifest, focus=None, current_payload=None)
+    hybrid_runtime = module._tolbert_hybrid_runtime(
+        output_dir=Path("/tmp/tolbert_generic_only"),
+        dataset_manifest=dataset_manifest,
+        manifest={"model_family": "tolbert_ssm_v1"},
+        focus=None,
+    )
+
+    assert policy["template_preferences"] == {}
+    assert gate["require_novel_command_signal"] is False
+    assert gate["min_novel_valid_command_steps"] == 0
+    assert gate["proposal_gate_by_benchmark_family"]["project"]["require_novel_command_signal"] is False
+    assert runtime_policy["primary_benchmark_families"] == []
+    assert hybrid_runtime["primary_enabled"] is False
 
 
 def test_compact_tolbert_model_candidate_output_keeps_final_checkpoint(tmp_path: Path) -> None:
@@ -700,11 +766,15 @@ def test_run_tolbert_finetune_pipeline_prefers_manifest_backed_cache(monkeypatch
     assert cache_artifact_path == output_dir / "retrieval_cache" / "tolbert_epoch2.json"
     assert fake_queue is not None
     train_success_command = fake_queue.jobs["tolbert_model_train"].runtime_overrides["task_payload"]["success_command"]
+    train_command = fake_queue.jobs["tolbert_model_train"].runtime_overrides["worker_command"]
     cache_command = fake_queue.jobs["tolbert_model_cache"].runtime_overrides["worker_command"]
+    train_timeout_seconds = fake_queue.jobs["tolbert_model_train"].runtime_overrides["worker_timeout_seconds"]
     assert "--shard-size" in cache_command
     assert "1234" in cache_command
     success_command = fake_queue.jobs["tolbert_model_cache"].runtime_overrides["task_payload"]["success_command"]
     assert train_success_command == f"test -f {module.sh_quote(checkpoint_path.resolve())}"
+    assert train_command[-1] == str(config.tolbert_device)
+    assert train_timeout_seconds == 300
     assert success_command == f"test -f {module.sh_quote(cache_artifact_path.resolve())}"
     assert [record["job_id"] for record in job_records] == ["tolbert_model_train", "tolbert_model_cache"]
 
@@ -790,8 +860,10 @@ def test_run_tolbert_finetune_pipeline_uses_parent_plus_delta_training(monkeypat
     delta_checkpoint_path = checkpoint_path.with_name("tolbert_epoch2__delta.pt")
     train_success_command = fake_queue.jobs["tolbert_model_train"].runtime_overrides["task_payload"]["success_command"]
     train_env = fake_queue.jobs["tolbert_model_train"].runtime_overrides["worker_env"]
+    train_timeout_seconds = fake_queue.jobs["tolbert_model_train"].runtime_overrides["worker_timeout_seconds"]
     cache_command = fake_queue.jobs["tolbert_model_cache"].runtime_overrides["worker_command"]
     assert train_success_command == f"test -f {module.sh_quote(delta_checkpoint_path.resolve())}"
+    assert train_timeout_seconds == 300
     assert train_env["AGENTKERNEL_TOLBERT_PARENT_CHECKPOINT_PATH"] == str(parent_checkpoint_path)
     assert train_env["AGENTKERNEL_TOLBERT_CHECKPOINT_DELTA_OUTPUT_PATH"] == str(delta_checkpoint_path)
     assert "--parent-checkpoint" in cache_command
@@ -799,6 +871,16 @@ def test_run_tolbert_finetune_pipeline_uses_parent_plus_delta_training(monkeypat
     assert str(parent_checkpoint_path) in cache_command
     assert str(delta_checkpoint_path) in cache_command
     assert [record["job_id"] for record in job_records] == ["tolbert_model_train", "tolbert_model_cache"]
+
+
+def test_tolbert_finetune_timeout_scales_with_epochs() -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    config = KernelConfig(command_timeout_seconds=20)
+
+    assert module._tolbert_finetune_timeout_seconds(config=config, num_epochs=1) == 180
+    assert module._tolbert_finetune_timeout_seconds(config=config, num_epochs=2) == 300
+    assert module._tolbert_finetune_timeout_seconds(config=config, num_epochs=4) == 540
 
 
 def test_tolbert_runtime_delegated_jobs_verify_absolute_manifest_paths(monkeypatch, tmp_path: Path) -> None:
@@ -885,3 +967,58 @@ def test_tolbert_runtime_delegated_jobs_verify_absolute_manifest_paths(monkeypat
     assert universal_manifest["manifest_path"] == str(universal_output_dir / "universal_runtime" / "hybrid_bundle_manifest.json")
     assert [record["job_id"] for record in hybrid_records] == ["tolbert_hybrid_runtime_train"]
     assert [record["job_id"] for record in universal_records] == ["tolbert_universal_decoder_train"]
+
+
+def test_tolbert_generation_device_plan_distributes_generic_cuda_across_three_gpus(monkeypatch, tmp_path: Path) -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    config = KernelConfig(
+        workspace_root=tmp_path / "workspace",
+        run_reports_dir=tmp_path / "reports",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime.json",
+        tolbert_device="cuda",
+    )
+
+    def _fake_run(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(returncode=0, stdout="3\n")
+
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
+
+    assert module._tolbert_generation_device_plan(config) == {
+        "parallel": True,
+        "finetune": "cuda:0",
+        "hybrid": "cuda:1",
+        "universal": "cuda:2",
+    }
+
+
+def test_tolbert_generation_device_plan_serializes_generic_cuda_when_gpu_count_is_limited(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_kernel import tolbert_model_improvement as module
+
+    config = KernelConfig(
+        workspace_root=tmp_path / "workspace",
+        run_reports_dir=tmp_path / "reports",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime.json",
+        tolbert_device="cuda",
+    )
+
+    def _fake_run(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
+
+    assert module._tolbert_generation_device_plan(config) == {
+        "parallel": False,
+        "finetune": "cuda:0",
+        "hybrid": "cuda:0",
+        "universal": "cuda:0",
+    }
