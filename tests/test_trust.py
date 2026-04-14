@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.trust import (
+from agent_kernel.extensions.trust import (
     build_unattended_trust_ledger,
     evaluate_unattended_trust,
     write_unattended_trust_ledger,
@@ -206,6 +206,56 @@ def test_build_unattended_trust_ledger_summarizes_recent_reports(tmp_path: Path)
     assert ledger["coverage_summary"]["missing_required_families"] == []
     assert ledger["coverage_summary"]["missing_required_gated_families"] == []
     assert ledger["coverage_summary"]["distinct_family_gap"] == 0
+
+
+def test_build_unattended_trust_ledger_distinguishes_open_world_and_replay_task_yield(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _write_report(
+        reports_dir,
+        "semantic_repo_success.json",
+        generated_at="2026-03-25T00:00:01+00:00",
+        benchmark_family="repository",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_origin="semantic_hub",
+    )
+    _write_report(
+        reports_dir,
+        "external_project_success.json",
+        generated_at="2026-03-25T00:00:02+00:00",
+        benchmark_family="project",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_origin="external_manifest",
+    )
+    _write_report(
+        reports_dir,
+        "episode_replay_safe_stop.json",
+        generated_at="2026-03-25T00:00:03+00:00",
+        benchmark_family="repository",
+        outcome="safe_stop",
+        success=False,
+        hidden_side_effect_risk=False,
+        task_origin="episode_replay",
+    )
+    config = KernelConfig(run_reports_dir=reports_dir, unattended_trust_recent_report_limit=10)
+
+    ledger = build_unattended_trust_ledger(config)
+
+    bucket_summary = ledger["overall_summary"]["task_yield_bucket_summary"]
+    assert bucket_summary["semantic_hub"]["reports"] == 1
+    assert bucket_summary["semantic_hub"]["clean_success_count"] == 1
+    assert bucket_summary["semantic_hub"]["benchmark_families"] == ["repository"]
+    assert bucket_summary["external_manifest"]["reports"] == 1
+    assert bucket_summary["external_manifest"]["clean_success_count"] == 1
+    assert bucket_summary["replay_derived"]["reports"] == 1
+    assert bucket_summary["replay_derived"]["success_count"] == 0
+    assert ledger["coverage_summary"]["open_world_task_yield_summary"]["semantic_hub"]["reports"] == 1
+    assert ledger["coverage_summary"]["open_world_task_yield_summary"]["external_manifest"]["reports"] == 1
+    assert ledger["coverage_summary"]["replay_derived_task_yield_summary"]["reports"] == 1
 
 
 def test_build_unattended_trust_ledger_surfaces_repo_semantic_clusters(tmp_path: Path):
@@ -738,6 +788,10 @@ def test_build_unattended_trust_ledger_tracks_contract_clean_failure_recovery_co
         outcome="success",
         success=True,
         hidden_side_effect_risk=False,
+        task_metadata={
+            "curriculum_kind": "failure_recovery",
+            "source_task": "repository_repair_seed",
+        },
         supervision={
             "mode": "unattended",
             "operator_turns": 0,
@@ -762,6 +816,11 @@ def test_build_unattended_trust_ledger_tracks_contract_clean_failure_recovery_co
     assert ledger["overall_summary"]["contract_clean_failure_recovery_candidate_count"] == 1
     assert ledger["overall_summary"]["contract_clean_failure_recovery_success_count"] == 1
     assert ledger["overall_summary"]["contract_clean_failure_recovery_clean_success_count"] == 1
+    assert ledger["overall_summary"]["failure_recovery_summary"]["reports"] == 1
+    assert ledger["overall_summary"]["failure_recovery_summary"]["success_count"] == 1
+    assert ledger["overall_summary"]["failure_recovery_summary"]["clean_success_count"] == 1
+    assert ledger["overall_summary"]["failure_recovery_summary"]["task_roots"] == ["repository_repair_seed"]
+    assert ledger["overall_summary"]["success_rate_confidence_interval"]["upper"] >= 0.9
     assert (
         ledger["coverage_summary"]["required_family_contract_clean_failure_recovery_report_counts"]["repository"] == 1
     )
@@ -774,6 +833,61 @@ def test_build_unattended_trust_ledger_tracks_contract_clean_failure_recovery_co
         ]
         == 1
     )
+    assert ledger["coverage_summary"]["required_family_failure_recovery_report_counts"]["repository"] == 1
+    assert ledger["coverage_summary"]["required_family_failure_recovery_success_counts"]["repository"] == 1
+    assert ledger["coverage_summary"]["required_family_failure_recovery_clean_success_counts"]["repository"] == 1
+
+
+def test_build_unattended_trust_ledger_tracks_failure_recovery_viability_and_confidence(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _write_report(
+        reports_dir,
+        "repository_failure_recovery_success.json",
+        generated_at="2026-03-25T00:00:03+00:00",
+        benchmark_family="repository",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_metadata={"curriculum_kind": "failure_recovery", "source_task": "repo_seed_a"},
+    )
+    _write_report(
+        reports_dir,
+        "repository_failure_recovery_safe_stop.json",
+        generated_at="2026-03-25T00:00:02+00:00",
+        benchmark_family="repository",
+        outcome="safe_stop",
+        success=False,
+        hidden_side_effect_risk=False,
+        task_metadata={"curriculum_kind": "failure_recovery", "source_task": "repo_seed_b"},
+    )
+    _write_report(
+        reports_dir,
+        "project_clean_success.json",
+        generated_at="2026-03-25T00:00:01+00:00",
+        benchmark_family="project",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+    )
+    config = KernelConfig(
+        run_reports_dir=reports_dir,
+        unattended_trust_required_benchmark_families=("repository",),
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_min_distinct_families=1,
+    )
+
+    ledger = build_unattended_trust_ledger(config)
+
+    failure_recovery = ledger["overall_summary"]["failure_recovery_summary"]
+    assert failure_recovery["reports"] == 2
+    assert failure_recovery["success_count"] == 1
+    assert failure_recovery["clean_success_count"] == 1
+    assert failure_recovery["success_rate"] == 0.5
+    assert 0.0 < failure_recovery["success_rate_confidence_interval"]["lower"] < 0.5
+    assert 0.5 < failure_recovery["success_rate_confidence_interval"]["upper"] <= 1.0
+    assert ledger["overall_summary"]["success_rate_confidence_interval"]["lower"] > 0.2
 
 
 def test_build_unattended_trust_ledger_tracks_false_pass_risk_and_clean_success_streak(tmp_path: Path):

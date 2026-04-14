@@ -2,8 +2,8 @@ import json
 from agent_kernel.config import KernelConfig
 from agent_kernel.sandbox import Sandbox
 from agent_kernel.schemas import CommandResult, TaskSpec
-from agent_kernel.shared_repo import bootstrap_shared_repo_seed
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.ops.shared_repo import bootstrap_shared_repo_seed
+from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.verifier import Verifier, synthesize_stricter_task
 from urllib import request as url_request
 import subprocess
@@ -57,6 +57,87 @@ def test_verifier_checks_forbidden_output_substrings(tmp_path):
 
     assert verification.passed is False
     assert "forbidden output present: warning" in verification.reasons
+
+
+def test_verifier_applies_behavior_check_regex_output_rules(tmp_path):
+    task = TaskSpec(
+        task_id="regex_behavior",
+        prompt="verify regex behavior",
+        workspace_subdir="regex_behavior",
+        metadata={
+            "semantic_verifier": {
+                "behavior_checks": [
+                    {
+                        "label": "json report",
+                        "argv": ["python", "-c", "print('status=ready\\ncount=3')"],
+                        "stdout_regex_must_match": [r"status=ready", r"count=\d+"],
+                        "stdout_regex_must_not_match": [r"error"],
+                    }
+                ]
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_json_field_regex_rules(tmp_path):
+    task = TaskSpec(
+        task_id="json_regex_behavior",
+        prompt="verify json regex behavior",
+        workspace_subdir="json_regex_behavior",
+        metadata={
+            "semantic_verifier": {
+                "behavior_checks": [
+                    {
+                        "label": "json behavior",
+                        "argv": [
+                            "python",
+                            "-c",
+                            "import json; print(json.dumps({'status': 'ready', 'message': 'release ready for deploy'}))",
+                        ],
+                        "stdout_json_fields": [
+                            {"path": "status", "regex": r"rea.*"},
+                            {"path": "message", "not_regex": r"failed|error"},
+                        ],
+                    }
+                ]
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_emits_structured_failure_codes_and_process_score(tmp_path):
+    task = TaskSpec(
+        task_id="output",
+        prompt="avoid warnings",
+        workspace_subdir="output",
+        expected_files=["artifact.txt"],
+        forbidden_output_substrings=["warning"],
+    )
+    result = CommandResult(command="echo warning", exit_code=2, stdout="warning\n", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+    payload = verification.to_payload()
+
+    assert verification.passed is False
+    assert verification.failure_codes[:3] == [
+        "command_failure",
+        "missing_expected_file",
+        "forbidden_output_present",
+    ]
+    assert verification.outcome_label == "command_failure"
+    assert verification.process_score < 1.0
+    assert payload["failure_codes"] == verification.failure_codes
+    assert payload["outcome_label"] == "command_failure"
 
 
 def test_sandbox_blocks_privileged_commands(tmp_path):
@@ -718,6 +799,395 @@ def test_verifier_rejects_git_repo_review_mismatches(tmp_path):
     assert verification.passed is False
     assert any("git branch mismatch" in reason for reason in verification.reasons)
     assert any("status check script exited with code" in reason for reason in verification.reasons)
+
+
+def test_verifier_applies_behavior_checks(tmp_path):
+    task = TaskSpec(
+        task_id="behavior_semantic_task",
+        prompt="Run semantic behavior checks.",
+        workspace_subdir="behavior_semantic_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "behavior_checks": [
+                    {
+                        "label": "behavior smoke",
+                        "argv": ["/bin/sh", "-lc", "printf 'READY\\n'"],
+                        "expect_exit_code": 0,
+                        "stdout_must_contain": ["READY"],
+                        "stdout_must_not_contain": ["BROKEN"],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_behavior_checks_can_assert_file_expectations_and_repo_invariants(tmp_path):
+    task = TaskSpec(
+        task_id="behavior_side_effect_task",
+        prompt="Run semantic behavior checks with workspace side effects.",
+        workspace_subdir="behavior_side_effect_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "behavior_checks": [
+                    {
+                        "label": "workspace repair",
+                        "argv": [
+                            "/bin/sh",
+                            "-lc",
+                            "mkdir -p reports && printf 'ready\\n' > reports/release_review.txt",
+                        ],
+                        "expect_exit_code": 0,
+                        "file_expectations": [
+                            {
+                                "path": "reports/release_review.txt",
+                                "must_exist": True,
+                                "must_contain": ["ready"],
+                            }
+                        ],
+                        "repo_invariants": [
+                            {
+                                "kind": "file_contains",
+                                "path": "reports/release_review.txt",
+                                "must_contain": ["ready"],
+                                "must_not_contain": ["broken"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_behavior_check_json_fields(tmp_path):
+    task = TaskSpec(
+        task_id="behavior_semantic_json_task",
+        prompt="Run semantic behavior checks with structured JSON output.",
+        workspace_subdir="behavior_semantic_json_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "behavior_checks": [
+                    {
+                        "label": "json smoke",
+                        "argv": ["/bin/sh", "-lc", "printf '{\"status\":\"ready\",\"metrics\":{\"pass_rate\":0.75},\"families\":[\"integration\",\"repo\"]}\\n'"],
+                        "stdout_json_fields": [
+                            {"path": "status", "equals": "ready"},
+                            {"path": "metrics.pass_rate", "min": 0.7},
+                            {"path": "families", "contains": "integration"},
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_rejects_behavior_check_json_field_mismatch(tmp_path):
+    task = TaskSpec(
+        task_id="behavior_semantic_json_fail_task",
+        prompt="Reject incorrect structured JSON output.",
+        workspace_subdir="behavior_semantic_json_fail_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "behavior_checks": [
+                    {
+                        "label": "json smoke",
+                        "argv": ["/bin/sh", "-lc", "printf '{\"status\":\"broken\",\"metrics\":{\"pass_rate\":0.25}}\\n'"],
+                        "stdout_json_fields": [
+                            {"path": "status", "equals": "ready"},
+                            {"path": "metrics.pass_rate", "min": 0.7},
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is False
+    assert "json smoke stdout JSON path 'status' expected 'ready' got 'broken'" in verification.reasons
+    assert "json smoke stdout JSON path 'metrics.pass_rate' expected >= 0.7 got 0.25" in verification.reasons
+
+
+def test_verifier_applies_differential_checks(tmp_path):
+    task = TaskSpec(
+        task_id="differential_semantic_task",
+        prompt="Run differential semantic checks.",
+        workspace_subdir="differential_semantic_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "differential_checks": [
+                    {
+                        "label": "stable output",
+                        "candidate_argv": ["/bin/sh", "-lc", "printf 'match\\n'"],
+                        "baseline_argv": ["/bin/sh", "-lc", "printf 'match\\n'"],
+                        "expect_same_exit_code": True,
+                        "expect_same_stdout": True,
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_richer_differential_checks(tmp_path):
+    task = TaskSpec(
+        task_id="differential_semantic_rich_task",
+        prompt="Run richer differential semantic checks.",
+        workspace_subdir="differential_semantic_rich_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "differential_checks": [
+                    {
+                        "label": "candidate beats baseline",
+                        "candidate_argv": ["/bin/sh", "-lc", "printf 'ready\\n'"],
+                        "baseline_argv": ["/bin/sh", "-lc", "printf 'broken\\n'; exit 1"],
+                        "expect_same_exit_code": False,
+                        "expect_candidate_exit_code": 0,
+                        "expect_baseline_exit_code": 1,
+                        "expect_stdout_difference": True,
+                        "candidate_stdout_must_contain": ["ready"],
+                        "baseline_stdout_must_contain": ["broken"],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_differential_json_output_checks(tmp_path):
+    task = TaskSpec(
+        task_id="differential_semantic_json_output_task",
+        prompt="Run richer differential semantic checks on structured command output.",
+        workspace_subdir="differential_semantic_json_output_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "differential_checks": [
+                    {
+                        "label": "candidate structured status beats baseline",
+                        "candidate_argv": ["/bin/sh", "-lc", "printf '{\"status\":\"ready\",\"score\":0.93}\\n'"],
+                        "baseline_argv": ["/bin/sh", "-lc", "printf '{\"status\":\"broken\",\"score\":0.2}\\n'"],
+                        "expect_same_exit_code": True,
+                        "candidate_stdout_json_fields": [
+                            {"path": "status", "equals": "ready"},
+                            {"path": "score", "min": 0.9},
+                        ],
+                        "baseline_stdout_json_fields": [
+                            {"path": "status", "equals": "broken"},
+                            {"path": "score", "max": 0.3},
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_differential_file_expectations_in_isolated_workspaces(tmp_path):
+    (tmp_path / "reports").mkdir()
+    task = TaskSpec(
+        task_id="differential_semantic_file_task",
+        prompt="Run differential semantic checks with file assertions.",
+        workspace_subdir="differential_semantic_file_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "differential_checks": [
+                    {
+                        "label": "candidate writes ready report",
+                        "candidate_argv": ["/bin/sh", "-lc", "printf 'READY\\n' > reports/release_review.txt"],
+                        "baseline_argv": ["/bin/sh", "-lc", "printf 'BROKEN\\n' > reports/release_review.txt"],
+                        "expect_same_exit_code": True,
+                        "candidate_file_expectations": [
+                            {
+                                "path": "reports/release_review.txt",
+                                "expected_content": "READY\n",
+                            }
+                        ],
+                        "baseline_file_expectations": [
+                            {
+                                "path": "reports/release_review.txt",
+                                "must_contain": ["BROKEN"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_differential_json_file_expectations(tmp_path):
+    (tmp_path / "reports").mkdir()
+    task = TaskSpec(
+        task_id="differential_semantic_json_file_task",
+        prompt="Run differential semantic checks with JSON file assertions.",
+        workspace_subdir="differential_semantic_json_file_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "differential_checks": [
+                    {
+                        "label": "candidate writes structured status",
+                        "candidate_argv": ["/bin/sh", "-lc", "printf '{\"status\":\"ready\",\"score\":0.91}\\n' > reports/status.json"],
+                        "baseline_argv": ["/bin/sh", "-lc", "printf '{\"status\":\"broken\",\"score\":0.12}\\n' > reports/status.json"],
+                        "candidate_file_expectations": [
+                            {
+                                "path": "reports/status.json",
+                                "json_fields": [
+                                    {"path": "status", "equals": "ready"},
+                                    {"path": "score", "min": 0.9},
+                                ],
+                            }
+                        ],
+                        "baseline_file_expectations": [
+                            {
+                                "path": "reports/status.json",
+                                "json_fields": [
+                                    {"path": "status", "equals": "broken"},
+                                    {"path": "score", "max": 0.2},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_repo_invariants(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "docs" / "context.md").write_text("context stable\n", encoding="utf-8")
+    (tmp_path / "reports" / "status.txt").write_text("READY\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "agent@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Agent Kernel"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "add", "docs/context.md", "reports/status.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "reports" / "status.txt").write_text("READY\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="repo_invariant_task",
+        prompt="Validate repo invariants.",
+        workspace_subdir="repo_invariant_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "repo_invariants": [
+                    {
+                        "kind": "file_unchanged",
+                        "path": "docs/context.md",
+                        "expected_content": "context stable\n",
+                    },
+                    {
+                        "kind": "file_contains",
+                        "path": "reports/status.txt",
+                        "must_contain": ["READY"],
+                        "must_not_contain": ["BROKEN"],
+                    },
+                    {
+                        "kind": "git_clean",
+                        "allow_paths": ["reports/status.txt"],
+                    },
+                    {
+                        "kind": "git_tracked_paths",
+                        "paths": ["docs/context.md", "reports/status.txt"],
+                    },
+                    {"kind": "git_no_unmerged"},
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
+
+
+def test_verifier_applies_json_repo_invariant(tmp_path):
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "status.json").write_text(
+        "{\"status\":\"ready\",\"checks\":{\"passed\":3},\"families\":[\"integration\",\"repo\"]}\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="repo_json_invariant_task",
+        prompt="Validate JSON repo invariant.",
+        workspace_subdir="repo_json_invariant_task",
+        metadata={
+            "semantic_verifier": {
+                "kind": "behavioral_semantic",
+                "repo_invariants": [
+                    {
+                        "kind": "file_contains",
+                        "path": "reports/status.json",
+                        "json_fields": [
+                            {"path": "status", "equals": "ready"},
+                            {"path": "checks.passed", "min": 3},
+                            {"path": "families", "contains": "integration"},
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    result = CommandResult(command="true", exit_code=0, stdout="", stderr="")
+
+    verification = Verifier().verify(task, tmp_path, result)
+
+    assert verification.passed is True
 
 
 def test_verifier_accepts_git_repo_test_repair_workflow(tmp_path):

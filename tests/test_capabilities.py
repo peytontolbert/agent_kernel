@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from agent_kernel.capabilities import (
+from agent_kernel.extensions.capabilities import (
     capability_enabled,
     capability_policy_satisfies,
     capability_registry_snapshot,
@@ -12,9 +12,9 @@ from agent_kernel.capabilities import (
     effective_http_allowed_hosts,
     load_capability_modules,
 )
-from agent_kernel.capability_improvement import build_capability_module_artifact, capability_surface_summary
+from agent_kernel.extensions.improvement.capability_improvement import build_capability_module_artifact, capability_surface_summary
 from agent_kernel.config import KernelConfig
-from agent_kernel.preflight import run_unattended_preflight
+from agent_kernel.ops.preflight import run_unattended_preflight
 from agent_kernel.schemas import StepRecord, TaskSpec
 
 

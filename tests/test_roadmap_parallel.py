@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent_kernel.roadmap_parallel import build_asi_parallel_manifest, write_asi_parallel_manifest
+from agent_kernel.ops.roadmap_parallel import build_asi_parallel_manifest, write_asi_parallel_manifest
 
 
 def test_build_asi_parallel_manifest_from_repo_asi_document(tmp_path):

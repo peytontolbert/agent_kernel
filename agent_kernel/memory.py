@@ -4,9 +4,9 @@ import json
 from pathlib import Path, PurePosixPath
 
 from .config import KernelConfig
-from .episode_store import iter_episode_documents, load_episode_document
-from .episode_store import episode_storage_metadata
-from .extractors import render_episode_document
+from .ops.episode_store import iter_episode_documents, load_episode_document
+from .ops.episode_store import episode_storage_metadata
+from .extensions.extractors import render_episode_document
 from .learning_compiler import load_learning_candidates
 from .schemas import EpisodeRecord
 
@@ -17,6 +17,48 @@ class GraphMemory:
 
     def summarize(self, task_id: str = "") -> dict[str, object]:
         return self.episode_memory.graph_summary(task_id)
+
+    def recall(
+        self,
+        *,
+        task_id: str = "",
+        benchmark_family: str = "",
+        changed_paths: list[str] | None = None,
+        verifier_obligations: list[str] | None = None,
+        failure_signals: list[str] | None = None,
+        require_success: bool | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, object]]:
+        return self.episode_memory.semantic_recall(
+            task_id=task_id,
+            benchmark_family=benchmark_family,
+            changed_paths=changed_paths,
+            verifier_obligations=verifier_obligations,
+            failure_signals=failure_signals,
+            require_success=require_success,
+            limit=limit,
+        )
+
+    def prototype_recall(
+        self,
+        *,
+        task_id: str = "",
+        benchmark_family: str = "",
+        changed_paths: list[str] | None = None,
+        verifier_obligations: list[str] | None = None,
+        failure_signals: list[str] | None = None,
+        require_success: bool | None = True,
+        limit: int = 4,
+    ) -> list[dict[str, object]]:
+        return self.episode_memory.semantic_prototype_recall(
+            task_id=task_id,
+            benchmark_family=benchmark_family,
+            changed_paths=changed_paths,
+            verifier_obligations=verifier_obligations,
+            failure_signals=failure_signals,
+            require_success=require_success,
+            limit=limit,
+        )
 
 
 class EpisodeMemory:
@@ -71,6 +113,11 @@ class EpisodeMemory:
         retrieval_backed_command_counts: dict[str, int] = {}
         trusted_retrieval_command_counts: dict[str, int] = {}
         trusted_retrieval_procedure_counts: dict[tuple[str, ...], int] = {}
+        verifier_obligation_counts: dict[str, int] = {}
+        changed_path_counts: dict[str, int] = {}
+        edit_patch_path_counts: dict[str, int] = {}
+        recovery_command_counts: dict[str, int] = {}
+        semantic_episodes: list[dict[str, object]] = []
         observed_environment_modes: dict[str, dict[str, int]] = {
             "network_access_mode": {},
             "git_write_mode": {},
@@ -144,6 +191,25 @@ class EpisodeMemory:
                     key = str(label).strip()
                     if key:
                         environment_alignment_failures[key] = environment_alignment_failures.get(key, 0) + 1
+                verifier_obligations = _document_verifier_obligation_texts(document)
+                for obligation in verifier_obligations:
+                    verifier_obligation_counts[obligation] = verifier_obligation_counts.get(obligation, 0) + 1
+                changed_paths = _document_changed_paths(document)
+                for changed_path in changed_paths:
+                    changed_path_counts[changed_path] = changed_path_counts.get(changed_path, 0) + 1
+                edit_patches = _document_edit_patches(document)
+                for patch in edit_patches:
+                    edit_path = str(patch.get("path", "")).strip()
+                    if edit_path:
+                        edit_patch_path_counts[edit_path] = edit_patch_path_counts.get(edit_path, 0) + 1
+                recovery_traces = _document_recovery_traces(document)
+                for trace in recovery_traces:
+                    recovery_command = str(trace.get("recovery_command", "")).strip()
+                    if recovery_command:
+                        recovery_command_counts[recovery_command] = recovery_command_counts.get(recovery_command, 0) + 1
+                semantic_episode = _document_semantic_episode(document)
+                if semantic_episode is not None:
+                    semantic_episodes.append(semantic_episode)
                 snapshot = summary.get("environment_snapshot", {})
                 if isinstance(snapshot, dict):
                     for field in observed_environment_modes:
@@ -172,10 +238,129 @@ class EpisodeMemory:
             "retrieval_backed_command_counts": _sorted_count_mapping(retrieval_backed_command_counts),
             "trusted_retrieval_command_counts": _sorted_count_mapping(trusted_retrieval_command_counts),
             "trusted_retrieval_procedures": _sorted_procedure_counts(trusted_retrieval_procedure_counts),
+            "verifier_obligation_counts": _sorted_count_mapping(verifier_obligation_counts),
+            "changed_path_counts": _sorted_count_mapping(changed_path_counts),
+            "edit_patch_path_counts": _sorted_count_mapping(edit_patch_path_counts),
+            "recovery_command_counts": _sorted_count_mapping(recovery_command_counts),
+            "semantic_episodes": _sorted_semantic_episodes(semantic_episodes, task_id=task_id),
+            "semantic_prototypes": _semantic_prototypes(semantic_episodes),
             "observed_environment_modes": observed_environment_modes,
             "related_tasks": neighbors,
             "neighbors": neighbors,
         }
+
+    def semantic_recall(
+        self,
+        *,
+        task_id: str = "",
+        benchmark_family: str = "",
+        changed_paths: list[str] | None = None,
+        verifier_obligations: list[str] | None = None,
+        failure_signals: list[str] | None = None,
+        require_success: bool | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, object]]:
+        documents = self.list_documents()
+        candidate_episodes = [
+            semantic_episode
+            for semantic_episode in (_document_semantic_episode(document) for document in documents)
+            if semantic_episode is not None
+        ]
+        if not candidate_episodes:
+            return []
+
+        requested_paths = _normalized_semantic_strings(changed_paths or [])
+        requested_obligations = _normalized_semantic_strings(verifier_obligations or [])
+        requested_failures = _normalized_semantic_strings(failure_signals or [])
+        requested_family = str(benchmark_family).strip().lower()
+        requested_task = str(task_id).strip()
+
+        scored: list[tuple[int, dict[str, object]]] = []
+        for episode in candidate_episodes:
+            if require_success is not None and bool(episode.get("success", False)) is not require_success:
+                continue
+            episode_family = str(episode.get("benchmark_family", "bounded")).strip().lower()
+            if requested_family and episode_family != requested_family:
+                continue
+            score = _semantic_episode_query_score(
+                episode,
+                task_id=requested_task,
+                changed_paths=requested_paths,
+                verifier_obligations=requested_obligations,
+                failure_signals=requested_failures,
+            )
+            if requested_task or requested_paths or requested_obligations or requested_failures or requested_family:
+                if score <= 0:
+                    continue
+            scored.append((score, episode))
+
+        return [
+            episode
+            for _, episode in sorted(
+                scored,
+                key=lambda item: (
+                    -item[0],
+                    -int(bool(item[1].get("success", False))),
+                    str(item[1].get("task_id", "")).strip(),
+                ),
+            )[: max(0, int(limit))]
+        ]
+
+    def semantic_prototype_recall(
+        self,
+        *,
+        task_id: str = "",
+        benchmark_family: str = "",
+        changed_paths: list[str] | None = None,
+        verifier_obligations: list[str] | None = None,
+        failure_signals: list[str] | None = None,
+        require_success: bool | None = True,
+        limit: int = 4,
+    ) -> list[dict[str, object]]:
+        del task_id
+        documents = self.list_documents()
+        candidate_episodes = [
+            semantic_episode
+            for semantic_episode in (_document_semantic_episode(document) for document in documents)
+            if semantic_episode is not None
+        ]
+        if not candidate_episodes:
+            return []
+        requested_paths = _normalized_semantic_strings(changed_paths or [])
+        requested_obligations = _normalized_semantic_strings(verifier_obligations or [])
+        requested_failures = _normalized_semantic_strings(failure_signals or [])
+        requested_family = str(benchmark_family).strip().lower()
+        scored: list[tuple[int, dict[str, object]]] = []
+        for prototype in _semantic_prototypes(candidate_episodes):
+            if require_success is True and int(prototype.get("success_count", 0) or 0) <= 0:
+                continue
+            if require_success is False and int(prototype.get("success_count", 0) or 0) > 0:
+                continue
+            prototype_family = str(prototype.get("benchmark_family", "bounded")).strip().lower()
+            if requested_family and prototype_family != requested_family:
+                continue
+            score = _semantic_prototype_query_score(
+                prototype,
+                changed_paths=requested_paths,
+                verifier_obligations=requested_obligations,
+                failure_signals=requested_failures,
+            )
+            if requested_paths or requested_obligations or requested_failures or requested_family:
+                if score <= 0:
+                    continue
+            scored.append((score, prototype))
+        return [
+            prototype
+            for _, prototype in sorted(
+                scored,
+                key=lambda item: (
+                    -item[0],
+                    -int(item[1].get("success_count", 0) or 0),
+                    -int(item[1].get("episode_count", 0) or 0),
+                    str(item[1].get("benchmark_family", "bounded")).strip(),
+                ),
+            )[: max(0, int(limit))]
+        ]
 
 
 def _episode_storage_metadata_for_sqlite(
@@ -275,6 +460,48 @@ def _document_retrieval_summary(document: dict[str, object]) -> dict[str, object
     }
 
 
+def _document_semantic_episode(document: dict[str, object]) -> dict[str, object] | None:
+    source_id = str(document.get("task_id", "")).strip()
+    task_metadata = document.get("task_metadata", {})
+    summary = document.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    verifier_obligations = _document_verifier_obligation_texts(document)
+    changed_paths = _document_changed_paths(document)
+    edit_patches = _document_edit_patches(document)
+    recovery_traces = _document_recovery_traces(document)
+    failure_signals = [
+        str(value).strip()
+        for value in summary.get("failure_signals", [])
+        if str(value).strip()
+    ]
+    if not (verifier_obligations or changed_paths or recovery_traces or edit_patches or failure_signals):
+        return None
+    return {
+        "task_id": source_id,
+        "benchmark_family": str(task_metadata.get("benchmark_family", "bounded")).strip()
+        if isinstance(task_metadata, dict)
+        else "bounded",
+        "memory_source": str(task_metadata.get("memory_source", "")).strip() if isinstance(task_metadata, dict) else "",
+        "success": bool(document.get("success", False)),
+        "verifier_obligations": verifier_obligations[:4],
+        "changed_paths": changed_paths[:6],
+        "failure_signals": failure_signals[:4],
+        "command_sequence": _document_success_command_sequence(document)[:3],
+        "edit_patches": [
+            {
+                "path": str(item.get("path", "")).strip(),
+                "status": str(item.get("status", "")).strip(),
+                "patch_summary": str(item.get("patch_summary", "")).strip(),
+                "patch_excerpt": str(item.get("patch", "")).strip()[:160],
+            }
+            for item in edit_patches[:2]
+            if str(item.get("path", "")).strip()
+        ],
+        "recovery_trace": recovery_traces[0] if recovery_traces else {},
+    }
+
+
 def _sorted_count_mapping(counts: dict[str, int]) -> dict[str, int]:
     return {
         key: int(value)
@@ -355,9 +582,399 @@ def _document_success_command_sequence(document: dict[str, object]) -> list[str]
     return commands
 
 
+def _document_verifier_obligation_texts(document: dict[str, object]) -> list[str]:
+    summary = document.get("summary", {})
+    if not isinstance(summary, dict):
+        return []
+    obligations = summary.get("verifier_obligations", [])
+    texts: list[str] = []
+    for item in obligations if isinstance(obligations, list) else []:
+        if isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+        else:
+            text = str(item).strip()
+        if text and text not in texts:
+            texts.append(text)
+    return texts
+
+
+def _document_changed_paths(document: dict[str, object]) -> list[str]:
+    summary = document.get("summary", {})
+    if isinstance(summary, dict):
+        changed_paths = summary.get("changed_paths", [])
+        if isinstance(changed_paths, list):
+            ordered = [str(value).strip() for value in changed_paths if str(value).strip()]
+            if ordered:
+                return ordered
+    changed: list[str] = []
+    for fragment in document.get("fragments", []) if isinstance(document.get("fragments", []), list) else []:
+        if not isinstance(fragment, dict):
+            continue
+        if str(fragment.get("kind", "")).strip() not in {"command_outcome", "recovery_trace"}:
+            continue
+        for value in fragment.get("changed_paths", fragment.get("recovered_changed_paths", [])):
+            normalized = str(value).strip()
+            if normalized and normalized not in changed:
+                changed.append(normalized)
+    return changed
+
+
+def _document_recovery_traces(document: dict[str, object]) -> list[dict[str, object]]:
+    summary = document.get("summary", {})
+    if isinstance(summary, dict):
+        traces = summary.get("recovery_traces", [])
+        if isinstance(traces, list):
+            normalized = [dict(item) for item in traces if isinstance(item, dict)]
+            if normalized:
+                return normalized
+    traces: list[dict[str, object]] = []
+    for fragment in document.get("fragments", []) if isinstance(document.get("fragments", []), list) else []:
+        if not isinstance(fragment, dict):
+            continue
+        if str(fragment.get("kind", "")).strip() != "recovery_trace":
+            continue
+        traces.append(dict(fragment))
+    return traces
+
+
+def _document_edit_patches(document: dict[str, object]) -> list[dict[str, object]]:
+    summary = document.get("summary", {})
+    if isinstance(summary, dict):
+        patches = summary.get("edit_patches", [])
+        if isinstance(patches, list):
+            normalized = [dict(item) for item in patches if isinstance(item, dict)]
+            if normalized:
+                return normalized
+    patches: list[dict[str, object]] = []
+    for fragment in document.get("fragments", []) if isinstance(document.get("fragments", []), list) else []:
+        if not isinstance(fragment, dict):
+            continue
+        if str(fragment.get("kind", "")).strip() != "edit_patch":
+            continue
+        patches.append(dict(fragment))
+    return patches
+
+
+def _sorted_semantic_episodes(
+    episodes: list[dict[str, object]],
+    *,
+    task_id: str = "",
+) -> list[dict[str, object]]:
+    if not episodes:
+        return []
+
+    def _episode_priority(payload: dict[str, object]) -> tuple[int, int, int, str]:
+        current_task = str(payload.get("task_id", "")).strip()
+        related_bonus = 1 if task_id and (current_task.startswith(f"{task_id}_") or task_id.startswith(f"{current_task}_")) else 0
+        success_bonus = 1 if bool(payload.get("success", False)) else 0
+        semantic_pressure = len(list(payload.get("verifier_obligations", []))) + len(list(payload.get("changed_paths", [])))
+        return (-related_bonus, -success_bonus, -semantic_pressure, current_task)
+
+    return [
+        {
+            "task_id": str(item.get("task_id", "")).strip(),
+            "benchmark_family": str(item.get("benchmark_family", "bounded")).strip() or "bounded",
+            "memory_source": str(item.get("memory_source", "")).strip(),
+            "success": bool(item.get("success", False)),
+            "verifier_obligations": [
+                str(value).strip()
+                for value in item.get("verifier_obligations", [])
+                if str(value).strip()
+            ][:4],
+            "changed_paths": [
+                str(value).strip()
+                for value in item.get("changed_paths", [])
+                if str(value).strip()
+            ][:6],
+            "failure_signals": [
+                str(value).strip()
+                for value in item.get("failure_signals", [])
+                if str(value).strip()
+            ][:4],
+            "edit_patches": [
+                {
+                    "path": str(dict(patch).get("path", "")).strip(),
+                    "status": str(dict(patch).get("status", "")).strip(),
+                    "patch_summary": str(dict(patch).get("patch_summary", "")).strip(),
+                    "patch_excerpt": str(dict(patch).get("patch_excerpt", dict(patch).get("patch", ""))).strip()[:160],
+                }
+                for patch in item.get("edit_patches", [])[:2]
+                if isinstance(patch, dict) and str(dict(patch).get("path", "")).strip()
+            ],
+            "recovery_trace": dict(item.get("recovery_trace", {}))
+            if isinstance(item.get("recovery_trace", {}), dict)
+            else {},
+        }
+        for item in sorted(episodes, key=_episode_priority)[:6]
+        if str(item.get("task_id", "")).strip()
+    ]
+
+
+def _normalized_semantic_strings(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        text = str(value).strip().lower()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _semantic_prototypes(episodes: list[dict[str, object]]) -> list[dict[str, object]]:
+    prototypes: dict[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], dict[str, object]] = {}
+    for episode in episodes:
+        family = str(episode.get("benchmark_family", "bounded")).strip() or "bounded"
+        changed_paths = tuple(
+            _normalized_semantic_strings(
+                [str(value).strip() for value in episode.get("changed_paths", []) if str(value).strip()]
+            )[:3]
+        )
+        obligations = tuple(
+            _normalized_semantic_strings(
+                [str(value).strip() for value in episode.get("verifier_obligations", []) if str(value).strip()]
+            )[:2]
+        )
+        failure_signals = tuple(
+            _normalized_semantic_strings(
+                [str(value).strip() for value in episode.get("failure_signals", []) if str(value).strip()]
+            )[:2]
+        )
+        key = (family, changed_paths, obligations, failure_signals)
+        prototype = prototypes.setdefault(
+            key,
+            {
+                "benchmark_family": family,
+                "changed_paths": list(changed_paths),
+                "verifier_obligations": list(obligations),
+                "failure_signals": list(failure_signals),
+                "episode_count": 0,
+                "success_count": 0,
+                "memory_sources": {},
+                "task_ids": [],
+                "recovery_commands": {},
+                "failed_commands": {},
+                "command_sequences": {},
+            },
+        )
+        prototype["episode_count"] = int(prototype.get("episode_count", 0) or 0) + 1
+        if bool(episode.get("success", False)):
+            prototype["success_count"] = int(prototype.get("success_count", 0) or 0) + 1
+        memory_source = str(episode.get("memory_source", "")).strip()
+        if memory_source:
+            source_counts = prototype.setdefault("memory_sources", {})
+            if isinstance(source_counts, dict):
+                source_counts[memory_source] = int(source_counts.get(memory_source, 0) or 0) + 1
+        task_id = str(episode.get("task_id", "")).strip()
+        if task_id:
+            task_ids = prototype.setdefault("task_ids", [])
+            if isinstance(task_ids, list) and task_id not in task_ids:
+                task_ids.append(task_id)
+        recovery_trace = episode.get("recovery_trace", {})
+        recovery_trace = dict(recovery_trace) if isinstance(recovery_trace, dict) else {}
+        recovery_command = str(recovery_trace.get("recovery_command", "")).strip()
+        if recovery_command:
+            recovery_commands = prototype.setdefault("recovery_commands", {})
+            if isinstance(recovery_commands, dict):
+                recovery_commands[recovery_command] = int(recovery_commands.get(recovery_command, 0) or 0) + 1
+        failed_command = str(recovery_trace.get("failed_command", "")).strip()
+        if failed_command:
+            failed_commands = prototype.setdefault("failed_commands", {})
+            if isinstance(failed_commands, dict):
+                failed_commands[failed_command] = int(failed_commands.get(failed_command, 0) or 0) + 1
+        command_sequence = [
+            str(value).strip()
+            for value in episode.get("command_sequence", [])
+            if str(value).strip()
+        ]
+        if command_sequence:
+            sequence_key = " || ".join(command_sequence[:3])
+            command_sequences = prototype.setdefault("command_sequences", {})
+            if isinstance(command_sequences, dict):
+                command_sequences[sequence_key] = int(command_sequences.get(sequence_key, 0) or 0) + 1
+
+    return [
+        {
+            "benchmark_family": str(item.get("benchmark_family", "bounded")).strip() or "bounded",
+            "changed_paths": [
+                str(value).strip()
+                for value in item.get("changed_paths", [])
+                if str(value).strip()
+            ][:3],
+            "verifier_obligations": [
+                str(value).strip()
+                for value in item.get("verifier_obligations", [])
+                if str(value).strip()
+            ][:2],
+            "failure_signals": [
+                str(value).strip()
+                for value in item.get("failure_signals", [])
+                if str(value).strip()
+            ][:2],
+            "episode_count": int(item.get("episode_count", 0) or 0),
+            "success_count": int(item.get("success_count", 0) or 0),
+            "memory_sources": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("memory_sources", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "task_ids": [
+                str(value).strip()
+                for value in item.get("task_ids", [])
+                if str(value).strip()
+            ][:4],
+            "recovery_commands": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("recovery_commands", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "failed_commands": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("failed_commands", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "command_sequences": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("command_sequences", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "application_commands": _prototype_application_commands(item),
+        }
+        for item in sorted(
+            prototypes.values(),
+            key=lambda payload: (
+                -int(payload.get("success_count", 0) or 0),
+                -int(payload.get("episode_count", 0) or 0),
+                str(payload.get("benchmark_family", "bounded")).strip(),
+                list(payload.get("changed_paths", [])),
+            ),
+        )[:6]
+    ]
+
+
+def _semantic_episode_query_score(
+    episode: dict[str, object],
+    *,
+    task_id: str,
+    changed_paths: list[str],
+    verifier_obligations: list[str],
+    failure_signals: list[str],
+) -> int:
+    score = 0
+    current_task = str(episode.get("task_id", "")).strip()
+    if task_id:
+        if current_task == task_id:
+            score += 8
+        elif current_task.startswith(f"{task_id}_") or task_id.startswith(f"{current_task}_"):
+            score += 4
+    episode_paths = _normalized_semantic_strings(
+        [str(value).strip() for value in episode.get("changed_paths", []) if str(value).strip()]
+    )
+    episode_obligations = _normalized_semantic_strings(
+        [str(value).strip() for value in episode.get("verifier_obligations", []) if str(value).strip()]
+    )
+    episode_failures = _normalized_semantic_strings(
+        [str(value).strip() for value in episode.get("failure_signals", []) if str(value).strip()]
+    )
+    for path in changed_paths:
+        if any(candidate == path or candidate.endswith(path) or path.endswith(candidate) for candidate in episode_paths):
+            score += 4
+    for obligation in verifier_obligations:
+        if any(
+            obligation == candidate
+            or obligation in candidate
+            or candidate in obligation
+            for candidate in episode_obligations
+        ):
+            score += 4
+    for failure_signal in failure_signals:
+        if failure_signal in episode_failures:
+            score += 3
+    if bool(episode.get("success", False)):
+        score += 1
+    score += min(3, len(episode_paths) + len(episode_obligations))
+    return score
+
+
+def _semantic_prototype_query_score(
+    prototype: dict[str, object],
+    *,
+    changed_paths: list[str],
+    verifier_obligations: list[str],
+    failure_signals: list[str],
+) -> int:
+    score = 0
+    prototype_paths = _normalized_semantic_strings(
+        [str(value).strip() for value in prototype.get("changed_paths", []) if str(value).strip()]
+    )
+    prototype_obligations = _normalized_semantic_strings(
+        [str(value).strip() for value in prototype.get("verifier_obligations", []) if str(value).strip()]
+    )
+    prototype_failures = _normalized_semantic_strings(
+        [str(value).strip() for value in prototype.get("failure_signals", []) if str(value).strip()]
+    )
+    for path in changed_paths:
+        if any(candidate == path or candidate.endswith(path) or path.endswith(candidate) for candidate in prototype_paths):
+            score += 5
+    for obligation in verifier_obligations:
+        if any(
+            obligation == candidate
+            or obligation in candidate
+            or candidate in obligation
+            for candidate in prototype_obligations
+        ):
+            score += 4
+    for failure_signal in failure_signals:
+        if failure_signal in prototype_failures:
+            score += 3
+    score += min(4, int(prototype.get("success_count", 0) or 0))
+    score += min(2, int(prototype.get("episode_count", 0) or 0))
+    return score
+
+
+def _prototype_application_commands(prototype: dict[str, object]) -> list[str]:
+    ranked: list[tuple[int, str]] = []
+    for source in ("recovery_commands", "command_sequences"):
+        payload = prototype.get(source, {})
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        for key, count in payload.items():
+            normalized = str(key).strip()
+            if not normalized:
+                continue
+            if source == "command_sequences":
+                commands = [part.strip() for part in normalized.split(" || ") if part.strip()]
+                if not commands:
+                    continue
+                normalized = commands[-1]
+            ranked.append((int(count or 0), normalized))
+    seen: list[str] = []
+    for _, command in sorted(ranked, key=lambda item: (-item[0], item[1])):
+        if command not in seen:
+            seen.append(command)
+    return seen[:4]
+
+
 def _learning_artifacts_path_for_memory(root: Path, *, config: KernelConfig | None = None) -> Path:
     if config is not None:
-        return config.learning_artifacts_path
+        path = config.learning_artifacts_path
+        if path.is_absolute():
+            return path
+        try:
+            if root.resolve() == config.trajectories_root.resolve():
+                parts = path.parts
+                if parts[:1] == ("trajectories",):
+                    remainder = Path(*parts[1:]) if len(parts) > 1 else Path(path.name)
+                    return root.parent / remainder
+                return root.parent / path
+        except OSError:
+            pass
+        return path
     try:
         default_config = KernelConfig()
         if root.resolve() == default_config.trajectories_root.resolve():

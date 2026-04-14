@@ -8,9 +8,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.capabilities import capability_registry_snapshot
-from agent_kernel.delegation_policy import delegation_policy_snapshot
-from agent_kernel.job_queue import (
+from agent_kernel.extensions.capabilities import capability_registry_snapshot
+from agent_kernel.extensions.delegation_policy import delegation_policy_snapshot
+from agent_kernel.ops.job_queue import (
     TERMINAL_JOB_STATES,
     DelegatedJobQueue,
     DelegatedRuntimeController,
@@ -20,12 +20,12 @@ from agent_kernel.job_queue import (
     resolve_job_task,
     run_next_delegated_job,
 )
-from agent_kernel.operator_policy import operator_policy_snapshot
-from agent_kernel.preflight import run_unattended_preflight
-from agent_kernel.shared_repo import prepare_runtime_task
-from agent_kernel.task_bank import TaskBank
-from agent_kernel.trust import build_unattended_trust_ledger
-from agent_kernel.unattended_controller import discover_structural_classes, structural_class_family_aliases
+from agent_kernel.extensions.operator_policy import operator_policy_snapshot
+from agent_kernel.ops.preflight import run_unattended_preflight
+from agent_kernel.ops.shared_repo import prepare_runtime_task
+from agent_kernel.tasking.task_bank import TaskBank
+from agent_kernel.extensions.trust import build_unattended_trust_ledger
+from agent_kernel.ops.unattended_controller import discover_structural_classes, structural_class_family_aliases
 
 
 def _load_report_payload(report_path: str) -> dict[str, object]:

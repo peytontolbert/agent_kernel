@@ -122,9 +122,11 @@ def score_hybrid_candidates(
         decoder_world_progress_score = 0.0
         decoder_world_risk_score = 0.0
         decoder_world_entropy_mean = 0.0
+        decoder_world_belief_vector: list[float] = []
         decoder_world_final = decoder_diagnostics.get("world_final_belief")
         if isinstance(decoder_world_final, torch.Tensor) and decoder_world_final.dim() == 2:
             decoder_world_probs = decoder_world_final[index].exp()
+            decoder_world_belief_vector = _tensor_row_to_float_list(decoder_world_probs)
             decoder_world_progress_score = (
                 float(decoder_world_probs[0].item()) if decoder_world_probs.numel() > 0 else 0.0
             )
@@ -135,8 +137,10 @@ def score_hybrid_candidates(
             decoder_world_entropy_mean = float((-(safe_probs * safe_probs.log()).sum()).item())
         world_progress_score = 0.0
         world_risk_score = 0.0
+        world_belief_vector: list[float] = []
         if output.world_final_belief is not None:
             world_probs = output.world_final_belief[index].exp()
+            world_belief_vector = _tensor_row_to_float_list(world_probs)
             world_progress_score = float(world_probs[0].item()) if world_probs.numel() > 0 else 0.0
             world_risk_score = float(world_probs[1].item()) if world_probs.numel() > 1 else 0.0
             if world_probs.numel() > 2:
@@ -249,9 +253,17 @@ def score_hybrid_candidates(
                 "hybrid_decoder_logprob": decoder_logprob,
                 "hybrid_world_progress_score": world_progress_score,
                 "hybrid_world_risk_score": world_risk_score,
+                "hybrid_world_belief_vector": world_belief_vector,
+                "hybrid_world_belief_top_states": _belief_vector_top_states(world_belief_vector),
+                "hybrid_world_belief_top_state_probs": _belief_vector_top_state_probs(world_belief_vector),
                 "hybrid_decoder_world_progress_score": decoder_world_progress_score,
                 "hybrid_decoder_world_risk_score": decoder_world_risk_score,
                 "hybrid_decoder_world_entropy_mean": decoder_world_entropy_mean,
+                "hybrid_decoder_world_belief_vector": decoder_world_belief_vector,
+                "hybrid_decoder_world_belief_top_states": _belief_vector_top_states(decoder_world_belief_vector),
+                "hybrid_decoder_world_belief_top_state_probs": _belief_vector_top_state_probs(
+                    decoder_world_belief_vector
+                ),
                 "hybrid_task_horizon": task_horizon,
                 "hybrid_long_horizon_scale": horizon_scale if is_long_horizon else 1.0,
                 "hybrid_long_horizon_progress_signal": long_horizon_progress_signal,
@@ -337,6 +349,29 @@ def infer_hybrid_world_signal(
     )
     if not scored:
         return {}
+    controller_scores: dict[str, float] = {}
+    controller_world_vectors: dict[str, list[float]] = {}
+    controller_decoder_vectors: dict[str, list[float]] = {}
+    for item in scored:
+        controller_mode_key = _controller_mode_for_probe(item)
+        if not controller_mode_key:
+            continue
+        score = float(item.get("hybrid_total_score", 0.0) or 0.0)
+        if controller_mode_key not in controller_scores or score > controller_scores[controller_mode_key]:
+            controller_scores[controller_mode_key] = score
+            controller_world_vectors[controller_mode_key] = _float_list(item.get("hybrid_world_belief_vector", []))
+            controller_decoder_vectors[controller_mode_key] = _float_list(
+                item.get("hybrid_decoder_world_belief_vector", [])
+            )
+    controller_belief = _controller_belief_distribution(controller_scores)
+    controller_mode = max(controller_belief, key=controller_belief.get) if controller_belief else ""
+    controller_expected_world_belief = _weighted_belief_vector(controller_world_vectors, controller_belief)
+    controller_expected_decoder_world_belief = _weighted_belief_vector(
+        controller_decoder_vectors,
+        controller_belief,
+    )
+    controller_world_summary = _belief_vector_summary(controller_expected_world_belief)
+    controller_decoder_summary = _belief_vector_summary(controller_expected_decoder_world_belief)
     world_progress = max(float(item.get("hybrid_world_progress_score", 0.0) or 0.0) for item in scored)
     world_risk = max(float(item.get("hybrid_world_risk_score", 0.0) or 0.0) for item in scored)
     decoder_world_progress = max(
@@ -369,6 +404,19 @@ def infer_hybrid_world_signal(
         "risk_signal": round(risk_signal, 4),
         "top_probe_reason": str(top.get("reason", "")).strip(),
         "probe_count": len(scored),
+        "controller_belief": controller_belief,
+        "controller_mode": controller_mode,
+        "controller_mode_probability": round(float(controller_belief.get(controller_mode, 0.0) or 0.0), 4)
+        if controller_mode
+        else 0.0,
+        "controller_expected_world_belief": controller_expected_world_belief,
+        "controller_expected_world_top_states": controller_world_summary["top_states"],
+        "controller_expected_world_top_state_probs": controller_world_summary["top_state_probs"],
+        "controller_expected_world_entropy_mean": controller_world_summary["entropy_mean"],
+        "controller_expected_decoder_world_belief": controller_expected_decoder_world_belief,
+        "controller_expected_decoder_world_top_states": controller_decoder_summary["top_states"],
+        "controller_expected_decoder_world_top_state_probs": controller_decoder_summary["top_state_probs"],
+        "controller_expected_decoder_world_entropy_mean": controller_decoder_summary["entropy_mean"],
         "world_prior_backend": str(top.get("hybrid_world_prior_backend", "")).strip(),
         "world_prior_top_state": int(top.get("hybrid_world_prior_top_state", -1) or -1),
         "world_prior_top_probability": round(
@@ -676,6 +724,107 @@ def _normalized_scoring_policy(policy: dict[str, object] | None) -> dict[str, fl
             normalized[key] = float(policy.get(key, default))
         except (TypeError, ValueError):
             normalized[key] = default
+    return normalized
+
+
+def _controller_mode_for_probe(candidate: dict[str, object]) -> str:
+    if str(candidate.get("action", "")).strip() == "respond":
+        return "stop"
+    command = str(candidate.get("command", candidate.get("content", ""))).strip()
+    if command == "__probe_recover_state__":
+        return "recover"
+    if command == "__probe_continue_progress__":
+        return "continue"
+    return ""
+
+
+def _controller_belief_distribution(scores: dict[str, float]) -> dict[str, float]:
+    belief = {"recover": 0.0, "continue": 0.0, "stop": 0.0}
+    if not scores:
+        return belief
+    max_score = max(scores.values())
+    scaled = {key: math.exp(float(value) - max_score) for key, value in scores.items()}
+    total = sum(scaled.values())
+    if total <= 0.0:
+        return belief
+    for key, value in scaled.items():
+        belief[key] = round(float(value / total), 4)
+    return belief
+
+
+def _weighted_belief_vector(
+    vectors: dict[str, list[float]],
+    weights: dict[str, float],
+) -> list[float]:
+    if not vectors:
+        return []
+    width = max((len(vector) for vector in vectors.values()), default=0)
+    if width <= 0:
+        return []
+    aggregated = [0.0] * width
+    total = 0.0
+    for key, vector in vectors.items():
+        weight = float(weights.get(key, 0.0) or 0.0)
+        if weight <= 0.0 or not vector:
+            continue
+        total += weight
+        for index, value in enumerate(vector[:width]):
+            aggregated[index] += weight * float(value)
+    if total <= 0.0:
+        return []
+    normalized = [max(0.0, value / total) for value in aggregated]
+    norm_total = sum(normalized)
+    if norm_total <= 0.0:
+        return []
+    return [round(value / norm_total, 4) for value in normalized]
+
+
+def _belief_vector_summary(vector: list[float]) -> dict[str, object]:
+    if not vector:
+        return {
+            "top_states": [],
+            "top_state_probs": [],
+            "entropy_mean": 0.0,
+        }
+    safe = [max(float(value), 1.0e-8) for value in vector]
+    total = sum(safe)
+    if total <= 0.0:
+        return {
+            "top_states": [],
+            "top_state_probs": [],
+            "entropy_mean": 0.0,
+        }
+    normalized = [value / total for value in safe]
+    ranked = sorted(enumerate(normalized), key=lambda item: item[1], reverse=True)[:3]
+    entropy = -sum(value * math.log(value) for value in normalized)
+    return {
+        "top_states": [int(index) for index, _ in ranked],
+        "top_state_probs": [round(float(value), 4) for _, value in ranked],
+        "entropy_mean": round(float(entropy), 4),
+    }
+
+
+def _belief_vector_top_states(vector: list[float]) -> list[int]:
+    return list(_belief_vector_summary(vector)["top_states"])
+
+
+def _belief_vector_top_state_probs(vector: list[float]) -> list[float]:
+    return list(_belief_vector_summary(vector)["top_state_probs"])
+
+
+def _tensor_row_to_float_list(row: torch.Tensor) -> list[float]:
+    return [round(float(value), 4) for value in row.detach().cpu().tolist()]
+
+
+def _float_list(values: object) -> list[float]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[float] = []
+    for value in values:
+        try:
+            normalized.append(float(value))
+        except (TypeError, ValueError):
+            continue
     return normalized
 
 

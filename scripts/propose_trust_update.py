@@ -10,7 +10,7 @@ import argparse
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementPlanner
-from agent_kernel.trust_improvement import build_trust_proposal_artifact
+from agent_kernel.extensions.improvement.trust_improvement import build_trust_proposal_artifact
 from evals.harness import run_eval
 
 

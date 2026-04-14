@@ -9,8 +9,8 @@ import time
 import evals.harness as harness_module
 from agent_kernel.config import KernelConfig
 from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
-from agent_kernel.task_bank import TaskBank
-from agent_kernel.trust import build_unattended_trust_ledger
+from agent_kernel.tasking.task_bank import TaskBank
+from agent_kernel.extensions.trust import build_unattended_trust_ledger
 from evals.harness import (
     _limit_tasks_for_compare,
     compare_abstraction_transfer_modes,

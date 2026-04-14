@@ -3,17 +3,17 @@ from pathlib import Path
 from evals.metrics import EvalMetrics
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.capabilities import adapter_catalog_snapshot
+from agent_kernel.extensions.capabilities import adapter_catalog_snapshot
 from agent_kernel.loop import _FRONTIER_STEP_FLOOR_FAMILIES
-from agent_kernel.subsystems import baseline_candidate_flags, subsystem_spec
-from agent_kernel.task_bank import _synthetic_lineage_seed_skipped
-from agent_kernel.tolbert_model_improvement import (
+from agent_kernel.extensions.strategy.subsystems import baseline_candidate_flags, subsystem_spec
+from agent_kernel.tasking.task_bank import _synthetic_lineage_seed_skipped
+from agent_kernel.extensions.improvement.tolbert_model_improvement import (
     _DEFAULT_TOLBERT_BUILD_POLICY,
     _TOLBERT_SHARED_STORE_GROUPS,
     _tolbert_family_proposal_gate,
 )
-from agent_kernel.trust_improvement import trust_behavior_controls
-from agent_kernel.unattended_controller import _DISCOVERED_STATE_FEATURES, _FOCUSES, _STATE_FEATURE_ORDER, _policy_features
+from agent_kernel.extensions.improvement.trust_improvement import trust_behavior_controls
+from agent_kernel.ops.unattended_controller import _DISCOVERED_STATE_FEATURES, _FOCUSES, _STATE_FEATURE_ORDER, _policy_features
 
 
 def test_subsystem_specs_and_flags_are_dataset_backed():

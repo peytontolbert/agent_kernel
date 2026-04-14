@@ -104,6 +104,60 @@ def build_latent_state_summary(
             "transition_regression_score": _float_value(learned.get("transition_regression_score"), 0.0),
             "top_probe_reason": str(learned.get("top_probe_reason", "")).strip(),
             "probe_count": int(learned.get("probe_count", 0) or 0),
+            "controller_belief": {
+                "recover": _float_value(
+                    _mapping_value(learned.get("controller_belief"), "recover"),
+                    0.0,
+                ),
+                "continue": _float_value(
+                    _mapping_value(learned.get("controller_belief"), "continue"),
+                    0.0,
+                ),
+                "stop": _float_value(
+                    _mapping_value(learned.get("controller_belief"), "stop"),
+                    0.0,
+                ),
+            },
+            "controller_mode": str(learned.get("controller_mode", "")).strip(),
+            "controller_mode_probability": _float_value(learned.get("controller_mode_probability"), 0.0),
+            "controller_expected_world_belief": [
+                round(_float_value(value, 0.0), 4)
+                for value in learned.get("controller_expected_world_belief", [])
+                if _is_float_like(value)
+            ],
+            "controller_expected_world_top_states": [
+                int(value)
+                for value in learned.get("controller_expected_world_top_states", [])
+                if _is_int_like(value)
+            ],
+            "controller_expected_world_top_state_probs": [
+                round(_float_value(value, 0.0), 4)
+                for value in learned.get("controller_expected_world_top_state_probs", [])
+                if _is_float_like(value)
+            ],
+            "controller_expected_world_entropy_mean": _float_value(
+                learned.get("controller_expected_world_entropy_mean"),
+                0.0,
+            ),
+            "controller_expected_decoder_world_belief": [
+                round(_float_value(value, 0.0), 4)
+                for value in learned.get("controller_expected_decoder_world_belief", [])
+                if _is_float_like(value)
+            ],
+            "controller_expected_decoder_world_top_states": [
+                int(value)
+                for value in learned.get("controller_expected_decoder_world_top_states", [])
+                if _is_int_like(value)
+            ],
+            "controller_expected_decoder_world_top_state_probs": [
+                round(_float_value(value, 0.0), 4)
+                for value in learned.get("controller_expected_decoder_world_top_state_probs", [])
+                if _is_float_like(value)
+            ],
+            "controller_expected_decoder_world_entropy_mean": _float_value(
+                learned.get("controller_expected_decoder_world_entropy_mean"),
+                0.0,
+            ),
             "world_prior_backend": str(learned.get("world_prior_backend", "")).strip(),
             "world_prior_top_state": int(learned.get("world_prior_top_state", -1) or -1),
             "world_prior_top_probability": _float_value(learned.get("world_prior_top_probability"), 0.0),
@@ -290,3 +344,17 @@ def _is_int_like(value: object) -> bool:
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _is_float_like(value: object) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _mapping_value(value: object, key: str) -> object:
+    if not isinstance(value, dict):
+        return 0.0
+    return value.get(key, 0.0)

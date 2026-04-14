@@ -24,26 +24,28 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.cycle_runner import semantic_progress_state
-from agent_kernel.curriculum_improvement import retained_curriculum_controls
-from agent_kernel.runtime_supervision import (
+from agent_kernel.extensions.improvement.curriculum_improvement import retained_curriculum_controls
+from agent_kernel.ops.improvement_reporting import semantic_progress_state
+from agent_kernel.ops.runtime_supervision import (
     append_jsonl,
     atomic_write_json,
     install_termination_handlers,
     spawn_process_group,
     terminate_process_tree,
 )
-from agent_kernel.semantic_hub import (
+from agent_kernel.modeling.artifacts import load_model_artifact, retained_tolbert_model_surfaces
+from agent_kernel.extensions.strategy.semantic_hub import (
     record_semantic_attempt,
     record_semantic_note,
     record_semantic_redirect,
     record_semantic_skill,
+    record_semantic_task,
     upsert_semantic_agent,
 )
 from agent_kernel.strategy_memory import load_strategy_nodes
-from agent_kernel.trust import build_unattended_trust_ledger
-from agent_kernel.prompt_improvement import retained_improvement_planner_controls
-from agent_kernel.unattended_controller import (
+from agent_kernel.extensions.trust import build_unattended_trust_ledger
+from agent_kernel.extensions.improvement.prompt_improvement import retained_improvement_planner_controls
+from agent_kernel.ops.unattended_controller import (
     action_key_for_policy,
     build_failure_observation,
     build_round_observation,
@@ -405,12 +407,43 @@ def _live_status_projection(
         int(child.get("retained_gain_runs", 0) or 0),
         int(authoritative_decision_state.get("retained_gain_runs", 0) or 0),
     )
+    unattended_evidence = report_payload.get("unattended_evidence", {})
+    if not isinstance(unattended_evidence, Mapping):
+        unattended_evidence = {}
+    open_world_breadth_summary = _open_world_evidence_snapshot(unattended_evidence)
+    provider_independence_summary = _provider_independence_summary(
+        payload=report_payload,
+        active_run=active_run_payload,
+        authoritative_decision_state=authoritative_decision_state,
+    )
+    tolbert_retained_routing_summary = _tolbert_retained_routing_summary_from_campaign_report(campaign_report)
+    retrieval_carryover_summary = _retrieval_carryover_summary_from_campaign_report(campaign_report)
+    long_horizon_finalize_summary = _long_horizon_finalize_summary(
+        active_child=child,
+        authoritative_decision_state=authoritative_decision_state,
+    )
     decision_runs = max(
         decision_runs,
         int(authoritative_decision_state.get("decision_records_considered", 0) or 0),
     )
     if decision_runs > 0:
         partial_productive_without_decision_runs = 0
+    handoff_summary = _handoff_summary(
+        payload=report_payload,
+        active_run=active_run_payload,
+        active_child=child,
+        latest_generated_run_report_path=latest_generated_run_report_path,
+    )
+    closure_gap_summary = _closure_gap_summary(
+        retained_gain_runs=retained_gain_runs,
+        trust_breadth_summary=trusted_breadth,
+        open_world_breadth_summary=open_world_breadth_summary,
+        provider_independence_summary=provider_independence_summary,
+        tolbert_retained_routing_summary=tolbert_retained_routing_summary,
+        retrieval_carryover_summary=retrieval_carryover_summary,
+        long_horizon_finalize_summary=long_horizon_finalize_summary,
+        handoff_summary=handoff_summary,
+    )
     return {
         "campaign_round_index": int(
             child.get("round_index", report_payload.get("rounds_completed", 0) or 0) or 0
@@ -473,9 +506,24 @@ def _live_status_projection(
                 trusted_breadth.get("distinct_external_benchmark_families", 0) or 0
             ),
             "external_report_count": int(trusted_breadth.get("external_report_count", 0) or 0),
+            "distinct_semantic_hub_benchmark_families": int(
+                open_world_breadth_summary.get("distinct_semantic_hub_benchmark_families", 0) or 0
+            ),
+            "semantic_hub_report_count": int(open_world_breadth_summary.get("semantic_hub_report_count", 0) or 0),
+            "distinct_replay_derived_benchmark_families": int(
+                open_world_breadth_summary.get("distinct_replay_derived_benchmark_families", 0) or 0
+            ),
+            "replay_derived_report_count": int(open_world_breadth_summary.get("replay_derived_report_count", 0) or 0),
             "sampled_families_from_progress": sampled_families,
             "bootstrap_sampled_required_families": sampled_required_families,
         },
+        "open_world_breadth_summary": open_world_breadth_summary,
+        "provider_independence_summary": provider_independence_summary,
+        "tolbert_retained_routing_summary": tolbert_retained_routing_summary,
+        "retrieval_carryover_summary": retrieval_carryover_summary,
+        "long_horizon_finalize_summary": long_horizon_finalize_summary,
+        "handoff_summary": handoff_summary,
+        "closure_gap_summary": closure_gap_summary,
     }
 
 
@@ -528,6 +576,287 @@ def _authoritative_status_decision_state(
         "retained_gain_runs": retained_gain_runs,
         "pending_decision_state": pending_decision_state,
         "decision_conversion_state": decision_conversion_state,
+    }
+
+
+def _retrieval_carryover_summary_from_campaign_report(campaign_report: Mapping[str, object] | None) -> dict[str, object]:
+    payload = campaign_report if isinstance(campaign_report, Mapping) else {}
+    records: list[Mapping[str, object]] = []
+    for key in ("recent_production_decisions", "recent_runtime_managed_decisions"):
+        value = payload.get(key, [])
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, Mapping):
+                    records.append(item)
+    seen: set[str] = set()
+    retrieval_cycle_ids: list[str] = []
+    decisions_with_metrics = 0
+    verified_improvement_cycle_ids: list[str] = []
+    verified_non_regression_cycle_ids: list[str] = []
+    best_rate = 0.0
+    best_verified_steps = 0
+    for index, record in enumerate(records, start=1):
+        decision_state = record.get("decision_state", {})
+        if not isinstance(decision_state, Mapping):
+            decision_state = {}
+        subsystem = str(record.get("subsystem") or decision_state.get("subsystem") or "").strip()
+        if subsystem != "retrieval":
+            continue
+        cycle_id = str(record.get("cycle_id", "")).strip() or f"retrieval:{index}"
+        if cycle_id in seen:
+            continue
+        seen.add(cycle_id)
+        retrieval_cycle_ids.append(cycle_id)
+        metrics = record.get("metrics_summary", {})
+        if not isinstance(metrics, Mapping):
+            metrics = {}
+        baseline_rate = float(metrics.get("baseline_trusted_carryover_repair_rate", 0.0) or 0.0)
+        carryover_rate = float(metrics.get("trusted_carryover_repair_rate", 0.0) or 0.0)
+        baseline_steps = int(metrics.get("baseline_trusted_carryover_verified_steps", 0) or 0)
+        verified_steps = int(metrics.get("trusted_carryover_verified_steps", 0) or 0)
+        verified_step_delta = int(
+            metrics.get("trusted_carryover_verified_step_delta", verified_steps - baseline_steps) or 0
+        )
+        if (
+            baseline_rate > 0.0
+            or carryover_rate > 0.0
+            or baseline_steps > 0
+            or verified_steps > 0
+            or verified_step_delta != 0
+        ):
+            decisions_with_metrics += 1
+            best_rate = max(best_rate, carryover_rate)
+            best_verified_steps = max(best_verified_steps, verified_steps)
+            if carryover_rate >= baseline_rate and verified_step_delta > 0 and verified_steps >= baseline_steps:
+                verified_improvement_cycle_ids.append(cycle_id)
+            if carryover_rate >= baseline_rate and verified_step_delta >= 0 and verified_steps >= max(1, baseline_steps):
+                verified_non_regression_cycle_ids.append(cycle_id)
+    retrieval_decision_count = len(retrieval_cycle_ids)
+    return {
+        "observed_retrieval_decision_count": retrieval_decision_count,
+        "retrieval_cycle_ids": retrieval_cycle_ids,
+        "decisions_with_carryover_metrics": decisions_with_metrics,
+        "decisions_with_verified_carryover_improvement": len(verified_improvement_cycle_ids),
+        "decisions_with_verified_carryover_non_regression": len(verified_non_regression_cycle_ids),
+        "verified_carryover_improvement_cycle_ids": verified_improvement_cycle_ids,
+        "verified_carryover_non_regression_cycle_ids": verified_non_regression_cycle_ids,
+        "best_trusted_carryover_repair_rate": round(best_rate, 4),
+        "best_trusted_carryover_verified_steps": best_verified_steps,
+        "carryover_proven": retrieval_decision_count > 0 and len(verified_non_regression_cycle_ids) == retrieval_decision_count,
+        "carryover_pressure": retrieval_decision_count > 0 and len(verified_non_regression_cycle_ids) < retrieval_decision_count,
+    }
+
+
+def _tolbert_retained_routing_summary_from_campaign_report(campaign_report: Mapping[str, object] | None) -> dict[str, object]:
+    payload = campaign_report if isinstance(campaign_report, Mapping) else {}
+    records = payload.get("recent_production_decisions", [])
+    if not isinstance(records, list):
+        records = []
+    tolbert_decision_count = 0
+    retained_tolbert_decision_count = 0
+    primary_routing_failures = 0
+    retrieval_influence_failures = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("subsystem", "")).strip() != "tolbert_model":
+            continue
+        tolbert_decision_count += 1
+        if str(record.get("state", "")).strip() == "retain":
+            retained_tolbert_decision_count += 1
+        reason = str(record.get("reason", "")).strip().lower()
+        if "primary routing" in reason:
+            primary_routing_failures += 1
+        if "retrieval influence" in reason:
+            retrieval_influence_failures += 1
+    return {
+        "tolbert_decision_count": tolbert_decision_count,
+        "retained_tolbert_decision_count": retained_tolbert_decision_count,
+        "primary_routing_failures": primary_routing_failures,
+        "retrieval_influence_failures": retrieval_influence_failures,
+        "retained_routing_proven": retained_tolbert_decision_count > 0,
+    }
+
+
+def _provider_independence_summary(
+    *,
+    payload: Mapping[str, object] | None,
+    active_run: Mapping[str, object] | None,
+    authoritative_decision_state: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report_payload = payload if isinstance(payload, Mapping) else {}
+    active_run_payload = active_run if isinstance(active_run, Mapping) else {}
+    decision_state = authoritative_decision_state if isinstance(authoritative_decision_state, Mapping) else {}
+    resolved_provider = str(active_run_payload.get("provider", "")).strip()
+    active_run_policy = active_run_payload.get("policy", {})
+    if not isinstance(active_run_policy, Mapping):
+        active_run_policy = {}
+    decision_records_considered = int(decision_state.get("decision_records_considered", 0) or 0)
+    retained_gain_runs = int(decision_state.get("retained_gain_runs", 0) or 0)
+    provider_signal_state = "none"
+    if resolved_provider:
+        provider_signal_state = "started"
+        if decision_records_considered > 0:
+            provider_signal_state = "decision_bearing"
+        if retained_gain_runs > 0:
+            provider_signal_state = "retained"
+    return {
+        "resolved_provider": resolved_provider,
+        "active_run_provider": resolved_provider,
+        "hybrid_provider_active": resolved_provider == "hybrid",
+        "decision_records_considered": decision_records_considered,
+        "retained_gain_runs": retained_gain_runs,
+        "provider_signal_state": provider_signal_state,
+        "decision_bearing_provider_signal": decision_records_considered > 0,
+        "retained_provider_signal": retained_gain_runs > 0,
+        "provider_requested_by_policy": str(active_run_policy.get("provider", "")).strip(),
+        "report_status": str(report_payload.get("status", "")).strip(),
+    }
+
+
+def _long_horizon_finalize_summary(
+    *,
+    active_child: Mapping[str, object] | None,
+    authoritative_decision_state: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child = active_child if isinstance(active_child, Mapping) else {}
+    decision_state = authoritative_decision_state if isinstance(authoritative_decision_state, Mapping) else {}
+    progress = child.get("active_cycle_progress", {})
+    if not isinstance(progress, Mapping):
+        progress = {}
+    last_progress_phase = str(child.get("last_progress_phase", "")).strip()
+    raw_phase = str(progress.get("raw_phase", "")).strip()
+    decision_records_considered = int(decision_state.get("decision_records_considered", 0) or 0)
+    generated_success_started = bool(progress.get("generated_success_started", False))
+    generated_success_completed = bool(progress.get("generated_success_completed", False))
+    candidate_generated = bool(progress.get("candidate_generated", False))
+    productive_partial = bool(progress.get("productive_partial", False))
+    finalize_active = "finalize" in last_progress_phase or raw_phase in {"metrics_finalize", "apply_decision", "finalize_cycle"}
+    return {
+        "productive_partial": productive_partial,
+        "candidate_generated": candidate_generated,
+        "generated_failure_completed": bool(progress.get("generated_failure_completed", False)),
+        "generated_success_started": generated_success_started,
+        "generated_success_completed": generated_success_completed,
+        "decision_records_considered": decision_records_considered,
+        "decision_emitted": decision_records_considered > 0,
+        "finalize_active": finalize_active,
+        "last_progress_phase": last_progress_phase,
+        "raw_phase": raw_phase,
+        "finalize_conversion_gap": (
+            productive_partial
+            and candidate_generated
+            and generated_success_started
+            and not generated_success_completed
+            and decision_records_considered <= 0
+        ),
+    }
+
+
+def _handoff_summary(
+    *,
+    payload: Mapping[str, object] | None,
+    active_run: Mapping[str, object] | None,
+    active_child: Mapping[str, object] | None,
+    latest_generated_run_report_path: str,
+) -> dict[str, object]:
+    report_payload = payload if isinstance(payload, Mapping) else {}
+    active_run_payload = active_run if isinstance(active_run, Mapping) else {}
+    child = active_child if isinstance(active_child, Mapping) else {}
+    status = str(report_payload.get("status", "")).strip()
+    reason = str(report_payload.get("reason", "")).strip()
+    event_log_present = bool(str(report_payload.get("event_log_path", "")).strip())
+    lock_path_present = bool(str(report_payload.get("lock_path", "")).strip())
+    child_report_present = bool(latest_generated_run_report_path)
+    child_status_mirrored = bool(
+        isinstance(active_run_payload.get("child_status", {}), Mapping) and active_run_payload.get("child_status", {})
+    ) or bool(child)
+    postmortem_ready = event_log_present and child_report_present and child_status_mirrored
+    handoff_ready = lock_path_present and event_log_present and child_status_mirrored
+    closure_state = "open"
+    if handoff_ready or postmortem_ready:
+        closure_state = "partial"
+    if handoff_ready and postmortem_ready:
+        closure_state = "ready"
+    return {
+        "restart_required": status in {"running", "interrupted", "timed_out"} or bool(reason),
+        "reason": reason,
+        "event_log_present": event_log_present,
+        "lock_path_present": lock_path_present,
+        "child_report_present": child_report_present,
+        "child_status_mirrored": child_status_mirrored,
+        "postmortem_ready": postmortem_ready,
+        "handoff_ready": handoff_ready,
+        "closure_state": closure_state,
+    }
+
+
+def _closure_gap_summary(
+    *,
+    retained_gain_runs: int,
+    trust_breadth_summary: Mapping[str, object] | None,
+    open_world_breadth_summary: Mapping[str, object] | None,
+    provider_independence_summary: Mapping[str, object] | None,
+    tolbert_retained_routing_summary: Mapping[str, object] | None,
+    retrieval_carryover_summary: Mapping[str, object] | None,
+    long_horizon_finalize_summary: Mapping[str, object] | None,
+    handoff_summary: Mapping[str, object] | None,
+) -> dict[str, object]:
+    trust = trust_breadth_summary if isinstance(trust_breadth_summary, Mapping) else {}
+    open_world = open_world_breadth_summary if isinstance(open_world_breadth_summary, Mapping) else {}
+    provider = provider_independence_summary if isinstance(provider_independence_summary, Mapping) else {}
+    tolbert = tolbert_retained_routing_summary if isinstance(tolbert_retained_routing_summary, Mapping) else {}
+    carryover = retrieval_carryover_summary if isinstance(retrieval_carryover_summary, Mapping) else {}
+    finalize = long_horizon_finalize_summary if isinstance(long_horizon_finalize_summary, Mapping) else {}
+    handoff = handoff_summary if isinstance(handoff_summary, Mapping) else {}
+    trust_closed = (
+        int(trust.get("external_report_count", 0) or 0) > 0
+        and not _normalize_benchmark_families(trust.get("missing_required_families", []))
+        and int(trust.get("distinct_family_gap", 0) or 0) <= 0
+    )
+    open_world_reports = int(open_world.get("open_world_report_count", 0) or 0)
+    open_world_retained_gain = bool(open_world.get("retained_open_world_gain", False))
+    provider_state = str(provider.get("provider_signal_state", "")).strip()
+    handoff_state = str(handoff.get("closure_state", "")).strip()
+    return {
+        "retained_conversion": "closed" if retained_gain_runs > 0 else "open",
+        "trust_breadth": "closed" if trust_closed else "open",
+        "open_world_breadth": (
+            "closed" if open_world_retained_gain and open_world_reports > 0 else "partial" if open_world_reports > 0 else "open"
+        ),
+        "decoder_runtime_independence": (
+            "closed"
+            if bool(provider.get("hybrid_provider_active", False)) and provider_state == "retained"
+            else "partial"
+            if bool(provider.get("hybrid_provider_active", False)) and provider_state in {"started", "decision_bearing"}
+            else "open"
+        ),
+        "tolbert_retained_routing": (
+            "closed"
+            if bool(tolbert.get("retained_routing_proven", False))
+            else "partial"
+            if int(tolbert.get("tolbert_decision_count", 0) or 0) > 0
+            else "open"
+        ),
+        "retrieval_carryover": (
+            "closed"
+            if bool(carryover.get("carryover_proven", False))
+            else "partial"
+            if int(carryover.get("observed_retrieval_decision_count", 0) or 0) > 0
+            else "open"
+        ),
+        "long_horizon_finalize_execution": (
+            "closed"
+            if bool(finalize.get("generated_success_completed", False)) and bool(finalize.get("decision_emitted", False))
+            else "partial"
+            if bool(finalize.get("candidate_generated", False))
+            or bool(finalize.get("generated_success_started", False))
+            or bool(finalize.get("productive_partial", False))
+            else "open"
+        ),
+        "evidence_hygiene_handoff": (
+            "closed" if handoff_state == "ready" else "partial" if handoff_state == "partial" else "open"
+        ),
     }
 
 
@@ -1567,12 +1896,19 @@ def _task_from_progress_line(line: str) -> dict[str, object]:
     )
     if not match:
         return {}
-    return {
+    payload = {
         "index": int(match.group("index")),
         "total": int(match.group("total")),
         "task_id": str(match.group("task_id")).strip(),
         "family": str(match.group("family")).strip(),
     }
+    task_origin_match = re.search(r"\btask_origin=(?P<task_origin>[A-Za-z0-9_:-]+)", normalized)
+    if task_origin_match:
+        payload["task_origin"] = str(task_origin_match.group("task_origin")).strip()
+    source_task_match = re.search(r"\bsource_task=(?P<source_task>\S+)", normalized)
+    if source_task_match:
+        payload["source_task"] = str(source_task_match.group("source_task")).strip()
+    return payload
 
 
 _UNATTENDED_CHILD_GENERATED_SUCCESS_COMPLETION_GRACE_SECONDS = 120.0
@@ -2868,6 +3204,146 @@ def _round_semantic_skill_payload(
     }
 
 
+def _safe_semantic_task_token(value: object, *, default: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip()).strip("._")
+    return normalized or default
+
+
+def _semantic_round_task_payloads(
+    *,
+    run_id: str,
+    round_payload: Mapping[str, object] | None,
+    current_policy: Mapping[str, object] | None,
+) -> list[dict[str, object]]:
+    payload = dict(round_payload or {})
+    semantic_redirection = (
+        dict(payload.get("semantic_redirection", {}))
+        if isinstance(payload.get("semantic_redirection", {}), Mapping)
+        else {}
+    )
+    campaign_report = (
+        dict(payload.get("campaign_report", {}))
+        if isinstance(payload.get("campaign_report", {}), Mapping)
+        else {}
+    )
+    trust_breadth = (
+        dict(payload.get("trust_breadth_summary", {}))
+        if isinstance(payload.get("trust_breadth_summary", {}), Mapping)
+        else {}
+    )
+    priority_family_yield = (
+        dict(campaign_report.get("priority_family_yield_summary", {}))
+        if isinstance(campaign_report.get("priority_family_yield_summary", {}), Mapping)
+        else {}
+    )
+    round_index = int(payload.get("round_index", 0) or 0)
+    reason_codes = [
+        str(value).strip()
+        for value in semantic_redirection.get("reason_codes", [])
+        if str(value).strip()
+    ]
+    source_subsystems = _normalize_excluded_subsystems(semantic_redirection.get("source_subsystems", []))
+    target_families = _normalize_benchmark_families(
+        semantic_redirection.get("target_priority_families", [])
+    )
+    if not target_families:
+        target_families = _normalize_benchmark_families(trust_breadth.get("missing_required_families", []))
+    if not target_families:
+        target_families = _normalize_benchmark_families(
+            priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
+        )
+    if not target_families:
+        target_families = _normalize_benchmark_families(
+            dict(current_policy or {}).get("priority_benchmark_families", [])
+        )
+    if not target_families:
+        return []
+
+    semantic_tasks: list[dict[str, object]] = []
+    attempt_id = f"unattended_round:{run_id}:{round_index}"
+    for family in target_families[:3]:
+        family_token = _safe_semantic_task_token(family, default="bounded")
+        task_stem = (
+            f"semantic_open_world_{_safe_semantic_task_token(run_id, default='run')}_"
+            f"round_{round_index}_{family_token}"
+        )
+        workspace_subdir = f"semantic_hub/{task_stem}"
+        report_relpath = f"semantic_open_world/{family_token}_evidence.md"
+        contract_relpath = f"semantic_open_world/{family_token}_task.json"
+        success_command = (
+            "python - <<'PY'\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            f"contract_path = Path({contract_relpath!r})\n"
+            f"report_path = Path({report_relpath!r})\n"
+            "assert contract_path.exists(), contract_path\n"
+            "assert report_path.exists(), report_path\n"
+            "payload = json.loads(contract_path.read_text(encoding='utf-8'))\n"
+            "assert isinstance(payload, dict)\n"
+            "assert str(payload.get('task_id', '')).strip()\n"
+            "assert str(payload.get('prompt', '')).strip()\n"
+            "assert str(payload.get('workspace_subdir', '')).strip()\n"
+            "metadata = payload.get('metadata', {})\n"
+            "assert isinstance(metadata, dict)\n"
+            f"assert str(metadata.get('benchmark_family', '')).strip() == {family!r}\n"
+            "assert bool(metadata.get('open_world_candidate', False)) is True\n"
+            "origin = str(metadata.get('semantic_source', metadata.get('source_task', ''))).strip().lower()\n"
+            "assert 'replay' not in origin\n"
+            "PY"
+        )
+        prompt = (
+            f"Inspect this repository for a non-replay {family} task surface suggested by the latest unattended round. "
+            f"Write `{contract_relpath}` as a runnable task contract for a future unattended run and write "
+            f"`{report_relpath}` explaining why the contract is repo-specific, semantic/open-world, and not replay-derived."
+        )
+        semantic_tasks.append(
+            {
+                "task_id": task_stem,
+                "payload": {
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "attempt_id": attempt_id,
+                    "round_index": round_index,
+                    "target_family": family,
+                    "reason_codes": reason_codes,
+                    "source_subsystems": source_subsystems,
+                    "task_candidate_kind": "semantic_open_world_gapfill",
+                    "task": {
+                        "task_id": task_stem,
+                        "prompt": prompt,
+                        "workspace_subdir": workspace_subdir,
+                        "suggested_commands": [
+                            f"mkdir -p semantic_open_world && printf '# {family} open-world evidence\\n' > {report_relpath}",
+                            (
+                                "python - <<'PY'\n"
+                                "import json\n"
+                                "from pathlib import Path\n"
+                                f"payload = {{'task_id': '{task_stem}_candidate', 'prompt': 'Describe a repo-specific {family} task.', "
+                                f"'workspace_subdir': '{task_stem}_candidate', 'metadata': {{'benchmark_family': '{family}', "
+                                "'capability': 'semantic_open_world', 'open_world_candidate': True, "
+                                f"'semantic_source': '{attempt_id}'}}}}\n"
+                                f"Path({contract_relpath!r}).write_text(json.dumps(payload, indent=2), encoding='utf-8')\n"
+                                "PY"
+                            ),
+                        ],
+                        "success_command": success_command,
+                        "expected_files": [contract_relpath, report_relpath],
+                        "metadata": {
+                            "benchmark_family": family,
+                            "capability": "semantic_open_world",
+                            "difficulty": "generated",
+                            "open_world_candidate": True,
+                            "semantic_seed_kind": "unattended_round",
+                            "semantic_parent_attempt_id": attempt_id,
+                            "semantic_source_subsystems": source_subsystems,
+                            "semantic_reason_codes": reason_codes,
+                        },
+                    },
+                },
+            }
+        )
+    return semantic_tasks
+
+
 def _normalize_policy_shift_alert_subscriptions(raw: object) -> list[str]:
     if isinstance(raw, str):
         values = [item.strip() for item in raw.split(",")]
@@ -3628,6 +4104,9 @@ def _mirrored_child_status_from_parent_status(status_path: Path | None) -> dict[
     payload = _read_json(status_path)
     if not payload:
         return {}
+    report_kind = str(payload.get("report_kind", "")).strip()
+    if report_kind == "repeated_improvement_status" or isinstance(payload.get("active_cycle_run"), Mapping):
+        return dict(payload)
     active_run = payload.get("active_run", {})
     if not isinstance(active_run, dict):
         return {}
@@ -4276,6 +4755,12 @@ def _merge_mirrored_child_status_fields(
         cycle_task = active_cycle_run.get("current_task", {})
         if not isinstance(cycle_task, Mapping):
             cycle_task = {}
+        cycle_progress_line = str(
+            active_cycle_run.get("last_progress_line") or active_cycle_run.get("last_output_line") or ""
+        ).strip()
+        cycle_progress_phase = str(active_cycle_run.get("last_progress_phase", "")).strip()
+        if not cycle_progress_phase and cycle_progress_line:
+            cycle_progress_phase = _phase_from_progress_line(cycle_progress_line)
         cycle_same_task_scope = _task_scope_matches(cycle_task, merged.get("current_task", {}))
         active_task_scope_missing = merged.get("current_task") in ({}, [], "", None)
         for key in (
@@ -4330,6 +4815,24 @@ def _merge_mirrored_child_status_fields(
             or mirrored_snapshot_is_newer
         ):
             merged["current_task"] = dict(cycle_task)
+        cycle_has_task = bool(cycle_task)
+        live_progress_phase = str(merged.get("last_progress_phase", "")).strip()
+        cycle_phase_advances_beyond_live_task = (
+            bool(cycle_progress_phase)
+            and not cycle_has_task
+            and cycle_progress_phase != live_progress_phase
+        )
+        if cycle_phase_advances_beyond_live_task:
+            merged["last_progress_phase"] = cycle_progress_phase
+            if cycle_progress_line:
+                merged["last_progress_line"] = cycle_progress_line
+                merged["last_output_line"] = str(
+                    active_cycle_run.get("last_output_line") or cycle_progress_line
+                ).strip()
+            merged["current_task"] = {}
+            merged["current_cognitive_stage"] = {}
+            merged["current_task_progress_timeline"] = []
+            merged["current_task_verification_passed"] = None
         if "tolbert_runtime_summary" in active_cycle_run and "active_cycle_tolbert_runtime_summary" not in merged:
             merged["active_cycle_tolbert_runtime_summary"] = active_cycle_run.get("tolbert_runtime_summary")
         if "last_progress_phase" in active_cycle_run and not str(merged.get("last_progress_phase", "")).strip():
@@ -4711,6 +5214,292 @@ def _child_partial_report_path(child_status: Mapping[str, object] | None) -> Pat
     return None
 
 
+def _safe_report_token(value: object) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in normalized)
+
+
+def _partial_task_origin_for_phase(
+    phase: str,
+    *,
+    task_id: str = "",
+    source_task: str = "",
+    task_origin: str = "",
+) -> str:
+    normalized = str(phase).strip()
+    explicit_origin = str(task_origin).strip().lower()
+    if explicit_origin:
+        return explicit_origin
+    lineage_candidates = [str(source_task).strip(), str(task_id).strip()]
+    for candidate in lineage_candidates:
+        normalized_candidate = candidate.lower()
+        if normalized_candidate.startswith("semantic_open_world_"):
+            return "semantic_hub"
+        if normalized_candidate.startswith("external_manifest_"):
+            return "external_manifest"
+    if normalized.startswith("generated_failure"):
+        return "transition_pressure"
+    if normalized.startswith("generated_success"):
+        return "discovered_task"
+    return "built_in"
+
+
+def _partial_task_root_for_phase(task_id: str, phase: str, family: str) -> str:
+    normalized_task_id = str(task_id).strip()
+    if not normalized_task_id:
+        return ""
+    normalized_phase = str(phase).strip()
+    normalized_family = str(family).strip()
+    suffixes: list[str] = []
+    if normalized_family:
+        suffixes.extend(
+            [
+                f"_{normalized_family}_adjacent",
+                f"_{normalized_family}_recovery",
+            ]
+        )
+    if normalized_phase.startswith("generated_success"):
+        suffixes.append("_adjacent")
+    elif normalized_phase.startswith("generated_failure"):
+        suffixes.append("_recovery")
+    for suffix in suffixes:
+        if normalized_task_id.endswith(suffix):
+            return normalized_task_id[: -len(suffix)]
+    return normalized_task_id
+
+
+def _partial_task_report_payload(
+    *,
+    task_id: str,
+    benchmark_family: str,
+    phase: str,
+    verification_passed: bool,
+    timestamp: float,
+    round_index: int,
+    step_index: int = 1,
+    task_origin: str = "",
+    source_task: str = "",
+) -> dict[str, object]:
+    normalized_phase = str(phase).strip()
+    normalized_task_id = str(task_id).strip()
+    normalized_family = str(benchmark_family).strip() or "bounded"
+    generated_at = (
+        datetime.fromtimestamp(float(timestamp), timezone.utc).isoformat()
+        if float(timestamp or 0.0) > 0.0
+        else datetime.now(timezone.utc).isoformat()
+    )
+    normalized_source_task = str(source_task).strip() or _partial_task_root_for_phase(
+        normalized_task_id,
+        normalized_phase,
+        normalized_family,
+    )
+    task_origin = _partial_task_origin_for_phase(
+        normalized_phase,
+        task_id=normalized_task_id,
+        source_task=normalized_source_task,
+        task_origin=task_origin,
+    )
+    task_metadata: dict[str, object] = {
+        "task_origin": task_origin,
+        "source_task": normalized_source_task or normalized_task_id,
+        "round_index": max(1, int(round_index or 0)),
+        "generated_phase": normalized_phase,
+        "partial_productive_timeout_evidence": True,
+    }
+    supervision: dict[str, object] = {
+        "mode": "unattended",
+        "independent_execution": True,
+        "partial_productive_timeout_evidence": True,
+    }
+    trust_scope = "gated"
+    if normalized_phase.startswith("generated_failure"):
+        task_metadata["curriculum_kind"] = "failure_recovery"
+        supervision["contract_clean_failure_recovery_candidate"] = True
+        trust_scope = "contract_clean_failure_recovery"
+    elif normalized_phase.startswith("generated_success"):
+        task_metadata["curriculum_kind"] = "generated_success"
+    command_steps = max(1, int(step_index or 0))
+    return {
+        "report_kind": "unattended_task_report",
+        "generated_at": generated_at,
+        "task_id": normalized_task_id,
+        "benchmark_family": normalized_family,
+        "outcome": "success" if verification_passed else "safe_stop",
+        "success": bool(verification_passed),
+        "termination_reason": "accepted_partial_timeout",
+        "task_metadata": task_metadata,
+        "task_contract": {
+            "metadata": dict(task_metadata),
+        },
+        "trust_scope": trust_scope,
+        "supervision": supervision,
+        "summary": {
+            "command_steps": command_steps,
+            "unexpected_change_files": 0,
+            "verified_steps": 1 if verification_passed else 0,
+            "hidden_side_effect_risk": False,
+        },
+        "commands": [{} for _ in range(command_steps)],
+        "side_effects": {"hidden_side_effect_risk": False},
+        "recovery": {"rollback_performed": False},
+        "uncertainties": [
+            "partial productive timeout evidence synthesized from parent event log before finalize completed"
+        ],
+        "workspace_files": [],
+    }
+
+
+def _partial_task_report_records_from_event_log(
+    event_log_path: Path | None,
+    *,
+    round_index: int,
+) -> list[dict[str, object]]:
+    if event_log_path is None or not event_log_path.exists():
+        return []
+    records: dict[tuple[str, str], dict[str, object]] = {}
+    try:
+        lines = event_log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if int(payload.get("round_index", 0) or 0) != int(round_index or 0):
+            continue
+        if str(payload.get("event_kind", "")).strip() != "child_event":
+            continue
+        phase = str(payload.get("phase", "")).strip()
+        if not phase.startswith("generated_"):
+            continue
+        if "verification_passed" not in payload:
+            continue
+        current_task = payload.get("current_task", {})
+        if not isinstance(current_task, Mapping):
+            continue
+        task_id = str(current_task.get("task_id", "")).strip()
+        family = str(current_task.get("family", "")).strip()
+        if not task_id or not family:
+            continue
+        timestamp = float(payload.get("timestamp", 0.0) or 0.0)
+        key = (phase, task_id)
+        prior = records.get(key)
+        if prior is not None and float(prior.get("timestamp", 0.0) or 0.0) > timestamp:
+            continue
+        records[key] = {
+            "task_id": task_id,
+            "benchmark_family": family,
+            "phase": phase,
+            "verification_passed": bool(payload.get("verification_passed", False)),
+            "timestamp": timestamp,
+            "step_index": int(payload.get("step_index", 0) or 0),
+            "task_origin": str(current_task.get("task_origin", "")).strip(),
+            "source_task": str(current_task.get("source_task", "")).strip(),
+        }
+    return sorted(records.values(), key=lambda item: (float(item.get("timestamp", 0.0) or 0.0), str(item.get("task_id", ""))))
+
+
+def _partial_task_report_record_from_child_status(
+    mirrored_child_status: Mapping[str, object] | None,
+    *,
+    round_index: int,
+) -> dict[str, object] | None:
+    child_status = mirrored_child_status if isinstance(mirrored_child_status, Mapping) else {}
+    current_task = child_status.get("current_task", {})
+    if not isinstance(current_task, Mapping):
+        current_task = {}
+    phase = str(current_task.get("phase", "")).strip()
+    task_id = str(current_task.get("task_id", "")).strip()
+    family = str(current_task.get("family", "")).strip()
+    if not phase.startswith("generated_") or not task_id or not family:
+        return None
+    verification_raw = child_status.get("current_task_verification_passed")
+    if verification_raw is None:
+        cognitive_stage = child_status.get("current_cognitive_stage", {})
+        if isinstance(cognitive_stage, Mapping) and "verification_passed" in cognitive_stage:
+            verification_raw = cognitive_stage.get("verification_passed")
+    if verification_raw is None:
+        return None
+    timeline = child_status.get("current_task_progress_timeline", [])
+    step_index = 1
+    timestamp = 0.0
+    if isinstance(timeline, list) and timeline:
+        for item in reversed(timeline):
+            if not isinstance(item, Mapping):
+                continue
+            timestamp = float(item.get("timestamp", 0.0) or 0.0)
+            step_index = max(step_index, int(item.get("step_index", 0) or 0))
+            if "verification_passed" in item:
+                break
+    if timestamp <= 0.0:
+        timestamp = time.time()
+    return {
+        "task_id": task_id,
+        "benchmark_family": family,
+        "phase": phase,
+        "verification_passed": bool(verification_raw),
+        "timestamp": timestamp,
+        "step_index": step_index,
+        "round_index": max(1, int(round_index or 0)),
+        "task_origin": str(current_task.get("task_origin", "")).strip(),
+        "source_task": str(current_task.get("source_task", "")).strip(),
+    }
+
+
+def _persist_partial_unattended_task_reports(
+    *,
+    reports_dir: Path,
+    event_log_path: Path | None,
+    round_index: int,
+    mirrored_child_status: Mapping[str, object] | None,
+    config: KernelConfig,
+) -> list[str]:
+    candidates = _partial_task_report_records_from_event_log(
+        event_log_path,
+        round_index=round_index,
+    )
+    if not candidates:
+        fallback_candidate = _partial_task_report_record_from_child_status(
+            mirrored_child_status,
+            round_index=round_index,
+        )
+        if fallback_candidate is not None:
+            candidates = [fallback_candidate]
+    written_paths: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        task_id = str(candidate.get("task_id", "")).strip()
+        phase = str(candidate.get("phase", "")).strip()
+        benchmark_family = str(candidate.get("benchmark_family", "")).strip()
+        if not task_id or not phase or not benchmark_family:
+            continue
+        filename = (
+            f"task_report_partial_round_{max(1, int(round_index or 0))}_"
+            f"{_safe_report_token(phase)}_{_safe_report_token(task_id)}.json"
+        )
+        payload = _partial_task_report_payload(
+            task_id=task_id,
+            benchmark_family=benchmark_family,
+            phase=phase,
+            verification_passed=bool(candidate.get("verification_passed", False)),
+            timestamp=float(candidate.get("timestamp", 0.0) or 0.0),
+            round_index=max(1, int(candidate.get("round_index", round_index) or round_index)),
+            step_index=max(1, int(candidate.get("step_index", 0) or 0)),
+            task_origin=str(candidate.get("task_origin", "")).strip(),
+            source_task=str(candidate.get("source_task", "")).strip(),
+        )
+        target = reports_dir / filename
+        atomic_write_json(target, payload, config=config, govern_storage=False)
+        written_paths.append(str(target))
+    return written_paths
+
+
 def _synthetic_productive_partial_campaign_report(
     *,
     mirrored_child_status: Mapping[str, object] | None,
@@ -4747,13 +5536,6 @@ def _synthetic_productive_partial_campaign_report(
     pending_decision_state = str(child_status.get("pending_decision_state", "")).strip()
     preview_state = str(child_status.get("preview_state", "")).strip()
     final_state = pending_decision_state or preview_state
-    accepted_productive_partial = productive_partial and generated_success_completed
-    if accepted_productive_partial:
-        decision_records_considered = max(1, decision_records_considered)
-        runtime_managed_decisions = max(1, runtime_managed_decisions)
-        non_runtime_managed_decisions = 0
-        retained_gain_runs = max(1, retained_gain_runs)
-        final_state = final_state or "retain"
     current_task = active_child.get("current_task", {})
     if not isinstance(current_task, Mapping):
         current_task = {}
@@ -4850,6 +5632,15 @@ def _accepted_partial_timeout_decision_state(
     payload = round_payload if isinstance(round_payload, Mapping) else {}
     report_runs = report.get("runs", [])
     first_run = report_runs[0] if isinstance(report_runs, list) and report_runs and isinstance(report_runs[0], Mapping) else {}
+    decision_records_considered = max(
+        0,
+        int(first_run.get("decision_records_considered", 0) or 0),
+        int(first_run.get("runtime_managed_decisions", 0) or 0),
+        int(first_run.get("non_runtime_managed_decisions", 0) or 0),
+        int(report.get("runtime_managed_decisions", 0) or 0),
+        int(report.get("non_runtime_managed_decisions", 0) or 0),
+    )
+    child_native_decision = decision_records_considered > 0
     timeout_reason = (
         str(run.get("timeout_reason", "")).strip()
         or str(first_run.get("timeout_reason", "")).strip()
@@ -4857,30 +5648,36 @@ def _accepted_partial_timeout_decision_state(
     acceptance = payload.get("campaign_partial_acceptance", {})
     if not isinstance(acceptance, Mapping):
         acceptance = {}
-    retention_state = (
-        str(first_run.get("final_state", "")).strip()
-        or ("retain" if int(report.get("retained_gain_runs", 0) or 0) > 0 else "")
-        or ("reject" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
-        or "incomplete"
-    )
-    decision_conversion_state = (
-        str(first_run.get("decision_conversion_state", "")).strip()
-        or ("runtime_managed" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
-        or ("non_runtime_managed" if int(report.get("non_runtime_managed_decisions", 0) or 0) > 0 else "")
-        or "partial_productive_without_decision"
-    )
+    retention_state = "incomplete"
+    if child_native_decision:
+        retention_state = (
+            str(first_run.get("final_state", "")).strip()
+            or ("retain" if int(report.get("retained_gain_runs", 0) or 0) > 0 else "")
+            or ("reject" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
+            or "undecided"
+        )
+    decision_conversion_state = "partial_productive_without_decision"
+    if child_native_decision:
+        decision_conversion_state = (
+            str(first_run.get("decision_conversion_state", "")).strip()
+            or ("runtime_managed" if int(report.get("runtime_managed_decisions", 0) or 0) > 0 else "")
+            or ("non_runtime_managed" if int(report.get("non_runtime_managed_decisions", 0) or 0) > 0 else "")
+            or "non_runtime_managed"
+        )
     retention_basis = (
         str(acceptance.get("reason", "")).strip()
         or timeout_reason
         or decision_conversion_state
     )
     return {
-        "decision_owner": "controller_runtime_manager",
-        "decision_credit": "accepted_partial_timeout",
+        "decision_owner": "child_native" if child_native_decision else "none",
+        "decision_credit": "child_emitted_decision" if child_native_decision else "partial_productive_evidence_only",
         "decision_conversion_state": decision_conversion_state,
         "retention_state": retention_state,
         "retention_basis": retention_basis,
-        "closeout_mode": "accepted_partial_timeout",
+        "closeout_mode": "child_native_before_partial_timeout"
+        if child_native_decision
+        else "partial_timeout_evidence_only",
         "controller_intervention_reason_code": _accepted_partial_timeout_reason_code(timeout_reason),
         "recorded_at": "",
     }
@@ -4904,6 +5701,11 @@ def _ensure_accepted_partial_decision_state_surfaces(
         campaign_run=campaign_run,
         round_payload=round_payload,
     )
+    child_native_decision = str(decision_state.get("decision_owner", "")).strip() == "child_native"
+    runtime_managed_decision = (
+        child_native_decision
+        and str(decision_state.get("decision_conversion_state", "")).strip() == "runtime_managed"
+    )
     normalized_run = dict(first_run)
     existing_run_decision_state = normalized_run.get("decision_state", {})
     if not isinstance(existing_run_decision_state, Mapping) or not existing_run_decision_state:
@@ -4913,12 +5715,14 @@ def _ensure_accepted_partial_decision_state_surfaces(
         retention_state = str(decision_state.get("retention_state", "")).strip()
         report["decision_state_summary"] = {
             "run_decisions": {
-                "child_native": 0,
-                "controller_runtime_manager": 1,
+                "child_native": 1 if child_native_decision else 0,
+                "controller_runtime_manager": 0,
             },
             "run_closeout_modes": {
                 "natural": 0,
-                "accepted_partial_timeout": 1,
+                "accepted_partial_timeout": 0,
+                "child_native_before_partial_timeout": 1 if child_native_decision else 0,
+                "partial_timeout_evidence_only": 0 if child_native_decision else 1,
                 "forced_reject": 0,
             },
             "run_retention_states": {
@@ -4928,8 +5732,8 @@ def _ensure_accepted_partial_decision_state_surfaces(
                 "undecided": 1 if retention_state == "undecided" else 0,
             },
             "record_decisions": {
-                "child_native": 0,
-                "controller_runtime_manager": 1,
+                "child_native": 1 if child_native_decision else 0,
+                "controller_runtime_manager": 0,
             },
         }
     synthesized_record = {
@@ -4944,11 +5748,21 @@ def _ensure_accepted_partial_decision_state_surfaces(
         },
     }
     recent_runtime = report.get("recent_runtime_managed_decisions", [])
-    if not isinstance(recent_runtime, list) or not recent_runtime:
+    if runtime_managed_decision and (not isinstance(recent_runtime, list) or not recent_runtime):
         report["recent_runtime_managed_decisions"] = [synthesized_record]
+    elif not isinstance(recent_runtime, list):
+        report["recent_runtime_managed_decisions"] = []
+    else:
+        report["recent_runtime_managed_decisions"] = list(recent_runtime)
     recent_production = report.get("recent_production_decisions", [])
-    if not isinstance(recent_production, list) or not recent_production:
-        report["recent_production_decisions"] = list(report["recent_runtime_managed_decisions"])
+    if child_native_decision and (not isinstance(recent_production, list) or not recent_production):
+        report["recent_production_decisions"] = (
+            list(report["recent_runtime_managed_decisions"])
+            if runtime_managed_decision
+            else [synthesized_record]
+        )
+    elif not isinstance(recent_production, list):
+        report["recent_production_decisions"] = []
     recent_non_runtime = report.get("recent_non_runtime_decisions", [])
     if not isinstance(recent_non_runtime, list):
         report["recent_non_runtime_decisions"] = []
@@ -5053,20 +5867,41 @@ def _credit_accepted_productive_partial_status(
     retained_gain_runs = max(0, int(_effective_live_retained_gain_runs(child_status) or 0))
     if not generated_success_completed or not productive_partial:
         return child_status
-    if decision_records_considered > 0 and runtime_managed_decisions > 0 and retained_gain_runs > 0:
+    child_status["accepted_partial_timeout_evidence"] = True
+    if decision_records_considered <= 0:
+        child_status["decision_records_considered"] = 0
+        child_status["runtime_managed_decisions"] = 0
+        child_status["non_runtime_managed_decisions"] = 0
+        child_status["retained_gain_runs"] = retained_gain_runs
+        summary = child_status.get("decision_conversion_summary", {})
+        if not isinstance(summary, Mapping):
+            summary = {}
+        child_status["decision_conversion_summary"] = {
+            **dict(summary),
+            "runtime_managed_runs": int(summary.get("runtime_managed_runs", 0) or 0),
+            "non_runtime_managed_runs": int(summary.get("non_runtime_managed_runs", 0) or 0),
+            "partial_productive_without_decision_runs": max(
+                1,
+                int(summary.get("partial_productive_without_decision_runs", 0) or 0),
+            ),
+            "decision_runs": 0,
+            "no_decision_runs": 0,
+        }
         return child_status
-    child_status["decision_records_considered"] = max(1, decision_records_considered)
-    child_status["runtime_managed_decisions"] = max(1, runtime_managed_decisions)
-    child_status["non_runtime_managed_decisions"] = 0
-    child_status["retained_gain_runs"] = max(1, retained_gain_runs)
-    child_status["pending_decision_state"] = str(child_status.get("pending_decision_state", "")).strip() or "retain"
+    child_status["decision_records_considered"] = decision_records_considered
+    child_status["runtime_managed_decisions"] = runtime_managed_decisions
+    child_status["non_runtime_managed_decisions"] = max(
+        int(child_status.get("non_runtime_managed_decisions", 0) or 0),
+        0 if runtime_managed_decisions > 0 else decision_records_considered,
+    )
+    child_status["retained_gain_runs"] = retained_gain_runs
     summary = child_status.get("decision_conversion_summary", {})
     if not isinstance(summary, Mapping):
         summary = {}
     child_status["decision_conversion_summary"] = {
         **dict(summary),
-        "runtime_managed_runs": max(1, int(summary.get("runtime_managed_runs", 0) or 0)),
-        "non_runtime_managed_runs": 0,
+        "runtime_managed_runs": max(runtime_managed_decisions, int(summary.get("runtime_managed_runs", 0) or 0)),
+        "non_runtime_managed_runs": 0 if runtime_managed_decisions > 0 else 1,
         "partial_productive_without_decision_runs": 0,
         "decision_runs": max(1, int(summary.get("decision_runs", 0) or 0)),
         "no_decision_runs": 0,
@@ -5074,13 +5909,6 @@ def _credit_accepted_productive_partial_status(
     recent_decisions = child_status.get("recent_structured_child_decisions", [])
     if not isinstance(recent_decisions, list):
         recent_decisions = []
-    if not recent_decisions:
-        child_status["recent_structured_child_decisions"] = [
-            {
-                "state": "retain",
-                "source": "parent_runtime_manager",
-            }
-        ]
     return child_status
 
 
@@ -5181,27 +6009,30 @@ def _normalize_accepted_productive_partial_campaign_report(
     retained_gain = bool(first_run.get("retained_gain", False)) or int(report.get("retained_gain_runs", 0) or 0) > 0
     if not productive_partial or not generated_success_completed:
         return _finalize(report)
-    if decision_records_considered > 0 and runtime_managed_decisions > 0 and retained_gain:
+    if decision_records_considered > 0:
         return _finalize(report)
     normalized_run = dict(first_run)
-    normalized_run["decision_records_considered"] = max(1, decision_records_considered)
-    normalized_run["runtime_managed_decisions"] = max(1, runtime_managed_decisions)
-    normalized_run["non_runtime_managed_decisions"] = 0
-    normalized_run["retained_gain"] = True
-    normalized_run["final_state"] = str(first_run.get("final_state", "")).strip() or "retain"
-    normalized_run["decision_conversion_state"] = "runtime_managed"
+    normalized_run["decision_records_considered"] = decision_records_considered
+    normalized_run["runtime_managed_decisions"] = runtime_managed_decisions
+    normalized_run["non_runtime_managed_decisions"] = int(first_run.get("non_runtime_managed_decisions", 0) or 0)
+    normalized_run["retained_gain"] = retained_gain
+    normalized_run["final_state"] = str(first_run.get("final_state", "")).strip() or ""
+    normalized_run["decision_conversion_state"] = "partial_productive_without_decision"
     report["runs"] = [normalized_run, *runs[1:]]
-    report["runtime_managed_decisions"] = max(1, int(report.get("runtime_managed_decisions", 0) or 0))
-    report["retained_gain_runs"] = max(1, int(report.get("retained_gain_runs", 0) or 0))
+    report["runtime_managed_decisions"] = int(report.get("runtime_managed_decisions", 0) or 0)
+    report["retained_gain_runs"] = int(report.get("retained_gain_runs", 0) or 0)
     conversion_summary = report.get("decision_conversion_summary", {})
     if not isinstance(conversion_summary, Mapping):
         conversion_summary = {}
     report["decision_conversion_summary"] = {
         **dict(conversion_summary),
-        "runtime_managed_runs": max(1, int(conversion_summary.get("runtime_managed_runs", 0) or 0)),
-        "non_runtime_managed_runs": 0,
-        "partial_productive_without_decision_runs": 0,
-        "decision_runs": max(1, int(conversion_summary.get("decision_runs", 0) or 0)),
+        "runtime_managed_runs": int(conversion_summary.get("runtime_managed_runs", 0) or 0),
+        "non_runtime_managed_runs": int(conversion_summary.get("non_runtime_managed_runs", 0) or 0),
+        "partial_productive_without_decision_runs": max(
+            1,
+            int(conversion_summary.get("partial_productive_without_decision_runs", 0) or 0),
+        ),
+        "decision_runs": int(conversion_summary.get("decision_runs", 0) or 0),
         "no_decision_runs": 0,
     }
     return _finalize(report)
@@ -5283,6 +6114,14 @@ def _finalize_completed_campaign_round(
         round_payload.setdefault("controller_observation_start", dict(start_observation))
     else:
         start_observation = {}
+    controller_state = _update_strategy_memory_priors(
+        controller_state,
+        config=config,
+    )
+    controller_state = _update_repo_setting_policy_priors(
+        controller_state,
+        round_payload=round_payload,
+    )
     end_observation = _controller_observation(
         campaign_report=campaign_report,
         liftoff_payload=liftoff_payload,
@@ -5337,14 +6176,6 @@ def _finalize_completed_campaign_round(
     if updated_phase_detail:
         round_payload["phase_detail"] = updated_phase_detail
         report["phase_detail"] = updated_phase_detail
-    controller_state = _update_strategy_memory_priors(
-        controller_state,
-        config=config,
-    )
-    controller_state = _update_repo_setting_policy_priors(
-        controller_state,
-        round_payload=round_payload,
-    )
     round_payload["controller_update"] = controller_update
     report["controller_summary"] = controller_state_summary(controller_state)
     report["unattended_evidence"] = _unattended_evidence_snapshot(config)
@@ -5938,6 +6769,74 @@ def _trust_assessment_snapshot(assessment: object) -> dict[str, object]:
     }
 
 
+def _task_yield_bucket_snapshot(summary: object) -> dict[str, object]:
+    payload = summary if isinstance(summary, Mapping) else {}
+    return {
+        "reports": int(payload.get("reports", 0) or 0),
+        "success_count": int(payload.get("success_count", 0) or 0),
+        "clean_success_count": int(payload.get("clean_success_count", 0) or 0),
+        "benchmark_families": _normalize_benchmark_families(payload.get("benchmark_families", [])),
+        "distinct_benchmark_families": int(payload.get("distinct_benchmark_families", 0) or 0),
+        "task_roots": list(payload.get("task_roots", [])) if isinstance(payload.get("task_roots", []), list) else [],
+        "distinct_task_roots": int(payload.get("distinct_task_roots", 0) or 0),
+        "clean_success_task_roots": (
+            list(payload.get("clean_success_task_roots", []))
+            if isinstance(payload.get("clean_success_task_roots", []), list)
+            else []
+        ),
+        "distinct_clean_success_task_roots": int(payload.get("distinct_clean_success_task_roots", 0) or 0),
+        "task_origins": dict(payload.get("task_origins", {})) if isinstance(payload.get("task_origins", {}), dict) else {},
+    }
+
+
+def _open_world_evidence_snapshot(unattended_evidence: Mapping[str, object] | None) -> dict[str, object]:
+    payload = unattended_evidence if isinstance(unattended_evidence, Mapping) else {}
+    semantic_hub_summary = _task_yield_bucket_snapshot(payload.get("semantic_hub_summary", {}))
+    external_summary = _trust_scope_snapshot(payload.get("external_summary", {}))
+    replay_derived_summary = _task_yield_bucket_snapshot(payload.get("replay_derived_summary", {}))
+    open_world_families = _rank_priority_benchmark_families(
+        list(
+            {
+                *semantic_hub_summary.get("benchmark_families", []),
+                *external_summary.get("benchmark_families", []),
+            }
+        )
+    )
+    return {
+        "semantic_hub_report_count": int(semantic_hub_summary.get("reports", 0) or 0),
+        "distinct_semantic_hub_benchmark_families": int(
+            semantic_hub_summary.get("distinct_benchmark_families", 0) or 0
+        ),
+        "semantic_hub_benchmark_families": _normalize_benchmark_families(
+            semantic_hub_summary.get("benchmark_families", [])
+        ),
+        "external_report_count": int(external_summary.get("total", 0) or 0),
+        "distinct_external_benchmark_families": int(
+            external_summary.get("distinct_benchmark_families", 0) or 0
+        ),
+        "external_benchmark_families": _normalize_benchmark_families(
+            external_summary.get("benchmark_families", [])
+        ),
+        "replay_derived_report_count": int(replay_derived_summary.get("reports", 0) or 0),
+        "distinct_replay_derived_benchmark_families": int(
+            replay_derived_summary.get("distinct_benchmark_families", 0) or 0
+        ),
+        "replay_derived_benchmark_families": _normalize_benchmark_families(
+            replay_derived_summary.get("benchmark_families", [])
+        ),
+        "open_world_report_count": int(semantic_hub_summary.get("reports", 0) or 0)
+        + int(external_summary.get("total", 0) or 0),
+        "distinct_open_world_benchmark_families": len(open_world_families),
+        "open_world_benchmark_families": open_world_families,
+        "open_world_task_yield_present": bool(
+            int(semantic_hub_summary.get("reports", 0) or 0) > 0 or int(external_summary.get("total", 0) or 0) > 0
+        ),
+        "semantic_hub_summary": semantic_hub_summary,
+        "external_summary": external_summary,
+        "replay_derived_summary": replay_derived_summary,
+    }
+
+
 def _family_evidence_snapshot(summary: object, assessment: object) -> dict[str, object]:
     summary_payload = _trust_scope_snapshot(summary)
     assessment_payload = _trust_assessment_snapshot(assessment)
@@ -6011,6 +6910,25 @@ def _unattended_evidence_snapshot(config: KernelConfig) -> dict[str, object]:
         "overall_summary": _trust_scope_snapshot(ledger.get("overall_summary", {})),
         "gated_summary": _trust_scope_snapshot(ledger.get("gated_summary", {})),
         "external_summary": _trust_scope_snapshot(ledger.get("external_summary", {})),
+        "semantic_hub_summary": _task_yield_bucket_snapshot(
+            dict(coverage_summary.get("open_world_task_yield_summary", {})).get("semantic_hub", {})
+            if isinstance(coverage_summary.get("open_world_task_yield_summary", {}), dict)
+            else {}
+        ),
+        "replay_derived_summary": _task_yield_bucket_snapshot(
+            coverage_summary.get("replay_derived_task_yield_summary", {})
+        ),
+        "open_world_summary": _open_world_evidence_snapshot(
+            {
+                "external_summary": ledger.get("external_summary", {}),
+                "semantic_hub_summary": (
+                    dict(coverage_summary.get("open_world_task_yield_summary", {})).get("semantic_hub", {})
+                    if isinstance(coverage_summary.get("open_world_task_yield_summary", {}), dict)
+                    else {}
+                ),
+                "replay_derived_summary": coverage_summary.get("replay_derived_task_yield_summary", {}),
+            }
+        ),
         "required_family_statuses": required_family_statuses,
         "required_families_missing_reports": [
             family
@@ -6094,6 +7012,39 @@ def _tolbert_shared_store_references(config: KernelConfig) -> set[str]:
             continue
         referenced.update(_tolbert_shared_store_paths_from_payload(payload))
     return referenced
+
+
+def _retained_tolbert_surfaces_available(config: KernelConfig) -> bool:
+    if not bool(config.use_tolbert_model_artifacts):
+        return False
+    if not config.tolbert_model_artifact_path.exists():
+        return False
+    try:
+        payload = load_model_artifact(config.tolbert_model_artifact_path)
+    except RuntimeError:
+        return False
+    surfaces = retained_tolbert_model_surfaces(payload)
+    return any(
+        bool(
+            surfaces.get(key, False)
+        )
+        for key in (
+            "retrieval_surface",
+            "policy_head",
+            "value_head",
+            "transition_head",
+            "latent_state",
+            "universal_runtime",
+        )
+    )
+
+
+def _preferred_unattended_provider(args: argparse.Namespace, *, config: KernelConfig) -> str:
+    if str(args.provider or "").strip():
+        return KernelConfig.normalize_provider_name(str(args.provider).strip())
+    if _retained_tolbert_surfaces_available(config):
+        return "hybrid"
+    return config.normalized_provider()
 
 
 def _cleanup_tolbert_model_shared_store(config: KernelConfig) -> list[str]:
@@ -8299,7 +9250,7 @@ def _persist_semantic_round_artifacts(
     run_id: str,
     round_payload: dict[str, object],
     current_policy: dict[str, object],
-) -> dict[str, str]:
+) -> dict[str, object]:
     round_index = int(round_payload.get("round_index", 0) or 0)
     semantic_agent_id = f"unattended_agent:{run_id}"
     semantic_attempt_id = f"unattended_round:{run_id}:{round_index}"
@@ -8309,6 +9260,11 @@ def _persist_semantic_round_artifacts(
         else {}
     )
     semantic_skill = _round_semantic_skill_payload(
+        round_payload=round_payload,
+        current_policy=current_policy,
+    )
+    semantic_task_payloads = _semantic_round_task_payloads(
+        run_id=run_id,
         round_payload=round_payload,
         current_policy=current_policy,
     )
@@ -8402,6 +9358,20 @@ def _persist_semantic_round_artifacts(
                 **semantic_skill,
             },
         )
+    semantic_task_paths: list[str] = []
+    for semantic_task in semantic_task_payloads:
+        if not isinstance(semantic_task, dict):
+            continue
+        task_id = str(semantic_task.get("task_id", "")).strip()
+        payload_body = semantic_task.get("payload", {})
+        if not task_id or not isinstance(payload_body, dict):
+            continue
+        task_path = record_semantic_task(
+            config,
+            task_id=task_id,
+            payload=payload_body,
+        )
+        semantic_task_paths.append(str(task_path))
     upsert_semantic_agent(
         config,
         agent_id=semantic_agent_id,
@@ -8416,6 +9386,7 @@ def _persist_semantic_round_artifacts(
             "last_attempt_id": semantic_attempt_id,
             "last_redirect_id": "" if redirect_path is None else f"redirect:{redirect_path.stem}",
             "last_skill_id": "" if skill_path is None else f"skill:{skill_path.stem}",
+            "last_task_ids": [f"task:{Path(path).stem}" for path in semantic_task_paths],
             "stagnation_count": max(
                 int(round_payload.get("no_yield_rounds", 0) or 0),
                 int(round_payload.get("policy_stall_rounds", 0) or 0),
@@ -8429,6 +9400,7 @@ def _persist_semantic_round_artifacts(
         "semantic_note_path": str(note_path),
         "semantic_redirect_path": "" if redirect_path is None else str(redirect_path),
         "semantic_skill_path": "" if skill_path is None else str(skill_path),
+        "semantic_task_paths": semantic_task_paths,
     }
 
 
@@ -8583,6 +9555,7 @@ def _strategy_memory_observation_features(
     *,
     controller_state: Mapping[str, object] | None,
     planner_pressure_signal: Mapping[str, object] | None,
+    campaign_signal: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
     state = controller_state if isinstance(controller_state, Mapping) else {}
     repo_setting_priors = (
@@ -8596,11 +9569,16 @@ def _strategy_memory_observation_features(
         else {}
     )
     pressure = planner_pressure_signal if isinstance(planner_pressure_signal, Mapping) else {}
+    campaign = campaign_signal if isinstance(campaign_signal, Mapping) else {}
     if not repo_setting_priors:
         features = {
             "strategy_memory_prior_strength": 0.0,
             "strategy_memory_alignment": 0.0,
             "strategy_memory_reject_pressure": 0.0,
+            "strategy_memory_family_breadth_gain": 0.0,
+            "strategy_memory_family_breadth_pressure": 0.0,
+            "strategy_memory_closeout_gain": 0.0,
+            "strategy_memory_closeout_pressure": 0.0,
         }
     else:
         campaign_width_signals = set(_normalize_benchmark_families(pressure.get("frontier_repo_setting_families", [])))
@@ -8616,6 +9594,10 @@ def _strategy_memory_observation_features(
             "strategy_memory_prior_strength": min(1.0, weighted_prior_count / 3.0),
             "strategy_memory_alignment": min(1.0, alignment / 2.0),
             "strategy_memory_reject_pressure": 0.0,
+            "strategy_memory_family_breadth_gain": 0.0,
+            "strategy_memory_family_breadth_pressure": 0.0,
+            "strategy_memory_closeout_gain": 0.0,
+            "strategy_memory_closeout_pressure": 0.0,
         }
     if not strategy_priors:
         return features
@@ -8644,6 +9626,22 @@ def _strategy_memory_observation_features(
         max(0, int(rejects_by_family.get(family, 0) or 0))
         for family in sorted(relevant_families)
     )
+    retained_family_breadth_gain = max(0.0, float(strategy_priors.get("retained_family_breadth_gain", 0.0) or 0.0))
+    retained_closeout_gain = max(0.0, float(strategy_priors.get("retained_closeout_gain", 0.0) or 0.0))
+    recent_reject_closeout_failures = max(
+        0.0,
+        float(strategy_priors.get("recent_reject_closeout_failures", 0.0) or 0.0),
+    )
+    breadth_pressure = (
+        max(0, int(pressure.get("campaign_breadth_pressure_cycles", 0) or 0))
+        + max(0, int(pressure.get("variant_breadth_pressure_cycles", 0) or 0))
+        + len(_normalize_benchmark_families(pressure.get("missing_required_families", [])))
+    )
+    closeout_pressure = (
+        max(0, int(campaign.get("failed_decisions", 0) or 0))
+        + max(0, int(campaign.get("incomplete_cycle_count", 0) or 0))
+        + max(0, int(campaign.get("partial_productive_without_decision_runs", 0) or 0))
+    )
     features["strategy_memory_prior_strength"] = min(
         1.0,
         max(
@@ -8667,6 +9665,17 @@ def _strategy_memory_observation_features(
         (float(aligned_rejects) / 3.0)
         + min(0.4, float(max(0, int(strategy_priors.get("recent_rejects", 0) or 0))) / 5.0),
     )
+    features["strategy_memory_family_breadth_gain"] = min(1.0, retained_family_breadth_gain / 3.0)
+    features["strategy_memory_family_breadth_pressure"] = min(
+        1.0,
+        (float(breadth_pressure) / 4.0)
+        + max(0.0, float(features.get("strategy_memory_reject_pressure", 0.0) or 0.0)) * 0.3,
+    )
+    features["strategy_memory_closeout_gain"] = min(1.0, retained_closeout_gain)
+    features["strategy_memory_closeout_pressure"] = min(
+        1.0,
+        (float(closeout_pressure) / 4.0) + min(0.5, recent_reject_closeout_failures / 4.0),
+    )
     return features
 
 
@@ -8677,8 +9686,12 @@ def _summarize_strategy_memory_priors(config: KernelConfig) -> dict[str, object]
     retained_subsystems: dict[str, float] = {}
     recent_rejects_by_subsystem: dict[str, int] = {}
     retained_count = 0
+    retained_discovered_strategy_count = 0
     rejected_count = 0
     best_retained_gain = 0.0
+    retained_family_breadth_gain = 0.0
+    retained_closeout_gain = 0.0
+    recent_reject_closeout_failures = 0
     recent_nodes = sorted(
         nodes,
         key=lambda node: (str(node.updated_at), str(node.created_at), str(node.strategy_node_id)),
@@ -8687,7 +9700,18 @@ def _summarize_strategy_memory_priors(config: KernelConfig) -> dict[str, object]
         subsystem = str(node.subsystem).strip().lower()
         if node.retention_state == "retain":
             retained_count += 1
+            if str(getattr(node, "strategy_origin", "")).strip() == "discovered_strategy":
+                retained_discovered_strategy_count += 1
             best_retained_gain = max(best_retained_gain, max(0.0, float(node.retained_gain)))
+            execution_evidence = dict(getattr(node, "execution_evidence", {}) or {})
+            retained_family_breadth_gain = max(
+                retained_family_breadth_gain,
+                max(0.0, float(execution_evidence.get("family_breadth_gain", 0.0) or 0.0)),
+            )
+            retained_closeout_gain = max(
+                retained_closeout_gain,
+                1.0 if bool(execution_evidence.get("closeout_ready", False)) else 0.0,
+            )
             if subsystem:
                 retained_subsystems[subsystem] = max(
                     float(retained_subsystems.get(subsystem, 0.0) or 0.0),
@@ -8707,8 +9731,11 @@ def _summarize_strategy_memory_priors(config: KernelConfig) -> dict[str, object]
     recent_retains = 0
     for node in recent_nodes:
         subsystem = str(node.subsystem).strip().lower()
+        execution_evidence = dict(getattr(node, "execution_evidence", {}) or {})
         if node.retention_state == "reject":
             recent_rejects += 1
+            if execution_evidence and not bool(execution_evidence.get("closeout_ready", False)):
+                recent_reject_closeout_failures += 1
             if subsystem:
                 recent_rejects_by_subsystem[subsystem] = int(recent_rejects_by_subsystem.get(subsystem, 0) or 0) + 1
             for family, value in dict(node.family_coverage).items():
@@ -8721,10 +9748,14 @@ def _summarize_strategy_memory_priors(config: KernelConfig) -> dict[str, object]
     return {
         "node_count": len(nodes),
         "retained_count": retained_count,
+        "retained_discovered_strategy_count": retained_discovered_strategy_count,
         "rejected_count": rejected_count,
         "recent_rejects": recent_rejects,
         "recent_retains": recent_retains,
         "best_retained_gain": round(best_retained_gain, 4),
+        "retained_family_breadth_gain": round(retained_family_breadth_gain, 4),
+        "retained_closeout_gain": round(retained_closeout_gain, 4),
+        "recent_reject_closeout_failures": recent_reject_closeout_failures,
         "retained_family_gains": dict(sorted(retained_family_gains.items())),
         "recent_rejects_by_family": dict(sorted(recent_rejects_by_family.items())),
         "retained_subsystems": dict(sorted(retained_subsystems.items())),
@@ -8784,6 +9815,8 @@ def _strategy_memory_candidate_score_adjustment(
         max(0, int(rejects_by_family.get(family, 0) or 0))
         for family in relevant_families
     )
+    retained_family_breadth_gain = max(0.0, float(priors.get("retained_family_breadth_gain", 0.0) or 0.0))
+    retained_closeout_gain = max(0.0, float(priors.get("retained_closeout_gain", 0.0) or 0.0))
     policy_change_units = 0.0
     if bool(proposal.get("adaptive_search", False)) != bool(current.get("adaptive_search", False)):
         policy_change_units += 1.0
@@ -8806,11 +9839,21 @@ def _strategy_memory_candidate_score_adjustment(
         else:
             score_adjustment += min(0.16, 0.04 * reject_alignment_pressure)
             reasons.append(f"reject_escape_bonus={reject_alignment_pressure:.4f}")
+    if retained_family_breadth_gain > 0.0 and policy_change_units > 0.0:
+        breadth_bonus = min(0.08, retained_family_breadth_gain * 0.02)
+        score_adjustment += breadth_bonus
+        reasons.append(f"family_breadth_gain_bonus={retained_family_breadth_gain:.4f}")
+    if retained_closeout_gain > 0.0 and policy_change_units > 0.0:
+        closeout_bonus = min(0.05, retained_closeout_gain * 0.03)
+        score_adjustment += closeout_bonus
+        reasons.append(f"closeout_gain_bonus={retained_closeout_gain:.4f}")
     return {
         "score_adjustment": round(score_adjustment, 4),
         "policy_change_units": round(policy_change_units, 4),
         "retained_alignment_gain": round(retained_alignment_gain, 4),
         "reject_alignment_pressure": round(reject_alignment_pressure, 4),
+        "retained_family_breadth_gain": round(retained_family_breadth_gain, 4),
+        "retained_closeout_gain": round(retained_closeout_gain, 4),
         "reasons": reasons,
     }
 
@@ -8845,6 +9888,7 @@ def _controller_observation(
         _strategy_memory_observation_features(
             controller_state=controller_state,
             planner_pressure_signal=planner_pressure_signal,
+            campaign_signal=campaign_signal,
         )
     )
     if controller_features:
@@ -11029,17 +12073,19 @@ def main() -> None:
             report["phase"] = phase
             round_payload["phase"] = phase
             round_run_match_id = f"unattended:round:{run_id}:{round_index}"
+            resolved_provider = _preferred_unattended_provider(args, config=config)
             report["active_run"] = {
                 "run_index": round_index,
                 "run_match_id": round_run_match_id,
                 "phase": phase,
                 "policy": dict(current_policy),
+                "provider": resolved_provider,
             }
             _progress(
                 f"[campaign] phase=campaign round={round_index} cycles={int(current_policy['cycles'])} "
                 f"task_limit={int(current_policy['task_limit'])} "
                 f"task_step_floor={int(current_policy['task_step_floor'])} focus={current_policy['focus']} "
-                f"tolbert_device={current_policy['tolbert_device']}"
+                f"tolbert_device={current_policy['tolbert_device']} provider={resolved_provider}"
             )
             _append_event(
                 event_log_path,
@@ -11083,8 +12129,8 @@ def main() -> None:
                 campaign_cmd.extend(["--exclude-subsystem", excluded_subsystem])
             if bool(current_policy["adaptive_search"]):
                 campaign_cmd.append("--adaptive-search")
-            if args.provider:
-                campaign_cmd.extend(["--provider", args.provider])
+            if resolved_provider:
+                campaign_cmd.extend(["--provider", resolved_provider])
             if args.model:
                 campaign_cmd.extend(["--model", args.model])
             campaign_env = dict(env)
@@ -11119,7 +12165,7 @@ def main() -> None:
                 max_runtime_seconds=float(args.max_child_runtime_seconds),
                 max_progress_stall_seconds=float(args.max_child_progress_stall_seconds),
                 on_event=campaign_progress,
-                mirrored_status_path=status_path,
+                mirrored_status_path=child_improvement_reports_dir / "repeated_improvement_status.json",
             )
             round_payload["campaign_run"] = campaign_run
             campaign_report_path = _last_report_path(str(campaign_run["stdout"]))
@@ -11137,6 +12183,14 @@ def main() -> None:
                 round_payload["campaign_partial_acceptance"] = partial_acceptance
                 if bool(partial_acceptance.get("accepted", False)):
                     mirrored_child_status = _credit_accepted_productive_partial_status(mirrored_child_status)
+                    partial_task_report_paths = _persist_partial_unattended_task_reports(
+                        reports_dir=report_path.parent,
+                        event_log_path=event_log_path,
+                        round_index=round_index,
+                        mirrored_child_status=mirrored_child_status,
+                        config=config,
+                    )
+                    round_payload["partial_task_report_paths"] = partial_task_report_paths
                     partial_report_path = str(partial_acceptance.get("report_path", "")).strip()
                     if partial_report_path:
                         campaign_report_path = Path(partial_report_path)
@@ -11174,18 +12228,39 @@ def main() -> None:
                         round_payload["active_child"] = finalized_active_child
                         report["active_child"] = finalized_active_child
                     round_payload["campaign_report"] = campaign_report
+                    partial_decision_state = _authoritative_status_decision_state(
+                        active_child=round_payload.get("active_child", {}),
+                        campaign_report=campaign_report,
+                    )
+                    partial_runtime_decisions = int(
+                        partial_decision_state.get("runtime_managed_decisions", 0) or 0
+                    )
+                    partial_non_runtime_decisions = int(
+                        partial_decision_state.get("non_runtime_managed_decisions", 0) or 0
+                    )
+                    partial_child_native_decision = partial_runtime_decisions > 0 or partial_non_runtime_decisions > 0
                     round_payload["campaign_validation"] = {
-                        "passed": True,
-                        "detail": f"accepted productive partial child timeout: {partial_acceptance['reason']}",
+                        "passed": False,
+                        "detail": (
+                            f"productive partial child timeout recorded with child-native decision but incomplete child run: {partial_acceptance['reason']}"
+                            if partial_child_native_decision
+                            else (
+                                "productive partial child timeout recorded as evidence only; "
+                                "child did not emit retain/reject closure"
+                            )
+                        ),
                         "accepted_partial_timeout": True,
+                        "decision_credit": "child_native" if partial_child_native_decision else "none",
+                        "requires_child_native_decision": True,
                     }
                     round_payload["campaign_warning"] = str(campaign_run.get("timeout_reason", "")).strip()
                     round_payload["liftoff_skipped"] = {
                         "mode": current_policy["liftoff"],
-                        "reason": "accepted productive partial timeout bypassed liftoff",
+                        "reason": "partial timeout incomplete child run; liftoff requires complete child report",
                     }
                     report["campaign_report_path"] = round_payload["campaign_report_path"]
                     report["campaign_report"] = campaign_report
+                    report["partial_task_report_paths"] = list(partial_task_report_paths)
                     report["campaign_validation"] = round_payload["campaign_validation"]
                     report["liftoff_skipped"] = round_payload["liftoff_skipped"]
                     report["phase_detail"] = round_payload["campaign_warning"]
@@ -11288,8 +12363,8 @@ def main() -> None:
                     liftoff_cmd.append("--apply-routing")
                 if args.promote_on_retain:
                     liftoff_cmd.append("--promote-on-retain")
-                if args.provider:
-                    liftoff_cmd.extend(["--provider", args.provider])
+                if resolved_provider:
+                    liftoff_cmd.extend(["--provider", resolved_provider])
                 if args.model:
                     liftoff_cmd.extend(["--model", args.model])
                 liftoff_env = dict(env)

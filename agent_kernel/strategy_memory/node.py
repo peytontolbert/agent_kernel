@@ -41,6 +41,7 @@ class StrategyNode:
     strategy_id: str = ""
     strategy_candidate_id: str = ""
     strategy_candidate_kind: str = ""
+    strategy_origin: str = ""
     motivation: str = ""
     controls: dict[str, object] = field(default_factory=dict)
     actor_summary: dict[str, object] = field(default_factory=dict)
@@ -58,6 +59,7 @@ class StrategyNode:
     stagnation_count: int = 0
     descendant_node_ids: list[str] = field(default_factory=list)
     transfer_artifact_ids: list[str] = field(default_factory=list)
+    execution_evidence: dict[str, object] = field(default_factory=dict)
     score: float = 0.0
     visit_count: int = 0
     family_coverage: dict[str, object] = field(default_factory=dict)
@@ -75,6 +77,7 @@ class StrategyNode:
             "strategy_id": self.strategy_id or self.strategy_candidate_id,
             "strategy_candidate_id": self.strategy_candidate_id,
             "strategy_candidate_kind": self.strategy_candidate_kind,
+            "strategy_origin": self.strategy_origin,
             "motivation": self.motivation,
             "controls": dict(self.controls),
             "actor_summary": dict(self.actor_summary),
@@ -92,6 +95,7 @@ class StrategyNode:
             "stagnation_count": int(self.stagnation_count),
             "descendant_node_ids": list(self.descendant_node_ids),
             "transfer_artifact_ids": list(self.transfer_artifact_ids),
+            "execution_evidence": dict(self.execution_evidence),
             "score": float(self.score),
             "visit_count": int(self.visit_count),
             "family_coverage": dict(self.family_coverage),
@@ -116,6 +120,7 @@ class StrategyNode:
             strategy_id=str(payload.get("strategy_id", payload.get("strategy_candidate_id", ""))).strip(),
             strategy_candidate_id=str(payload.get("strategy_candidate_id", payload.get("strategy_id", ""))).strip(),
             strategy_candidate_kind=str(payload.get("strategy_candidate_kind", "")).strip(),
+            strategy_origin=str(payload.get("strategy_origin", payload.get("origin", ""))).strip(),
             motivation=str(payload.get("motivation", "")).strip(),
             controls=_object_map(payload.get("controls", {})),
             actor_summary=_object_map(payload.get("actor_summary", {})),
@@ -133,6 +138,7 @@ class StrategyNode:
             stagnation_count=max(0, int(payload.get("stagnation_count", 0) or 0)),
             descendant_node_ids=_string_list(payload.get("descendant_node_ids", [])),
             transfer_artifact_ids=_string_list(payload.get("transfer_artifact_ids", [])),
+            execution_evidence=_object_map(payload.get("execution_evidence", {})),
             score=float(payload.get("score", 0.0) or 0.0),
             visit_count=max(0, int(payload.get("visit_count", 0) or 0)),
             family_coverage=_object_map(payload.get("family_coverage", {})),

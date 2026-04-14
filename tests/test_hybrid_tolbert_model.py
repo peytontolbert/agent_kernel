@@ -27,7 +27,7 @@ from agent_kernel.modeling.adapter_training import InjectedLoRAState
 from agent_kernel.policy import LLMDecisionPolicy, SkillLibrary
 from agent_kernel.schemas import StepRecord, TaskSpec
 from agent_kernel.state import AgentState
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 import numpy as np
 
 
@@ -1792,13 +1792,17 @@ def test_infer_hybrid_world_signal_includes_decoder_world_feedback(monkeypatch) 
         "score_hybrid_candidates",
         lambda **kwargs: [
             {
+                "action": "respond",
                 "hybrid_world_progress_score": 0.2,
                 "hybrid_world_risk_score": 0.1,
+                "hybrid_world_belief_vector": [0.7, 0.3],
                 "hybrid_decoder_world_progress_score": 0.8,
                 "hybrid_decoder_world_risk_score": 0.4,
                 "hybrid_decoder_world_entropy_mean": 0.6,
+                "hybrid_decoder_world_belief_vector": [0.6, 0.4],
                 "hybrid_transition_progress": 0.3,
                 "hybrid_transition_regression": 0.05,
+                "hybrid_total_score": 2.0,
                 "hybrid_model_family": "tolbert_ssm_v1",
                 "reason": "respond candidate",
                 "hybrid_world_prior_backend": "profile_conditioned",
@@ -1827,6 +1831,10 @@ def test_infer_hybrid_world_signal_includes_decoder_world_feedback(monkeypatch) 
     assert signal["decoder_world_risk_score"] == 0.4
     assert signal["progress_signal"] == 0.8
     assert signal["risk_signal"] == 0.4
+    assert signal["controller_mode"] == "stop"
+    assert signal["controller_belief"]["stop"] == 1.0
+    assert signal["controller_expected_world_belief"] == [0.7, 0.3]
+    assert signal["controller_expected_decoder_world_belief"] == [0.6, 0.4]
 
 
 def test_policy_surfaces_hybrid_shadow_decision(tmp_path: Path) -> None:

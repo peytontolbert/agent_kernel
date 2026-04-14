@@ -21,9 +21,10 @@ from uuid import uuid4
 
 from agent_kernel.cycle_runner import active_artifact_path_for_subsystem, finalize_cycle
 from agent_kernel.config import KernelConfig
-from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner, staged_candidate_artifact_path
-from agent_kernel.runtime_supervision import atomic_write_json, terminate_process_tree
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
+from agent_kernel.extensions.improvement.artifacts import staged_candidate_artifact_path
+from agent_kernel.ops.runtime_supervision import atomic_write_json, terminate_process_tree
+from agent_kernel.tasking.task_bank import TaskBank
 from evals.harness import run_eval, scoped_improvement_cycle_config
 from evals.metrics import EvalMetrics
 

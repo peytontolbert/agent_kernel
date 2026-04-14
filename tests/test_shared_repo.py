@@ -1,7 +1,7 @@
 from agent_kernel.config import KernelConfig
-from agent_kernel.job_queue import DelegatedJobQueue, DelegatedRuntimeController
+from agent_kernel.ops.job_queue import DelegatedJobQueue, DelegatedRuntimeController
 from agent_kernel.schemas import TaskSpec
-from agent_kernel.shared_repo import prepare_runtime_task, shared_repo_claim
+from agent_kernel.ops.shared_repo import prepare_runtime_task, shared_repo_claim
 
 
 def test_shared_repo_claim_derives_claimed_paths_from_semantic_verifier():

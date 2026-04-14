@@ -8,10 +8,10 @@ import subprocess
 from pathlib import Path
 
 from .config import KernelConfig
-from .improvement_common import retained_artifact_payload
+from .extensions.improvement.improvement_common import retained_artifact_payload
 from .sandbox import sandbox_containment_status
 from .schemas import TaskSpec
-from .universe_improvement import (
+from .extensions.improvement.universe_improvement import (
     DEFAULT_UNIVERSE_ACTION_RISK_CONTROLS,
     DEFAULT_UNIVERSE_ENVIRONMENT_ASSUMPTIONS,
     UNIVERSE_ACTION_RISK_CONTROL_KEYS,
@@ -310,6 +310,51 @@ class UniverseModel:
                 snapshot=environment_snapshot,
             ),
             "network_host": str(profile.get("network_host", "")).strip(),
+        }
+
+    def should_block_command(self, summary: dict[str, object], command: str) -> dict[str, object]:
+        governance = self.simulate_command_governance(summary, command)
+        forbidden_matches = governance.get("forbidden_pattern_matches", [])
+        forbidden_matches = forbidden_matches if isinstance(forbidden_matches, list) else []
+        risk_flags = {
+            str(item).strip()
+            for item in governance.get("risk_flags", [])
+            if str(item).strip()
+        }
+        block_reasons: list[str] = []
+        if forbidden_matches:
+            block_reasons.append("forbidden_pattern")
+        for label in (
+            "remote_execution",
+            "privileged_command",
+            "inline_destructive_interpreter",
+            "destructive_mutation",
+            "network_access_conflict",
+            "git_write_conflict",
+            "path_scope_conflict",
+            "unbounded_execution",
+        ):
+            if label in risk_flags:
+                block_reasons.append(label)
+        blocked = bool(block_reasons)
+        primary_reason = block_reasons[0] if block_reasons else ""
+        if primary_reason == "forbidden_pattern":
+            detail = str(forbidden_matches[0]).strip() if forbidden_matches else ""
+            message = (
+                f"universe governance rejected command due to forbidden_pattern: {detail}"
+                if detail
+                else "universe governance rejected command due to forbidden_pattern"
+            )
+        elif primary_reason:
+            message = f"universe governance rejected command due to {primary_reason}"
+        else:
+            message = ""
+        return {
+            **governance,
+            "blocked": blocked,
+            "block_reason": primary_reason,
+            "block_reasons": block_reasons,
+            "block_message": message,
         }
 
     def assess_plan_risk(self, summary: dict[str, object], commands: list[str]) -> dict[str, object]:
@@ -838,6 +883,9 @@ class UniverseModel:
     ) -> bool:
         assumed_mode = str(assumptions.get("git_write_mode", "operator_gated"))
         actual_mode = str(snapshot.get("git_write_mode", "blocked"))
+        workspace_scope = str(snapshot.get("workspace_write_scope", "task_only"))
+        if actual_mode == "task_scoped" and workspace_scope == "shared_repo_gated":
+            return False
         return assumed_mode in {"blocked", "operator_gated"} or actual_mode == "blocked"
 
     def _network_fetch_penalized(

@@ -4,17 +4,17 @@ import json
 import os
 from pathlib import Path
 
-import agent_kernel.export_governance as export_governance
+import agent_kernel.ops.export_governance as export_governance
 from agent_kernel.config import KernelConfig
-from agent_kernel.export_governance import govern_improvement_export_storage
+from agent_kernel.ops.export_governance import govern_improvement_export_storage
 from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
-from agent_kernel.job_queue import DelegatedJobQueue
+from agent_kernel.ops.job_queue import DelegatedJobQueue
 from agent_kernel.learning_compiler import load_learning_candidates, persist_episode_learning_candidates
 from agent_kernel.memory import EpisodeMemory
 from agent_kernel.modeling.training.hybrid_dataset import materialize_hybrid_training_dataset
 from agent_kernel.modeling.training.universal_dataset import collect_universal_decoder_examples
 from agent_kernel.modeling.tolbert.config import HybridTolbertSSMConfig
-from agent_kernel.runtime_supervision import append_jsonl, atomic_write_json
+from agent_kernel.ops.runtime_supervision import append_jsonl, atomic_write_json
 from agent_kernel.schemas import EpisodeRecord, StepRecord
 
 

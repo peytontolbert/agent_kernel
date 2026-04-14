@@ -13,9 +13,9 @@ import time
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementPlanner
-from agent_kernel.job_queue import DelegatedJobQueue, DelegatedRuntimeController, TERMINAL_JOB_STATES
-from agent_kernel.runtime_supervision import append_jsonl, atomic_write_json
-from agent_kernel.trust import write_unattended_trust_ledger
+from agent_kernel.ops.job_queue import DelegatedJobQueue, DelegatedRuntimeController, TERMINAL_JOB_STATES
+from agent_kernel.ops.runtime_supervision import append_jsonl, atomic_write_json
+from agent_kernel.extensions.trust import write_unattended_trust_ledger
 from evals.metrics import EvalMetrics
 
 

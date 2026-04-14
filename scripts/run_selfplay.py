@@ -8,11 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.curriculum import CurriculumEngine
+from agent_kernel.tasking.curriculum import CurriculumEngine
 from agent_kernel.loop import AgentKernel
 from agent_kernel.policy import Policy
 from agent_kernel.schemas import ActionDecision, EpisodeRecord, TaskSpec
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 
 
 class ForcedFailurePolicy(Policy):

@@ -6,8 +6,8 @@ import json
 import re
 
 from ..config import KernelConfig
-from ..runtime_supervision import atomic_write_json
-from ..semantic_hub import record_semantic_attempt, record_semantic_note, record_semantic_skill
+from ..ops.runtime_supervision import atomic_write_json
+from ..extensions.strategy.semantic_hub import record_semantic_attempt, record_semantic_note, record_semantic_skill
 from .lesson import synthesize_strategy_lesson
 from .node import StrategyNode
 from .snapshot import build_strategy_snapshots
@@ -69,6 +69,52 @@ def _summarize_actor_summary(payload: object) -> dict[str, object]:
         "notes": [str(value).strip() for value in result.get("notes", []) if str(value).strip()],
     }
     return {key: value for key, value in summary.items() if value not in ("", [], {})}
+
+
+def _summarize_execution_evidence(report: dict[str, object], *, family_coverage: dict[str, object]) -> dict[str, object]:
+    evidence = report.get("evidence", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    phase_gate = report.get("phase_gate_report", {})
+    if not isinstance(phase_gate, dict):
+        phase_gate = {}
+    improved_families = sorted(
+        str(family).strip()
+        for family, value in family_coverage.items()
+        if str(family).strip() and float(value or 0.0) > 0.0
+    )
+    regressed_families = sorted(
+        str(family).strip()
+        for family, value in family_coverage.items()
+        if str(family).strip() and float(value or 0.0) < 0.0
+    )
+    closeout_mode = str(report.get("closeout_mode", "")).strip()
+    phase_gate_failures = [str(value).strip() for value in list(phase_gate.get("failures", []) or []) if str(value).strip()]
+    payload = {
+        "pass_rate_delta": float(evidence.get("pass_rate_delta", 0.0) or 0.0),
+        "average_step_delta": float(evidence.get("average_step_delta", 0.0) or 0.0),
+        "trusted_carryover_repair_rate_delta": float(
+            evidence.get("trusted_carryover_repair_rate_delta", 0.0) or 0.0
+        ),
+        "false_failure_rate": float(evidence.get("false_failure_rate", 0.0) or 0.0),
+        "improved_families": improved_families,
+        "regressed_families": regressed_families,
+        "family_positive_count": len(improved_families),
+        "family_regression_count": len(regressed_families),
+        "family_breadth_gain": len(improved_families),
+        "closeout_mode": closeout_mode,
+        "closeout_ready": bool(
+            str(report.get("final_state", "")).strip() == "retain"
+            and bool(phase_gate.get("passed", False))
+            and closeout_mode in {"natural", "child_native_before_partial_timeout"}
+        ),
+        "phase_gate_passed": bool(phase_gate.get("passed", False)),
+        "phase_gate_failures": phase_gate_failures,
+        "phase_gate_failure_count": len(phase_gate_failures),
+        "generated_lane_included": bool(phase_gate.get("generated_lane_included", False)),
+        "failure_recovery_lane_included": bool(phase_gate.get("failure_recovery_lane_included", False)),
+    }
+    return {key: value for key, value in payload.items() if value not in ("", [], {})}
 
 
 def load_strategy_nodes(config: KernelConfig) -> list[StrategyNode]:
@@ -167,6 +213,7 @@ def record_pending_strategy_node(
         strategy_id=_strategy_id_from_payload(strategy_candidate),
         strategy_candidate_id=str(strategy_candidate.get("strategy_candidate_id", "")).strip(),
         strategy_candidate_kind=str(strategy_candidate.get("strategy_candidate_kind", "")).strip(),
+        strategy_origin=str(strategy_candidate.get("origin", strategy_candidate.get("strategy_origin", ""))).strip(),
         motivation=str(motivation).strip(),
         controls=dict(controls),
         actor_summary=_summarize_actor_summary(strategy_candidate.get("actor_summary", {})),
@@ -203,6 +250,7 @@ def record_pending_strategy_node(
             "strategy_id": node.strategy_id or node.strategy_candidate_id,
             "strategy_candidate_id": node.strategy_candidate_id,
             "strategy_candidate_kind": node.strategy_candidate_kind,
+            "strategy_origin": node.strategy_origin,
             "parent_strategy_node_ids": list(node.parent_strategy_node_ids),
             "continuation_parent_node_id": node.continuation_parent_node_id,
             "continuation_workspace_ref": node.continuation_workspace_ref,
@@ -245,6 +293,11 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
             strategy_id=_strategy_id_from_payload(strategy_candidate) or str(report.get("strategy_id", "")).strip(),
             strategy_candidate_id=str(report.get("strategy_candidate_id", "")).strip(),
             strategy_candidate_kind=str(report.get("strategy_candidate_kind", "")).strip(),
+            strategy_origin=str(
+                strategy_candidate.get("origin")
+                or strategy_candidate.get("strategy_origin")
+                or report.get("strategy_origin", "")
+            ).strip(),
             continuation_parent_node_id=str(
                 strategy_candidate.get("continuation_parent_node_id")
                 or strategy_candidate.get("best_retained_strategy_node_id", "")
@@ -252,11 +305,28 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
             continuation_workspace_ref=str(strategy_candidate.get("continuation_workspace_ref", "")).strip(),
             continuation_artifact_path=str(strategy_candidate.get("continuation_artifact_path", "")).strip(),
             continuation_branch=str(strategy_candidate.get("continuation_branch", "")).strip(),
+            semantic_hypotheses=[
+                str(value).strip()
+                for value in list(strategy_candidate.get("semantic_hypotheses", []) or report.get("semantic_hypotheses", []) or [])
+                if str(value).strip()
+            ],
         )
     if not node.strategy_id:
         node.strategy_id = _strategy_id_from_payload(strategy_candidate) or str(report.get("strategy_id", "")).strip()
     if not node.strategy_candidate_id:
         node.strategy_candidate_id = node.strategy_id
+    if not node.strategy_candidate_kind:
+        node.strategy_candidate_kind = str(
+            strategy_candidate.get("strategy_candidate_kind")
+            or strategy_candidate.get("strategy_kind")
+            or report.get("strategy_candidate_kind", "")
+        ).strip()
+    if not node.strategy_origin:
+        node.strategy_origin = str(
+            strategy_candidate.get("origin")
+            or strategy_candidate.get("strategy_origin")
+            or report.get("strategy_origin", "")
+        ).strip()
     if not node.parent_strategy_node_ids:
         node.parent_strategy_node_ids = _parent_node_ids_from_payload(
             strategy_candidate,
@@ -267,6 +337,12 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
         actor_summary = _summarize_actor_summary(strategy_candidate.get("actor_summary", {}))
     if actor_summary:
         node.actor_summary = actor_summary
+    if not node.semantic_hypotheses:
+        node.semantic_hypotheses = [
+            str(value).strip()
+            for value in list(strategy_candidate.get("semantic_hypotheses", []) or report.get("semantic_hypotheses", []) or [])
+            if str(value).strip()
+        ]
     lesson = synthesize_strategy_lesson(report)
     evidence = report.get("evidence", {})
     if not isinstance(evidence, dict):
@@ -287,12 +363,14 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
     node.score = round(float(node.retained_gain) + max(0.0, -float(evidence.get("average_step_delta", 0.0) or 0.0)) * 0.05, 4)
     node.visit_count = max(1, int(node.visit_count or 0))
     node.family_coverage = {str(key): value for key, value in family_coverage.items() if str(key).strip()}
+    node.execution_evidence = _summarize_execution_evidence(report, family_coverage=node.family_coverage)
     node.results_summary = {
         "status": node.retention_state,
         "final_reason": str(report.get("final_reason", "")).strip(),
         "selected_variant_id": node.selected_variant_id,
         "strategy_id": node.strategy_id or node.strategy_candidate_id,
         "strategy_candidate_kind": node.strategy_candidate_kind,
+        "strategy_origin": node.strategy_origin,
         "pass_rate_delta": float(evidence.get("pass_rate_delta", 0.0) or 0.0),
         "average_step_delta": float(evidence.get("average_step_delta", 0.0) or 0.0),
         "trusted_carryover_repair_rate_delta": float(evidence.get("trusted_carryover_repair_rate_delta", 0.0) or 0.0),
@@ -323,13 +401,16 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
             "created_at": _now_iso(),
             "strategy_node_id": node.strategy_node_id,
             "strategy_id": node.strategy_id or node.strategy_candidate_id,
+            "strategy_origin": node.strategy_origin,
             "subsystem": node.subsystem,
             "retention_state": node.retention_state,
             "analysis_lesson": node.analysis_lesson,
             "reuse_conditions": list(node.reuse_conditions),
             "avoid_conditions": list(node.avoid_conditions),
+            "semantic_hypotheses": list(node.semantic_hypotheses),
             "stagnation_count": int(node.stagnation_count),
             "family_coverage": dict(node.family_coverage),
+            "execution_evidence": dict(node.execution_evidence),
         },
     )
     node.transfer_artifact_ids = sorted(
@@ -346,12 +427,15 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
                 "created_at": _now_iso(),
                 "strategy_node_id": node.strategy_node_id,
                 "strategy_id": node.strategy_id or node.strategy_candidate_id,
+                "strategy_origin": node.strategy_origin,
                 "subsystem": node.subsystem,
                 "retention_state": node.retention_state,
                 "analysis_lesson": node.analysis_lesson,
                 "reuse_conditions": list(node.reuse_conditions),
                 "avoid_conditions": list(node.avoid_conditions),
+                "semantic_hypotheses": list(node.semantic_hypotheses),
                 "continuation_artifact_path": node.continuation_artifact_path,
+                "execution_evidence": dict(node.execution_evidence),
             },
         )
         node.transfer_artifact_ids = sorted(
@@ -369,6 +453,7 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
             "subsystem": node.subsystem,
             "status": node.retention_state,
             "strategy_id": node.strategy_id or node.strategy_candidate_id,
+            "strategy_origin": node.strategy_origin,
             "parent_strategy_node_ids": list(node.parent_strategy_node_ids),
             "actor_summary": dict(node.actor_summary),
             "results_summary": dict(node.results_summary),
@@ -384,6 +469,7 @@ def finalize_strategy_node(config: KernelConfig, report: dict[str, object]) -> S
             "transfer_artifact_ids": list(node.transfer_artifact_ids),
             "artifact_paths": dict(node.artifact_paths),
             "family_coverage": dict(node.family_coverage),
+            "execution_evidence": dict(node.execution_evidence),
             "retained_gain": float(node.retained_gain),
             "stagnation_count": int(node.stagnation_count),
         },

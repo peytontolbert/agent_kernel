@@ -15,10 +15,10 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.curriculum_improvement import retained_curriculum_controls
+from agent_kernel.extensions.improvement.curriculum_improvement import retained_curriculum_controls
 from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
-from agent_kernel.improvement_common import build_standard_proposal_artifact, retention_gate_preset
-from agent_kernel.prompt_improvement import resolve_improvement_planner_controls, retained_improvement_planner_controls
+from agent_kernel.extensions.improvement.improvement_common import build_standard_proposal_artifact, retention_gate_preset
+from agent_kernel.extensions.improvement.prompt_improvement import resolve_improvement_planner_controls, retained_improvement_planner_controls
 
 DEFAULT_NON_REPLAY_TRANSFER_FAMILIES = ("workflow", "project", "repository", "tooling", "integration")
 MIN_ACCEPTABLE_TRANSFER_RETURN_ON_COST = 0.01

@@ -10,7 +10,7 @@ import argparse
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementPlanner
-from agent_kernel.recovery_improvement import build_recovery_proposal_artifact
+from agent_kernel.extensions.improvement.recovery_improvement import build_recovery_proposal_artifact
 from evals.harness import run_eval
 
 

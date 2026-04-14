@@ -11,7 +11,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_kernel.runtime_supervision import atomic_write_json
+from agent_kernel.ops.runtime_supervision import atomic_write_json
 
 
 class LeaseRegistry:

@@ -383,7 +383,7 @@ def _extract_config_fields(names: list[str]) -> list[dict[str, Any]]:
 def build_prompt_influence_graph() -> dict[str, Any]:
     policy_collector = PromptDiagnosticsCollector()
     policy_collector.visit(_parse_module(REPO_ROOT / "agent_kernel" / "policy.py"))
-    policy_collector.visit(_parse_module(REPO_ROOT / "agent_kernel" / "context_budget.py"))
+    policy_collector.visit(_parse_module(REPO_ROOT / "agent_kernel" / "extensions" / "context_budget.py"))
 
     llm_collector = LLMRenderCollector()
     llm_collector.visit(_parse_module(REPO_ROOT / "agent_kernel" / "llm.py"))
@@ -508,7 +508,7 @@ def main() -> None:
     print()
     print("context_payload_keys:")
     for item in prompt["context_payload_keys"]:
-        print(f"  - {item['key']} <= {item['source_expr']} (context_budget.py:{item['line']})")
+        print(f"  - {item['key']} <= {item['source_expr']} (extensions/context_budget.py:{item['line']})")
     print()
     print("runtime_payload_additions:")
     for item in prompt["payload_runtime_additions"]:

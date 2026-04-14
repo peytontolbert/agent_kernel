@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.transition_model_improvement import build_transition_model_proposal_artifact
+from agent_kernel.extensions.improvement.transition_model_improvement import build_transition_model_proposal_artifact
 
 
 def _current_payload(path: Path) -> object | None:

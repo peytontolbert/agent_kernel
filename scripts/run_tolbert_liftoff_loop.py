@@ -19,15 +19,15 @@ from agent_kernel.modeling.artifacts import retained_tolbert_liftoff_gate
 from agent_kernel.modeling.evaluation.drift import run_takeover_drift_eval
 from agent_kernel.modeling.evaluation.liftoff import build_liftoff_gate_report
 from agent_kernel.modeling.evaluation.universal_decoder_eval import evaluate_universal_decoder_against_seed
-from agent_kernel.runtime_supervision import (
+from agent_kernel.ops.runtime_supervision import (
     atomic_write_json,
     atomic_write_text,
     install_termination_handlers,
     spawn_process_group,
     terminate_process_tree,
 )
-from agent_kernel.trust import build_unattended_trust_ledger
-from agent_kernel.tolbert_model_improvement import build_tolbert_model_candidate_artifact
+from agent_kernel.extensions.trust import build_unattended_trust_ledger
+from agent_kernel.extensions.improvement.tolbert_model_improvement import build_tolbert_model_candidate_artifact
 from evals.harness import run_eval
 
 

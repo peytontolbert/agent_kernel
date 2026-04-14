@@ -11,8 +11,8 @@ from agent_kernel.config import KernelConfig
 from agent_kernel.llm import MockLLMClient
 from agent_kernel.policy import LLMDecisionPolicy
 from agent_kernel.state import AgentState
-from agent_kernel.task_bank import TaskBank
-from agent_kernel.tolbert import (
+from agent_kernel.tasking.task_bank import TaskBank
+from agent_kernel.extensions.tolbert import (
     TolbertContextCompiler,
     TolbertServiceClient,
     _discover_v2_paper_research_runtime_paths,
@@ -994,7 +994,7 @@ def test_tolbert_service_client_prefers_retained_bundle_runtime_paths(monkeypatc
         captured["kwargs"] = kwargs
         return FakeProcess()
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", _fake_popen)
 
     config = KernelConfig(
         provider="mock",
@@ -1616,7 +1616,7 @@ def test_paper_research_runtime_paths_prefers_discovered_v2_bundle(monkeypatch, 
             "/data/TOLBERT_BRAIN/checkpoints/tolbert_brain_joint_v2/retrieval_cache/cache.pt",
         ),
     }
-    monkeypatch.setattr("agent_kernel.tolbert._discover_v2_paper_research_runtime_paths", lambda: discovered)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert._discover_v2_paper_research_runtime_paths", lambda: discovered)
 
     runtime_paths = _paper_research_runtime_paths(config, repo_root=tmp_path)
 
@@ -1644,7 +1644,7 @@ def test_discover_v2_paper_research_runtime_paths_prefers_checkpoint_manifest(mo
 
     real_path = Path
     monkeypatch.setattr(
-        "agent_kernel.tolbert.Path",
+        "agent_kernel.extensions.tolbert.Path",
         lambda raw: base if str(raw) == "/data/TOLBERT_BRAIN" else real_path(raw),
     )
 
@@ -1732,10 +1732,10 @@ def test_tolbert_service_client_times_out_and_resets(monkeypatch, tmp_path: Path
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
     monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
-    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 21.3]))
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 21.3]))
 
     config = KernelConfig(
         provider="mock",
@@ -1839,8 +1839,8 @@ def test_tolbert_service_client_waits_for_startup_ready(monkeypatch, tmp_path: P
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
 
     config = KernelConfig(
         provider="mock",
@@ -1965,8 +1965,8 @@ def test_tolbert_service_client_raises_on_startup_error(monkeypatch, tmp_path: P
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
 
     config = KernelConfig(
         provider="mock",
@@ -2056,11 +2056,11 @@ def test_tolbert_service_client_retries_startup_ready_timeout_once(monkeypatch, 
         created_processes.append(process)
         return process
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
     monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
     monkeypatch.setattr(
-        "agent_kernel.tolbert.time.monotonic",
+        "agent_kernel.extensions.tolbert.time.monotonic",
         _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 11.3]),
     )
 
@@ -2148,11 +2148,11 @@ def test_tolbert_service_client_reports_attempt_count_after_repeated_startup_tim
         created_processes.append(process)
         return process
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
     monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
     monkeypatch.setattr(
-        "agent_kernel.tolbert.time.monotonic",
+        "agent_kernel.extensions.tolbert.time.monotonic",
         _monotonic_sequence([0.0, 0.0, 1.1, 11.2, 11.3, 12.4, 23.5]),
     )
 
@@ -2233,10 +2233,10 @@ def test_tolbert_service_client_uses_distinct_startup_timeout_budget(
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
     monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "9")
-    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 9.1, 19.2]))
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 9.1, 19.2]))
 
     config = KernelConfig(
         provider="mock",
@@ -2324,10 +2324,10 @@ def test_tolbert_service_client_keeps_same_process_alive_during_startup_grace(
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
     monkeypatch.setenv("AGENT_KERNEL_TOLBERT_SERVICE_STARTUP_TIMEOUT_SECONDS", "1")
-    monkeypatch.setattr("agent_kernel.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1]))
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.time.monotonic", _monotonic_sequence([0.0, 0.0, 1.1]))
 
     config = KernelConfig(
         provider="mock",
@@ -2406,8 +2406,8 @@ def test_tolbert_service_client_preserves_full_request_controls(monkeypatch, tmp
         def close(self):
             return None
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-    monkeypatch.setattr("agent_kernel.tolbert.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.selectors.DefaultSelector", FakeSelector)
 
     config = KernelConfig(
         provider="mock",
@@ -2482,7 +2482,7 @@ def test_tolbert_service_client_close_terminates_live_process(monkeypatch, tmp_p
         created.append(process)
         return process
 
-    monkeypatch.setattr("agent_kernel.tolbert.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("agent_kernel.extensions.tolbert.subprocess.Popen", _fake_popen)
 
     config = KernelConfig(
         provider="mock",

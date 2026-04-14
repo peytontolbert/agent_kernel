@@ -10,14 +10,15 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.delegation_improvement import build_delegation_proposal_artifact
-from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner, retention_gate_for_payload
-from agent_kernel.operator_policy_improvement import build_operator_policy_proposal_artifact
-from agent_kernel.recovery_improvement import build_recovery_proposal_artifact
-from agent_kernel.state_estimation_improvement import build_state_estimation_proposal_artifact
-from agent_kernel.transition_model_improvement import build_transition_model_proposal_artifact
-from agent_kernel.trust_improvement import build_trust_proposal_artifact
-from agent_kernel.universe_improvement import (
+from agent_kernel.extensions.improvement.delegation_improvement import build_delegation_proposal_artifact
+from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
+from agent_kernel.extensions.improvement.artifacts import retention_gate_for_payload
+from agent_kernel.extensions.improvement.operator_policy_improvement import build_operator_policy_proposal_artifact
+from agent_kernel.extensions.improvement.recovery_improvement import build_recovery_proposal_artifact
+from agent_kernel.extensions.improvement.state_estimation_improvement import build_state_estimation_proposal_artifact
+from agent_kernel.extensions.improvement.transition_model_improvement import build_transition_model_proposal_artifact
+from agent_kernel.extensions.improvement.trust_improvement import build_trust_proposal_artifact
+from agent_kernel.extensions.improvement.universe_improvement import (
     build_operating_envelope_artifact,
     build_universe_constitution_artifact,
     compose_universe_bundle_payloads,
@@ -25,7 +26,7 @@ from agent_kernel.universe_improvement import (
     materialize_universe_constitution_payload,
     write_universe_bundle_files,
 )
-from agent_kernel.world_model_improvement import build_world_model_proposal_artifact
+from agent_kernel.extensions.improvement.world_model_improvement import build_world_model_proposal_artifact
 from evals.metrics import EvalMetrics
 
 
@@ -173,7 +174,7 @@ def _normalize_runtime_artifact(path: Path, subsystem: str) -> dict[str, object]
                 "primary_benchmark_families": [],
                 "min_path_confidence": 0.75,
                 "require_trusted_retrieval": True,
-                "fallback_to_vllm_on_low_confidence": True,
+                "fallback_to_vllm_on_low_confidence": False,
                 "allow_direct_command_primary": True,
                 "allow_skill_primary": True,
                 "primary_min_command_score": 2,

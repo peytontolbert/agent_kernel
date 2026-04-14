@@ -1,7 +1,7 @@
 # Learned World Modeling
 
-This package is for learned world-model components that complement, but do not
-replace, the symbolic runtime world model in
+This package is for learned world-model components that complement and now
+directly steer the bounded controller alongside the symbolic runtime world model in
 [`agent_kernel/world_model.py`](/data/agentkernel/agent_kernel/world_model.py).
 
 Current owned surfaces:
@@ -27,7 +27,7 @@ Planned next additions:
 Non-goals:
 
 - copying lexical shortcut or bigram trainer features from external repos
-- mixing learned-world runtime code into the symbolic control plane
+- replacing the symbolic runtime world model in one step instead of carrying both learned and symbolic state
 
 Operational guardrails:
 

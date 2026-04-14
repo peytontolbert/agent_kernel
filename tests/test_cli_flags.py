@@ -7,7 +7,7 @@ import sys
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementVariant
-from agent_kernel.preflight import PreflightCheck, PreflightReport
+from agent_kernel.ops.preflight import PreflightCheck, PreflightReport
 from agent_kernel.schemas import TaskSpec
 from evals.metrics import EvalMetrics
 import pytest
@@ -19,16 +19,20 @@ def test_kernel_config_allows_runtime_toggles():
         use_skills=False,
         use_graph_memory=False,
         use_world_model=False,
+        use_universe_model=False,
         use_planner=False,
         use_role_specialization=False,
+        persist_learning_candidates=False,
     )
 
     assert config.use_tolbert_context is False
     assert config.use_skills is False
     assert config.use_graph_memory is False
     assert config.use_world_model is False
+    assert config.use_universe_model is False
     assert config.use_planner is False
     assert config.use_role_specialization is False
+    assert config.persist_learning_candidates is False
     assert str(config.skills_path).endswith("command_skills.json")
     assert str(config.operator_classes_path).endswith("operator_classes.json")
     assert str(config.tool_candidates_path).endswith("tool_candidates.json")
@@ -77,6 +81,20 @@ def test_kernel_config_allows_runtime_toggles():
     assert config.unattended_trust_breadth_min_reports == 10
     assert config.unattended_trust_min_distinct_families == 2
     assert config.unattended_trust_min_success_rate == 0.7
+
+
+def test_kernel_config_executable_floor_preset():
+    config = KernelConfig.executable_floor()
+
+    assert config.use_tolbert_context is False
+    assert config.use_skills is False
+    assert config.use_graph_memory is False
+    assert config.use_world_model is False
+    assert config.use_universe_model is False
+    assert config.use_planner is False
+    assert config.use_role_specialization is False
+    assert config.persist_learning_candidates is False
+    assert config.persist_episode_memory is True
 
 
 def test_kernel_config_defaults_to_vllm_runtime(monkeypatch):

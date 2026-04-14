@@ -19,21 +19,24 @@ from uuid import uuid4
 
 from agent_kernel.cycle_runner import autonomous_runtime_eval_flags, finalize_cycle, preview_candidate_retention
 from agent_kernel.config import KernelConfig
+from agent_kernel.extensions.improvement.artifacts import (
+    snapshot_artifact_state,
+    staged_candidate_artifact_path,
+    stamp_artifact_experiment_variant,
+    stamp_artifact_generation_context,
+)
+from agent_kernel.extensions.improvement.artifact_compatibility import assess_artifact_compatibility
 from agent_kernel.improvement import (
     ImprovementCycleRecord,
     ImprovementExperiment,
     ImprovementPlanner,
     ImprovementSearchBudget,
     ImprovementVariant,
-    staged_candidate_artifact_path,
-    snapshot_artifact_state,
-    stamp_artifact_experiment_variant,
-    stamp_artifact_generation_context,
 )
 from agent_kernel.llm import VLLMClient, _extract_json_object
-from agent_kernel.runtime_supervision import atomic_write_json, terminate_process_tree
+from agent_kernel.ops.runtime_supervision import atomic_write_json, terminate_process_tree
 from agent_kernel.strategy_memory import record_pending_strategy_node
-from agent_kernel.subsystems import (
+from agent_kernel.extensions.strategy.subsystems import (
     active_artifact_path_for_subsystem,
     base_subsystem_for,
     default_variant_definitions,
@@ -389,6 +392,77 @@ def _sort_experiments_with_observe_bonus(ranked_experiments, observe_hypothesis:
     )
 
 
+def _selected_campaign_budget(
+    *,
+    recommended_budget: ImprovementSearchBudget,
+    campaign,
+    requested_campaign_width: int,
+) -> ImprovementSearchBudget:
+    if not campaign:
+        return recommended_budget
+    selected_ids = [str(candidate.subsystem).strip() for candidate in campaign if str(candidate.subsystem).strip()]
+    top_score = float(recommended_budget.top_score)
+    reasons: list[str] = []
+    for index, candidate in enumerate(campaign):
+        portfolio = dict(candidate.evidence.get("portfolio", {})) if isinstance(candidate.evidence, dict) else {}
+        if index == 0:
+            try:
+                top_score = float(portfolio.get("adjusted_score", candidate.score) or candidate.score or 0.0)
+            except (TypeError, ValueError):
+                top_score = float(candidate.score or 0.0)
+        candidate_reasons = [
+            str(reason).strip()
+            for reason in list(portfolio.get("reasons", []))
+            if str(reason).strip()
+        ]
+        if candidate_reasons:
+            reasons.append(
+                f"{'selected' if index == 0 else 'added'} {candidate.subsystem}: {candidate_reasons[0]}"
+            )
+        elif index == 0:
+            reasons.append(f"selected {candidate.subsystem} from portfolio campaign")
+        else:
+            reasons.append(f"added {candidate.subsystem} to portfolio campaign")
+    return ImprovementSearchBudget(
+        scope="campaign",
+        width=max(1, len(selected_ids)),
+        max_width=max(1, int(requested_campaign_width)),
+        strategy=str(recommended_budget.strategy or "adaptive_history"),
+        top_score=top_score,
+        selected_ids=selected_ids,
+        reasons=reasons or list(recommended_budget.reasons),
+    )
+
+
+def _candidate_preflight_compatibility(
+    *,
+    subsystem: str,
+    artifact_path: Path,
+    capability_modules_path: Path | None,
+) -> dict[str, object]:
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"compatible": True, "violations": []}
+    if not isinstance(payload, dict):
+        return {"compatible": True, "violations": []}
+    return assess_artifact_compatibility(
+        subsystem=subsystem,
+        payload=payload,
+        capability_modules_path=capability_modules_path,
+    )
+
+
+def _compatibility_failure_reason(compatibility: dict[str, object]) -> str:
+    violations = compatibility.get("violations", [])
+    if isinstance(violations, list):
+        for violation in violations:
+            token = str(violation).strip()
+            if token:
+                return token
+    return "artifact compatibility checks failed"
+
+
 def _select_variants_for_campaign(
     *,
     planner: ImprovementPlanner,
@@ -735,6 +809,15 @@ def _fallback_campaign_from_ranked_experiments(
             strategy_candidate["continuation_branch"] = str(
                 strategy_memory_summary.get("continuation_branch", "")
             ).strip()
+            strategy_candidate["selected_parent_nodes"] = list(
+                strategy_memory_summary.get("selected_parent_nodes", []) or []
+            )
+            strategy_candidate["best_retained_snapshot"] = dict(
+                strategy_memory_summary.get("best_retained_snapshot", {}) or {}
+            )
+            strategy_candidate["parent_control_surface"] = dict(
+                strategy_memory_summary.get("parent_control_surface", {}) or {}
+            )
             evidence = dict(getattr(experiment, "evidence", {}) or {})
             evidence["strategy_candidate"] = strategy_candidate
             experiment = ImprovementExperiment(
@@ -812,6 +895,15 @@ def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> 
     if priority_benchmark_family_weights:
         flags["priority_benchmark_family_weights"] = priority_benchmark_family_weights
     return flags
+
+
+def _retention_curriculum_flags(
+    eval_kwargs: dict[str, object] | None,
+    args: argparse.Namespace,
+) -> tuple[bool, bool]:
+    del eval_kwargs, args
+    # Retention and autonomous phase gates must always exercise generated lanes.
+    return True, True
 
 
 def _priority_family_allocation_summary(metrics, eval_kwargs: dict[str, object]) -> dict[str, object]:
@@ -1383,6 +1475,9 @@ def _reconcile_incomplete_cycles(
         )
         candidate_artifact_path = str(summary.get("candidate_artifact_path", "")).strip()
         artifact_kind = str(summary.get("artifact_kind", "")).strip() or "retention_decision"
+        strategy_candidate_id = str(summary.get("strategy_candidate_id", "")).strip()
+        strategy_candidate_kind = str(summary.get("strategy_candidate_kind", "")).strip()
+        strategy_origin = str(summary.get("strategy_origin", "")).strip()
         reason = (
             "incomplete autonomous cycle ended before retention finalization; "
             "recorded incomplete state for stale autonomous cycle"
@@ -1394,6 +1489,9 @@ def _reconcile_incomplete_cycles(
             "last_state": str(summary.get("last_state", "")).strip(),
             "last_action": str(summary.get("last_action", "")).strip(),
             "selected_variant_id": str(summary.get("selected_variant_id", "")).strip(),
+            "strategy_candidate_id": strategy_candidate_id,
+            "strategy_candidate_kind": strategy_candidate_kind,
+            "strategy_origin": strategy_origin,
             "record_count": int(summary.get("record_count", 0) or 0),
             "selected_cycles": int(summary.get("selected_cycles", 0) or 0),
         }
@@ -1408,6 +1506,9 @@ def _reconcile_incomplete_cycles(
                 artifact_kind=artifact_kind,
                 reason=reason,
                 metrics_summary=metrics_summary,
+                strategy_candidate_id=strategy_candidate_id,
+                strategy_candidate_kind=strategy_candidate_kind,
+                strategy_origin=strategy_origin,
                 candidate_artifact_path=candidate_artifact_path,
                 active_artifact_path=active_artifact_path,
             ),
@@ -1424,6 +1525,9 @@ def _reconcile_incomplete_cycles(
                 artifact_kind=artifact_kind,
                 reason="persisted fail-closed outcome for incomplete autonomous cycle",
                 metrics_summary=metrics_summary,
+                strategy_candidate_id=strategy_candidate_id,
+                strategy_candidate_kind=strategy_candidate_kind,
+                strategy_origin=strategy_origin,
                 candidate_artifact_path=candidate_artifact_path,
                 active_artifact_path=active_artifact_path,
             ),
@@ -1563,6 +1667,10 @@ def main() -> None:
         progress_label=str(args.progress_label).strip() or None,
     )
     eval_kwargs = _observation_eval_kwargs(config, args)
+    retention_include_curriculum, retention_include_failure_curriculum = _retention_curriculum_flags(
+        eval_kwargs,
+        args,
+    )
     comparison_task_limit = _comparison_task_limit(config, args)
     observation_task_limit = int(eval_kwargs.get("observation_task_limit", 0) or 0)
     requested_task_limit = int(eval_kwargs.get("requested_task_limit", 0) or 0)
@@ -1813,11 +1921,16 @@ def main() -> None:
         progress_label=progress_label,
     )
     ranked_experiments = _sort_experiments_with_observe_bonus(observed_ranked_experiments, observe_hypothesis)
-    campaign_budget = planner.recommend_campaign_budget(metrics, max_width=max(1, args.campaign_width))
+    recommended_campaign_budget = planner.recommend_campaign_budget(
+        metrics,
+        max_width=max(1, args.campaign_width),
+    )
     campaign = _filter_experiments_by_subsystem(
         planner.select_portfolio_campaign(
             metrics,
-            max_candidates=campaign_budget.width if args.adaptive_search else max(1, args.campaign_width),
+            max_candidates=(
+                recommended_campaign_budget.width if args.adaptive_search else max(1, args.campaign_width)
+            ),
             observe_hypothesis_bonus=dict(observe_hypothesis.get("bonus_by_subsystem", {})),
         ),
         excluded_subsystems=excluded_subsystems,
@@ -1830,7 +1943,7 @@ def main() -> None:
             diversified_campaign = _diversify_campaign_from_ranked_experiments(
                 campaign,
                 ranked_experiments,
-                max_candidates=campaign_budget.width,
+                max_candidates=recommended_campaign_budget.width,
                 capability_modules_path=config.capability_modules_path,
             )
             if len(diversified_campaign) > len(campaign):
@@ -1846,7 +1959,9 @@ def main() -> None:
                 ranked_experiments,
                 excluded_subsystems=excluded_subsystems,
             ),
-            max_candidates=campaign_budget.width if args.adaptive_search else max(1, args.campaign_width),
+            max_candidates=(
+                recommended_campaign_budget.width if args.adaptive_search else max(1, args.campaign_width)
+            ),
             planner=planner,
             metrics=metrics,
         )
@@ -1857,6 +1972,11 @@ def main() -> None:
                 f"selected_from_ranked_experiments={len(campaign)} "
                 f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
             )
+    campaign_budget = _selected_campaign_budget(
+        recommended_budget=recommended_campaign_budget,
+        campaign=campaign,
+        requested_campaign_width=max(1, args.campaign_width),
+    )
     outputs: list[str] = []
     if excluded_subsystems and not ranked_experiments:
         _progress(
@@ -1949,6 +2069,9 @@ def main() -> None:
                     "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
                     "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
                     "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                    "strategy_origin": str(
+                        target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                    ).strip(),
                     "selected_variant_id": primary_variant.variant_id,
                     "selected_variant_score": primary_variant.score,
                     "campaign_index": index,
@@ -2067,6 +2190,9 @@ def main() -> None:
                     "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
                     "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
                     "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                    "strategy_origin": str(
+                        target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                    ).strip(),
                     "candidate_subsystems": [candidate.subsystem for candidate in ranked_experiments],
                     "observe_hypothesis": observe_hypothesis,
                     "excluded_subsystems": sorted(excluded_subsystems),
@@ -2178,6 +2304,7 @@ def main() -> None:
             if snapshot_value:
                 prior_retained_snapshot_path = Path(snapshot_value)
         generated_variants: list[dict[str, object]] = []
+        preflight_rejection_reason = ""
         for variant_rank, variant in enumerate(selected_variants, start=1):
             _progress(
                 progress_label,
@@ -2232,7 +2359,17 @@ def main() -> None:
                             "selected_variant_id": variant.variant_id,
                             "selected_variant_score": variant.score,
                             "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                            "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                            "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                            "strategy_origin": str(
+                                target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                            ).strip(),
                         },
+                        strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                        strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                        strategy_origin=str(
+                            target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                        ).strip(),
                         candidate_artifact_path="",
                         active_artifact_path=str(active_artifact_path_obj),
                     ),
@@ -2256,6 +2393,9 @@ def main() -> None:
                 reason=target.reason,
                 strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
                 strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                strategy_origin=str(
+                    target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                ).strip(),
                 metrics_summary={
                         "total": metrics.total,
                         "passed": metrics.passed,
@@ -2268,6 +2408,9 @@ def main() -> None:
                         "variant_width": len(selected_variants),
                         "variant_rank": variant_rank,
                         "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                        "strategy_origin": str(
+                            target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                        ).strip(),
                         "search_strategy": "adaptive_history" if args.adaptive_search else "fixed_width",
                         "prior_retained_cycle_id": prior_retained_cycle_id,
                         "prior_retained_artifact_snapshot_path": "" if prior_retained_snapshot_path is None else str(prior_retained_snapshot_path),
@@ -2290,6 +2433,58 @@ def main() -> None:
                 ),
                 govern_exports=False,
             )
+            compatibility = _candidate_preflight_compatibility(
+                subsystem=target.subsystem,
+                artifact_path=Path(artifact),
+                capability_modules_path=config.capability_modules_path,
+            )
+            if not bool(compatibility.get("compatible", False)):
+                compatibility_reason = _compatibility_failure_reason(compatibility)
+                if not preflight_rejection_reason:
+                    preflight_rejection_reason = compatibility_reason
+                _progress(
+                    progress_label,
+                    f"variant preflight reject subsystem={target.subsystem} "
+                    f"variant={variant.variant_id} reason={compatibility_reason}",
+                )
+                planner.append_cycle_record(
+                    config.improvement_cycles_path,
+                    ImprovementCycleRecord(
+                        cycle_id=cycle_id,
+                        state="reject",
+                        subsystem=target.subsystem,
+                        action="preflight_candidate_compatibility",
+                        artifact_path=str(active_artifact_path_obj),
+                        artifact_kind=artifact_kind or "candidate_compatibility",
+                        reason=compatibility_reason,
+                        metrics_summary={
+                            "campaign_index": index,
+                            "campaign_width": len(campaign),
+                            "variant_width": len(selected_variants),
+                            "variant_rank": variant_rank,
+                            "selected_variant_id": variant.variant_id,
+                            "selected_variant_score": variant.score,
+                            "preview_reason_code": "artifact_compatibility_failed",
+                            "decision_reason_code": "artifact_compatibility_failed",
+                            "search_strategy": "adaptive_history" if args.adaptive_search else "fixed_width",
+                            "protocol": "autonomous",
+                            "protocol_strategy": "planner_scored",
+                            "protocol_match_id": protocol_match_id,
+                            "scoped_run": bool(scope_id),
+                            "scope_id": _sanitize_scope_id(scope_id) if scope_id else "",
+                        },
+                        strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                        strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                        strategy_origin=str(
+                            target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                        ).strip(),
+                        candidate_artifact_path=artifact,
+                        active_artifact_path=str(active_artifact_path_obj),
+                        compatibility=compatibility,
+                    ),
+                    govern_exports=False,
+                )
+                continue
             preview = None
             if artifact and len(selected_variants) > 1:
                 preview_progress_label = _variant_preview_progress_label(cycle_id, target.subsystem, variant.variant_id)
@@ -2311,8 +2506,8 @@ def main() -> None:
                     include_operator_memory=eval_kwargs["include_operator_memory"],
                     include_tool_memory=args.include_tool_memory,
                     include_verifier_memory=args.include_verifier_memory,
-                    include_curriculum=args.include_curriculum,
-                    include_failure_curriculum=args.include_failure_curriculum,
+                    include_curriculum=retention_include_curriculum,
+                    include_failure_curriculum=retention_include_failure_curriculum,
                     task_limit=comparison_task_limit,
                     priority_benchmark_families=eval_kwargs.get("priority_benchmark_families"),
                     priority_benchmark_family_weights=eval_kwargs.get("priority_benchmark_family_weights"),
@@ -2355,6 +2550,12 @@ def main() -> None:
                             "preview_pass_rate_delta": candidate_preview.pass_rate - baseline.pass_rate,
                             "preview_average_step_delta": candidate_preview.average_steps - baseline.average_steps,
                             "preview_task_limit": comparison_task_limit or 0,
+                            "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                            "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                            "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                            "strategy_origin": str(
+                                target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                            ).strip(),
                             "preview_phase_gate_passed": bool(
                                 phase_gate_report.get("passed", False)
                                 if isinstance(phase_gate_report, dict)
@@ -2370,6 +2571,11 @@ def main() -> None:
                                 else []
                             ),
                         },
+                        strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                        strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                        strategy_origin=str(
+                            target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                        ).strip(),
                         candidate_artifact_path=artifact,
                         active_artifact_path=str(active_artifact_path_obj),
                     ),
@@ -2384,6 +2590,16 @@ def main() -> None:
                     "preview": preview,
                 }
             )
+
+        if not generated_variants:
+            rejection_reason = preflight_rejection_reason or "all generated variants failed candidate preflight"
+            outputs.append(
+                f"subsystem={target.subsystem} priority={target.priority} campaign_index={index}/{len(campaign)} "
+                f"action=preflight_candidate_compatibility artifact=<none> reason={target.reason} "
+                f"final_state=reject final_reason={rejection_reason}"
+            )
+            _progress(progress_label, f"finalized subsystem={target.subsystem} state=reject")
+            continue
 
         selected_variant_entry = generated_variants[0]
         if len(generated_variants) > 1:
@@ -2407,6 +2623,12 @@ def main() -> None:
                             "variant_width": len(generated_variants),
                             "comparison_task_limit": comparison_task_limit or 0,
                             "selected_variant_id": selected_variant_entry["variant"].variant_id,
+                            "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
+                            "strategy_candidate_id": str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                            "strategy_candidate_kind": str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                            "strategy_origin": str(
+                                target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                            ).strip(),
                             "candidate_variants": [
                                 {
                                     "variant_id": entry["variant"].variant_id,
@@ -2423,6 +2645,11 @@ def main() -> None:
                                 for entry in generated_variants
                             ],
                     },
+                    strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                    strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                    strategy_origin=str(
+                        target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                    ).strip(),
                     candidate_artifact_path=str(selected_variant_entry["artifact"]),
                     active_artifact_path=str(active_artifact_path_obj),
                 ),
@@ -2452,8 +2679,8 @@ def main() -> None:
                     include_operator_memory=eval_kwargs["include_operator_memory"],
                     include_tool_memory=args.include_tool_memory,
                     include_verifier_memory=args.include_verifier_memory,
-                    include_curriculum=bool(eval_kwargs.get("include_generated", True)),
-                    include_failure_curriculum=bool(eval_kwargs.get("include_failure_generated", True)),
+                    include_curriculum=retention_include_curriculum,
+                    include_failure_curriculum=retention_include_failure_curriculum,
                     comparison_task_limit=comparison_task_limit,
                     priority_benchmark_families=eval_kwargs.get("priority_benchmark_families"),
                     priority_benchmark_family_weights=eval_kwargs.get("priority_benchmark_family_weights"),

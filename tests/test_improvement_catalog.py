@@ -1,11 +1,11 @@
-from agent_kernel.improvement_catalog import (
+from agent_kernel.extensions.improvement.improvement_catalog import (
     catalog_mapping,
     catalog_nested_string_sets,
     catalog_string_list,
     catalog_string_set,
 )
-from agent_kernel.improvement_common import retention_gate_preset
-from agent_kernel.task_budget import uplifted_task_max_steps
+from agent_kernel.extensions.improvement.improvement_common import retention_gate_preset
+from agent_kernel.tasking.task_budget import uplifted_task_max_steps
 
 
 def test_improvement_catalog_exposes_expected_schema_metadata():

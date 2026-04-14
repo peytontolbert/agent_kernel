@@ -8,7 +8,7 @@ import shutil
 from typing import Any, Callable
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.trust import build_unattended_trust_ledger
+from agent_kernel.extensions.trust import build_unattended_trust_ledger
 from evals.harness import run_eval, scoped_eval_config
 from evals.metrics import EvalMetrics
 

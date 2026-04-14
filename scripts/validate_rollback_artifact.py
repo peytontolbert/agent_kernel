@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.improvement import ImprovementPlanner, artifact_sha256
+from agent_kernel.improvement import ImprovementPlanner
+from agent_kernel.extensions.improvement.artifacts import artifact_sha256
 
 
 def main() -> None:

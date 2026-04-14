@@ -1,15 +1,15 @@
 from pathlib import Path
 import json
 
-from agent_kernel.curriculum import CurriculumEngine
-from agent_kernel.curriculum_catalog import render_curriculum_template
+from agent_kernel.tasking.curriculum import CurriculumEngine
+from agent_kernel.tasking.curriculum_catalog import render_curriculum_template
 from agent_kernel.loop import AgentKernel
 from agent_kernel.memory import EpisodeMemory
 from agent_kernel.policy import Policy
 from agent_kernel.schemas import EpisodeRecord, StepRecord
 from agent_kernel.config import KernelConfig
 from agent_kernel.schemas import ActionDecision
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 
 
 def test_curriculum_generates_adjacent_task():
@@ -951,6 +951,75 @@ def test_curriculum_records_retrieved_failure_patterns(tmp_path: Path):
 
     assert "missing_expected_file" in task.metadata["retrieved_failure_types"]
     assert "Avoid" in task.prompt
+
+
+def test_curriculum_retrieves_more_than_three_semantic_failure_references(tmp_path: Path):
+    memory = EpisodeMemory(tmp_path / "episodes")
+    for index in range(5):
+        memory.save(
+            EpisodeRecord(
+                task_id=f"repo_regression_reference_{index}",
+                prompt="Recover repository state regression by recreating out.txt.",
+                workspace=f"workspace/repo_regression_reference_{index}",
+                success=False,
+                task_metadata={
+                    "benchmark_family": "repository",
+                    "repo_semantics": ["stateful_repo", "validation"],
+                    "lineage_families": ["repository"],
+                },
+                termination_reason="no_state_progress",
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="stalled command",
+                        action="code_execute",
+                        content="false",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={
+                            "passed": False,
+                            "reasons": ["missing expected file: out.txt", "no state progress detected"],
+                        },
+                        failure_signals=["no_state_progress", "state_regression"],
+                    )
+                ],
+            )
+        )
+
+    episode = EpisodeRecord(
+        task_id="repo_regression_target",
+        prompt="Recover repository state regression and create out.txt.",
+        workspace="workspace/repo_regression_target",
+        success=False,
+        task_metadata={
+            "benchmark_family": "repository",
+            "repo_semantics": ["stateful_repo", "validation"],
+            "lineage_families": ["repository"],
+        },
+        termination_reason="no_state_progress",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="bad command",
+                action="code_execute",
+                content="false",
+                selected_skill_id=None,
+                command_result=None,
+                verification={
+                    "passed": False,
+                    "reasons": ["missing expected file: out.txt", "no state progress detected"],
+                },
+                failure_signals=["no_state_progress", "state_regression"],
+            )
+        ],
+    )
+
+    task = CurriculumEngine(memory_root=tmp_path / "episodes").generate_followup_task(episode)
+
+    assert task.metadata["context_reference_limit"] == 6
+    assert len(task.metadata["reference_task_ids"]) == 5
+    assert all(task_id.startswith("repo_regression_reference_") for task_id in task.metadata["reference_task_ids"])
+    assert task.metadata["semantic_context_matches"]
 
 
 def test_curriculum_records_retrieved_transition_failures(tmp_path: Path):

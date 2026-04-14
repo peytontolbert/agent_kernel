@@ -14,15 +14,16 @@ def test_kernel_rejects_unknown_provider_at_startup(tmp_path):
         AgentKernel(config=config)
 
 
-def test_kernel_rejects_tolbert_provider_alias_at_startup(tmp_path):
+def test_kernel_accepts_tolbert_provider_alias_at_startup(tmp_path):
     config = KernelConfig(
         provider="tolbert",
         workspace_root=tmp_path / "workspace",
         trajectories_root=tmp_path / "trajectories",
     )
 
-    with pytest.raises(ValueError, match="unsupported provider"):
-        AgentKernel(config=config)
+    kernel = AgentKernel(config=config)
+
+    assert kernel.config.normalized_provider() == "hybrid"
 
 
 def test_kernel_rejects_nonpositive_timeout_at_startup(tmp_path):
@@ -76,3 +77,22 @@ def test_kernel_config_validation_allows_json_storage_and_unlimited_budget_group
 
     assert config.workspace_root.exists()
     assert config.trajectories_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"use_graph_memory": False}, "bounded_autonomous runtime requires use_graph_memory=True"),
+        ({"use_world_model": False}, "bounded_autonomous runtime requires use_world_model=True"),
+    ],
+)
+def test_kernel_rejects_weakened_bounded_autonomous_runtime_minimum(tmp_path, override, message):
+    config = KernelConfig(
+        provider="mock",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        **override,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        AgentKernel(config=config)

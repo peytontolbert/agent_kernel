@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_kernel.benchmark_synthesis import synthesize_benchmark_candidates
+from agent_kernel.tasking.benchmark_synthesis import synthesize_benchmark_candidates
 from agent_kernel.config import KernelConfig
 
 

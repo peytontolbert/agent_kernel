@@ -9,7 +9,7 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.episode_store import iter_episode_documents
+from agent_kernel.ops.episode_store import iter_episode_documents
 
 
 def _load_documents(root: Path) -> list[dict[str, object]]:

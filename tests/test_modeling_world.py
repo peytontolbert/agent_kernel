@@ -6,6 +6,9 @@ import time
 import numpy as np
 import pytest
 
+from agent_kernel.config import KernelConfig
+from agent_kernel.memory import EpisodeMemory
+from agent_kernel.schemas import EpisodeRecord, StepRecord
 from agent_kernel.schemas import TaskSpec
 from agent_kernel.world_model import WorldModel
 
@@ -245,6 +248,359 @@ def test_world_model_prioritized_long_horizon_hotspots_prioritize_regressed_pres
 
     assert hotspots[0]["subgoal"] == "preserve required artifact docs/context.md"
     assert "state_regression" in hotspots[0]["signals"]
+
+
+def test_world_model_uses_empirical_transition_priors_from_episode_traces(tmp_path: Path):
+    config = KernelConfig(provider="mock", trajectories_root=tmp_path / "episodes")
+    memory = EpisodeMemory(config.trajectories_root, config=config)
+    memory.save(
+        EpisodeRecord(
+            task_id="release_repair_trace",
+            prompt="Repair the release report.",
+            workspace=str(tmp_path / "workspace" / "release_repair_trace"),
+            success=True,
+            task_metadata={"benchmark_family": "repository"},
+            task_contract={
+                "prompt": "Repair the release report.",
+                "workspace_subdir": "release_repair_trace",
+                "setup_commands": [],
+                "success_command": "pytest -q tests/test_release.py",
+                "suggested_commands": ["printf 'ready\\n' > reports/release_review.txt"],
+                "expected_files": ["reports/release_review.txt"],
+                "expected_output_substrings": [],
+                "forbidden_files": [],
+                "forbidden_output_substrings": [],
+                "expected_file_contents": {"reports/release_review.txt": "ready\n"},
+                "max_steps": 3,
+                "metadata": {"benchmark_family": "repository"},
+            },
+            termination_reason="success",
+            steps=[
+                StepRecord(
+                    index=1,
+                    thought="repair the report",
+                    action="code_execute",
+                    content="printf 'ready\\n' > reports/release_review.txt",
+                    selected_skill_id=None,
+                    command_result={
+                        "command": "printf 'ready\\n' > reports/release_review.txt",
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "timed_out": False,
+                    },
+                    verification={"passed": True, "reasons": ["verification passed"]},
+                    state_progress_delta=0.6,
+                    state_transition={
+                        "progress_delta": 0.6,
+                        "changed_paths": ["reports/release_review.txt"],
+                        "newly_materialized_expected_artifacts": ["reports/release_review.txt"],
+                        "newly_satisfied_expected_contents": ["reports/release_review.txt"],
+                        "verifier_delta": 2,
+                    },
+                )
+            ],
+            world_model_summary={"completion_ratio": 1.0, "horizon": "bounded"},
+        )
+    )
+    model = WorldModel(config=config)
+    summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+    }
+
+    favored = "printf 'ready\\n' > reports/release_review.txt"
+    unrelated = "printf 'todo\\n' > notes/todo.txt"
+
+    favored_score = model.score_command(summary, favored)
+    unrelated_score = model.score_command(summary, unrelated)
+    favored_effect = model.simulate_command_effect(summary, favored)
+
+    assert favored_score > unrelated_score
+    assert favored_effect["empirical_prior"]["sample_count"] >= 1
+    assert favored_effect["predicted_verifier_delta"] >= 1.0
+    assert "reports/release_review.txt" in favored_effect["predicted_changed_paths"]
+
+
+def test_world_model_uses_state_conditioned_model_with_bootstrap_prior_fallback(tmp_path: Path):
+    config = KernelConfig(provider="mock", trajectories_root=tmp_path / "episodes")
+    memory = EpisodeMemory(config.trajectories_root, config=config)
+    memory.save(
+        EpisodeRecord(
+            task_id="release_trace",
+            prompt="Repair the release report.",
+            workspace=str(tmp_path / "workspace" / "release_trace"),
+            success=True,
+            task_metadata={
+                "benchmark_family": "repository",
+                "semantic_verifier": {
+                    "report_rules": [{"path": "reports/release_review.txt"}],
+                    "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}],
+                },
+            },
+            task_contract={
+                "prompt": "Repair the release report.",
+                "workspace_subdir": "release_trace",
+                "setup_commands": [],
+                "success_command": "pytest -q tests/test_release.py",
+                "suggested_commands": ["printf 'ready\\n' > reports/release_review.txt"],
+                "expected_files": ["reports/release_review.txt"],
+                "expected_output_substrings": [],
+                "forbidden_files": [],
+                "forbidden_output_substrings": [],
+                "expected_file_contents": {"reports/release_review.txt": "ready\n"},
+                "max_steps": 3,
+                "metadata": {
+                    "benchmark_family": "repository",
+                    "semantic_verifier": {
+                        "report_rules": [{"path": "reports/release_review.txt"}],
+                        "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}],
+                    },
+                },
+            },
+            termination_reason="success",
+            steps=[
+                StepRecord(
+                    index=1,
+                    thought="repair release report",
+                    action="code_execute",
+                    content="printf 'ready\\n' > reports/release_review.txt",
+                    selected_skill_id=None,
+                    command_result={
+                        "command": "printf 'ready\\n' > reports/release_review.txt",
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "timed_out": False,
+                    },
+                    verification={"passed": True, "reasons": ["verification passed"]},
+                    state_progress_delta=0.6,
+                    state_transition={
+                        "progress_delta": 0.6,
+                        "changed_paths": ["reports/release_review.txt"],
+                        "newly_materialized_expected_artifacts": ["reports/release_review.txt"],
+                        "newly_satisfied_expected_contents": ["reports/release_review.txt"],
+                        "verifier_delta": 2,
+                    },
+                )
+            ],
+            world_model_summary={"completion_ratio": 1.0, "horizon": "bounded"},
+        )
+    )
+    memory.save(
+        EpisodeRecord(
+            task_id="notes_trace",
+            prompt="Write the todo note.",
+            workspace=str(tmp_path / "workspace" / "notes_trace"),
+            success=False,
+            task_metadata={"benchmark_family": "repository"},
+            task_contract={
+                "prompt": "Write the todo note.",
+                "workspace_subdir": "notes_trace",
+                "setup_commands": [],
+                "success_command": "test -f notes/todo.txt",
+                "suggested_commands": ["printf 'todo\\n' > notes/todo.txt"],
+                "expected_files": ["notes/todo.txt"],
+                "expected_output_substrings": [],
+                "forbidden_files": [],
+                "forbidden_output_substrings": [],
+                "expected_file_contents": {"notes/todo.txt": "todo\n"},
+                "max_steps": 3,
+                "metadata": {"benchmark_family": "repository"},
+            },
+            termination_reason="failure",
+            steps=[
+                StepRecord(
+                    index=1,
+                    thought="write todo note",
+                    action="code_execute",
+                    content="printf 'todo\\n' > notes/todo.txt",
+                    selected_skill_id=None,
+                    command_result={
+                        "command": "printf 'todo\\n' > notes/todo.txt",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "write failed",
+                        "timed_out": False,
+                    },
+                    verification={"passed": False, "reasons": ["exit code was 1"]},
+                    state_progress_delta=0.0,
+                    state_transition={
+                        "progress_delta": 0.0,
+                        "changed_paths": ["notes/todo.txt"],
+                        "regressions": ["notes/todo.txt"],
+                        "verifier_delta": -1,
+                    },
+                )
+            ],
+            world_model_summary={"completion_ratio": 0.0, "horizon": "bounded"},
+        )
+    )
+    model = WorldModel(config=config)
+    summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+        "workflow_required_tests": ["release check"],
+        "workflow_required_merges": [],
+    }
+
+    effect = model.simulate_command_effect(summary, "printf 'ready\\n' > reports/release_review.txt")
+
+    assert effect["empirical_prior"]["prediction_source"] == "learned_state_model"
+    assert effect["empirical_prior"]["learned_state_model"]["sample_count"] >= 1
+    assert effect["empirical_prior"]["bootstrap_prior"]["sample_count"] >= 1
+    assert effect["predicted_verifier_delta"] >= 1.0
+
+
+def test_world_model_uses_semantic_memory_prior_for_recalled_repair_paths(tmp_path: Path):
+    config = KernelConfig(provider="mock", trajectories_root=tmp_path / "episodes")
+    model = WorldModel(config=config)
+    summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+        "semantic_episodes": [
+            {
+                "task_id": "release_repair_memory",
+                "benchmark_family": "repository",
+                "memory_source": "episode",
+                "success": True,
+                "verifier_obligations": ["write workflow report reports/release_review.txt and mention ready"],
+                "changed_paths": ["reports/release_review.txt"],
+                "failure_signals": ["state_regression"],
+                "edit_patches": [
+                    {
+                        "path": "reports/release_review.txt",
+                        "status": "modified",
+                        "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                        "patch_excerpt": "-BROKEN\n+READY",
+                    }
+                ],
+                "recovery_trace": {
+                    "failed_command": "printf 'broken\\n' > reports/release_review.txt",
+                    "recovery_command": "printf 'ready\\n' > reports/release_review.txt",
+                    "failure_signals": ["state_regression"],
+                },
+            }
+        ],
+    }
+
+    favored = "printf 'ready\\n' > reports/release_review.txt"
+    repeated_failure = "printf 'broken\\n' > reports/release_review.txt"
+
+    favored_score = model.score_command(summary, favored)
+    repeated_failure_score = model.score_command(summary, repeated_failure)
+    favored_effect = model.simulate_command_effect(summary, favored)
+    repeated_failure_effect = model.simulate_command_effect(summary, repeated_failure)
+
+    assert favored_score > repeated_failure_score
+    assert favored_effect["empirical_prior"]["prediction_source"] == "semantic_memory"
+    assert favored_effect["predicted_progress_gain"] >= 1.0
+    assert favored_effect["predicted_verifier_delta"] >= 1.0
+    assert "reports/release_review.txt" in favored_effect["predicted_changed_paths"]
+    assert repeated_failure_effect["empirical_prior"]["regression_rate"] >= 0.5
+
+
+def test_world_model_uses_semantic_prototype_sequence_alignment_for_rollout(tmp_path: Path):
+    del tmp_path
+    model = WorldModel(config=KernelConfig(provider="mock"))
+    summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+        "semantic_prototypes": [
+            {
+                "benchmark_family": "repository",
+                "changed_paths": ["reports/release_review.txt"],
+                "verifier_obligations": ["write workflow report reports/release_review.txt"],
+                "failure_signals": ["state_regression"],
+                "episode_count": 2,
+                "success_count": 2,
+                "application_commands": ["mkdir -p reports", "printf 'ready\\n' > reports/release_review.txt"],
+                "command_sequences": {
+                    "mkdir -p reports || printf 'ready\\n' > reports/release_review.txt": 2
+                },
+                "failed_commands": {},
+            }
+        ],
+    }
+
+    favored = model.simulate_command_sequence_effect(
+        summary,
+        ["mkdir -p reports", "printf 'ready\\n' > reports/release_review.txt"],
+    )
+    partial = model.simulate_command_sequence_effect(summary, ["mkdir -p reports"])
+
+    assert favored["sequence_alignment_bonus"] > 0.0
+    assert favored["score"] > partial["score"]
+    assert favored["predicted_progress_gain"] >= partial["predicted_progress_gain"]
+
+
+def test_world_model_describe_transition_emits_preview_edit_patches():
+    model = WorldModel()
+
+    transition = model.describe_transition(
+        {
+            "completion_ratio": 0.0,
+            "existing_expected_artifacts": [],
+            "satisfied_expected_contents": [],
+            "present_forbidden_artifacts": [],
+            "changed_preserved_artifacts": [],
+            "updated_workflow_paths": [],
+            "updated_generated_paths": [],
+            "updated_report_paths": [],
+            "workspace_file_previews": {
+                "reports/release_review.txt": {"content": "BROKEN\n"},
+            },
+        },
+        {
+            "completion_ratio": 0.5,
+            "existing_expected_artifacts": ["reports/release_review.txt"],
+            "satisfied_expected_contents": ["reports/release_review.txt"],
+            "present_forbidden_artifacts": [],
+            "changed_preserved_artifacts": [],
+            "updated_workflow_paths": [],
+            "updated_generated_paths": [],
+            "updated_report_paths": ["reports/release_review.txt"],
+            "workspace_file_previews": {
+                "reports/release_review.txt": {"content": "READY\n"},
+            },
+        },
+    )
+
+    assert transition["edit_patches"][0]["path"] == "reports/release_review.txt"
+    assert "-BROKEN" in transition["edit_patches"][0]["patch"]
+    assert "+READY" in transition["edit_patches"][0]["patch"]
 
 
 @pytest.mark.skipif(not _TORCH_RUNTIME_READY, reason="full torch runtime is required")

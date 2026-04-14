@@ -276,8 +276,8 @@ class MockLLMClient:
         }
 
 
-class TolbertFallbackClient:
-    """Providerless fallback that keeps the kernel runnable without an external LLM."""
+class HybridFallbackClient:
+    """Providerless fallback for the retained hybrid runtime path."""
 
     def create_decision(
         self,
@@ -309,9 +309,13 @@ class TolbertFallbackClient:
         return {
             "thought": "No deterministic providerless fallback command remains.",
             "action": "respond",
-            "content": "Providerless tolbert fallback exhausted deterministic commands.",
+            "content": "Providerless hybrid fallback exhausted deterministic commands.",
             "done": True,
         }
+
+
+# Backward-compatible alias while callers migrate from the old overloaded name.
+TolbertFallbackClient = HybridFallbackClient
 
 
 def coerce_action_decision(raw: dict[str, Any]) -> dict[str, Any]:

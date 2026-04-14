@@ -5,7 +5,7 @@ import sys
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementCycleRecord, ImprovementPlanner
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.universe_model import UniverseModel
 from evals.metrics import AbstractionComparison, EvalMetrics
 

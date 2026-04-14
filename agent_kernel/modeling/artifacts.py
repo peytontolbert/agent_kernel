@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..improvement_common import retained_artifact_payload
+from ..extensions.improvement.improvement_common import retained_artifact_payload
 
 
 _DEFAULT_TOLBERT_RUNTIME_POLICY: dict[str, object] = {
@@ -14,7 +14,7 @@ _DEFAULT_TOLBERT_RUNTIME_POLICY: dict[str, object] = {
     "allow_trusted_primary_without_min_confidence": False,
     "trusted_primary_min_confidence": 0.0,
     "require_trusted_retrieval": True,
-    "fallback_to_vllm_on_low_confidence": True,
+    "fallback_to_vllm_on_low_confidence": False,
     "allow_direct_command_primary": True,
     "allow_skill_primary": True,
     "primary_min_command_score": 2,

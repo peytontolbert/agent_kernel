@@ -17,7 +17,7 @@ from agent_kernel.modeling.world.rollout import rollout_action_value
 from agent_kernel.policy import LLMDecisionPolicy, SkillLibrary
 from agent_kernel.schemas import ActionDecision, ContextPacket, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 
 
 def test_active_prompt_adjustments_dedupe_before_top3_truncation(tmp_path):
@@ -993,6 +993,175 @@ def test_llm_policy_includes_dynamic_world_state_in_payload():
     assert client.last_payload["transition_preview"]["present_forbidden_artifacts"] == ["temp.txt"]
 
 
+def test_transition_preview_expands_with_semantic_memory_and_ranks_recovery_command():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(client)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="semantic_preview_task",
+            prompt="Repair the release report.",
+            workspace_subdir="semantic_preview_task",
+            suggested_commands=[
+                "printf 'todo\\n' > notes/todo.txt",
+                "printf 'draft\\n' > reports/release_review.txt",
+                "printf 'ready\\n' > reports/release_review.txt",
+                "pytest -q tests/test_release.py",
+            ],
+            expected_files=["reports/release_review.txt"],
+            metadata={"benchmark_family": "repository"},
+        )
+    )
+    state.world_model_summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "changed_preserved_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+    }
+    state.graph_summary = {
+        "semantic_episodes": [
+            {
+                "task_id": "release_memory",
+                "benchmark_family": "repository",
+                "memory_source": "episode",
+                "success": True,
+                "verifier_obligations": ["write workflow report reports/release_review.txt and mention ready"],
+                "changed_paths": ["reports/release_review.txt"],
+                "failure_signals": ["state_regression"],
+                "edit_patches": [],
+                "recovery_trace": {
+                    "failed_command": "printf 'draft\\n' > reports/release_review.txt",
+                    "recovery_command": "printf 'ready\\n' > reports/release_review.txt",
+                    "failure_signals": ["state_regression"],
+                },
+            }
+        ]
+    }
+
+    preview = policy._transition_preview(state)
+
+    assert 4 <= len(preview["candidates"]) <= 5
+    assert preview["candidates"][0]["command"] == "printf 'ready\\n' > reports/release_review.txt"
+    assert preview["candidates"][0]["search_score"] >= preview["candidates"][0]["preview_score"]
+    assert preview["search_branches"][0]["sequence"][0] == "printf 'ready\\n' > reports/release_review.txt"
+    assert 1 <= preview["search_branches"][0]["depth"] <= 3
+    assert any(
+        item["command"] == "printf 'draft\\n' > reports/release_review.txt"
+        for item in preview["candidates"]
+    )
+    assert any(
+        item["command"] == "pytest -q tests/test_release.py"
+        for item in preview["candidates"]
+    )
+
+
+def test_transition_preview_stays_bounded_without_semantic_memory():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(client)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="bounded_preview_task",
+            prompt="Repair the release report.",
+            workspace_subdir="bounded_preview_task",
+            suggested_commands=[
+                "printf 'one\\n' > a.txt",
+                "printf 'two\\n' > b.txt",
+                "printf 'three\\n' > c.txt",
+                "printf 'four\\n' > d.txt",
+            ],
+            expected_files=["a.txt"],
+            metadata={"benchmark_family": "micro"},
+        )
+    )
+    state.world_model_summary = {
+        "benchmark_family": "micro",
+        "horizon": "bounded",
+        "expected_artifacts": ["a.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["a.txt"],
+        "present_forbidden_artifacts": [],
+        "changed_preserved_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": [],
+    }
+    state.graph_summary = {}
+
+    preview = policy._transition_preview(state)
+
+    assert len(preview["candidates"]) == 3
+    assert all(1 <= branch["depth"] <= 2 for branch in preview["search_branches"])
+
+
+def test_transition_preview_uses_semantic_prototypes_when_no_episode_trace_is_present():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(client)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="prototype_preview_task",
+            prompt="Repair the release report.",
+            workspace_subdir="prototype_preview_task",
+            suggested_commands=[
+                "printf 'draft\\n' > reports/release_review.txt",
+                "mkdir -p reports",
+                "printf 'ready\\n' > reports/release_review.txt",
+            ],
+            expected_files=["reports/release_review.txt"],
+            metadata={"benchmark_family": "repository"},
+        )
+    )
+    state.world_model_summary = {
+        "benchmark_family": "repository",
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/release_review.txt"],
+        "forbidden_artifacts": [],
+        "preserved_artifacts": [],
+        "missing_expected_artifacts": ["reports/release_review.txt"],
+        "present_forbidden_artifacts": [],
+        "changed_preserved_artifacts": [],
+        "workflow_expected_changed_paths": [],
+        "workflow_generated_paths": [],
+        "workflow_report_paths": ["reports/release_review.txt"],
+    }
+    state.graph_summary = {
+        "semantic_prototypes": [
+            {
+                "benchmark_family": "repository",
+                "changed_paths": ["reports/release_review.txt"],
+                "verifier_obligations": ["write workflow report reports/release_review.txt"],
+                "failure_signals": ["state_regression"],
+                "episode_count": 2,
+                "success_count": 2,
+                "application_commands": ["mkdir -p reports", "printf 'ready\\n' > reports/release_review.txt"],
+                "command_sequences": {
+                    "mkdir -p reports || printf 'ready\\n' > reports/release_review.txt": 2
+                },
+                "failed_commands": {
+                    "printf 'draft\\n' > reports/release_review.txt": 1
+                },
+            }
+        ]
+    }
+
+    preview = policy._transition_preview(state)
+
+    assert preview["candidates"][0]["command"] in {
+        "mkdir -p reports",
+        "printf 'ready\\n' > reports/release_review.txt",
+    }
+    assert any(
+        branch["sequence"][:2] == ["mkdir -p reports", "printf 'ready\\n' > reports/release_review.txt"]
+        for branch in preview["search_branches"]
+    )
+
+
 def test_llm_policy_includes_active_subgoal_diagnosis_in_payload():
     client = CapturingClient()
     policy = LLMDecisionPolicy(client)
@@ -1115,6 +1284,55 @@ def test_llm_policy_graph_memory_environment_priors_penalize_unfamiliar_mutation
     risky_score = policy._command_control_score(state, "git commit -am 'checkpoint'")
 
     assert safe_score > risky_score
+
+
+def test_llm_policy_graph_memory_failure_signals_bias_planner_toward_recovery_checks():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(task=TaskBank().get("cleanup_task"))
+    state.current_role = "planner"
+    state.universe_summary = {
+        "environment_assumptions": {
+            "network_access_mode": "blocked",
+            "git_write_mode": "blocked",
+            "workspace_write_scope": "task_only",
+            "require_path_scoped_mutations": True,
+        },
+        "environment_snapshot": {
+            "network_access_mode": "blocked",
+            "git_write_mode": "blocked",
+            "workspace_write_scope": "task_only",
+            "allowed_http_hosts": [],
+        },
+        "action_risk_controls": {
+            "git_mutation_penalty": 1,
+            "network_fetch_penalty": 1,
+            "scope_escape_penalty": 1,
+            "read_only_discovery_bonus": 1,
+            "verification_bonus": 2,
+        },
+        "forbidden_command_patterns": [],
+        "preferred_command_prefixes": ["pytest"],
+        "requires_verification": True,
+        "requires_bounded_steps": True,
+        "prefer_reversible_actions": True,
+    }
+    state.graph_summary = {
+        "failure_signals": {
+            "no_state_progress": 3,
+            "state_regression": 2,
+        },
+        "failure_types": {
+            "command_failure": 2,
+        },
+        "environment_alignment_failures": {
+            "git_write_aligned": 2,
+        },
+    }
+
+    recovery_score = policy._command_control_score(state, "python -m pytest -q")
+    risky_score = policy._command_control_score(state, "git commit -am 'checkpoint'")
+
+    assert recovery_score > risky_score
 
 
 def test_llm_policy_universe_layer_penalizes_workspace_scope_escape():
@@ -1506,6 +1724,17 @@ def test_build_latent_state_summary_blends_learned_world_signal():
             "model_family": "tolbert_ssm_v1",
             "progress_signal": 0.82,
             "risk_signal": 0.77,
+            "controller_belief": {"recover": 0.18, "continue": 0.27, "stop": 0.55},
+            "controller_mode": "stop",
+            "controller_mode_probability": 0.55,
+            "controller_expected_world_belief": [0.62, 0.23, 0.15],
+            "controller_expected_world_top_states": [0, 1, 2],
+            "controller_expected_world_top_state_probs": [0.62, 0.23, 0.15],
+            "controller_expected_world_entropy_mean": 0.9198,
+            "controller_expected_decoder_world_belief": [0.51, 0.49],
+            "controller_expected_decoder_world_top_states": [0, 1],
+            "controller_expected_decoder_world_top_state_probs": [0.51, 0.49],
+            "controller_expected_decoder_world_entropy_mean": 0.6929,
             "world_progress_score": 0.8,
             "world_risk_score": 0.76,
             "decoder_world_progress_score": 0.74,
@@ -1535,6 +1764,10 @@ def test_build_latent_state_summary_blends_learned_world_signal():
     assert summary["progress_band"] == "improving"
     assert summary["risk_band"] == "blocked"
     assert summary["learned_world_state"]["source"] == "tolbert_hybrid_runtime"
+    assert summary["learned_world_state"]["controller_mode"] == "stop"
+    assert summary["learned_world_state"]["controller_belief"]["stop"] == 0.55
+    assert summary["learned_world_state"]["controller_expected_world_belief"] == [0.62, 0.23, 0.15]
+    assert summary["learned_world_state"]["controller_expected_decoder_world_belief"] == [0.51, 0.49]
     assert summary["learned_world_state"]["world_prior_backend"] == "profile_conditioned"
     assert summary["learned_world_state"]["world_profile_horizons"] == [1, 2]
     assert summary["learned_world_state"]["decoder_world_progress_score"] == 0.74
@@ -1592,6 +1825,76 @@ def test_command_control_score_prefers_active_path_recovery_when_learned_world_r
     unrelated_score = policy._command_control_score(state, "printf 'note\\n' > notes.txt")
 
     assert recovery_score > unrelated_score
+
+
+def test_command_control_score_uses_controller_belief_to_prefer_recovery_path():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(task=TaskBank().get("cleanup_task"))
+    state.world_model_summary = {
+        "present_forbidden_artifacts": ["temp.txt"],
+        "missing_expected_artifacts": [],
+        "forbidden_artifacts": ["temp.txt"],
+    }
+    state.latent_state_summary = {
+        "risk_band": "stable",
+        "progress_band": "flat",
+        "retrieval_mode": "blind",
+        "active_paths": ["temp.txt"],
+        "learned_world_state": {
+            "controller_belief": {"recover": 0.82, "continue": 0.1, "stop": 0.08},
+        },
+    }
+
+    recovery_score = policy._command_control_score(state, "rm -f temp.txt")
+    unrelated_score = policy._command_control_score(state, "printf 'note\\n' > notes.txt")
+
+    assert recovery_score > unrelated_score
+
+
+def test_command_control_score_uses_graph_memory_failure_pressure_for_recovery_bias():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(task=TaskBank().get("cleanup_task"))
+    state.current_role = "critic"
+    state.universe_summary = {
+        "environment_assumptions": {
+            "network_access_mode": "blocked",
+            "git_write_mode": "blocked",
+            "workspace_write_scope": "task_only",
+            "require_path_scoped_mutations": True,
+        },
+        "environment_snapshot": {
+            "network_access_mode": "blocked",
+            "git_write_mode": "blocked",
+            "workspace_write_scope": "task_only",
+            "allowed_http_hosts": [],
+        },
+        "action_risk_controls": {
+            "git_mutation_penalty": 1,
+            "network_fetch_penalty": 1,
+            "scope_escape_penalty": 1,
+            "read_only_discovery_bonus": 1,
+            "verification_bonus": 2,
+        },
+        "forbidden_command_patterns": [],
+        "preferred_command_prefixes": ["pytest"],
+        "requires_verification": True,
+        "requires_bounded_steps": True,
+        "prefer_reversible_actions": True,
+    }
+    state.graph_summary = {
+        "failure_signals": {
+            "no_state_progress": 2,
+            "state_regression": 2,
+        },
+        "failure_types": {
+            "command_failure": 1,
+        },
+    }
+
+    recovery_score = policy._command_control_score(state, "python -m pytest -q")
+    risky_score = policy._command_control_score(state, "printf 'bad\\n' > ../escape.txt")
+
+    assert recovery_score > risky_score
 
 
 def test_command_control_score_prefers_diagnosed_hotspot_repair_for_generic_subgoal():
@@ -1703,6 +2006,107 @@ def test_llm_policy_uses_retained_tolbert_primary_family_routing(tmp_path):
     assert decision.tolbert_route_mode == "primary"
 
 
+def test_llm_policy_uses_high_confidence_direct_primary_without_trusted_retrieval(tmp_path):
+    artifact_path = tmp_path / "tolbert_model" / "artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "runtime_policy": {
+                    "shadow_benchmark_families": ["workflow"],
+                    "primary_benchmark_families": ["workflow"],
+                    "min_path_confidence": 0.7,
+                    "require_trusted_retrieval": True,
+                    "fallback_to_vllm_on_low_confidence": True,
+                    "allow_direct_command_primary": True,
+                    "allow_skill_primary": False,
+                    "primary_min_command_score": 0,
+                    "use_value_head": True,
+                    "use_transition_head": True,
+                    "use_policy_head": True,
+                    "use_latent_state": True,
+                },
+                "decoder_policy": {
+                    "allow_retrieval_guidance": True,
+                    "allow_skill_commands": True,
+                    "allow_task_suggestions": True,
+                    "allow_stop_decision": True,
+                    "min_stop_completion_ratio": 0.95,
+                    "max_task_suggestions": 3,
+                },
+                "rollout_policy": {
+                    "predicted_progress_gain_weight": 3.0,
+                    "predicted_conflict_penalty_weight": 4.0,
+                    "predicted_preserved_bonus_weight": 1.0,
+                    "predicted_workflow_bonus_weight": 1.5,
+                    "latent_progress_bonus_weight": 1.0,
+                    "latent_risk_penalty_weight": 2.0,
+                    "recover_from_stall_bonus_weight": 1.5,
+                    "stop_completion_weight": 8.0,
+                    "stop_missing_expected_penalty_weight": 6.0,
+                    "stop_forbidden_penalty_weight": 6.0,
+                    "stop_preserved_penalty_weight": 4.0,
+                    "stable_stop_bonus_weight": 1.5,
+                },
+                "model_surfaces": {
+                    "retrieval_surface": True,
+                    "policy_head": True,
+                    "value_head": True,
+                    "transition_head": True,
+                    "latent_state": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class HighConfidenceUntrustedProvider:
+        def compile(self, state):
+            del state
+            return ContextPacket(
+                request_id="req-1",
+                created_at="2026-04-10T00:00:00+00:00",
+                task={"goal": "g", "completion_criteria": "c"},
+                control={
+                    "mode": "verify",
+                    "path_confidence": 0.9,
+                    "trust_retrieval": False,
+                    "retrieval_guidance": {
+                        "recommended_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                        "recommended_command_spans": [
+                            {
+                                "span_id": "task:hello:suggested:1",
+                                "command": "printf 'hello agent kernel\\n' > hello.txt",
+                            }
+                        ],
+                        "avoidance_notes": [],
+                        "evidence": [],
+                    },
+                },
+                tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+                retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+                verifier_contract={"success_command": "true"},
+            )
+
+    class NeverCalledClient:
+        def create_decision(self, **kwargs):
+            raise AssertionError("LLM should not be called when high-confidence direct primary routing takes over")
+
+    policy = LLMDecisionPolicy(
+        NeverCalledClient(),
+        context_provider=HighConfidenceUntrustedProvider(),
+        config=KernelConfig(tolbert_model_artifact_path=artifact_path, use_tolbert_model_artifacts=True),
+    )
+    task = TaskBank().get("hello_task")
+    task.metadata["benchmark_family"] = "workflow"
+
+    decision = policy.decide(AgentState(task=task))
+
+    assert decision.action == "code_execute"
+    assert decision.tolbert_route_mode == "primary"
+
+
 def test_llm_policy_hybrid_primary_uses_world_feedback_to_choose_respond(tmp_path, monkeypatch):
     artifact_path = tmp_path / "tolbert_model" / "artifact.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1794,8 +2198,10 @@ def test_llm_policy_hybrid_primary_uses_world_feedback_to_choose_respond(tmp_pat
                 "hybrid_decoder_world_progress_score": 0.95,
                 "hybrid_decoder_world_risk_score": 0.05,
                 "hybrid_decoder_world_entropy_mean": 0.21,
+                "hybrid_decoder_world_belief_vector": [0.9, 0.1],
                 "hybrid_world_progress_score": 0.8,
                 "hybrid_world_risk_score": 0.2,
+                "hybrid_world_belief_vector": [0.75, 0.2, 0.05],
                 "hybrid_world_transition_family": "banded",
                 "hybrid_world_transition_bandwidth": 1,
                 "hybrid_world_transition_gate": 0.67,
@@ -1831,6 +2237,8 @@ def test_llm_policy_hybrid_primary_uses_world_feedback_to_choose_respond(tmp_pat
     assert decision.decision_source == "tolbert_hybrid_decoder"
     assert decision.tolbert_route_mode == "primary"
     assert decision.proposal_metadata["hybrid_decoder_world_progress_score"] == 0.95
+    assert decision.proposal_metadata["hybrid_decoder_world_belief_vector"] == [0.9, 0.1]
+    assert decision.proposal_metadata["hybrid_world_belief_vector"] == [0.75, 0.2, 0.05]
     assert decision.proposal_metadata["hybrid_world_transition_family"] == "banded"
     assert decision.proposal_metadata["hybrid_reason"] == "stop_decision"
 
@@ -14843,6 +15251,85 @@ def test_llm_policy_compacts_graph_summary_trusted_retrieval_procedures():
     ]
 
 
+def test_llm_policy_compacts_graph_summary_semantic_memory_fields():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(client)
+    state = AgentState(task=TaskBank().get("hello_task"))
+    state.graph_summary = {
+        "verifier_obligation_counts": {
+            "write workflow report reports/release_review.txt and mention ready": 2,
+        },
+        "changed_path_counts": {
+            "reports/release_review.txt": 3,
+        },
+        "recovery_command_counts": {
+            "printf 'ready\\n' > reports/release_review.txt": 2,
+        },
+        "semantic_episodes": [
+            {
+                "task_id": "semantic_memory_task",
+                "benchmark_family": "integration",
+                "memory_source": "episode_replay",
+                "success": True,
+                "verifier_obligations": [
+                    "write workflow report reports/release_review.txt and mention ready",
+                ],
+                "changed_paths": ["reports/release_review.txt", "docs/release.md"],
+                "edit_patches": [
+                    {
+                        "path": "reports/release_review.txt",
+                        "status": "modified",
+                        "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                        "patch_excerpt": "-BROKEN\n+READY",
+                    }
+                ],
+                "recovery_trace": {
+                    "failed_command": "false",
+                    "recovery_command": "printf 'ready\\n' > reports/release_review.txt",
+                    "failure_signals": ["no_state_progress"],
+                },
+            }
+        ],
+    }
+
+    policy.decide(state)
+
+    assert client.last_payload["graph_summary"]["verifier_obligation_counts"] == {
+        "write workflow report reports/release_review.txt and mention ready": 2,
+    }
+    assert client.last_payload["graph_summary"]["changed_path_counts"] == {
+        "reports/release_review.txt": 3,
+    }
+    assert client.last_payload["graph_summary"]["recovery_command_counts"] == {
+        "printf 'ready\\n' > reports/release_review.txt": 2,
+    }
+    assert client.last_payload["graph_summary"]["semantic_episodes"] == [
+        {
+            "task_id": "semantic_memory_task",
+            "benchmark_family": "integration",
+            "memory_source": "episode_replay",
+            "success": True,
+            "verifier_obligations": [
+                "write workflow report reports/release_review.txt and mention ready",
+            ],
+            "changed_paths": ["reports/release_review.txt", "docs/release.md"],
+            "edit_patches": [
+                {
+                    "path": "reports/release_review.txt",
+                    "status": "modified",
+                    "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                    "patch_excerpt": "-BROKEN +READY",
+                }
+            ],
+            "recovery_trace": {
+                "failed_command": "false",
+                "recovery_command": "printf 'ready\\n' > reports/release_review.txt",
+                "failure_signals": ["no_state_progress"],
+            },
+        }
+    ]
+
+
 def test_llm_policy_uses_trusted_retrieval_carryover_before_context_compile():
     class UnexpectedContextProvider:
         def __init__(self) -> None:
@@ -17752,6 +18239,50 @@ def test_choose_tolbert_route_allows_trusted_primary_override_below_min_confiden
     assert "override" in route.reason
 
 
+def test_choose_tolbert_route_allows_high_confidence_primary_without_trusted_retrieval_for_direct_primary():
+    from agent_kernel.modeling.policy.runtime import choose_tolbert_route
+
+    route = choose_tolbert_route(
+        runtime_policy={
+            "primary_benchmark_families": ["project"],
+            "shadow_benchmark_families": ["project"],
+            "min_path_confidence": 0.7,
+            "require_trusted_retrieval": True,
+            "allow_direct_command_primary": True,
+            "allow_skill_primary": False,
+            "use_latent_state": True,
+        },
+        benchmark_family="project",
+        path_confidence=0.9,
+        trust_retrieval=False,
+    )
+
+    assert route.mode == "primary"
+    assert "direct or skill primary routing" in route.reason
+
+
+def test_choose_tolbert_route_keeps_trusted_retrieval_requirement_when_direct_and_skill_primary_are_disabled():
+    from agent_kernel.modeling.policy.runtime import choose_tolbert_route
+
+    route = choose_tolbert_route(
+        runtime_policy={
+            "primary_benchmark_families": ["project"],
+            "shadow_benchmark_families": ["project"],
+            "min_path_confidence": 0.7,
+            "require_trusted_retrieval": True,
+            "allow_direct_command_primary": False,
+            "allow_skill_primary": False,
+            "use_latent_state": True,
+        },
+        benchmark_family="project",
+        path_confidence=0.9,
+        trust_retrieval=False,
+    )
+
+    assert route.mode == "disabled"
+    assert "requires trusted retrieval" in route.reason
+
+
 def test_llm_policy_applies_retained_retrieval_threshold_overrides(tmp_path):
     retrieval_path = tmp_path / "retrieval" / "retrieval_proposals.json"
     retrieval_path.parent.mkdir(parents=True, exist_ok=True)
@@ -18118,7 +18649,7 @@ def test_llm_policy_raises_primary_min_command_score_from_retrieval_overrides(tm
 
     assert policy._tolbert_runtime_policy()["min_path_confidence"] == 0.88
     assert policy._tolbert_runtime_policy()["require_trusted_retrieval"] is True
-    assert policy._tolbert_runtime_policy()["fallback_to_vllm_on_low_confidence"] is True
+    assert policy._tolbert_runtime_policy()["fallback_to_vllm_on_low_confidence"] is False
     assert policy._tolbert_runtime_policy()["primary_min_command_score"] == 4
 
 
@@ -18250,6 +18781,7 @@ def test_long_horizon_rollout_action_value_uses_learned_world_signal_for_recover
             "risk_signal": 0.9,
             "world_progress_score": 0.79,
             "world_risk_score": 0.88,
+            "controller_belief": {"recover": 0.8, "continue": 0.15, "stop": 0.05},
         },
     }
     latest_transition = {"no_progress": True}
@@ -18274,6 +18806,66 @@ def test_long_horizon_rollout_action_value_uses_learned_world_signal_for_recover
     )
 
     assert recover_value > stall_value
+
+
+def test_rollout_stop_value_uses_controller_stop_belief():
+    class FakeWorldModel:
+        def simulate_command_effect(self, world_model_summary, content):
+            del world_model_summary, content
+            return {
+                "predicted_progress_gain": 0.0,
+                "predicted_conflicts": [],
+                "predicted_preserved": [],
+                "predicted_workflow_paths": [],
+            }
+
+    rollout_policy = {
+        "stop_completion_weight": 8.0,
+        "stop_missing_expected_penalty_weight": 6.0,
+        "stop_forbidden_penalty_weight": 6.0,
+        "stop_preserved_penalty_weight": 4.0,
+        "stop_learned_progress_weight": 1.5,
+        "stop_learned_risk_penalty_weight": 4.0,
+        "stable_stop_bonus_weight": 1.5,
+        "controller_belief_stop_bonus_weight": 3.0,
+        "controller_belief_recover_stop_penalty_weight": 2.0,
+        "controller_belief_continue_stop_penalty_weight": 1.5,
+    }
+    stop_belief_state = {
+        "risk_band": "stable",
+        "progress_band": "flat",
+        "learned_world_state": {
+            "controller_belief": {"recover": 0.1, "continue": 0.1, "stop": 0.8},
+        },
+    }
+    recover_belief_state = {
+        "risk_band": "stable",
+        "progress_band": "flat",
+        "learned_world_state": {
+            "controller_belief": {"recover": 0.8, "continue": 0.1, "stop": 0.1},
+        },
+    }
+
+    stop_value = rollout_action_value(
+        world_model_summary={"completion_ratio": 0.8, "horizon": "bounded"},
+        latent_state_summary=stop_belief_state,
+        latest_transition={},
+        action="respond",
+        content="done",
+        rollout_policy=rollout_policy,
+        world_model=FakeWorldModel(),
+    )
+    continue_value = rollout_action_value(
+        world_model_summary={"completion_ratio": 0.8, "horizon": "bounded"},
+        latent_state_summary=recover_belief_state,
+        latest_transition={},
+        action="respond",
+        content="done",
+        rollout_policy=rollout_policy,
+        world_model=FakeWorldModel(),
+    )
+
+    assert stop_value > continue_value
 
 
 def test_llm_policy_blocks_first_step_partial_skill_for_multi_artifact_task():

@@ -10,9 +10,12 @@ import json
 from datetime import datetime, timezone
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.improvement import artifact_retrieval_reuse_evidence, tool_shared_repo_bundle_evidence
-from agent_kernel.runtime_supervision import atomic_write_json
-from agent_kernel.improvement import assess_artifact_compatibility
+from agent_kernel.extensions.improvement.artifacts import assess_artifact_compatibility
+from agent_kernel.extensions.improvement.artifact_support_evidence import (
+    artifact_retrieval_reuse_evidence,
+    tool_shared_repo_bundle_evidence,
+)
+from agent_kernel.ops.runtime_supervision import atomic_write_json
 
 
 def _safe_float(value: object) -> float:

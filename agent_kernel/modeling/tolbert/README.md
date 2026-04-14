@@ -1,9 +1,17 @@
-# TOLBERT Universal Family
+# TOLBERT and Hybrid Runtime
 
-In this repo, `TOLBERT` names the full retained model family rather than only the
-original ontology encoder.
+In this repo, `TOLBERT` should be read as the seeded encoder/retrieval/compiler
+system, not as the canonical name for every later retained runtime checkpoint.
 
-The family contract is:
+The repo currently has two connected layers:
+
+- [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+  The seeded strict service wrapper for the original encoder/retrieval compiler.
+- [`hybrid_model.py`](/data/agentkernel/agent_kernel/modeling/tolbert/hybrid_model.py)
+  The retained modeled runtime candidate that adds latent dynamics, decoder
+  control, world-model scoring, and kernel-facing decision heads.
+
+The retained hybrid runtime contract includes:
 
 - `encoder_surface`: hierarchy-aware representation and retrieval
 - `latent_dynamics_surface`: recurrent or state-space task/world state updates
@@ -11,15 +19,6 @@ The family contract is:
 - `world_model_surface`: transition, recovery, and side-effect forecasting
 - `policy/value/transition/risk/stop heads`: kernel-facing decision surfaces
 
-The current implementation is split across two layers:
-
-- [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
-  The seed strict service wrapper for the original encoder/retrieval compiler.
-- [`hybrid_model.py`](/data/agentkernel/agent_kernel/modeling/tolbert/hybrid_model.py)
-  The first internal latent/runtime candidate using state-space modeling and
-  learned control heads.
-
 The seed `vllm` runtime still owns free-form decoding today. The purpose of this
-package is to make retained TOLBERT-family checkpoints capable of taking over
-family by family through the existing liftoff gate, not to bypass verifier,
-trust, or retention controls.
+package is to host the retained hybrid runtime code next to the seeded TOLBERT
+integration until retained checkpoints earn authority through the liftoff gate.

@@ -8,15 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.loop import AgentKernel
-from agent_kernel.preflight import (
+from agent_kernel.ops.preflight import (
     capture_workspace_snapshot,
     classify_run_outcome,
     run_unattended_preflight,
     write_unattended_task_report,
 )
-from agent_kernel.task_bank import TaskBank
-from agent_kernel.trust import write_unattended_trust_ledger
-from agent_kernel.workspace_recovery import (
+from agent_kernel.tasking.task_bank import TaskBank
+from agent_kernel.extensions.trust import write_unattended_trust_ledger
+from agent_kernel.ops.workspace_recovery import (
     annotate_task_report_recovery,
     recovery_annotation,
     restore_workspace_tree,

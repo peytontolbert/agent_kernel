@@ -7,13 +7,14 @@ from agent_kernel.modeling.policy import decoder as decoder_module
 from agent_kernel.policy import LLMDecisionPolicy
 from agent_kernel.schemas import TaskSpec
 from agent_kernel.state import AgentState
-from agent_kernel.subsystems import external_subsystem_specs
-from agent_kernel.unattended_controller import (
+from agent_kernel.extensions.strategy.subsystems import external_subsystem_specs
+from agent_kernel.ops.unattended_controller import (
     action_key_for_policy,
     build_failure_observation,
     build_round_observation,
     controller_state_summary,
     default_controller_state,
+    observation_promotion_reward,
     observation_reward,
     plan_next_policy,
     predict_next_observation,
@@ -64,6 +65,9 @@ def test_controller_state_summary_preserves_strategy_memory_priors():
         "retained_count": 2,
         "recent_rejects": 1,
         "best_retained_gain": 0.25,
+        "retained_family_breadth_gain": 2.0,
+        "retained_closeout_gain": 1.0,
+        "recent_reject_closeout_failures": 1,
         "retained_family_gains": {"integration": 0.25},
         "recent_rejects_by_family": {"integration": 1},
     }
@@ -72,6 +76,8 @@ def test_controller_state_summary_preserves_strategy_memory_priors():
 
     assert summary["strategy_memory_priors"]["retained_count"] == 2
     assert summary["strategy_memory_priors"]["best_retained_gain"] == 0.25
+    assert summary["strategy_memory_priors"]["retained_family_breadth_gain"] == 2.0
+    assert summary["strategy_memory_priors"]["retained_closeout_gain"] == 1.0
     assert summary["strategy_memory_priors"]["retained_family_gains"]["integration"] == 0.25
     assert summary["strategy_memory_priors"]["recent_rejects_by_family"]["integration"] == 1
 
@@ -298,6 +304,67 @@ def test_build_round_observation_tracks_priority_family_yield_feedback():
     )
 
     assert observation_reward(productive_observation) > observation_reward(stalled_observation)
+
+
+def test_promotion_reward_excludes_scheduler_only_pressure_signals():
+    pressure_only = build_round_observation(
+        campaign_signal={
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository", "integration"],
+        },
+        planner_pressure_signal={
+            "frontier_failure_motif_families": ["workflow", "integration"],
+            "frontier_repo_setting_families": ["integration"],
+        },
+        round_signal={
+            "broad_observe_then_retrieval_first": True,
+            "live_decision_credit_gap": True,
+        },
+    )
+    retained = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 1,
+            "average_retained_pass_rate_delta": 0.03,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_with_retained_gain": ["project"],
+        }
+    )
+
+    assert observation_reward(pressure_only) != 0.0
+    assert observation_promotion_reward(pressure_only) == 0.0
+    assert observation_promotion_reward(retained) > 0.0
+
+
+def test_update_controller_state_learns_promotion_reward_not_steering_score():
+    state = default_controller_state(exploration_bonus=0.0)
+    policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 2,
+        "campaign_width": 3,
+        "variant_width": 2,
+        "task_limit": 256,
+    }
+    neutral = build_round_observation(campaign_signal={})
+    pressure_only = build_round_observation(
+        campaign_signal={
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository", "integration"],
+        }
+    )
+
+    state, diagnostics = update_controller_state(
+        state,
+        start_observation=neutral,
+        action_policy=policy,
+        end_observation=pressure_only,
+    )
+
+    action_stats = state["action_models"][action_key_for_policy(policy)]
+    assert diagnostics["promotion_reward"] == 0.0
+    assert diagnostics["steering_reward"] < 0.0
+    assert action_stats["reward_mean"] == 0.0
+    assert action_stats["steering_reward_mean"] < 0.0
 
 
 def test_build_round_observation_tracks_generalization_pressure():
@@ -700,7 +767,8 @@ def test_update_controller_state_preserves_discovered_feature_transitions():
     predicted = predict_next_observation(updated_state, start, policy)
 
     action_key = action_key_for_policy(policy)
-    assert diagnostics["reward"] > 0.0
+    assert diagnostics["promotion_reward"] == 0.0
+    assert diagnostics["steering_reward"] > 0.0
     assert (
         updated_state["action_models"][action_key]["transition_mean"]["novel_subsystem_capability_gain"] > 0.0
     )
@@ -1391,6 +1459,90 @@ def test_plan_next_policy_prefers_broader_policy_under_subsystem_reject_pressure
     narrow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == action_key_for_policy(narrow_policy))
     assert broad_diag["pressure_alignment_bonus"] > narrow_diag["pressure_alignment_bonus"]
     assert broad_diag["score"] > narrow_diag["score"]
+
+
+def test_plan_next_policy_bounds_steering_signal_separately_from_promotion_reward():
+    narrow_policy = {
+        "focus": "balanced",
+        "adaptive_search": False,
+        "cycles": 1,
+        "campaign_width": 1,
+        "variant_width": 1,
+        "task_limit": 64,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project"],
+    }
+    broad_policy = {
+        "focus": "discovered_task_adaptation",
+        "adaptive_search": True,
+        "cycles": 3,
+        "campaign_width": 4,
+        "variant_width": 3,
+        "task_limit": 256,
+        "task_step_floor": 50,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+    }
+    narrow_key = action_key_for_policy(narrow_policy)
+    broad_key = action_key_for_policy(broad_policy)
+    state = default_controller_state(
+        exploration_bonus=0.0,
+        uncertainty_penalty=0.0,
+        repeat_action_penalty=0.0,
+        steering_signal_cap=1.5,
+    )
+    state["action_models"] = {
+        narrow_key: {
+            "count": 4,
+            "reward_mean": 5.0,
+            "reward_m2": 0.0,
+            "transition_mean": {},
+            "transition_error_ema": {},
+            "policy_template": dict(narrow_policy),
+            "last_reward": 5.0,
+        },
+        broad_key: {
+            "count": 4,
+            "reward_mean": 5.0,
+            "reward_m2": 0.0,
+            "transition_mean": {},
+            "transition_error_ema": {},
+            "policy_template": dict(broad_policy),
+            "last_reward": 5.0,
+        },
+    }
+    pressured = build_round_observation(
+        campaign_signal={
+            "retained_cycles": 0,
+            "rejected_cycles": 2,
+            "priority_families": ["project", "repository", "integration"],
+            "priority_families_without_signal": ["project", "repository"],
+            "priority_families_with_signal_but_no_retained_gain": ["integration"],
+            "max_low_confidence_episode_delta": 2,
+            "min_trusted_retrieval_step_delta": -1,
+        },
+        subsystem_signal={
+            "rejected_by_subsystem": {"retrieval": 4},
+            "retained_by_subsystem": {},
+        },
+        planner_pressure_signal={
+            "campaign_breadth_pressure_cycles": 2,
+            "variant_breadth_pressure_cycles": 1,
+        },
+    )
+
+    selected, diagnostics = plan_next_policy(
+        state,
+        current_observation=pressured,
+        candidate_policies=[narrow_policy, broad_policy],
+    )
+
+    assert selected["focus"] == "discovered_task_adaptation"
+    broad_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == broad_key)
+    narrow_diag = next(item for item in diagnostics["candidates"] if item["action_key"] == narrow_key)
+    assert broad_diag["raw_pressure_alignment_bonus"] > 1.5
+    assert broad_diag["pressure_alignment_bonus"] < 1.5
+    assert broad_diag["pressure_alignment_bonus"] > narrow_diag["pressure_alignment_bonus"]
+    assert broad_diag["steering_signal_cap"] == 1.5
 
 
 def test_plan_next_policy_prefers_broader_policy_when_no_retained_gain_pressure_is_present():

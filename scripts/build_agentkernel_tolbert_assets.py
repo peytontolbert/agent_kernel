@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_kernel.tolbert_assets import build_agentkernel_tolbert_assets
+from agent_kernel.extensions.tolbert_assets import build_agentkernel_tolbert_assets
 
 
 def main() -> None:

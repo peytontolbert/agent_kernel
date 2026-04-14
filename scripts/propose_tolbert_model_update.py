@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.tolbert_model_improvement import build_tolbert_model_candidate_artifact
+from agent_kernel.extensions.improvement.tolbert_model_improvement import build_tolbert_model_candidate_artifact
 from evals.harness import run_eval
 
 

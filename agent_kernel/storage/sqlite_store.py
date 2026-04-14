@@ -402,7 +402,8 @@ class SQLiteKernelStore:
         return attempts
 
     def load_episode_document(self, task_id: str) -> dict[str, object]:
-        attempts = self.load_episode_attempt_documents(task_id)
+        normalized = str(task_id).strip()
+        attempts = self.load_episode_attempt_documents(normalized)
         if not attempts:
             raise FileNotFoundError(f"episode document not found for task_id={normalized}")
         return self._aggregate_episode_documents(attempts)[0]
@@ -715,6 +716,12 @@ def _selected_variant_id(payload: dict[str, object]) -> str:
 
 def store_for_config(config: Any) -> SQLiteKernelStore:
     path = Path(getattr(config, "runtime_database_path"))
+    if not path.is_absolute():
+        trajectories_root = getattr(config, "trajectories_root", None)
+        if trajectories_root is not None:
+            trajectories_path = Path(trajectories_root)
+            if trajectories_path.is_absolute():
+                path = trajectories_path.parent / path
     resolved = path.resolve()
     with _STORE_CACHE_LOCK:
         cached = _STORE_CACHE.get(resolved)

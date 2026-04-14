@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_kernel import kernel_catalog
+from agent_kernel.extensions.strategy import kernel_catalog
 
 
 @pytest.fixture(autouse=True)

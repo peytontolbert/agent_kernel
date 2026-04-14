@@ -36,10 +36,13 @@ def choose_tolbert_route(
     allow_trusted_primary_without_min_confidence = bool(
         runtime_policy.get("allow_trusted_primary_without_min_confidence", False)
     )
+    allow_direct_primary = bool(runtime_policy.get("allow_direct_command_primary", True))
+    allow_skill_primary = bool(runtime_policy.get("allow_skill_primary", True))
     require_trusted = bool(runtime_policy.get("require_trusted_retrieval", True))
     use_latent_state = bool(runtime_policy.get("use_latent_state", True))
     if family in primary_families:
-        if require_trusted and not trust_retrieval:
+        direct_or_skill_primary_allowed = allow_direct_primary or allow_skill_primary
+        if require_trusted and not trust_retrieval and not direct_or_skill_primary_allowed:
             return TolbertRoutingDecision(
                 mode="disabled",
                 benchmark_family=family,
@@ -67,6 +70,15 @@ def choose_tolbert_route(
                 mode="primary",
                 benchmark_family=family,
                 reason="trusted retrieval satisfied the retained Tolbert primary route override",
+                min_confidence=min_confidence,
+                require_trusted_retrieval=require_trusted,
+                use_latent_state=use_latent_state,
+            )
+        if require_trusted and not trust_retrieval and direct_or_skill_primary_allowed:
+            return TolbertRoutingDecision(
+                mode="primary",
+                benchmark_family=family,
+                reason="benchmark family is approved for retained Tolbert primary control via direct or skill primary routing",
                 min_confidence=min_confidence,
                 require_trusted_retrieval=require_trusted,
                 use_latent_state=use_latent_state,

@@ -11,9 +11,9 @@ from urllib import error as url_error
 from urllib import parse as url_parse
 from urllib import request as url_request
 
-from .capabilities import effective_http_allowed_hosts, segment_capabilities
+from .extensions.capabilities import effective_http_allowed_hosts, segment_capabilities
 from .config import KernelConfig
-from .operator_policy import operator_policy_snapshot
+from .extensions.operator_policy import operator_policy_snapshot
 from .schemas import CommandResult
 from .schemas import TaskSpec
 

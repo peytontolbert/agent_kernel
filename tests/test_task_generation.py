@@ -5,9 +5,10 @@ from pathlib import Path
 import pytest
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.extensions.strategy.semantic_hub import record_semantic_task
+from agent_kernel.tasking import task_bank as task_bank_module
+from agent_kernel.tasking.task_bank import TaskBank
 from evals.harness import run_eval
-from agent_kernel import task_bank as task_bank_module
-from agent_kernel.task_bank import TaskBank
 
 
 def test_task_bank_loads_default_tasks_from_bundled_manifest(monkeypatch, tmp_path):
@@ -197,6 +198,39 @@ def test_task_bank_loads_external_manifest_tasks(tmp_path):
     assert task.metadata["task_origin"] == "external_manifest"
     assert task.metadata["external_manifest_path"] == str(manifest_path)
     assert task.metadata["benchmark_family"] == "external_lab"
+
+
+def test_task_bank_loads_semantic_hub_tasks(tmp_path):
+    config = KernelConfig(
+        semantic_hub_root=tmp_path / "trajectories" / "semantic_hub",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    config.ensure_directories()
+    record_semantic_task(
+        config,
+        task_id="semantic_hub_task",
+        payload={
+            "task": {
+                "task_id": "semantic_hub_task",
+                "prompt": "Create semantic.txt containing semantic ready.",
+                "workspace_subdir": "semantic_hub_task",
+                "suggested_commands": ["printf 'semantic ready\\n' > semantic.txt"],
+                "success_command": "test -f semantic.txt && grep -q '^semantic ready$' semantic.txt",
+                "expected_files": ["semantic.txt"],
+                "expected_file_contents": {"semantic.txt": "semantic ready\n"},
+                "metadata": {"benchmark_family": "field_ops", "capability": "semantic_flow"},
+            }
+        },
+    )
+
+    bank = TaskBank(config=config, external_task_manifests=())
+    task = bank.get("semantic_hub_task")
+
+    assert task.metadata["task_origin"] == "semantic_hub"
+    assert task.metadata["semantic_task_path"].endswith("semantic_hub_task.json")
+    assert task.metadata["open_world_candidate"] is True
+    assert task.metadata["benchmark_family"] == "field_ops"
 
 
 def test_task_bank_preserves_nested_repo_sandbox_metadata_from_bundled_manifest():

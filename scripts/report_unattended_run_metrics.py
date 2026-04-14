@@ -10,7 +10,22 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.trust import build_unattended_trust_ledger, write_unattended_trust_ledger
+from agent_kernel.extensions.trust import build_unattended_trust_ledger, write_unattended_trust_ledger
+
+_REPLAY_DERIVED_TASK_ORIGINS = frozenset(
+    {
+        "episode_replay",
+        "skill_replay",
+        "skill_transfer",
+        "operator_replay",
+        "tool_replay",
+        "verifier_replay",
+        "discovered_task",
+        "transition_pressure",
+        "benchmark_candidate",
+        "verifier_candidate",
+    }
+)
 
 
 def _load_reports(root: Path) -> list[dict[str, object]]:
@@ -70,6 +85,8 @@ def main() -> None:
     family_hidden_risk: Counter[str] = Counter()
     family_success_hidden_risk: Counter[str] = Counter()
     family_external_totals: Counter[str] = Counter()
+    family_semantic_hub_totals: Counter[str] = Counter()
+    family_replay_derived_totals: Counter[str] = Counter()
     hidden_side_effect_risk_count = 0
     success_hidden_side_effect_risk_count = 0
     false_pass_risk_count = 0
@@ -102,6 +119,10 @@ def main() -> None:
         family_totals[family] += 1
         if task_origin == "external_manifest":
             family_external_totals[family] += 1
+        if task_origin == "semantic_hub":
+            family_semantic_hub_totals[family] += 1
+        if task_origin in _REPLAY_DERIVED_TASK_ORIGINS:
+            family_replay_derived_totals[family] += 1
         unexpected_change_files_total += unexpected_change_files
         if unexpected_change_files > 0:
             unexpected_change_report_count += 1
@@ -143,12 +164,18 @@ def main() -> None:
     print(f"test_command_total={test_command_total}")
     print(f"external_report_count={sum(family_external_totals.values())}")
     print(f"external_distinct_families={len(family_external_totals)}")
+    print(f"semantic_hub_report_count={sum(family_semantic_hub_totals.values())}")
+    print(f"semantic_hub_distinct_families={len(family_semantic_hub_totals)}")
+    print(f"replay_derived_report_count={sum(family_replay_derived_totals.values())}")
+    print(f"replay_derived_distinct_families={len(family_replay_derived_totals)}")
     for outcome in sorted(outcomes):
         print(f"outcome_count outcome={outcome} count={outcomes[outcome]}")
     for family in sorted(family_totals):
         print(
             f"benchmark_family={family} total={family_totals[family]} "
             f"external_total={family_external_totals.get(family, 0)} "
+            f"semantic_hub_total={family_semantic_hub_totals.get(family, 0)} "
+            f"replay_derived_total={family_replay_derived_totals.get(family, 0)} "
             f"hidden_side_effect_risk={family_hidden_risk.get(family, 0)} "
             f"success_hidden_side_effect_risk={family_success_hidden_risk.get(family, 0)}"
         )
@@ -168,12 +195,60 @@ def main() -> None:
         f"clean_success_streak={int(gated.get('clean_success_streak', 0))} "
         f"distinct_families={int(gated.get('distinct_benchmark_families', 0))}"
     )
+    success_ci = overall.get("success_rate_confidence_interval", {})
+    if not isinstance(success_ci, dict):
+        success_ci = {}
+    unsafe_ci = overall.get("unsafe_ambiguous_rate_confidence_interval", {})
+    if not isinstance(unsafe_ci, dict):
+        unsafe_ci = {}
+    hidden_ci = overall.get("hidden_side_effect_risk_rate_confidence_interval", {})
+    if not isinstance(hidden_ci, dict):
+        hidden_ci = {}
+    print(
+        "trust_confidence "
+        f"success_rate_low={float(success_ci.get('lower', 0.0)):.3f} "
+        f"success_rate_high={float(success_ci.get('upper', 0.0)):.3f} "
+        f"unsafe_ambiguous_rate_low={float(unsafe_ci.get('lower', 0.0)):.3f} "
+        f"unsafe_ambiguous_rate_high={float(unsafe_ci.get('upper', 0.0)):.3f} "
+        f"hidden_side_effect_risk_rate_low={float(hidden_ci.get('lower', 0.0)):.3f} "
+        f"hidden_side_effect_risk_rate_high={float(hidden_ci.get('upper', 0.0)):.3f}"
+    )
     print(
         "trust_coverage "
         f"reports={overall.get('total', 0)} "
         f"families={','.join(str(name) for name in overall.get('benchmark_families', []))} "
         f"external_reports={int(overall.get('external_report_count', 0))} "
         f"external_families={','.join(str(name) for name in overall.get('external_benchmark_families', []))}"
+    )
+    task_yield_bucket_summary = overall.get("task_yield_bucket_summary", {})
+    if not isinstance(task_yield_bucket_summary, dict):
+        task_yield_bucket_summary = {}
+    print(
+        "trust_task_yield "
+        f"semantic_hub_reports={int(dict(task_yield_bucket_summary.get('semantic_hub', {})).get('reports', 0) or 0)} "
+        f"external_manifest_reports={int(dict(task_yield_bucket_summary.get('external_manifest', {})).get('reports', 0) or 0)} "
+        f"replay_derived_reports={int(dict(task_yield_bucket_summary.get('replay_derived', {})).get('reports', 0) or 0)}"
+    )
+    failure_recovery_summary = overall.get("failure_recovery_summary", {})
+    if not isinstance(failure_recovery_summary, dict):
+        failure_recovery_summary = {}
+    failure_recovery_success_ci = failure_recovery_summary.get("success_rate_confidence_interval", {})
+    if not isinstance(failure_recovery_success_ci, dict):
+        failure_recovery_success_ci = {}
+    failure_recovery_clean_success_ci = failure_recovery_summary.get("clean_success_rate_confidence_interval", {})
+    if not isinstance(failure_recovery_clean_success_ci, dict):
+        failure_recovery_clean_success_ci = {}
+    print(
+        "trust_failure_recovery "
+        f"reports={int(failure_recovery_summary.get('reports', 0) or 0)} "
+        f"successes={int(failure_recovery_summary.get('success_count', 0) or 0)} "
+        f"clean_successes={int(failure_recovery_summary.get('clean_success_count', 0) or 0)} "
+        f"success_rate={float(failure_recovery_summary.get('success_rate', 0.0)):.3f} "
+        f"success_rate_low={float(failure_recovery_success_ci.get('lower', 0.0)):.3f} "
+        f"success_rate_high={float(failure_recovery_success_ci.get('upper', 0.0)):.3f} "
+        f"clean_success_rate={float(failure_recovery_summary.get('clean_success_rate', 0.0)):.3f} "
+        f"clean_success_rate_low={float(failure_recovery_clean_success_ci.get('lower', 0.0)):.3f} "
+        f"clean_success_rate_high={float(failure_recovery_clean_success_ci.get('upper', 0.0)):.3f}"
     )
     coverage = ledger.get("coverage_summary", {})
     if not isinstance(coverage, dict):

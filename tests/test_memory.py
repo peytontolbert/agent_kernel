@@ -1,9 +1,8 @@
 import json
 
-from agent_kernel import task_bank as task_bank_module
 from agent_kernel.config import KernelConfig
-from agent_kernel.context_budget import ContextBudgeter
-from agent_kernel.extractors import (
+from agent_kernel.extensions.context_budget import ContextBudgeter
+from agent_kernel.extensions.extractors import (
     _normalize_command_for_workspace,
     extract_operator_classes,
     dedupe_skills,
@@ -16,10 +15,11 @@ from agent_kernel.learning_compiler import (
     load_learning_candidates,
     matching_learning_candidates,
 )
-from agent_kernel.memory import EpisodeMemory
+from agent_kernel.memory import EpisodeMemory, GraphMemory
 from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
-from agent_kernel.task_bank import (
+from agent_kernel.tasking import task_bank as task_bank_module
+from agent_kernel.tasking.task_bank import (
     TaskBank,
     load_benchmark_candidate_tasks,
     load_discovered_tasks,
@@ -862,6 +862,543 @@ def test_episode_memory_graph_summary_tracks_trusted_retrieval_procedures(tmp_pa
     ]
 
 
+def test_episode_memory_graph_summary_surfaces_semantic_obligations_and_recovery_traces(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    episode = EpisodeRecord(
+        task_id="semantic_memory_task",
+        prompt="Repair the release report and keep docs stable.",
+        workspace=str(tmp_path / "workspace" / "semantic_memory_task"),
+        success=True,
+        task_metadata={
+            "benchmark_family": "repository",
+            "memory_source": "episode",
+            "semantic_verifier": {
+                "expected_changed_paths": ["src/release_state.txt"],
+                "generated_paths": ["generated/release.patch"],
+                "preserved_paths": ["docs/context.md"],
+                "report_rules": [{"path": "reports/release_review.txt", "must_mention": ["ready"]}],
+                "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}],
+            },
+        },
+        task_contract={
+            "prompt": "Repair the release report and keep docs stable.",
+            "workspace_subdir": "semantic_memory_task",
+            "setup_commands": [],
+            "success_command": "pytest -q tests/test_release.py",
+            "suggested_commands": [
+                "printf 'broken\\n' > reports/release_review.txt",
+                "printf 'ready\\n' > reports/release_review.txt",
+            ],
+            "expected_files": ["reports/release_review.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"reports/release_review.txt": "ready\n"},
+            "max_steps": 4,
+            "metadata": {
+                "semantic_verifier": {
+                    "expected_changed_paths": ["src/release_state.txt"],
+                    "generated_paths": ["generated/release.patch"],
+                    "preserved_paths": ["docs/context.md"],
+                    "report_rules": [{"path": "reports/release_review.txt", "must_mention": ["ready"]}],
+                    "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}],
+                }
+            },
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="write the wrong report",
+                action="code_execute",
+                content="printf 'broken\\n' > reports/release_review.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'broken\\n' > reports/release_review.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": False, "reasons": ["unexpected file content: reports/release_review.txt"]},
+                failure_signals=["state_regression"],
+                state_progress_delta=0.0,
+                state_transition={"progress_delta": 0.0, "regressions": ["reports/release_review.txt"]},
+            ),
+            StepRecord(
+                index=2,
+                thought="repair the report",
+                action="code_execute",
+                content="printf 'ready\\n' > reports/release_review.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'ready\\n' > reports/release_review.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                state_progress_delta=0.5,
+                state_transition={
+                    "progress_delta": 0.5,
+                    "newly_materialized_expected_artifacts": ["reports/release_review.txt"],
+                    "newly_satisfied_expected_contents": ["reports/release_review.txt"],
+                    "newly_updated_report_paths": ["reports/release_review.txt"],
+                    "edit_patches": [
+                        {
+                            "path": "reports/release_review.txt",
+                            "status": "modified",
+                            "patch": "--- a/reports/release_review.txt\n+++ b/reports/release_review.txt\n@@ -1 +1 @@\n-broken\n+ready\n",
+                            "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                        }
+                    ],
+                    "state_change_score": 3,
+                },
+            ),
+        ],
+    )
+
+    memory.save(episode)
+    payload = memory.load("semantic_memory_task")
+    summary = memory.graph_summary()
+
+    assert payload["summary"]["verifier_obligation_count"] >= 4
+    assert "reports/release_review.txt" in payload["summary"]["changed_paths"]
+    assert payload["summary"]["recovery_trace_count"] == 1
+    assert any(fragment["kind"] == "verifier_obligation" for fragment in payload["fragments"])
+    assert any(fragment["kind"] == "command_outcome" for fragment in payload["fragments"])
+    assert any(fragment["kind"] == "edit_patch" for fragment in payload["fragments"])
+    assert any(fragment["kind"] == "recovery_trace" for fragment in payload["fragments"])
+    assert summary["verifier_obligation_counts"]["write workflow report reports/release_review.txt and mention ready"] == 1
+    assert summary["changed_path_counts"]["reports/release_review.txt"] >= 1
+    assert summary["edit_patch_path_counts"]["reports/release_review.txt"] >= 1
+    assert summary["recovery_command_counts"]["printf 'ready\\n' > reports/release_review.txt"] == 1
+    assert summary["semantic_episodes"][0]["task_id"] == "semantic_memory_task"
+    assert summary["semantic_episodes"][0]["edit_patches"][0]["path"] == "reports/release_review.txt"
+    assert summary["semantic_episodes"][0]["failure_signals"] == ["state_regression"]
+    assert summary["semantic_prototypes"][0]["changed_paths"] == ["reports/release_review.txt"]
+    assert summary["semantic_prototypes"][0]["success_count"] == 1
+    assert summary["semantic_prototypes"][0]["recovery_commands"] == {
+        "printf 'ready\\n' > reports/release_review.txt": 1
+    }
+
+
+def test_episode_memory_semantic_recall_ranks_changed_paths_and_obligations(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    repair_episode = EpisodeRecord(
+        task_id="release_repair_task",
+        prompt="Repair the release report and mention ready.",
+        workspace=str(tmp_path / "workspace" / "release_repair_task"),
+        success=True,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Repair the release report and mention ready.",
+            "workspace_subdir": "release_repair_task",
+            "setup_commands": [],
+            "success_command": "pytest -q tests/test_release.py",
+            "suggested_commands": [],
+            "expected_files": ["reports/release_review.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"reports/release_review.txt": "ready\n"},
+            "max_steps": 3,
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="repair report",
+                action="code_execute",
+                content="printf 'ready\\n' > reports/release_review.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'ready\\n' > reports/release_review.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                state_progress_delta=1.0,
+                state_transition={
+                    "progress_delta": 1.0,
+                    "newly_updated_report_paths": ["reports/release_review.txt"],
+                    "edit_patches": [
+                        {
+                            "path": "reports/release_review.txt",
+                            "status": "modified",
+                            "patch": "-broken\n+ready\n",
+                            "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    docs_episode = EpisodeRecord(
+        task_id="docs_cleanup_task",
+        prompt="Refresh docs context.",
+        workspace=str(tmp_path / "workspace" / "docs_cleanup_task"),
+        success=True,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Refresh docs context.",
+            "workspace_subdir": "docs_cleanup_task",
+            "setup_commands": [],
+            "success_command": "true",
+            "suggested_commands": [],
+            "expected_files": ["docs/context.md"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {"docs/context.md": "updated\n"},
+            "max_steps": 2,
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="refresh docs",
+                action="code_execute",
+                content="printf 'updated\\n' > docs/context.md",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'updated\\n' > docs/context.md",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                state_progress_delta=1.0,
+                state_transition={
+                    "progress_delta": 1.0,
+                    "edit_patches": [
+                        {
+                            "path": "docs/context.md",
+                            "status": "modified",
+                            "patch": "-old\n+updated\n",
+                            "patch_summary": "modified docs/context.md (+1 -1)",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    memory.save(repair_episode)
+    memory.save(docs_episode)
+
+    recalled = memory.semantic_recall(
+        benchmark_family="repository",
+        changed_paths=["reports/release_review.txt"],
+        verifier_obligations=["write workflow report reports/release_review.txt and mention ready"],
+        require_success=True,
+        limit=2,
+    )
+
+    assert [item["task_id"] for item in recalled] == ["release_repair_task", "docs_cleanup_task"]
+    assert recalled[0]["changed_paths"] == ["reports/release_review.txt"]
+
+
+def test_episode_memory_semantic_recall_matches_failure_signals(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    regression_episode = EpisodeRecord(
+        task_id="recovery_failure_task",
+        prompt="Repair the release state after regression.",
+        workspace=str(tmp_path / "workspace" / "recovery_failure_task"),
+        success=False,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Repair the release state after regression.",
+            "workspace_subdir": "recovery_failure_task",
+            "setup_commands": [],
+            "success_command": "true",
+            "suggested_commands": [],
+            "expected_files": ["reports/release_review.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {},
+            "max_steps": 2,
+        },
+        termination_reason="verification_failed",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="make a bad edit",
+                action="code_execute",
+                content="printf 'broken\\n' > reports/release_review.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'broken\\n' > reports/release_review.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": False, "reasons": ["unexpected file content: reports/release_review.txt"]},
+                failure_signals=["state_regression"],
+                state_progress_delta=0.0,
+                state_transition={"progress_delta": 0.0, "regressions": ["reports/release_review.txt"]},
+            )
+        ],
+    )
+    other_failure = EpisodeRecord(
+        task_id="other_failure_task",
+        prompt="Run a broken command.",
+        workspace=str(tmp_path / "workspace" / "other_failure_task"),
+        success=False,
+        task_metadata={"benchmark_family": "tooling", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Run a broken command.",
+            "workspace_subdir": "other_failure_task",
+            "setup_commands": [],
+            "success_command": "true",
+            "suggested_commands": [],
+            "expected_files": [],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {},
+            "max_steps": 1,
+        },
+        termination_reason="verification_failed",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="fail for another reason",
+                action="code_execute",
+                content="false",
+                selected_skill_id=None,
+                command_result={
+                    "command": "false",
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": False, "reasons": ["command failed"]},
+                failure_signals=["command_failed"],
+                state_progress_delta=0.0,
+                state_transition={"progress_delta": 0.0},
+            )
+        ],
+    )
+    memory.save(regression_episode)
+    memory.save(other_failure)
+
+    recalled = memory.semantic_recall(
+        failure_signals=["state_regression"],
+        require_success=False,
+        limit=2,
+    )
+
+    assert [item["task_id"] for item in recalled] == ["recovery_failure_task"]
+    assert recalled[0]["failure_signals"] == ["state_regression"]
+
+
+def test_graph_memory_recall_delegates_to_episode_memory(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    episode = EpisodeRecord(
+        task_id="semantic_recall_task",
+        prompt="Repair the release report and keep docs stable.",
+        workspace=str(tmp_path / "workspace" / "semantic_recall_task"),
+        success=True,
+        task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+        task_contract={
+            "prompt": "Repair the release report and keep docs stable.",
+            "workspace_subdir": "semantic_recall_task",
+            "setup_commands": [],
+            "success_command": "true",
+            "suggested_commands": [],
+            "expected_files": ["reports/release_review.txt"],
+            "expected_output_substrings": [],
+            "forbidden_files": [],
+            "forbidden_output_substrings": [],
+            "expected_file_contents": {},
+            "max_steps": 2,
+        },
+        termination_reason="success",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="repair report",
+                action="code_execute",
+                content="printf 'ready\\n' > reports/release_review.txt",
+                selected_skill_id=None,
+                command_result={
+                    "command": "printf 'ready\\n' > reports/release_review.txt",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+                verification={"passed": True, "reasons": ["verification passed"]},
+                state_progress_delta=1.0,
+                state_transition={
+                    "progress_delta": 1.0,
+                    "edit_patches": [
+                        {
+                            "path": "reports/release_review.txt",
+                            "status": "modified",
+                            "patch": "-broken\n+ready\n",
+                            "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    memory.save(episode)
+
+    recalled = GraphMemory(memory).recall(changed_paths=["reports/release_review.txt"], limit=1)
+
+    assert [item["task_id"] for item in recalled] == ["semantic_recall_task"]
+
+
+def test_episode_memory_graph_summary_builds_semantic_prototypes_across_matching_repairs(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    for task_id in ("repair_a", "repair_b"):
+        memory.save(
+            EpisodeRecord(
+                task_id=task_id,
+                prompt="Repair the release report.",
+                workspace=str(tmp_path / "workspace" / task_id),
+                success=True,
+                task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+                task_contract={
+                    "prompt": "Repair the release report.",
+                    "workspace_subdir": task_id,
+                    "setup_commands": [],
+                    "success_command": "true",
+                    "suggested_commands": [],
+                    "expected_files": ["reports/release_review.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {},
+                    "max_steps": 2,
+                },
+                termination_reason="success",
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="repair report",
+                        action="code_execute",
+                        content="printf 'ready\\n' > reports/release_review.txt",
+                        selected_skill_id=None,
+                        command_result={
+                            "command": "printf 'ready\\n' > reports/release_review.txt",
+                            "exit_code": 0,
+                            "stdout": "",
+                            "stderr": "",
+                            "timed_out": False,
+                        },
+                        verification={"passed": True, "reasons": ["verification passed"]},
+                        state_progress_delta=1.0,
+                        state_transition={
+                            "progress_delta": 1.0,
+                            "newly_updated_report_paths": ["reports/release_review.txt"],
+                            "edit_patches": [
+                                {
+                                    "path": "reports/release_review.txt",
+                                    "status": "modified",
+                                    "patch": "-broken\n+ready\n",
+                                    "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            )
+        )
+
+    summary = memory.graph_summary()
+    prototype = summary["semantic_prototypes"][0]
+
+    assert prototype["episode_count"] == 2
+    assert prototype["success_count"] == 2
+    assert prototype["task_ids"] == ["repair_a", "repair_b"]
+    assert prototype["application_commands"] == ["printf 'ready\\n' > reports/release_review.txt"]
+    assert prototype["command_sequences"] == {
+        "printf 'ready\\n' > reports/release_review.txt": 2
+    }
+
+
+def test_episode_memory_semantic_prototype_recall_returns_applicable_repair_patterns(tmp_path):
+    memory = EpisodeMemory(tmp_path)
+    for task_id in ("repair_a", "repair_b"):
+        memory.save(
+            EpisodeRecord(
+                task_id=task_id,
+                prompt="Repair the release report.",
+                workspace=str(tmp_path / "workspace" / task_id),
+                success=True,
+                task_metadata={"benchmark_family": "repository", "memory_source": "episode"},
+                task_contract={
+                    "prompt": "Repair the release report.",
+                    "workspace_subdir": task_id,
+                    "setup_commands": [],
+                    "success_command": "true",
+                    "suggested_commands": [],
+                    "expected_files": ["reports/release_review.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {},
+                    "max_steps": 3,
+                },
+                termination_reason="success",
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="repair report",
+                        action="code_execute",
+                        content="mkdir -p reports",
+                        selected_skill_id=None,
+                        command_result={"command": "mkdir -p reports", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+                        verification={"passed": True, "reasons": ["verification passed"]},
+                        state_progress_delta=0.5,
+                        state_transition={"progress_delta": 0.5},
+                    ),
+                    StepRecord(
+                        index=2,
+                        thought="write report",
+                        action="code_execute",
+                        content="printf 'ready\\n' > reports/release_review.txt",
+                        selected_skill_id=None,
+                        command_result={
+                            "command": "printf 'ready\\n' > reports/release_review.txt",
+                            "exit_code": 0,
+                            "stdout": "",
+                            "stderr": "",
+                            "timed_out": False,
+                        },
+                        verification={"passed": True, "reasons": ["verification passed"]},
+                        state_progress_delta=1.0,
+                        state_transition={
+                            "progress_delta": 1.0,
+                            "newly_updated_report_paths": ["reports/release_review.txt"],
+                        },
+                    ),
+                ],
+            )
+        )
+
+    recalled = memory.semantic_prototype_recall(
+        benchmark_family="repository",
+        changed_paths=["reports/release_review.txt"],
+        require_success=True,
+        limit=1,
+    )
+
+    assert recalled[0]["success_count"] == 2
+    assert recalled[0]["application_commands"][0] == "printf 'ready\\n' > reports/release_review.txt"
+    assert "mkdir -p reports || printf 'ready\\n' > reports/release_review.txt" in recalled[0]["command_sequences"]
+
+
 def test_context_budgeter_surfaces_trusted_retrieval_carryover_chunks():
     task = TaskSpec(
         task_id="release_task",
@@ -966,6 +1503,65 @@ def test_context_budgeter_surfaces_trusted_retrieval_procedure_chunks():
     assert any(
         chunk["source"] == "graph_trusted_retrieval_procedure"
         and "pytest -q tests/test_release_status.py" in chunk["text"]
+        for chunk in payload["state_context_chunks"]
+    )
+
+
+def test_context_budgeter_surfaces_semantic_patch_chunks():
+    task = TaskSpec(
+        task_id="release_patch_task",
+        prompt="Repair the release report.",
+        workspace_subdir="release_patch_task",
+        success_command="pytest -q tests/test_release_status.py",
+        expected_files=["reports/release_review.txt"],
+        expected_file_contents={"reports/release_review.txt": "READY\n"},
+        metadata={"benchmark_family": "integration"},
+    )
+    state = AgentState(task=task, current_role="planner")
+    payload = ContextBudgeter(
+        KernelConfig(provider="mock", tolbert_context_char_budget=768, tolbert_context_max_chunks=8)
+    ).build_payload(
+        state=state,
+        task_payload={"task_id": "release_patch_task"},
+        history_payload=[],
+        history_archive={},
+        llm_context_packet=None,
+        retrieval_plan={},
+        transition_preview=None,
+        available_skills=[],
+        prompt_adjustments=[],
+        allowed_actions=["code_execute"],
+        graph_summary={
+            "semantic_episodes": [
+                {
+                    "task_id": "release_patch_memory",
+                    "benchmark_family": "integration",
+                    "memory_source": "episode_replay",
+                    "success": True,
+                    "verifier_obligations": ["write workflow report reports/release_review.txt and mention ready"],
+                    "changed_paths": ["reports/release_review.txt"],
+                    "edit_patches": [
+                        {
+                            "path": "reports/release_review.txt",
+                            "status": "modified",
+                            "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                            "patch_excerpt": "-BROKEN\n+READY",
+                        }
+                    ],
+                    "recovery_trace": {},
+                }
+            ]
+        },
+        universe_summary={},
+        world_model_summary={"expected_artifacts": ["reports/release_review.txt"]},
+        plan=["materialize expected artifact reports/release_review.txt"],
+        active_subgoal="materialize expected artifact reports/release_review.txt",
+    )
+
+    assert any(
+        chunk["source"] == "graph_semantic_episode"
+        and "modified reports/release_review.txt (+1 -1)" in chunk["text"]
+        and "+READY" in chunk["text"]
         for chunk in payload["state_context_chunks"]
     )
 
@@ -3420,3 +4016,46 @@ def test_verifier_candidate_tasks_skip_invalid_top_level_lifecycle_state(tmp_pat
     tasks = load_verifier_candidate_tasks(candidates_path)
 
     assert tasks == []
+
+
+def test_verifier_candidate_tasks_preserve_semantic_verifier_contracts(tmp_path):
+    candidates_path = tmp_path / "verifiers.json"
+    candidates_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "verifier_candidate_set",
+                "lifecycle_state": "proposed",
+                "proposals": [
+                    {
+                        "proposal_id": "verifier:hello_task:strict",
+                        "source_task_id": "hello_task",
+                        "benchmark_family": "micro",
+                        "contract": {
+                            "expected_files": ["hello.txt"],
+                            "forbidden_files": [],
+                            "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                            "forbidden_output_substrings": [],
+                            "semantic_verifier": {
+                                "kind": "behavioral_semantic",
+                                "behavior_checks": [
+                                    {
+                                        "label": "hello smoke",
+                                        "argv": ["/bin/sh", "-lc", "printf 'hello agent kernel\\n'"],
+                                        "expect_exit_code": 0,
+                                        "stdout_must_contain": ["hello agent kernel"],
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_verifier_candidate_tasks(candidates_path)
+
+    assert len(tasks) == 1
+    assert tasks[0].metadata["semantic_verifier"]["kind"] == "behavioral_semantic"
+    assert tasks[0].metadata["semantic_verifier"]["behavior_checks"][0]["label"] == "hello smoke"

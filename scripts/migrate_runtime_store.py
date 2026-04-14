@@ -9,7 +9,7 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.episode_store import episode_storage_metadata
+from agent_kernel.ops.episode_store import episode_storage_metadata
 from agent_kernel.storage import store_for_config
 
 

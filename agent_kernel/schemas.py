@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from collections.abc import Mapping
 
 
 ActionType = str
@@ -171,6 +172,28 @@ class VerificationResult:
     passed: bool
     reasons: list[str]
     command_result: CommandResult | None = None
+    process_score: float = 0.0
+    outcome_label: str = "failure"
+    outcome_confidence: float = 1.0
+    controllability: str = "agent"
+    failure_codes: list[str] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
+    criteria: list[dict[str, Any]] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "passed": bool(self.passed),
+            "reasons": list(self.reasons),
+            "process_score": float(self.process_score),
+            "outcome_label": str(self.outcome_label).strip() or ("success" if self.passed else "failure"),
+            "outcome_confidence": float(self.outcome_confidence),
+            "controllability": str(self.controllability).strip() or "agent",
+            "failure_codes": list(self.failure_codes),
+            "side_effects": list(self.side_effects),
+            "criteria": [dict(item) for item in self.criteria],
+            "evidence": [dict(item) for item in self.evidence],
+        }
 
 
 @dataclass(slots=True)
@@ -256,6 +279,98 @@ def step_verification_passed(step: StepRecord | Mapping[str, Any] | None) -> boo
     else:
         payload = {}
     return bool(payload.get("passed", False))
+
+
+def classify_verification_reason(reason: str) -> str:
+    normalized = str(reason).strip()
+    if not normalized or normalized.lower() == "verification passed":
+        return ""
+    lowered = normalized.lower()
+    if "timed out" in lowered:
+        return "timeout"
+    if "exit code" in lowered:
+        return "command_failure"
+    if "missing expected file content target" in lowered:
+        return "missing_expected_file_content_target"
+    if "missing expected file" in lowered:
+        return "missing_expected_file"
+    if "missing expected output" in lowered:
+        return "missing_expected_output"
+    if "forbidden file present" in lowered:
+        return "forbidden_file_present"
+    if "unexpected file content" in lowered:
+        return "unexpected_file_content"
+    if "forbidden output present" in lowered:
+        return "forbidden_output_present"
+    if "semantic report missing phrase" in lowered:
+        return "semantic_report_missing_phrase"
+    if "semantic report missing" in lowered:
+        return "semantic_report_missing"
+    if "semantic report does not cover" in lowered:
+        return "semantic_report_missing_coverage"
+    if "git repository missing" in lowered:
+        return "git_repository_missing"
+    if "git branch mismatch" in lowered:
+        return "git_branch_mismatch"
+    if "git branch inspection failed" in lowered:
+        return "git_branch_inspection_failed"
+    if "git diff missing expected path" in lowered:
+        return "git_diff_missing_expected_path"
+    if "git diff includes unexpected path" in lowered:
+        return "git_diff_unexpected_path"
+    if "required worker branch not accepted" in lowered:
+        return "required_branch_unaccepted"
+    if "git diff unexpectedly changed preserved path" in lowered:
+        return "preserved_path_changed"
+    if "generated artifact missing" in lowered:
+        return "generated_artifact_missing"
+    if "generated artifact not recorded in git diff" in lowered:
+        return "generated_artifact_not_in_diff"
+    if "git conflict remains unresolved" in lowered:
+        return "unresolved_git_conflict"
+    if "conflict markers still present" in lowered:
+        return "conflict_markers_present"
+    if "git worktree not clean" in lowered:
+        return "git_worktree_not_clean"
+    if "failed to execute" in lowered:
+        return "verification_command_execution_failed"
+    if "test command" in lowered and "exited with code" in lowered:
+        return "verification_test_failed"
+    if "success command" in lowered and "timed out" in lowered:
+        return "success_command_timeout"
+    if "success command" in lowered and "exited with code" in lowered:
+        return "success_command_failed"
+    if "semantic verifier contract malformed" in lowered:
+        return "semantic_verifier_contract_malformed"
+    if "policy terminated" in lowered:
+        return "policy_terminated"
+    if "governance rejected command" in lowered:
+        return "governance_rejected"
+    if "repeated failed action" in lowered:
+        return "repeated_failed_action"
+    if "no state progress" in lowered:
+        return "no_state_progress"
+    return "verification_failure"
+
+
+def verification_failure_codes(verification: Mapping[str, Any] | None) -> list[str]:
+    payload = verification if isinstance(verification, Mapping) else {}
+    normalized: list[str] = []
+    raw_codes = payload.get("failure_codes", [])
+    if isinstance(raw_codes, list):
+        for value in raw_codes:
+            code = str(value).strip()
+            if code and code not in normalized:
+                normalized.append(code)
+    if normalized:
+        return normalized
+    raw_reasons = payload.get("reasons", [])
+    if isinstance(raw_reasons, list):
+        for value in raw_reasons:
+            code = classify_verification_reason(str(value))
+            if code and code not in normalized:
+                normalized.append(code)
+    return normalized
 
 
 def episode_success_criteria(episode: EpisodeRecord) -> dict[str, bool]:

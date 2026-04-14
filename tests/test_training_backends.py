@@ -387,7 +387,7 @@ def test_run_training_backend_script_loads_generic_qwen_artifact_env(tmp_path: P
 
 
 def test_tolbert_model_candidate_artifact_exposes_external_training_backends(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     repo_root = Path(__file__).resolve().parents[1]
     _write_backend_fixture(repo_root)

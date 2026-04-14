@@ -5,7 +5,7 @@ from io import StringIO
 import sys
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.job_queue import (
+from agent_kernel.ops.job_queue import (
     DelegatedJobQueue,
     DelegatedRuntimeController,
     delegated_job_progress_path,
@@ -14,7 +14,7 @@ from agent_kernel.job_queue import (
     run_next_delegated_job,
 )
 from agent_kernel.schemas import EpisodeRecord, TaskSpec
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 
 
 def _load_script_module(name: str):
@@ -28,8 +28,8 @@ def _load_script_module(name: str):
 
 
 def _install_successful_kernel(monkeypatch):
-    from agent_kernel import job_queue as job_queue_module
-    from agent_kernel.shared_repo import prepare_runtime_task
+    from agent_kernel.ops import job_queue as job_queue_module
+    from agent_kernel.ops.shared_repo import prepare_runtime_task
 
     class SuccessfulKernel:
         def __init__(self, config):
@@ -311,14 +311,65 @@ def test_run_next_delegated_job_persists_worker_command_diagnostics_in_checkpoin
     assert checkpoint_payload["exit_code"] == 7
     assert checkpoint_payload["timed_out"] is False
     assert "exit code was 7" in checkpoint_payload["verification_reasons"]
+    assert checkpoint_payload["verification"]["passed"] is False
+    assert checkpoint_payload["verification"]["outcome_label"] == "command_failure"
+    assert "command_failure" in checkpoint_payload["verification"]["failure_codes"]
+    assert checkpoint_payload["command_result"]["exit_code"] == 7
+    assert checkpoint_payload["task_contract_summary"]["benchmark_family"] == "tooling"
     assert "worker stdout" in checkpoint_payload["stdout_summary"]["tail"]
     assert "worker stderr" in checkpoint_payload["stderr_summary"]["tail"]
     assert checkpoint_payload["stdout_summary"]["line_count"] == 1
     assert checkpoint_payload["stderr_summary"]["line_count"] == 1
 
 
+def test_run_next_delegated_job_persists_success_command_failure_diagnostics_in_checkpoint(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    queue.enqueue(
+        task_id="worker_command_success_contract_failure_job",
+        runtime_overrides={
+            "task_payload": TaskSpec(
+                task_id="worker_command_success_contract_failure_job",
+                prompt="Exit cleanly but fail the success contract.",
+                workspace_subdir="worker_command_success_contract_failure_job",
+                success_command="test -f produced.txt",
+                max_steps=1,
+                metadata={"benchmark_family": "repository", "capability": "shell"},
+            ).to_dict(),
+            "worker_command": "printf 'command ok\\n'",
+        },
+    )
+
+    job = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+        enforce_preflight=False,
+    )
+
+    assert job is not None
+    assert job.state == "safe_stop"
+    checkpoint_payload = json.loads(Path(job.checkpoint_path).read_text(encoding="utf-8"))
+    assert checkpoint_payload["verification"]["passed"] is False
+    assert checkpoint_payload["verification"]["outcome_label"] == "success_command_failed"
+    assert "success_command_failed" in checkpoint_payload["verification"]["failure_codes"]
+    assert checkpoint_payload["success_command_result"]["command"] == "test -f produced.txt"
+    assert checkpoint_payload["success_command_result"]["exit_code"] == 1
+    assert checkpoint_payload["task_contract_summary"]["benchmark_family"] == "repository"
+
+
 def test_run_next_delegated_job_writes_report_on_runner_exception(monkeypatch, tmp_path):
-    from agent_kernel import job_queue as job_queue_module
+    from agent_kernel.ops import job_queue as job_queue_module
 
     config = KernelConfig(
         provider="mock",
@@ -362,7 +413,7 @@ def test_run_next_delegated_job_writes_report_on_runner_exception(monkeypatch, t
 
 
 def test_run_next_delegated_job_safe_stops_when_acceptance_verifier_fails(monkeypatch, tmp_path):
-    from agent_kernel import job_queue as job_queue_module
+    from agent_kernel.ops import job_queue as job_queue_module
     from agent_kernel.schemas import EpisodeRecord
 
     config = KernelConfig(
@@ -432,7 +483,7 @@ def test_run_next_delegated_job_safe_stops_when_acceptance_verifier_fails(monkey
 
 
 def test_drain_stops_after_interrupted_job(monkeypatch, tmp_path):
-    from agent_kernel import job_queue as job_queue_module
+    from agent_kernel.ops import job_queue as job_queue_module
 
     config = KernelConfig(
         provider="mock",
@@ -2107,7 +2158,7 @@ def test_runtime_controller_blocks_colliding_shared_repo_claims_and_allows_disjo
             "claimed_paths": ["src"],
         },
     )
-    from agent_kernel.task_bank import TaskBank
+    from agent_kernel.tasking.task_bank import TaskBank
 
     bank = TaskBank()
     first_task = bank.get("git_parallel_worker_api_task")
@@ -2187,7 +2238,7 @@ def test_run_next_delegated_jobs_complete_shared_repo_worker_then_integrator_flo
 
 
 def test_materialize_shared_repo_workspace_uses_absolute_git_paths(tmp_path):
-    from agent_kernel.shared_repo import materialize_shared_repo_workspace
+    from agent_kernel.ops.shared_repo import materialize_shared_repo_workspace
 
     config = KernelConfig(
         provider="mock",
@@ -2361,7 +2412,7 @@ def test_run_next_delegated_job_marks_safe_stop_when_artifact_budget_exceeded(tm
 
 
 def test_run_next_delegated_job_restores_workspace_after_non_success(monkeypatch, tmp_path):
-    from agent_kernel import job_queue as job_queue_module
+    from agent_kernel.ops import job_queue as job_queue_module
     from agent_kernel.schemas import EpisodeRecord, StepRecord
 
     config = KernelConfig(

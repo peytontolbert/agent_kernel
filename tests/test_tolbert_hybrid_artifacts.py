@@ -23,7 +23,7 @@ def test_retained_tolbert_hybrid_runtime_uses_defaults_without_payload() -> None
 
 
 def test_tolbert_model_candidate_artifact_includes_hybrid_runtime(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     config = KernelConfig(
@@ -192,7 +192,7 @@ def test_tolbert_model_candidate_artifact_runs_independent_generation_pipelines_
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     config = KernelConfig(
@@ -334,7 +334,7 @@ def test_tolbert_model_candidate_artifact_runs_independent_generation_pipelines_
 
 
 def test_tolbert_build_policy_requires_long_horizon_head_coverage_when_present() -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     insufficient = module._tolbert_build_policy(
         {
@@ -376,7 +376,7 @@ def test_tolbert_build_policy_requires_long_horizon_head_coverage_when_present()
 
 
 def test_tolbert_generic_only_action_generation_surface_disables_primary_and_novel_gate() -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     dataset_manifest = {
         "policy_examples": 4,
@@ -420,7 +420,7 @@ def test_tolbert_generic_only_action_generation_surface_disables_primary_and_nov
 
 
 def test_compact_tolbert_model_candidate_output_keeps_final_checkpoint(tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     checkpoints_dir = output_dir / "training" / "checkpoints"
@@ -462,7 +462,7 @@ def test_compact_tolbert_model_candidate_output_keeps_final_checkpoint(tmp_path:
 
 
 def test_materialize_tolbert_model_shared_store_dedupes_normalized_candidate_paths(tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     config = KernelConfig(
         tolbert_model_artifact_path=tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json",
@@ -517,7 +517,7 @@ def test_materialize_tolbert_model_shared_store_dedupes_normalized_candidate_pat
 
 
 def test_cleanup_tolbert_model_candidate_storage_prunes_old_dirs_and_unreferenced_store(tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     config = KernelConfig(
         candidate_artifacts_root=tmp_path / "candidates",
@@ -580,7 +580,7 @@ def test_tolbert_model_candidate_artifact_stores_parameter_delta_when_parent_che
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     training_dir = output_dir / "training"
@@ -652,7 +652,7 @@ def test_tolbert_model_candidate_artifact_stores_parameter_delta_when_parent_che
 
 
 def test_build_runtime_bundle_checkpoint_delta_rewrites_manifest(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     bundle_dir = tmp_path / "hybrid_runtime"
     manifest_path = bundle_dir / "hybrid_bundle_manifest.json"
@@ -699,7 +699,7 @@ def test_build_runtime_bundle_checkpoint_delta_rewrites_manifest(monkeypatch, tm
 
 
 def test_run_tolbert_finetune_pipeline_prefers_manifest_backed_cache(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     repo_root = tmp_path / "repo"
@@ -780,7 +780,7 @@ def test_run_tolbert_finetune_pipeline_prefers_manifest_backed_cache(monkeypatch
 
 
 def test_run_tolbert_finetune_pipeline_uses_parent_plus_delta_training(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     output_dir = tmp_path / "candidate"
     repo_root = tmp_path / "repo"
@@ -874,7 +874,7 @@ def test_run_tolbert_finetune_pipeline_uses_parent_plus_delta_training(monkeypat
 
 
 def test_tolbert_finetune_timeout_scales_with_epochs() -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     config = KernelConfig(command_timeout_seconds=20)
 
@@ -884,7 +884,7 @@ def test_tolbert_finetune_timeout_scales_with_epochs() -> None:
 
 
 def test_tolbert_runtime_delegated_jobs_verify_absolute_manifest_paths(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir(parents=True, exist_ok=True)
@@ -970,7 +970,7 @@ def test_tolbert_runtime_delegated_jobs_verify_absolute_manifest_paths(monkeypat
 
 
 def test_tolbert_generation_device_plan_distributes_generic_cuda_across_three_gpus(monkeypatch, tmp_path: Path) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     config = KernelConfig(
         workspace_root=tmp_path / "workspace",
@@ -999,7 +999,7 @@ def test_tolbert_generation_device_plan_serializes_generic_cuda_when_gpu_count_i
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from agent_kernel import tolbert_model_improvement as module
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
     config = KernelConfig(
         workspace_root=tmp_path / "workspace",

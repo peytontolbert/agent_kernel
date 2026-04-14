@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.extractors import extract_operator_classes
+from agent_kernel.extensions.extractors import extract_operator_classes
 
 
 def main() -> None:

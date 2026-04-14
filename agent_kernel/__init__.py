@@ -34,7 +34,7 @@ __all__ = [
 _MODULE_MAP = {
     "KernelConfig": ".config",
     "AgentKernel": ".loop",
-    "TaskBank": ".task_bank",
+    "TaskBank": ".tasking.task_bank",
     "CodingActorMode": ".actors",
     "CodingActorOutcome": ".actors",
     "CodingActorPlan": ".actors",
@@ -45,13 +45,13 @@ _MODULE_MAP = {
     "coding_actor_plan_for_task": ".actors",
     "coding_actor_kernel_summary": ".actors",
     "default_coding_actor_policy": ".actors",
-    "DelegatedJob": ".job_queue",
-    "DelegatedJobLease": ".job_queue",
-    "DelegatedJobQueue": ".job_queue",
-    "DelegatedResourcePolicy": ".job_queue",
-    "DelegatedRuntimeController": ".job_queue",
-    "drain_delegated_jobs": ".job_queue",
-    "run_next_delegated_job": ".job_queue",
+    "DelegatedJob": ".ops.job_queue",
+    "DelegatedJobLease": ".ops.job_queue",
+    "DelegatedJobQueue": ".ops.job_queue",
+    "DelegatedResourcePolicy": ".ops.job_queue",
+    "DelegatedRuntimeController": ".ops.job_queue",
+    "drain_delegated_jobs": ".ops.job_queue",
+    "run_next_delegated_job": ".ops.job_queue",
 }
 
 

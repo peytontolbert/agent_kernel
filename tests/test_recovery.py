@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.workspace_recovery import (
+from agent_kernel.ops.workspace_recovery import (
     recovery_annotation,
     recovery_policy_snapshot,
     should_restore_on_outcome,

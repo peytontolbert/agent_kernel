@@ -4,16 +4,11 @@ from pathlib import Path
 import agent_kernel.improvement as improvement_module
 from agent_kernel.cycle_runner import prior_retained_guard_reason
 from agent_kernel.config import KernelConfig
-from agent_kernel.modeling.artifacts import tolbert_kernel_autobuild_ready
-from agent_kernel.improvement import (
-    ImprovementCycleRecord,
-    ImprovementExperiment,
-    ImprovementPlanner,
-    ImprovementVariant,
+from agent_kernel.improvement import ImprovementCycleRecord, ImprovementExperiment, ImprovementPlanner, ImprovementVariant
+from agent_kernel.extensions.improvement.artifacts import (
     apply_artifact_retention_decision,
     assess_artifact_compatibility,
     effective_artifact_payload_for_retention,
-    evaluate_artifact_retention,
     materialize_replay_verified_tool_payload,
     persist_replay_verified_tool_artifact,
     snapshot_artifact_state,
@@ -21,31 +16,34 @@ from agent_kernel.improvement import (
     stamp_artifact_experiment_variant,
     stamp_artifact_generation_context,
 )
-from agent_kernel.benchmark_synthesis import synthesize_benchmark_candidates
-from agent_kernel.curriculum_improvement import build_curriculum_proposal_artifact
-from agent_kernel.delegation_improvement import build_delegation_proposal_artifact
-from agent_kernel.operator_policy_improvement import build_operator_policy_proposal_artifact
-from agent_kernel.policy_improvement import build_policy_proposal_artifact
-from agent_kernel.prompt_improvement import (
+from agent_kernel.improvement_retention import evaluate_artifact_retention
+from agent_kernel.modeling.artifacts import tolbert_kernel_autobuild_ready
+from agent_kernel.tasking.benchmark_synthesis import synthesize_benchmark_candidates
+from agent_kernel.extensions.improvement.curriculum_improvement import build_curriculum_proposal_artifact
+from agent_kernel.extensions.improvement.delegation_improvement import build_delegation_proposal_artifact
+from agent_kernel.extensions.improvement.operator_policy_improvement import build_operator_policy_proposal_artifact
+from agent_kernel.extensions.improvement.policy_improvement import build_policy_proposal_artifact
+from agent_kernel.extensions.improvement.prompt_improvement import (
     build_prompt_proposal_artifact,
     propose_prompt_adjustments,
     retained_improvement_planner_controls,
     retained_planner_controls,
     retained_role_directives,
 )
-from agent_kernel.recovery_improvement import build_recovery_proposal_artifact
-from agent_kernel.retrieval_improvement import build_retrieval_proposal_artifact, retained_retrieval_overrides
-from agent_kernel.state_estimation_improvement import build_state_estimation_proposal_artifact
-from agent_kernel.subsystems import (
+from agent_kernel.extensions.improvement.recovery_improvement import build_recovery_proposal_artifact
+from agent_kernel.extensions.improvement.retrieval_improvement import build_retrieval_proposal_artifact, retained_retrieval_overrides
+from agent_kernel.extensions.improvement.state_estimation_improvement import build_state_estimation_proposal_artifact
+from agent_kernel.extensions.strategy.subsystems import (
     active_artifact_path_for_subsystem,
     comparison_config_for_subsystem_artifact,
     generate_candidate_artifact,
 )
-from agent_kernel.transition_model_improvement import build_transition_model_proposal_artifact
-from agent_kernel.trust_improvement import build_trust_proposal_artifact
-from agent_kernel.universe_improvement import build_universe_contract_artifact
-from agent_kernel.verifier_improvement import synthesize_verifier_contracts
-from agent_kernel.world_model_improvement import build_world_model_proposal_artifact
+from agent_kernel.extensions.improvement.transition_model_improvement import build_transition_model_proposal_artifact
+from agent_kernel.extensions.improvement.trust_improvement import build_trust_proposal_artifact
+from agent_kernel.extensions.improvement.universe_improvement import build_universe_contract_artifact
+from agent_kernel.extensions.improvement.verifier_improvement import synthesize_verifier_contracts
+from agent_kernel.extensions.improvement.world_model_improvement import build_world_model_proposal_artifact
+from agent_kernel.tasking.task_bank import TaskBank
 from evals.metrics import EvalMetrics
 
 
@@ -749,6 +747,74 @@ def test_evaluate_artifact_retention_accepts_qwen_adapter_candidate(tmp_path: Pa
 
     assert state == "retain"
     assert "Qwen adapter candidate improved or preserved the coding baseline" in reason
+
+
+def test_evaluate_artifact_retention_rejects_qwen_adapter_without_measurable_runtime_signal(tmp_path: Path):
+    train_path = tmp_path / "dataset" / "train.jsonl"
+    eval_path = tmp_path / "dataset" / "eval.jsonl"
+    manifest_path = tmp_path / "dataset" / "manifest.json"
+    for path in (train_path, eval_path, manifest_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "qwen_adapter_bundle",
+        "lifecycle_state": "candidate",
+        "generation_focus": "coding_lane_sft",
+        "runtime_role": "support_runtime",
+        "training_objective": "qlora_sft",
+        "base_model_name": "Qwen/Qwen3.5-9B",
+        "supported_benchmark_families": ["repository", "project"],
+        "runtime_policy": {
+            "allow_primary_routing": False,
+            "allow_shadow_routing": True,
+            "allow_teacher_generation": True,
+            "allow_post_liftoff_fallback": True,
+            "require_retained_promotion_for_runtime_use": True,
+        },
+        "retention_gate": {
+            "require_non_regression": True,
+            "disallow_liftoff_authority": True,
+            "require_generated_lane_non_regression": True,
+            "require_failure_recovery_non_regression": True,
+            "require_support_runtime_only": True,
+            "require_teacher_generation": True,
+            "require_runtime_target_declared": True,
+        },
+        "training_dataset_manifest": {
+            "manifest_path": str(manifest_path),
+            "train_dataset_path": str(train_path),
+            "eval_dataset_path": str(eval_path),
+            "total_examples": 4,
+        },
+    }
+    baseline = EvalMetrics(
+        total=10,
+        passed=8,
+        average_steps=1.5,
+        generated_total=2,
+        generated_passed=1,
+        generated_by_kind={"failure_recovery": 2},
+        generated_passed_by_kind={"failure_recovery": 1},
+        total_by_origin_benchmark_family={"repository": 5, "project": 5},
+        passed_by_origin_benchmark_family={"repository": 4, "project": 4},
+    )
+    candidate = EvalMetrics(
+        total=10,
+        passed=8,
+        average_steps=1.5,
+        generated_total=2,
+        generated_passed=1,
+        generated_by_kind={"failure_recovery": 2},
+        generated_passed_by_kind={"failure_recovery": 1},
+        total_by_origin_benchmark_family={"repository": 5, "project": 5},
+        passed_by_origin_benchmark_family={"repository": 4, "project": 4},
+    )
+
+    state, reason = evaluate_artifact_retention("qwen_adapter", baseline, candidate, payload=payload)
+
+    assert state == "reject"
+    assert "no measurable runtime influence" in reason
 
 
 def test_evaluate_artifact_retention_accepts_tolbert_selection_signal_fallback_without_proposals(tmp_path: Path):
@@ -1581,7 +1647,7 @@ def test_comparison_config_for_tolbert_model_artifact_materializes_delta_checkpo
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "agent_kernel.subsystems.resolve_tolbert_runtime_checkpoint_path",
+        "agent_kernel.extensions.strategy.subsystems.resolve_tolbert_runtime_checkpoint_path",
         lambda runtime_paths, *, artifact_path=None: str(materialized_checkpoint),
     )
     config = KernelConfig(tolbert_model_artifact_path=tmp_path / "retained_tolbert_model.json")
@@ -1632,7 +1698,7 @@ def test_comparison_config_for_qwen_adapter_artifact_falls_back_to_base_model_be
 
 
 def test_generate_candidate_artifact_supports_tolbert_model(monkeypatch, tmp_path: Path):
-    from agent_kernel import subsystems as subsystems_module
+    from agent_kernel.extensions.strategy import subsystems as subsystems_module
 
     config = KernelConfig(
         candidate_artifacts_root=tmp_path / "candidates",
@@ -1707,7 +1773,7 @@ def test_generate_candidate_artifact_supports_tolbert_model(monkeypatch, tmp_pat
 
 
 def test_generate_candidate_artifact_supports_qwen_adapter(monkeypatch, tmp_path: Path):
-    from agent_kernel import subsystems as subsystems_module
+    from agent_kernel.extensions.strategy import subsystems as subsystems_module
 
     config = KernelConfig(
         candidate_artifacts_root=tmp_path / "candidates",
@@ -1759,7 +1825,7 @@ def test_generate_candidate_artifact_supports_qwen_adapter(monkeypatch, tmp_path
 
 
 def test_generate_candidate_artifact_governs_candidate_exports_only(monkeypatch, tmp_path: Path):
-    from agent_kernel import subsystems as subsystems_module
+    from agent_kernel.extensions.strategy import subsystems as subsystems_module
 
     config = KernelConfig(
         candidate_artifacts_root=tmp_path / "candidates",
@@ -2964,6 +3030,55 @@ def test_build_transition_model_regression_guard_uses_regression_evidence(tmp_pa
     assert artifact["generation_focus"] == "regression_guard"
     assert artifact["controls"]["regressed_path_command_penalty"] >= 5
     assert any(proposal["area"] == "regression_guard" for proposal in artifact["proposals"])
+
+
+def test_build_transition_model_proposal_artifact_uses_command_outcome_and_recovery_trace_fragments(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    episodes.joinpath("semantic_transition_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "semantic_transition_task",
+                "success": False,
+                "summary": {"transition_failures": []},
+                "fragments": [
+                    {
+                        "kind": "command_outcome",
+                        "step_index": 1,
+                        "command": "pytest -q tests/test_release.py",
+                        "command_pattern": "pytest",
+                        "passed": False,
+                        "progress_delta": 0.0,
+                        "changed_paths": [],
+                        "failure_signals": ["no_state_progress"],
+                    },
+                    {
+                        "kind": "edit_patch",
+                        "step_index": 1,
+                        "path": "reports/release_review.txt",
+                        "status": "modified",
+                        "patch": "--- a/reports/release_review.txt\n+++ b/reports/release_review.txt\n@@\n-BROKEN\n+READY\n",
+                        "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                    },
+                    {
+                        "kind": "recovery_trace",
+                        "failed_step_index": 1,
+                        "failed_command": "pytest -q tests/test_release.py",
+                        "failure_signals": ["no_state_progress"],
+                        "recovery_step_index": 2,
+                        "recovery_command": "printf 'READY\\n' > reports/release_review.txt",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifact = build_transition_model_proposal_artifact(episodes, focus="repeat_avoidance")
+
+    assert artifact["signatures"][0]["signal"] == "no_state_progress"
+    assert artifact["signatures"][0]["command"] == "pytest -q tests/test_release.py"
+    assert artifact["signatures"][0]["touched_paths"] == ["reports/release_review.txt"]
 
 
 def test_improvement_planner_surfaces_trust_for_restricted_unattended_ledger(tmp_path: Path):
@@ -4182,6 +4297,35 @@ def test_select_portfolio_campaign_prefers_non_retrieval_after_strong_broad_obse
     assert strategy_candidate["retention_inputs"]["selected_subsystem"] == "verifier"
 
 
+def test_select_portfolio_campaign_emits_discovered_strategy_for_primary_only_broad_observe(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("retrieval", "r", 5, 0.04, 2, 0.10, {}),
+        ImprovementExperiment("trust", "t", 4, 0.02, 2, 0.04, {}),
+    ]
+
+    metrics = EvalMetrics(
+        total=16,
+        passed=16,
+        generated_total=0,
+        generated_passed=0,
+        low_confidence_episodes=1,
+        trusted_retrieval_steps=1,
+        total_by_benchmark_family={"repository": 6, "project": 4, "integration": 6},
+        passed_by_benchmark_family={"repository": 6, "project": 4, "integration": 6},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["trust"]
+    broad_signal = campaign[0].evidence["portfolio"]["broad_observe_diversification"]
+    assert broad_signal["active"] is True
+    assert broad_signal["primary_only_broad_observe"] is True
+    strategy_candidate = campaign[0].evidence["strategy_candidate"]
+    assert strategy_candidate["origin"] == "discovered_strategy"
+    assert strategy_candidate["strategy_candidate_kind"] == "broad_observe_diversification"
+
+
 def test_select_portfolio_campaign_allows_retrieval_first_when_broad_observe_has_retrieval_emergency(tmp_path: Path):
     planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
     planner.rank_experiments = lambda current_metrics: [
@@ -4344,6 +4488,143 @@ def test_select_portfolio_campaign_prefers_discovered_countermeasure_for_low_yie
     assert strategy_candidate["strategy_candidate_id"].startswith("strategy:adaptive_countermeasure:policy:")
     assert "state_regression" in strategy_candidate["generation_basis"]["repeated_failure_motifs"]
     assert "retrieval_confidence_gap" in strategy_candidate["generation_basis"]["transfer_gaps"]
+
+
+def test_select_portfolio_campaign_skips_retrieval_stack_surface_when_strategy_memory_avoids_reselection(
+    tmp_path: Path,
+):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("tolbert_model", "t", 5, 0.05, 4, 0.11, {}),
+        ImprovementExperiment("policy", "p", 4, 0.03, 2, 0.09, {}),
+        ImprovementExperiment("qwen_adapter", "q", 4, 0.025, 3, 0.085, {}),
+    ]
+    planner._portfolio_adjusted_experiment_score = (
+        lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    )
+
+    def _strategy_choice(candidate, *, metrics, recent_activity, broad_observe_signal):
+        avoid = candidate.subsystem in {"tolbert_model", "qwen_adapter"}
+        strategy_candidate = {
+            "strategy_candidate_id": f"strategy:subsystem:{candidate.subsystem}",
+            "strategy_candidate_kind": "subsystem_direct",
+            "origin": "authored_strategy",
+            "target_subsystem": candidate.subsystem,
+            "generation_basis": {},
+            "target_conditions": {},
+            "controls": {},
+            "expected_signals": [],
+            "semantic_hypotheses": [],
+            "portfolio_reasons": [],
+        }
+        return {
+            "strategy_candidate": strategy_candidate,
+            "recent_activity": {},
+            "strategy_memory_summary": {
+                "avoid_reselection": avoid,
+                "selected_parent_strategy_node_ids": [],
+                "selected_parent_nodes": [],
+                "best_retained_snapshot": {},
+                "parent_control_surface": {},
+                "score_delta": 0.0,
+                "recent_rejects": 2 if avoid else 0,
+                "recent_retains": 0,
+            },
+            "score_delta": 0.0,
+            "reasons": [],
+        }
+
+    planner._strategy_portfolio_choice = _strategy_choice
+
+    campaign = planner.select_portfolio_campaign(EvalMetrics(total=10, passed=8), max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["policy"]
+
+
+def test_select_portfolio_campaign_uses_shared_retrieval_stack_history_for_portfolio_penalties(
+    tmp_path: Path,
+):
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    repeated_reason = "retrieval candidate showed no retrieval influence during autonomous evaluation"
+    for cycle_id, subsystem in (
+        ("cycle:retrieval:1", "retrieval"),
+        ("cycle:tolbert_model:1", "tolbert_model"),
+        ("cycle:qwen_adapter:1", "qwen_adapter"),
+    ):
+        planner.append_cycle_record(
+            cycles_path,
+            ImprovementCycleRecord(
+                cycle_id=cycle_id,
+                state="select",
+                subsystem=subsystem,
+                action="choose_target",
+                artifact_path=f"{subsystem}.json",
+                artifact_kind="improvement_target",
+                reason="test",
+                metrics_summary={"selected_variant": {"variant_id": "v1"}},
+            ),
+        )
+        planner.append_cycle_record(
+            cycles_path,
+            ImprovementCycleRecord(
+                cycle_id=cycle_id,
+                state="reject",
+                subsystem=subsystem,
+                action="finalize_cycle",
+                artifact_path=f"{subsystem}.json",
+                artifact_kind="retention_evaluation",
+                reason="flat reject",
+                metrics_summary={
+                    "baseline_pass_rate": 0.625,
+                    "candidate_pass_rate": 0.625,
+                    "baseline_average_steps": 1.8125,
+                    "candidate_average_steps": 1.8125,
+                    "phase_gate_passed": subsystem == "qwen_adapter",
+                    "phase_gate_failures": [] if subsystem == "qwen_adapter" else [repeated_reason],
+                },
+            ),
+        )
+
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("tolbert_model", "t", 5, 0.05, 4, 0.11, {}),
+        ImprovementExperiment("policy", "p", 4, 0.03, 2, 0.09, {}),
+    ]
+
+    def _strategy_choice(candidate, *, metrics, recent_activity, broad_observe_signal):
+        return {
+            "strategy_candidate": {
+                "strategy_candidate_id": f"strategy:subsystem:{candidate.subsystem}",
+                "strategy_candidate_kind": "subsystem_direct",
+                "origin": "authored_strategy",
+                "target_subsystem": candidate.subsystem,
+                "generation_basis": {},
+                "target_conditions": {},
+                "controls": {},
+                "expected_signals": [],
+                "semantic_hypotheses": [],
+                "portfolio_reasons": [],
+            },
+            "recent_activity": {},
+            "strategy_memory_summary": {
+                "avoid_reselection": False,
+                "selected_parent_strategy_node_ids": [],
+                "selected_parent_nodes": [],
+                "best_retained_snapshot": {},
+                "parent_control_surface": {},
+                "score_delta": 0.0,
+                "recent_rejects": 0,
+                "recent_retains": 0,
+            },
+            "score_delta": 0.0,
+            "reasons": [],
+        }
+
+    planner._strategy_portfolio_choice = _strategy_choice
+
+    campaign = planner.select_portfolio_campaign(EvalMetrics(total=10, passed=8), max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["policy"]
 
 
 def test_recent_strategy_activity_summary_uses_canonical_strategy_id_fallback(tmp_path: Path):
@@ -5215,6 +5496,165 @@ def test_verifier_improvement_records_generation_strategy(tmp_path: Path):
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["generation_strategy"] == "false_failure_guard"
+
+
+def test_verifier_improvement_emits_semantic_verifier_contracts(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    semantic_verifier = {
+        "kind": "git_repo_review",
+        "test_commands": ["pytest -q tests/test_release.py"],
+        "preserved_paths": ["docs/context.md"],
+        "expected_changed_paths": ["reports/release_review.txt"],
+        "clean_worktree": True,
+        "behavior_checks": [
+            {
+                "label": "existing behavior check",
+                "argv": ["/bin/sh", "-lc", "printf 'READY\\n'"],
+                "expect_exit_code": 0,
+                "stdout_must_contain": ["READY"],
+            }
+        ],
+    }
+    episodes.joinpath("semantic_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "semantic_task",
+                "success": True,
+                "task_metadata": {"benchmark_family": "integration", "capability": "repo_review", "difficulty": "seed"},
+                "summary": {"changed_paths": ["reports/release_review.txt"]},
+                "task_contract": {
+                    "prompt": "Prepare the release review packet.",
+                    "workspace_subdir": "semantic_task",
+                    "setup_commands": [],
+                    "success_command": "test -f reports/release_review.txt",
+                    "suggested_commands": ["printf 'READY\\n' > reports/release_review.txt"],
+                    "expected_files": ["reports/release_review.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"reports/release_review.txt": "READY\n"},
+                    "max_steps": 5,
+                    "metadata": {
+                        "benchmark_family": "integration",
+                        "capability": "repo_review",
+                        "difficulty": "seed",
+                        "semantic_verifier": semantic_verifier,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "verifiers.json"
+
+    synthesize_verifier_contracts(episodes, output)
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    contract = payload["proposals"][0]["contract"]["semantic_verifier"]
+    assert contract["behavior_checks"][0]["label"] == "existing behavior check"
+    assert any(check["argv"] == ["/bin/sh", "-lc", "pytest -q tests/test_release.py"] for check in contract["behavior_checks"])
+    assert {"kind": "git_tracked_paths", "paths": ["docs/context.md"]} in contract["repo_invariants"]
+    assert {
+        "kind": "git_clean",
+        "allow_paths": ["reports/release_review.txt"],
+    } in contract["repo_invariants"]
+    assert payload["proposals"][0]["evidence"]["strict_contract"] is True
+
+
+def test_verifier_improvement_synthesizes_differential_checks_from_episode_evidence(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    episodes.joinpath("release_task_success.json").write_text(
+        json.dumps(
+            {
+                "task_id": "release_task",
+                "success": True,
+                "task_metadata": {"benchmark_family": "integration"},
+                "task_contract": {
+                    "prompt": "Repair the release report.",
+                    "workspace_subdir": "release_task",
+                    "setup_commands": [],
+                    "success_command": "pytest -q tests/test_release.py",
+                    "suggested_commands": ["printf 'READY\\n' > reports/release_review.txt"],
+                    "expected_files": ["reports/release_review.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"reports/release_review.txt": "READY\n"},
+                    "max_steps": 4,
+                    "metadata": {
+                        "benchmark_family": "integration",
+                        "semantic_verifier": {
+                            "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}]
+                        },
+                    },
+                },
+                "steps": [
+                    {
+                        "index": 1,
+                        "action": "code_execute",
+                        "content": "pytest -q tests/test_release.py",
+                        "command_result": {"exit_code": 0, "stdout": "READY\n", "stderr": ""},
+                        "verification": {"passed": True, "reasons": ["verification passed"]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    episodes.joinpath("release_task_failed.json").write_text(
+        json.dumps(
+            {
+                "task_id": "release_task",
+                "success": False,
+                "task_metadata": {"benchmark_family": "integration"},
+                "task_contract": {
+                    "prompt": "Repair the release report.",
+                    "workspace_subdir": "release_task",
+                    "setup_commands": [],
+                    "success_command": "pytest -q tests/test_release.py",
+                    "suggested_commands": ["printf 'READY\\n' > reports/release_review.txt"],
+                    "expected_files": ["reports/release_review.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"reports/release_review.txt": "READY\n"},
+                    "max_steps": 4,
+                    "metadata": {
+                        "benchmark_family": "integration",
+                        "semantic_verifier": {
+                            "test_commands": [{"label": "release check", "argv": ["pytest", "-q", "tests/test_release.py"]}]
+                        },
+                    },
+                },
+                "steps": [
+                    {
+                        "index": 1,
+                        "action": "code_execute",
+                        "content": "pytest -q tests/test_release.py",
+                        "command_result": {"exit_code": 1, "stdout": "BROKEN\n", "stderr": ""},
+                        "verification": {"passed": False, "reasons": ["exit code was 1"]},
+                    }
+                ],
+                "summary": {"failure_types": ["command_failure"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "verifiers.json"
+
+    synthesize_verifier_contracts(episodes, output)
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    checks = payload["proposals"][0]["contract"]["semantic_verifier"]["differential_checks"]
+    assert checks[0]["candidate_argv"] == ["/bin/sh", "-lc", "pytest -q tests/test_release.py"]
+    assert checks[0]["baseline_argv"] == ["/bin/sh", "-lc", "pytest -q tests/test_release.py"]
+    assert checks[0]["expect_candidate_exit_code"] == 0
+    assert checks[0]["expect_baseline_exit_code"] == 1
+    assert checks[0]["expect_stdout_difference"] is True
+    assert checks[0]["candidate_file_expectations"][0]["path"] == "reports/release_review.txt"
+    assert checks[0]["candidate_file_expectations"][0]["expected_content"] == "READY\n"
 
 
 def test_prompt_improvement_emits_proposals():
@@ -6282,6 +6722,44 @@ def test_evaluate_artifact_retention_retains_trust_control_improvement_without_r
     assert "trust candidate" in reason
 
 
+def test_evaluate_artifact_retention_rejects_zero_influence_trust_control_change():
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    payload = build_trust_proposal_artifact(EvalMetrics(total=10, passed=8), {})
+    payload["controls"].update(
+        {
+            "required_benchmark_families": ["repo_chore", "repo_sandbox", "project"],
+            "min_success_rate": 0.8,
+            "max_unsafe_ambiguous_rate": 0.05,
+            "max_hidden_side_effect_rate": 0.05,
+            "max_success_hidden_side_effect_rate": 0.01,
+            "min_distinct_families": 3,
+            "breadth_min_reports": 12,
+        }
+    )
+    payload["generation_context"] = {
+        "active_artifact_payload": {
+            "spec_version": "asi_v1",
+            "artifact_kind": "trust_policy_set",
+            "lifecycle_state": "retained",
+            "controls": {
+                "required_benchmark_families": ["repo_chore", "repo_sandbox"],
+                "min_success_rate": 0.7,
+                "max_unsafe_ambiguous_rate": 0.1,
+                "max_hidden_side_effect_rate": 0.1,
+                "max_success_hidden_side_effect_rate": 0.02,
+                "min_distinct_families": 2,
+                "breadth_min_reports": 10,
+            },
+        }
+    }
+
+    state, reason = evaluate_artifact_retention("trust", baseline, candidate, payload=payload)
+
+    assert state == "reject"
+    assert "no measurable runtime influence" in reason
+
+
 def test_evaluate_artifact_retention_retains_recovery_control_improvement_without_regression():
     baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
     candidate = EvalMetrics(total=10, passed=8, average_steps=1.4, generated_total=4, generated_passed=3)
@@ -7205,6 +7683,11 @@ def test_improvement_cycle_record_promotes_lineage_and_evidence_fields(tmp_path:
             reason="retained",
             metrics_summary={
                 "selected_variant": {"variant_id": "routing_depth"},
+                "strategy_candidate": {
+                    "strategy_candidate_id": "strategy:retrieval_support_rebalance",
+                    "strategy_candidate_kind": "retrieval_support_rebalance",
+                    "origin": "discovered_strategy",
+                },
                 "prior_retained_cycle_id": "cycle:retrieval:baseline",
                 "baseline_pass_rate": 0.72,
                 "candidate_pass_rate": 0.81,
@@ -7220,6 +7703,9 @@ def test_improvement_cycle_record_promotes_lineage_and_evidence_fields(tmp_path:
     record = planner.load_cycle_records(output)[0]
 
     assert record["selected_variant_id"] == "routing_depth"
+    assert record["strategy_candidate_id"] == "strategy:retrieval_support_rebalance"
+    assert record["strategy_candidate_kind"] == "retrieval_support_rebalance"
+    assert record["strategy_origin"] == "discovered_strategy"
     assert record["prior_retained_cycle_id"] == "cycle:retrieval:baseline"
     assert record["baseline_pass_rate"] == 0.72
     assert record["candidate_pass_rate"] == 0.81
@@ -8135,6 +8621,94 @@ def test_evaluate_artifact_retention_uses_operator_transfer_gate():
     assert state == "retain"
 
 
+def test_retention_evidence_attaches_learning_summary_from_compiled_candidates(tmp_path: Path, monkeypatch):
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:task1",
+                        "artifact_kind": "success_skill_candidate",
+                        "support_count": 3,
+                        "applicable_tasks": ["task1"],
+                        "memory_source": "episode",
+                    },
+                    {
+                        "candidate_id": "learning:success_skill:task2",
+                        "artifact_kind": "success_skill_candidate",
+                        "support_count": 2,
+                        "applicable_tasks": ["task2", "task3"],
+                        "memory_source": "verifier",
+                    },
+                    {
+                        "candidate_id": "learning:failure_case:task4",
+                        "artifact_kind": "failure_case",
+                        "support_count": 4,
+                        "memory_source": "episode",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(improvement_module, "_default_runtime_learning_artifacts_path", lambda: learning_path)
+
+    evidence = improvement_module.retention_evidence(
+        "skills",
+        EvalMetrics(total=10, passed=8, average_steps=1.2),
+        EvalMetrics(total=10, passed=8, average_steps=1.2),
+    )
+
+    assert evidence["learning_candidate_count"] == 2
+    assert evidence["learning_support_total"] == 5
+    assert evidence["learning_applicable_task_total"] == 3
+    assert evidence["learning_has_actionable_support"] is True
+    assert evidence["learning_memory_sources"] == {"episode": 1, "verifier": 1}
+    assert evidence["learning_evidence"]["artifact_kind_support"] == {"success_skill_candidate": 5}
+    assert evidence["learning_evidence"]["has_actionable_support"] is True
+
+
+def test_evaluate_artifact_retention_skills_can_retain_from_learning_support(tmp_path: Path, monkeypatch):
+    learning_path = tmp_path / "learning" / "run_learning_artifacts.json"
+    learning_path.parent.mkdir(parents=True, exist_ok=True)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "run_learning_candidate_set",
+                "candidates": [
+                    {
+                        "candidate_id": "learning:success_skill:task1",
+                        "artifact_kind": "success_skill_candidate",
+                        "support_count": 2,
+                        "applicable_tasks": ["task1"],
+                        "memory_source": "episode",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(improvement_module, "_default_runtime_learning_artifacts_path", lambda: learning_path)
+
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "skill_set",
+        "lifecycle_state": "promoted",
+        "retention_gate": {"min_learning_support_total": 2},
+        "skills": [_skill_record("skill:hello_task:primary")],
+    }
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.2)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.2)
+
+    state, reason = evaluate_artifact_retention("skills", baseline, candidate, payload=payload)
+
+    assert state == "retain"
+    assert "compiled success-skill evidence" in reason
+
+
 def test_apply_artifact_retention_decision_updates_tool_artifact(tmp_path: Path):
     artifact_path = tmp_path / "tools.json"
     artifact_path.write_text(
@@ -8623,6 +9197,81 @@ def test_apply_artifact_retention_decision_promotes_staged_candidate_on_retain(t
     assert summary["active_artifact_path"] == str(live_artifact_path)
     assert summary["candidate_artifact_path"] == str(candidate_artifact_path)
     assert Path(str(summary["rollback_artifact_path"])).exists()
+
+
+def test_apply_artifact_retention_decision_runs_retrieval_lifecycle_hook(tmp_path: Path, monkeypatch):
+    live_artifact_path = tmp_path / "retrieval" / "retrieval_proposals.json"
+    candidate_artifact_path = tmp_path / "candidates" / "retrieval" / "cycle_retrieval_2" / "retrieval_proposals.json"
+    live_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    live_artifact_path.write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "retained",
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate_artifact_path.write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "candidate",
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_manifest_path = tmp_path / "tolbert_bundle" / "manifest.json"
+
+    def _materialize_bundle(*, repo_root, config, cycle_id, **kwargs):
+        del repo_root, kwargs
+        config.retrieval_asset_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        config.retrieval_asset_bundle_path.write_text(
+            json.dumps(
+                {
+                    "artifact_kind": "tolbert_retrieval_asset_bundle",
+                    "lifecycle_state": "retained",
+                    "cycle_id": cycle_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config.retrieval_asset_bundle_path
+
+    monkeypatch.setattr(
+        "agent_kernel.improvement.assess_artifact_compatibility",
+        lambda **kwargs: {"compatible": True, "checked_rules": [], "violations": []},
+    )
+    monkeypatch.setattr(
+        "agent_kernel.extensions.improvement.improvement_plugins.materialize_retained_retrieval_asset_bundle",
+        _materialize_bundle,
+    )
+    monkeypatch.setattr(
+        "agent_kernel.cycle_runner.materialize_retained_retrieval_asset_bundle",
+        _materialize_bundle,
+    )
+
+    config = KernelConfig(retrieval_asset_bundle_path=bundle_manifest_path)
+    summary = apply_artifact_retention_decision(
+        artifact_path=candidate_artifact_path,
+        active_artifact_path=live_artifact_path,
+        subsystem="retrieval",
+        cycle_id="cycle:retrieval:retain",
+        decision_state="retain",
+        decision_reason="verified gain",
+        baseline_metrics=EvalMetrics(total=10, passed=8, average_steps=1.5),
+        candidate_metrics=EvalMetrics(total=10, passed=9, average_steps=1.2),
+        runtime_config=config,
+        repo_root=tmp_path,
+    )
+
+    assert summary["artifact_lifecycle_state"] == "retained"
+    assert len(summary["lifecycle_effects"]) == 1
+    assert summary["lifecycle_effects"][0]["action"] == "materialize_retrieval_asset_bundle"
+    assert bundle_manifest_path.exists()
 
 
 def test_apply_artifact_retention_decision_materializes_split_universe_artifacts_from_legacy_retain(tmp_path: Path):
@@ -9489,6 +10138,43 @@ def test_semantic_compatibility_rejects_verifier_contract_that_is_not_stricter()
     assert any("does not strengthen" in violation for violation in compatibility["violations"])
 
 
+def test_semantic_compatibility_accepts_verifier_contract_with_stricter_semantic_checks():
+    source_task = TaskBank().get("git_parallel_merge_acceptance_task")
+    payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "verifier_candidate_set",
+        "lifecycle_state": "proposed",
+        "retention_gate": {"min_discrimination_gain": 0.02},
+        "proposals": [
+            {
+                "proposal_id": "verifier:git_parallel_merge_acceptance_task:strict",
+                "source_task_id": "git_parallel_merge_acceptance_task",
+                "benchmark_family": "repo_sandbox",
+                "contract": {
+                    "expected_files": list(source_task.expected_files),
+                    "forbidden_files": list(source_task.forbidden_files),
+                    "expected_file_contents": dict(source_task.expected_file_contents),
+                    "forbidden_output_substrings": list(source_task.forbidden_output_substrings),
+                    "semantic_verifier": {
+                        "required_merged_branches": ["worker/api-status", "worker/docs-status"],
+                        "behavior_checks": [
+                            {"label": "api suite", "argv": ["tests/test_api.sh"], "expect_exit_code": 0},
+                            {"label": "docs suite", "argv": ["tests/test_docs.sh"], "expect_exit_code": 0},
+                        ],
+                        "repo_invariants": [
+                            {"kind": "git_tracked_paths", "paths": ["docs/context.md"]},
+                        ],
+                    },
+                },
+            }
+        ],
+    }
+
+    compatibility = assess_artifact_compatibility(subsystem="verifier", payload=payload)
+
+    assert compatibility["compatible"] is True
+
+
 def test_assess_artifact_compatibility_rejects_prompt_proposal_missing_required_fields():
     payload = {
         "spec_version": "asi_v1",
@@ -10000,6 +10686,58 @@ def test_rank_variants_penalizes_recent_no_yield_variant(tmp_path: Path, monkeyp
 
     assert ranked[0].variant_id == "fresh_variant"
     assert ranked[1].controls["history"]["recent_variant"]["no_yield_cycles"] == 1
+
+
+def test_rank_variants_prefers_parent_strategy_control_alignment(tmp_path: Path, monkeypatch):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=tmp_path / "improvement/cycles.jsonl")
+
+    monkeypatch.setattr(
+        planner,
+        "_variants_for_experiment",
+        lambda experiment, metrics, planner_controls=None: [
+            ImprovementVariant(
+                subsystem="policy",
+                variant_id="aligned_variant",
+                description="matches retained parent control surface",
+                expected_gain=0.02,
+                estimated_cost=2,
+                score=0.01,
+                controls={"planner_temperature": 0.2, "prefer_preview_yield": True},
+            ),
+            ImprovementVariant(
+                subsystem="policy",
+                variant_id="conflicting_variant",
+                description="replays rejected control surface",
+                expected_gain=0.02,
+                estimated_cost=2,
+                score=0.01,
+                controls={"planner_temperature": 0.4, "prefer_preview_yield": False},
+            ),
+        ],
+    )
+
+    ranked = planner.rank_variants(
+        ImprovementExperiment(
+            subsystem="policy",
+            reason="policy gap",
+            priority=3,
+            expected_gain=0.02,
+            estimated_cost=2,
+            score=0.1,
+            evidence={
+                "strategy_candidate": {
+                    "parent_control_surface": {
+                        "preferred_controls": {"planner_temperature": 0.2, "prefer_preview_yield": True},
+                        "rejected_controls": [{"planner_temperature": 0.4, "prefer_preview_yield": False}],
+                    }
+                }
+            },
+        ),
+        EvalMetrics(total=10, passed=8),
+    )
+
+    assert ranked[0].variant_id == "aligned_variant"
+    assert ranked[0].controls["strategy_memory_variant_lineage"]["preferred_control_matches"] == 2
 
 
 def test_rank_variants_clamps_stalled_variant_scores_non_negative(tmp_path: Path, monkeypatch):

@@ -9,7 +9,7 @@ import argparse
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.retrieval_improvement import build_retrieval_proposal_artifact
+from agent_kernel.extensions.improvement.retrieval_improvement import build_retrieval_proposal_artifact
 from evals.harness import run_eval
 
 

@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.operator_policy_improvement import build_operator_policy_proposal_artifact
+from agent_kernel.extensions.improvement.operator_policy_improvement import build_operator_policy_proposal_artifact
 
 
 def main() -> None:

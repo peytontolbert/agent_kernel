@@ -6,9 +6,9 @@ import subprocess
 
 import pytest
 
-import agent_kernel.runtime_supervision as runtime_supervision
+import agent_kernel.ops.runtime_supervision as runtime_supervision
 from agent_kernel.config import KernelConfig
-from agent_kernel.runtime_supervision import (
+from agent_kernel.ops.runtime_supervision import (
     append_jsonl,
     atomic_copy_file,
     atomic_write_json,

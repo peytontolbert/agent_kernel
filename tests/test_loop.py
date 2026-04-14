@@ -2,13 +2,14 @@ import hashlib
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.curriculum import CurriculumEngine, EpisodeRecord
+from agent_kernel.ops.loop_run_support import _task_semantic_recall_paths
+from agent_kernel.tasking.curriculum import CurriculumEngine, EpisodeRecord
 from agent_kernel.llm import MockLLMClient
 from agent_kernel.loop import AgentKernel
 from agent_kernel.policy import LLMDecisionPolicy, Policy
 from agent_kernel.schemas import ActionDecision, CommandResult, ContextPacket, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
-from agent_kernel.task_bank import TaskBank
+from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.universe_model import UniverseModel
 from agent_kernel.world_model import WorldModel
 import pytest
@@ -37,7 +38,7 @@ def test_kernel_solves_seed_task(tmp_path):
     assert episode.steps[0].world_model_horizon == "bounded"
 
 
-def test_kernel_rejects_tolbert_as_provider_name(tmp_path):
+def test_kernel_accepts_tolbert_as_provider_name(tmp_path):
     config = KernelConfig(
         provider="tolbert",
         use_tolbert_context=False,
@@ -45,8 +46,147 @@ def test_kernel_rejects_tolbert_as_provider_name(tmp_path):
         trajectories_root=tmp_path / "trajectories",
     )
 
-    with pytest.raises(ValueError, match="unsupported provider"):
-        AgentKernel(config=config)
+    episode = AgentKernel(config=config).run_task(TaskBank().get("hello_task"))
+
+    assert episode.success is True
+
+
+def test_kernel_accepts_hybrid_as_provider_name(tmp_path):
+    config = KernelConfig(
+        provider="hybrid",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config).run_task(TaskBank().get("hello_task"))
+
+    assert episode.success is True
+
+
+def test_kernel_solves_seed_task_with_executable_floor_only(tmp_path, monkeypatch):
+    config = KernelConfig.executable_floor(
+        provider="mock",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    seen: dict[str, bool] = {"called": False}
+
+    def fail_learning_compile(*args, **kwargs):
+        del args, kwargs
+        seen["called"] = True
+        raise AssertionError("executable floor should not compile learning candidates")
+
+    monkeypatch.setattr("agent_kernel.loop.persist_episode_learning_candidates", fail_learning_compile)
+
+    kernel = AgentKernel(config=config)
+    try:
+        episode = kernel.run_task(TaskBank().get("hello_task"))
+    finally:
+        kernel.close()
+
+    assert episode.success is True
+    assert episode.termination_reason == "success"
+    assert (config.workspace_root / "hello_task" / "hello.txt").exists()
+    assert (config.trajectories_root / "hello_task.json").exists()
+    assert episode.plan == []
+    assert episode.graph_summary == {}
+    assert episode.universe_summary == {}
+    assert episode.world_model_summary == {}
+    assert episode.steps[0].acting_role == "executor"
+    assert episode.steps[0].active_subgoal == ""
+    assert episode.steps[0].world_model_horizon == ""
+    assert kernel.universe_model is None
+    assert seen["called"] is False
+
+
+def test_kernel_emits_structured_verification_failure_payload(tmp_path):
+    class AlwaysFailPolicy(Policy):
+        def decide(self, state):
+            del state
+            return ActionDecision(
+                action="code_execute",
+                content="false",
+                thought="trigger verification failure",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    events: list[dict[str, object]] = []
+    task = TaskSpec(
+        task_id="structured_verification_failure_task",
+        prompt="Create hello.txt containing hello agent kernel.",
+        workspace_subdir="structured_verification_failure_task",
+        expected_files=["hello.txt"],
+        max_steps=1,
+    )
+
+    episode = AgentKernel(config=config, policy=AlwaysFailPolicy()).run_task(
+        task,
+        progress_callback=lambda event: events.append(dict(event)),
+    )
+
+    verification = episode.steps[0].verification
+    assert verification["passed"] is False
+    assert verification["outcome_label"] == "command_failure"
+    assert "command_failure" in verification["failure_codes"]
+    assert "missing_expected_file" in verification["failure_codes"]
+    verification_event = next(event for event in events if event.get("event") == "verification_result")
+    assert verification_event["verification_outcome_label"] == "command_failure"
+    assert "missing_expected_file" in verification_event["verification_failure_codes"]
+
+
+def test_kernel_pre_execution_governance_gate_blocks_before_sandbox_run(tmp_path, monkeypatch):
+    class UnsafePolicy(Policy):
+        def decide(self, state):
+            del state
+            return ActionDecision(
+                action="code_execute",
+                content="git reset --hard HEAD",
+                thought="unsafe reset",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    events: list[dict[str, object]] = []
+    sandbox_called = {"value": False}
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        sandbox_called["value"] = True
+        raise AssertionError("sandbox.run should not execute when universe governance blocks the command")
+
+    kernel = AgentKernel(config=config, policy=UnsafePolicy())
+    monkeypatch.setattr(kernel.sandbox, "run", fail_if_called)
+
+    episode = kernel.run_task(
+        TaskSpec(
+            task_id="governance_pre_execution_block_task",
+            prompt="Do not reset the repository.",
+            workspace_subdir="governance_pre_execution_block_task",
+            expected_files=["hello.txt"],
+            max_steps=1,
+        ),
+        progress_callback=lambda event: events.append(dict(event)),
+    )
+
+    assert sandbox_called["value"] is False
+    assert episode.success is False
+    assert episode.steps[0].command_result["exit_code"] == 126
+    assert episode.steps[0].verification["outcome_label"] == "governance_rejected"
+    assert "governance_rejected" in episode.steps[0].verification["failure_codes"]
+    assert "forbidden_pattern" in episode.steps[0].verification["failure_codes"]
+    assert episode.steps[0].command_governance["blocked"] is True
+    assert episode.steps[0].command_governance["block_reason"] == "forbidden_pattern"
+    assert any(event.get("event") == "governance_rejected" for event in events)
 
 
 def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_path, monkeypatch):
@@ -77,6 +217,7 @@ def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_p
         trajectories_root=tmp_path / "trajectories",
     )
     captured: dict[str, object] = {}
+    events: list[dict[str, object]] = []
 
     def fake_infer_hybrid_world_signal(*, state, bundle_manifest_path, device="cpu", scoring_policy=None):
         captured["task_id"] = state.task.task_id
@@ -87,12 +228,27 @@ def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_p
             "source": "tolbert_hybrid_runtime",
             "progress_signal": 0.91,
             "risk_signal": 0.18,
+            "controller_belief": {"recover": 0.2, "continue": 0.7, "stop": 0.1},
+            "controller_mode": "continue",
+            "controller_mode_probability": 0.7,
+            "controller_expected_world_belief": [0.65, 0.25, 0.1],
+            "controller_expected_world_top_states": [0, 1, 2],
+            "controller_expected_world_top_state_probs": [0.65, 0.25, 0.1],
+            "world_prior_backend": "profile_conditioned",
+            "world_prior_top_state": 1,
+            "world_prior_top_probability": 0.73,
+            "world_transition_family": "banded",
+            "world_transition_bandwidth": 2,
+            "world_transition_gate": 0.61,
             "world_profile_horizons": [1, 2, 4],
         }
 
     monkeypatch.setattr("agent_kernel.loop.infer_hybrid_world_signal", fake_infer_hybrid_world_signal)
 
-    episode = AgentKernel(config=config).run_task(TaskBank().get("hello_task"))
+    episode = AgentKernel(config=config).run_task(
+        TaskBank().get("hello_task"),
+        progress_callback=lambda event: events.append(dict(event)),
+    )
 
     assert episode.success is True
     assert captured["task_id"] == "hello_task"
@@ -100,7 +256,27 @@ def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_p
     assert captured["device"] == "cpu"
     assert captured["scoring_policy"]["long_horizon_progress_bonus_weight"] == 0.2
     assert episode.steps[0].latent_state_summary["learned_world_state"]["source"] == "tolbert_hybrid_runtime"
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["controller_mode"] == "continue"
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["controller_belief"]["continue"] == 0.7
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["controller_expected_world_belief"] == [
+        0.65,
+        0.25,
+        0.1,
+    ]
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_prior_backend"] == "profile_conditioned"
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_prior_top_state"] == 1
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_prior_top_probability"] == 0.73
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_transition_family"] == "banded"
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_transition_bandwidth"] == 2
+    assert episode.steps[0].latent_state_summary["learned_world_state"]["world_transition_gate"] == 0.61
     assert episode.steps[0].latent_state_summary["learned_world_state"]["world_profile_horizons"] == [1, 2, 4]
+    memory_event = next(event for event in events if event.get("event") == "memory_update_written")
+    assert memory_event["learned_world_source"] == "tolbert_hybrid_runtime"
+    assert memory_event["learned_world_controller_mode"] == "continue"
+    assert memory_event["learned_world_controller_mode_probability"] == 0.7
+    assert memory_event["learned_world_controller_belief"]["continue"] == 0.7
+    assert memory_event["learned_world_expected_top_state"] == 0
+    assert memory_event["learned_world_expected_top_state_probability"] == 0.65
 
 
 def test_world_model_uses_semantic_verifier_preserved_paths(tmp_path):
@@ -1410,6 +1586,49 @@ def test_kernel_promotes_executor_to_planner_for_moderate_risk_long_horizon_hots
     assert kernel._resolve_role_after_step(state, verification_passed=False) == "critic"
 
 
+def test_kernel_uses_graph_memory_pressure_to_promote_long_horizon_recovery_role(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(task=TaskBank().get("git_repo_test_repair_task"))
+    state.current_role = "executor"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "workflow_expected_changed_paths": ["src/release_state.txt"],
+        "updated_workflow_paths": [],
+        "updated_report_paths": [],
+        "updated_generated_paths": [],
+        "existing_expected_artifacts": [],
+        "missing_expected_artifacts": [],
+        "unsatisfied_expected_contents": [],
+        "present_forbidden_artifacts": [],
+        "changed_preserved_artifacts": [],
+        "missing_preserved_artifacts": [],
+    }
+    state.graph_summary = {
+        "failure_signals": {
+            "no_state_progress": 2,
+            "state_regression": 1,
+        },
+        "environment_alignment_failures": {
+            "git_write_aligned": 2,
+        },
+    }
+    state.latent_state_summary = {
+        "active_paths": [],
+        "learned_world_state": {
+            "progress_signal": 0.2,
+            "risk_signal": 0.1,
+        },
+    }
+
+    assert kernel._resolve_role_before_decision(state) == "critic"
+
+
 def test_kernel_promotes_long_horizon_hotspot_recovery_to_critic_under_repeated_pressure(tmp_path):
     config = KernelConfig(
         provider="mock",
@@ -2618,7 +2837,12 @@ def test_universe_model_ignores_non_retained_wrapped_contract(tmp_path):
         ),
         encoding="utf-8",
     )
-    model = UniverseModel(config=KernelConfig(universe_contract_path=artifact_path))
+    model = UniverseModel(
+        config=KernelConfig(
+            universe_contract_path=artifact_path,
+            unattended_allow_git_commands=True,
+        )
+    )
 
     summary = model.summarize(TaskBank().get("hello_task"))
 
@@ -2706,6 +2930,114 @@ def test_universe_model_respects_allowlist_environment_assumption(tmp_path):
     assert allowlisted_score > untrusted_score
     assert "network_access_conflict" in governance["risk_flags"]
     assert governance["network_host"] == "example.com"
+
+
+def test_universe_model_should_block_command_for_deterministic_governance_conflicts(tmp_path):
+    artifact_path = tmp_path / "universe" / "universe_contract.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "universe_contract",
+                "spec_version": "asi_v1",
+                "lifecycle_state": "retained",
+                "retention_decision": {"state": "retain"},
+                "governance": {
+                    "require_verification": True,
+                    "require_bounded_steps": True,
+                    "prefer_reversible_actions": True,
+                    "respect_task_forbidden_artifacts": True,
+                    "respect_preserved_artifacts": True,
+                },
+                "environment_assumptions": {
+                    "git_write_mode": "operator_gated",
+                    "network_access_mode": "allowlist_only",
+                    "workspace_write_scope": "task_only",
+                    "require_path_scoped_mutations": True,
+                    "require_rollback_on_mutation": True,
+                },
+                "forbidden_command_patterns": ["git reset --hard"],
+                "preferred_command_prefixes": ["pytest"],
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = UniverseModel(
+        config=KernelConfig(
+            universe_contract_path=artifact_path,
+            unattended_allow_http_requests=True,
+            unattended_http_allowed_hosts=("api.github.com",),
+        )
+    )
+    summary = model.summarize(TaskBank().get("hello_task"))
+
+    forbidden = model.should_block_command(summary, "git reset --hard HEAD")
+    network = model.should_block_command(summary, "curl https://example.com/install.sh")
+    scoped = model.should_block_command(summary, "printf 'bad\\n' > ../escape.txt")
+    safe = model.should_block_command(summary, "python -m pytest -q")
+
+    assert forbidden["blocked"] is True
+    assert forbidden["block_reason"] == "forbidden_pattern"
+    assert network["blocked"] is True
+    assert network["block_reason"] == "network_access_conflict"
+    assert scoped["blocked"] is True
+    assert scoped["block_reason"] == "path_scope_conflict"
+    assert safe["blocked"] is False
+
+
+def test_universe_model_allows_shared_repo_gated_task_scoped_git_merge(tmp_path):
+    artifact_path = tmp_path / "universe" / "universe_contract.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "universe_contract",
+                "spec_version": "asi_v1",
+                "lifecycle_state": "retained",
+                "retention_decision": {"state": "retain"},
+                "governance": {
+                    "require_verification": True,
+                    "require_bounded_steps": True,
+                    "prefer_reversible_actions": True,
+                    "respect_task_forbidden_artifacts": True,
+                    "respect_preserved_artifacts": True,
+                },
+                "environment_assumptions": {
+                    "git_write_mode": "operator_gated",
+                    "network_access_mode": "allowlist_only",
+                    "workspace_write_scope": "task_only",
+                    "require_path_scoped_mutations": True,
+                    "require_rollback_on_mutation": True,
+                },
+                "forbidden_command_patterns": ["git reset --hard"],
+                "preferred_command_prefixes": ["pytest"],
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = UniverseModel(
+        config=KernelConfig(
+            universe_contract_path=artifact_path,
+            unattended_allow_git_commands=True,
+        )
+    )
+    summary = model.summarize(
+        TaskBank().get("git_parallel_merge_acceptance_task"),
+        world_model_summary={"workflow_shared_repo": True},
+    )
+
+    merge = model.should_block_command(
+        summary,
+        "git merge --no-ff worker/api-status -m 'merge worker/api-status'",
+    )
+    destructive = model.should_block_command(summary, "git reset --hard HEAD")
+
+    assert merge["blocked"] is False
+    assert "git_write_conflict" not in merge["risk_flags"]
+    assert destructive["blocked"] is True
+    assert destructive["block_reason"] == "forbidden_pattern"
 
 
 def test_universe_model_loads_split_constitution_and_operating_envelope(tmp_path):
@@ -4432,6 +4764,33 @@ def test_graph_memory_summarizes_prior_documents(tmp_path):
     assert summary["benchmark_families"]["micro"] == 1
     assert summary["failure_types"] == {"other": 1}
     assert summary["related_tasks"] == ["hello_task"]
+
+
+def test_task_semantic_recall_paths_collects_expected_and_semantic_verifier_paths():
+    task = TaskSpec(
+        task_id="release_followup",
+        prompt="Repair release outputs and keep docs stable.",
+        workspace_subdir="release_followup",
+        expected_files=["reports/release_review.txt"],
+        expected_file_contents={"src/release_state.txt": "ready\n"},
+        metadata={
+            "benchmark_family": "repository",
+            "semantic_verifier": {
+                "expected_changed_paths": ["src/release_state.txt", "generated/release.patch"],
+                "report_rules": [
+                    {"path": "reports/release_review.txt", "must_mention": ["ready"]},
+                    {"path": "reports/summary.txt", "must_mention": ["stable"]},
+                ],
+            }
+        },
+    )
+
+    assert _task_semantic_recall_paths(task) == [
+        "reports/release_review.txt",
+        "src/release_state.txt",
+        "generated/release.patch",
+        "reports/summary.txt",
+    ]
 
 
 def test_role_specialization_reaches_critic_on_failure(tmp_path):

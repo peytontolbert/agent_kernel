@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.curriculum_improvement import build_curriculum_proposal_artifact
+from agent_kernel.extensions.improvement.curriculum_improvement import build_curriculum_proposal_artifact
 from evals.harness import run_eval
 
 

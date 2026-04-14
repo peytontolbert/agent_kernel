@@ -4,12 +4,14 @@ import json
 from pathlib import Path
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.tolbert_assets import (
+from agent_kernel.memory import EpisodeMemory
+from agent_kernel.extensions.tolbert_assets import (
     build_agentkernel_tolbert_assets,
     materialize_retained_retrieval_asset_bundle,
     retained_tolbert_runtime_paths,
 )
-from agent_kernel.tolbert_model_improvement import build_tolbert_supervised_dataset_manifest
+from agent_kernel.extensions.improvement.tolbert_model_improvement import build_tolbert_supervised_dataset_manifest
+from agent_kernel.schemas import EpisodeRecord, StepRecord
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -113,6 +115,56 @@ def test_build_agentkernel_tolbert_assets(tmp_path: Path) -> None:
     assert config["spans_files"] == [str(paths.model_spans_path)]
     assert "retrieval_asset_controls" in config
     assert config["level_sizes"] == {str(level): len(mapping) for level, mapping in label_map.items()}
+
+
+def test_build_agentkernel_tolbert_assets_includes_edit_patch_spans(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    trajectories_root = tmp_path / "episodes"
+    config = KernelConfig(trajectories_root=trajectories_root)
+    memory = EpisodeMemory(trajectories_root, config=config)
+    memory.save(
+        EpisodeRecord(
+            task_id="patch_episode_task",
+            prompt="Repair the release review.",
+            workspace=str(tmp_path / "workspace" / "patch_episode_task"),
+            success=True,
+            task_metadata={"benchmark_family": "repository"},
+            task_contract={"prompt": "Repair the release review.", "workspace_subdir": "patch_episode_task"},
+            termination_reason="success",
+            steps=[
+                StepRecord(
+                    index=1,
+                    thought="repair review",
+                    action="code_execute",
+                    content="printf 'READY\\n' > reports/release_review.txt",
+                    selected_skill_id=None,
+                    command_result={"command": "printf 'READY\\n' > reports/release_review.txt", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+                    verification={"passed": True, "reasons": ["verification passed"]},
+                    state_transition={
+                        "progress_delta": 0.5,
+                        "edit_patches": [
+                            {
+                                "path": "reports/release_review.txt",
+                                "status": "modified",
+                                "patch": "--- a/reports/release_review.txt\n+++ b/reports/release_review.txt\n@@ -1 +1 @@\n-BROKEN\n+READY\n",
+                                "patch_summary": "modified reports/release_review.txt (+1 -1)",
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+    )
+
+    paths = build_agentkernel_tolbert_assets(
+        repo_root=repo_root,
+        output_dir=tmp_path / "assets",
+        base_model_name="bert-base-uncased",
+        config=config,
+    )
+    source_spans = _load_jsonl(paths.source_spans_path)
+
+    assert any(span["meta"]["span_type"] == "agent:edit_patch" for span in source_spans)
 
 
 def test_build_agentkernel_tolbert_assets_filters_unretained_memory_artifacts(tmp_path: Path) -> None:
@@ -583,7 +635,7 @@ def test_retained_tolbert_runtime_paths_materializes_delta_checkpoint(monkeypatc
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "agent_kernel.tolbert_assets.resolve_tolbert_runtime_checkpoint_path",
+        "agent_kernel.extensions.tolbert_assets.resolve_tolbert_runtime_checkpoint_path",
         lambda runtime_paths, *, artifact_path=None: str(materialized_checkpoint),
     )
     config = KernelConfig(

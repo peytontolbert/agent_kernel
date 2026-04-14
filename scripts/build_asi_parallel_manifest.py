@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_kernel.roadmap_parallel import write_asi_parallel_manifest
+from agent_kernel.ops.roadmap_parallel import write_asi_parallel_manifest
 
 
 def main() -> None:

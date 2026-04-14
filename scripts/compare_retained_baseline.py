@@ -10,14 +10,10 @@ import json
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.cycle_runner import autonomous_runtime_eval_flags, comparison_flags
-from agent_kernel.improvement import (
-    ImprovementPlanner,
-    payload_with_active_artifact_context,
-    proposal_gate_failure_reasons_by_benchmark_family,
-    retention_evidence,
-    retention_gate_for_payload,
-)
-from agent_kernel.subsystems import active_artifact_path_for_subsystem, base_subsystem_for, comparison_config_for_subsystem_artifact
+from agent_kernel.improvement import ImprovementPlanner
+from agent_kernel.extensions.improvement.artifacts import payload_with_active_artifact_context, retention_gate_for_payload
+from agent_kernel.improvement_retention import proposal_gate_failure_reasons_by_benchmark_family, retention_evidence
+from agent_kernel.extensions.strategy.subsystems import active_artifact_path_for_subsystem, base_subsystem_for, comparison_config_for_subsystem_artifact
 from evals.harness import compare_abstraction_transfer_modes, run_eval
 
 

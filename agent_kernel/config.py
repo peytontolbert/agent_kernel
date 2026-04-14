@@ -4,7 +4,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 import os
 
-from .kernel_catalog import kernel_catalog_string_list
+from .extensions.strategy.kernel_catalog import kernel_catalog_string_list
 
 
 _DEFAULT_UNATTENDED_ALLOWED_BENCHMARK_FAMILIES = tuple(
@@ -126,6 +126,7 @@ class KernelConfig:
     use_skills: bool = os.getenv("AGENT_KERNEL_USE_SKILLS", "1") == "1"
     use_graph_memory: bool = os.getenv("AGENT_KERNEL_USE_GRAPH_MEMORY", "1") == "1"
     use_world_model: bool = os.getenv("AGENT_KERNEL_USE_WORLD_MODEL", "1") == "1"
+    use_universe_model: bool = os.getenv("AGENT_KERNEL_USE_UNIVERSE_MODEL", "1") == "1"
     use_state_estimation_proposals: bool = (
         os.getenv("AGENT_KERNEL_USE_STATE_ESTIMATION_PROPOSALS", "1") == "1"
     )
@@ -316,6 +317,7 @@ class KernelConfig:
         os.getenv("AGENT_KERNEL_COMPARE_FEATURE_MAX_TASKS", "40")
     )
     persist_episode_memory: bool = os.getenv("AGENT_KERNEL_PERSIST_EPISODE_MEMORY", "1") == "1"
+    persist_learning_candidates: bool = os.getenv("AGENT_KERNEL_PERSIST_LEARNING_CANDIDATES", "1") == "1"
     external_task_manifests_paths: tuple[str, ...] = _split_env_paths(
         "AGENT_KERNEL_EXTERNAL_TASK_MANIFESTS_PATHS"
     )
@@ -590,12 +592,39 @@ class KernelConfig:
     )
     min_skill_quality: float = float(os.getenv("AGENT_KERNEL_MIN_SKILL_QUALITY", "0.75"))
 
+    @staticmethod
+    def normalize_provider_name(provider: str) -> str:
+        normalized = provider.strip().lower()
+        if normalized == "tolbert":
+            return "hybrid"
+        return normalized
+
+    @classmethod
+    def executable_floor(cls, **overrides: object) -> "KernelConfig":
+        floor_defaults: dict[str, object] = {
+            "use_tolbert_context": False,
+            "use_skills": False,
+            "use_graph_memory": False,
+            "use_world_model": False,
+            "use_universe_model": False,
+            "use_planner": False,
+            "use_role_specialization": False,
+            "persist_learning_candidates": False,
+        }
+        floor_defaults.update(overrides)
+        return cls(**floor_defaults)
+
     def normalized_provider(self) -> str:
-        return self.provider.strip().lower()
+        return self.normalize_provider_name(self.provider)
+
+    def claimed_runtime_shape(self) -> str:
+        if bool(self.use_universe_model):
+            return "bounded_autonomous"
+        return "executable_floor"
 
     def validate(self) -> None:
         provider = self.normalized_provider()
-        if provider not in {"mock", "ollama", "vllm"}:
+        if provider not in {"mock", "ollama", "vllm", "hybrid"}:
             raise ValueError(f"unsupported provider: {self.provider}")
         if provider == "ollama" and not self.ollama_host.strip():
             raise ValueError("ollama_host must be non-empty when provider='ollama'")
@@ -672,6 +701,11 @@ class KernelConfig:
             "unattended_trust_max_success_hidden_side_effect_rate",
             self.unattended_trust_max_success_hidden_side_effect_rate,
         )
+        if self.claimed_runtime_shape() == "bounded_autonomous":
+            if not bool(self.use_graph_memory):
+                raise ValueError("bounded_autonomous runtime requires use_graph_memory=True")
+            if not bool(self.use_world_model):
+                raise ValueError("bounded_autonomous runtime requires use_world_model=True")
 
     def to_env(self) -> dict[str, str]:
         env: dict[str, str] = {}

@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.tolbert_model_improvement import (
+from agent_kernel.extensions.improvement.tolbert_model_improvement import (
     _compact_tolbert_model_candidate_output,
     _materialize_tolbert_model_shared_store,
 )

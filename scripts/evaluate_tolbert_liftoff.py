@@ -16,7 +16,7 @@ from agent_kernel.config import KernelConfig
 from agent_kernel.modeling.artifacts import retained_tolbert_liftoff_gate
 from agent_kernel.modeling.evaluation.drift import run_takeover_drift_eval
 from agent_kernel.modeling.evaluation.liftoff import build_liftoff_gate_report
-from agent_kernel.trust import build_unattended_trust_ledger, write_unattended_trust_ledger
+from agent_kernel.extensions.trust import build_unattended_trust_ledger, write_unattended_trust_ledger
 from evals.harness import run_eval, scoped_eval_config
 
 

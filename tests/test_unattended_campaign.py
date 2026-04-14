@@ -6,7 +6,7 @@ import os
 import sys
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.unattended_controller import default_controller_state, normalize_controller_state, update_controller_state
+from agent_kernel.ops.unattended_controller import default_controller_state, normalize_controller_state, update_controller_state
 
 
 def _load_script(name: str):
@@ -843,6 +843,10 @@ def test_run_unattended_campaign_surfaces_unattended_evidence_in_report_and_stat
     assert payload["unattended_evidence"]["family_breadth_min_distinct_task_roots"] == 0
     assert payload["unattended_evidence"]["required_family_clean_task_root_counts"]["repo_chore"] == 1
     assert payload["unattended_evidence"]["required_families_missing_clean_task_root_breadth"] == []
+    assert payload["unattended_evidence"]["semantic_hub_summary"]["reports"] == 0
+    assert payload["unattended_evidence"]["replay_derived_summary"]["reports"] == 0
+    assert payload["unattended_evidence"]["open_world_summary"]["external_report_count"] == 1
+    assert payload["unattended_evidence"]["open_world_summary"]["open_world_report_count"] == 1
     assert status_payload["unattended_evidence"]["overall_summary"]["distinct_benchmark_families"] == 2
     assert status_payload["unattended_evidence"]["external_summary"]["total"] == 1
     assert status_payload["unattended_evidence"]["required_families_missing_reports"] == []
@@ -4143,6 +4147,102 @@ def test_merge_mirrored_child_status_fields_preserves_live_variant_generate_over
     )
 
     assert merged["last_progress_phase"] == "variant_generate"
+
+
+def test_merge_mirrored_child_status_fields_clears_stale_primary_task_after_campaign_plan_complete():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "last_progress_phase": "primary",
+            "last_progress_line": (
+                "[eval:test] phase=primary task 16/16 service_release_task "
+                "family=repository cognitive_stage=memory_update_written step=1 verification_passed=1"
+            ),
+            "last_output_line": (
+                "[eval:test] phase=primary task 16/16 service_release_task "
+                "family=repository cognitive_stage=memory_update_written step=1 verification_passed=1"
+            ),
+            "current_task": {
+                "index": 16,
+                "total": 16,
+                "task_id": "service_release_task",
+                "family": "repository",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "memory_update_written",
+                "phase": "primary",
+                "step_index": 1,
+                "verification_passed": True,
+            },
+            "current_task_progress_timeline": [
+                {
+                    "cognitive_stage": "memory_update_written",
+                    "phase": "primary",
+                    "step_index": 1,
+                    "verification_passed": True,
+                }
+            ],
+            "current_task_verification_passed": True,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 16/16 reached the execution boundary and is awaiting verification",
+                "recorded_at": 500.0,
+            },
+            "adaptive_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 16/16 reached the execution boundary and is awaiting verification",
+                "recorded_at": 500.0,
+            },
+        },
+        {
+            "report_kind": "repeated_improvement_status",
+            "active_cycle_run": {
+                "last_progress_line": (
+                    "[cycle:test] campaign_plan complete subsystem=tolbert_model "
+                    "variant_strategy=adaptive_history selected_variants=1"
+                ),
+                "last_output_line": (
+                    "[cycle:test] campaign_plan complete subsystem=tolbert_model "
+                    "variant_strategy=adaptive_history selected_variants=1"
+                ),
+                "last_progress_phase": "campaign_select",
+                "current_task": {},
+                "current_cognitive_stage": {},
+                "current_task_progress_timeline": [],
+                "semantic_progress_state": {
+                    "phase": "campaign_select",
+                    "phase_family": "active",
+                    "status": "active",
+                    "progress_class": "healthy",
+                    "decision_distance": "active",
+                    "detail": "active work is progressing",
+                },
+            },
+            "active_cycle_progress": {
+                "observe_completed": True,
+                "last_progress_phase": "campaign_select",
+            },
+        },
+    )
+
+    assert merged["last_progress_phase"] == "campaign_select"
+    assert merged["current_task"] == {}
+    assert merged["current_cognitive_stage"] == {}
+    assert merged["current_task_progress_timeline"] == []
+    assert merged["current_task_verification_passed"] is None
+    assert "phase=campaign_select" in merged["last_progress_line"]
+    assert "task 16/16" not in merged["last_progress_line"]
+    assert merged["semantic_progress_state"]["phase"] == "campaign_select"
 
 
 def test_run_and_stream_terminates_child_on_interrupt(monkeypatch, tmp_path):
@@ -9903,6 +10003,248 @@ def test_accept_productive_partial_child_timeout_accepts_missing_report_path_for
     assert decision["requires_synthetic_report"] is True
 
 
+def test_persist_partial_unattended_task_reports_from_event_log(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    event_log_path = reports_dir / "unattended_campaign.events.jsonl"
+    event_log_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_kind": "child_event",
+                        "event": "cognitive_stage",
+                        "round_index": 1,
+                        "phase": "generated_success",
+                        "timestamp": 100.0,
+                        "step_index": 2,
+                        "verification_passed": False,
+                        "current_task": {
+                            "task_id": "deployment_manifest_task_project_adjacent",
+                            "family": "project",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_kind": "child_event",
+                        "event": "cognitive_stage",
+                        "round_index": 1,
+                        "phase": "generated_success",
+                        "timestamp": 110.0,
+                        "step_index": 9,
+                        "verification_passed": True,
+                        "current_task": {
+                            "task_id": "deployment_manifest_task_project_adjacent",
+                            "family": "project",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_kind": "child_event",
+                        "event": "cognitive_stage",
+                        "round_index": 1,
+                        "phase": "generated_success",
+                        "timestamp": 115.0,
+                        "step_index": 4,
+                        "verification_passed": True,
+                        "current_task": {
+                            "task_id": "semantic_open_world_run123_round_1_project_project_recovery",
+                            "family": "project",
+                            "task_origin": "semantic_hub",
+                            "source_task": "semantic_open_world_run123_round_1_project",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_kind": "child_event",
+                        "event": "cognitive_stage",
+                        "round_index": 1,
+                        "phase": "generated_success",
+                        "timestamp": 118.0,
+                        "step_index": 1,
+                        "verification_passed": True,
+                        "current_task": {
+                            "task_id": "deployment_manifest_task_project_adjacent",
+                            "family": "project",
+                            "task_origin": "external_manifest",
+                            "source_task": "deployment_manifest_task",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_kind": "child_event",
+                        "event": "cognitive_stage",
+                        "round_index": 1,
+                        "phase": "generated_failure",
+                        "timestamp": 120.0,
+                        "step_index": 1,
+                        "verification_passed": True,
+                        "current_task": {
+                            "task_id": "bridge_handoff_task_integration_recovery",
+                            "family": "integration",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = KernelConfig(run_reports_dir=reports_dir)
+    paths = module._persist_partial_unattended_task_reports(
+        reports_dir=reports_dir,
+        event_log_path=event_log_path,
+        round_index=1,
+        mirrored_child_status=None,
+        config=config,
+    )
+
+    assert len(paths) == 3
+    payloads = {
+        payload["task_id"]: payload
+        for payload in (json.loads(Path(path).read_text(encoding="utf-8")) for path in paths)
+    }
+    success_payload = payloads["deployment_manifest_task_project_adjacent"]
+    semantic_payload = payloads["semantic_open_world_run123_round_1_project_project_recovery"]
+    recovery_payload = payloads["bridge_handoff_task_integration_recovery"]
+
+    assert success_payload["report_kind"] == "unattended_task_report"
+    assert success_payload["task_id"] == "deployment_manifest_task_project_adjacent"
+    assert success_payload["success"] is True
+    assert success_payload["task_metadata"]["task_origin"] == "external_manifest"
+    assert success_payload["task_metadata"]["source_task"] == "deployment_manifest_task"
+    assert success_payload["summary"]["command_steps"] == 1
+
+    assert semantic_payload["report_kind"] == "unattended_task_report"
+    assert semantic_payload["task_id"] == "semantic_open_world_run123_round_1_project_project_recovery"
+    assert semantic_payload["success"] is True
+    assert semantic_payload["task_metadata"]["task_origin"] == "semantic_hub"
+    assert semantic_payload["task_metadata"]["source_task"] == "semantic_open_world_run123_round_1_project"
+
+    assert recovery_payload["report_kind"] == "unattended_task_report"
+    assert recovery_payload["task_id"] == "bridge_handoff_task_integration_recovery"
+    assert recovery_payload["success"] is True
+    assert recovery_payload["trust_scope"] == "contract_clean_failure_recovery"
+    assert recovery_payload["task_metadata"]["curriculum_kind"] == "failure_recovery"
+    assert recovery_payload["task_metadata"]["task_origin"] == "transition_pressure"
+    assert recovery_payload["task_metadata"]["source_task"] == "bridge_handoff_task"
+    assert recovery_payload["supervision"]["contract_clean_failure_recovery_candidate"] is True
+
+
+def test_persist_partial_unattended_task_reports_falls_back_to_mirrored_child_status(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    config = KernelConfig(run_reports_dir=reports_dir)
+
+    paths = module._persist_partial_unattended_task_reports(
+        reports_dir=reports_dir,
+        event_log_path=reports_dir / "missing.events.jsonl",
+        round_index=2,
+        mirrored_child_status={
+            "current_task": {
+                "task_id": "repository_guardrail_sync_task_repository_recovery",
+                "family": "repository",
+                "phase": "generated_failure",
+            },
+            "current_task_verification_passed": True,
+            "current_task_progress_timeline": [
+                {
+                    "step_index": 3,
+                    "verification_passed": True,
+                    "timestamp": 200.0,
+                }
+            ],
+        },
+        config=config,
+    )
+
+    assert len(paths) == 1
+    payload = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+    assert payload["task_id"] == "repository_guardrail_sync_task_repository_recovery"
+    assert payload["success"] is True
+    assert payload["task_metadata"]["source_task"] == "repository_guardrail_sync_task"
+    assert payload["summary"]["command_steps"] == 3
+
+
+def test_persist_partial_unattended_task_reports_preserves_semantic_origin_from_mirrored_child_status(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    config = KernelConfig(run_reports_dir=reports_dir)
+
+    paths = module._persist_partial_unattended_task_reports(
+        reports_dir=reports_dir,
+        event_log_path=reports_dir / "missing.events.jsonl",
+        round_index=3,
+        mirrored_child_status={
+            "current_task": {
+                "task_id": "semantic_open_world_run123_round_3_repository_repository_recovery",
+                "family": "repository",
+                "phase": "generated_failure",
+            },
+            "current_task_verification_passed": True,
+            "current_task_progress_timeline": [
+                {
+                    "step_index": 2,
+                    "verification_passed": True,
+                    "timestamp": 300.0,
+                }
+            ],
+        },
+        config=config,
+    )
+
+    assert len(paths) == 1
+    payload = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+    assert payload["task_metadata"]["task_origin"] == "semantic_hub"
+    assert payload["task_metadata"]["source_task"] == "semantic_open_world_run123_round_3_repository"
+
+
+def test_persist_partial_unattended_task_reports_preserves_external_manifest_origin_from_mirrored_child_status(
+    tmp_path,
+):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    config = KernelConfig(run_reports_dir=reports_dir)
+
+    paths = module._persist_partial_unattended_task_reports(
+        reports_dir=reports_dir,
+        event_log_path=reports_dir / "missing.events.jsonl",
+        round_index=4,
+        mirrored_child_status={
+            "current_task": {
+                "task_id": "deployment_manifest_task_project_recovery",
+                "family": "project",
+                "phase": "generated_failure",
+                "task_origin": "external_manifest",
+                "source_task": "deployment_manifest_task",
+            },
+            "current_task_verification_passed": True,
+            "current_task_progress_timeline": [
+                {
+                    "step_index": 2,
+                    "verification_passed": True,
+                    "timestamp": 400.0,
+                }
+            ],
+        },
+        config=config,
+    )
+
+    assert len(paths) == 1
+    payload = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+    assert payload["task_metadata"]["task_origin"] == "external_manifest"
+    assert payload["task_metadata"]["source_task"] == "deployment_manifest_task"
+
+
 def test_synthetic_productive_partial_campaign_report_preserves_live_decision_and_retained_signals():
     module = _load_script("run_unattended_campaign.py")
 
@@ -9939,15 +10281,15 @@ def test_synthetic_productive_partial_campaign_report_preserves_live_decision_an
     assert report["decision_conversion_summary"]["decision_runs"] == 1
     assert report["runs"][0]["retained_gain"] is True
     assert report["runs"][0]["decision_records_considered"] == 1
-    assert report["runs"][0]["decision_conversion_state"] == "runtime_managed"
-    assert report["runs"][0]["decision_state"]["decision_owner"] == "controller_runtime_manager"
-    assert report["runs"][0]["decision_state"]["closeout_mode"] == "accepted_partial_timeout"
-    assert report["decision_state_summary"]["run_closeout_modes"]["accepted_partial_timeout"] == 1
-    assert report["recent_runtime_managed_decisions"][0]["decision_state"]["decision_credit"] == "accepted_partial_timeout"
+    assert report["runs"][0]["decision_conversion_state"] == "non_runtime_managed"
+    assert report["runs"][0]["decision_state"]["decision_owner"] == "child_native"
+    assert report["runs"][0]["decision_state"]["closeout_mode"] == "child_native_before_partial_timeout"
+    assert report["decision_state_summary"]["run_closeout_modes"]["child_native_before_partial_timeout"] == 1
+    assert report["recent_production_decisions"][0]["decision_state"]["decision_credit"] == "child_emitted_decision"
     assert report["inferred_decision_credit"] is True
 
 
-def test_synthetic_productive_partial_campaign_report_credits_parent_accepted_partial_when_live_decision_missing():
+def test_synthetic_productive_partial_campaign_report_preserves_no_decision_when_live_decision_missing():
     module = _load_script("run_unattended_campaign.py")
 
     report = module._synthetic_productive_partial_campaign_report(
@@ -9976,16 +10318,19 @@ def test_synthetic_productive_partial_campaign_report_credits_parent_accepted_pa
         },
     )
 
-    assert report["runtime_managed_decisions"] == 1
-    assert report["retained_gain_runs"] == 1
-    assert report["decision_conversion_summary"]["runtime_managed_runs"] == 1
-    assert report["decision_conversion_summary"]["partial_productive_without_decision_runs"] == 0
-    assert report["runs"][0]["decision_records_considered"] == 1
-    assert report["runs"][0]["retained_gain"] is True
-    assert report["runs"][0]["decision_conversion_state"] == "runtime_managed"
+    assert report["runtime_managed_decisions"] == 0
+    assert report["retained_gain_runs"] == 0
+    assert report["decision_conversion_summary"]["runtime_managed_runs"] == 0
+    assert report["decision_conversion_summary"]["partial_productive_without_decision_runs"] == 1
+    assert report["runs"][0]["decision_records_considered"] == 0
+    assert report["runs"][0]["retained_gain"] is False
+    assert report["runs"][0]["decision_conversion_state"] == "partial_productive_without_decision"
+    assert report["runs"][0]["decision_state"]["decision_owner"] == "none"
+    assert report["runs"][0]["decision_state"]["closeout_mode"] == "partial_timeout_evidence_only"
+    assert report["recent_runtime_managed_decisions"] == []
 
 
-def test_credit_accepted_productive_partial_status_promotes_decision_and_retained_gain():
+def test_credit_accepted_productive_partial_status_records_evidence_without_promoting_decision():
     module = _load_script("run_unattended_campaign.py")
 
     credited = module._credit_accepted_productive_partial_status(
@@ -10000,15 +10345,16 @@ def test_credit_accepted_productive_partial_status_promotes_decision_and_retaine
         }
     )
 
-    assert credited["decision_records_considered"] == 1
-    assert credited["runtime_managed_decisions"] == 1
+    assert credited["accepted_partial_timeout_evidence"] is True
+    assert credited["decision_records_considered"] == 0
+    assert credited["runtime_managed_decisions"] == 0
     assert credited["non_runtime_managed_decisions"] == 0
-    assert credited["retained_gain_runs"] == 1
-    assert credited["pending_decision_state"] == "retain"
-    assert credited["decision_conversion_summary"]["runtime_managed_runs"] == 1
+    assert credited["retained_gain_runs"] == 0
+    assert credited["decision_conversion_summary"]["runtime_managed_runs"] == 0
+    assert credited["decision_conversion_summary"]["partial_productive_without_decision_runs"] == 1
 
 
-def test_normalize_accepted_productive_partial_campaign_report_credits_missing_decision():
+def test_normalize_accepted_productive_partial_campaign_report_preserves_missing_decision():
     module = _load_script("run_unattended_campaign.py")
 
     normalized = module._normalize_accepted_productive_partial_campaign_report(
@@ -10044,21 +10390,21 @@ def test_normalize_accepted_productive_partial_campaign_report_credits_missing_d
         },
     )
 
-    assert normalized["runtime_managed_decisions"] == 1
-    assert normalized["retained_gain_runs"] == 1
-    assert normalized["decision_conversion_summary"]["runtime_managed_runs"] == 1
-    assert normalized["decision_conversion_summary"]["partial_productive_without_decision_runs"] == 0
-    assert normalized["runs"][0]["decision_records_considered"] == 1
-    assert normalized["runs"][0]["runtime_managed_decisions"] == 1
+    assert normalized["runtime_managed_decisions"] == 0
+    assert normalized["retained_gain_runs"] == 0
+    assert normalized["decision_conversion_summary"]["runtime_managed_runs"] == 0
+    assert normalized["decision_conversion_summary"]["partial_productive_without_decision_runs"] == 1
+    assert normalized["runs"][0]["decision_records_considered"] == 0
+    assert normalized["runs"][0]["runtime_managed_decisions"] == 0
     assert normalized["runs"][0]["non_runtime_managed_decisions"] == 0
-    assert normalized["runs"][0]["retained_gain"] is True
-    assert normalized["runs"][0]["decision_state"]["decision_owner"] == "controller_runtime_manager"
-    assert normalized["runs"][0]["decision_state"]["closeout_mode"] == "accepted_partial_timeout"
-    assert normalized["decision_state_summary"]["record_decisions"]["controller_runtime_manager"] == 1
-    assert normalized["recent_runtime_managed_decisions"][0]["decision_state"]["controller_intervention_reason_code"] == "child_max_runtime"
+    assert normalized["runs"][0]["retained_gain"] is False
+    assert normalized["runs"][0]["decision_state"]["decision_owner"] == "none"
+    assert normalized["runs"][0]["decision_state"]["closeout_mode"] == "partial_timeout_evidence_only"
+    assert normalized["decision_state_summary"]["record_decisions"]["controller_runtime_manager"] == 0
+    assert normalized["recent_runtime_managed_decisions"] == []
 
 
-def test_synthetic_productive_partial_campaign_report_promotes_existing_non_runtime_credit_to_runtime_managed():
+def test_synthetic_productive_partial_campaign_report_preserves_existing_non_runtime_credit():
     module = _load_script("run_unattended_campaign.py")
 
     report = module._synthetic_productive_partial_campaign_report(
@@ -10078,16 +10424,16 @@ def test_synthetic_productive_partial_campaign_report_promotes_existing_non_runt
         round_payload={"active_child": {"current_task": {"task_id": "x", "phase": "generated_failure"}}},
     )
 
-    assert report["runtime_managed_decisions"] == 1
-    assert report["non_runtime_managed_decisions"] == 0
-    assert report["retained_gain_runs"] == 1
+    assert report["runtime_managed_decisions"] == 0
+    assert report["non_runtime_managed_decisions"] == 1
+    assert report["retained_gain_runs"] == 0
     assert report["runs"][0]["decision_records_considered"] == 1
-    assert report["runs"][0]["runtime_managed_decisions"] == 1
-    assert report["runs"][0]["non_runtime_managed_decisions"] == 0
-    assert report["runs"][0]["decision_conversion_state"] == "runtime_managed"
+    assert report["runs"][0]["runtime_managed_decisions"] == 0
+    assert report["runs"][0]["non_runtime_managed_decisions"] == 1
+    assert report["runs"][0]["decision_conversion_state"] == "non_runtime_managed"
 
 
-def test_credit_accepted_productive_partial_status_promotes_existing_decision_credit_to_runtime_managed():
+def test_credit_accepted_productive_partial_status_preserves_existing_decision_credit():
     module = _load_script("run_unattended_campaign.py")
 
     credited = module._credit_accepted_productive_partial_status(
@@ -10111,11 +10457,11 @@ def test_credit_accepted_productive_partial_status_promotes_existing_decision_cr
     )
 
     assert credited["decision_records_considered"] == 1
-    assert credited["runtime_managed_decisions"] == 1
-    assert credited["non_runtime_managed_decisions"] == 0
-    assert credited["retained_gain_runs"] == 1
-    assert credited["decision_conversion_summary"]["runtime_managed_runs"] == 1
-    assert credited["decision_conversion_summary"]["non_runtime_managed_runs"] == 0
+    assert credited["runtime_managed_decisions"] == 0
+    assert credited["non_runtime_managed_decisions"] == 1
+    assert credited["retained_gain_runs"] == 0
+    assert credited["decision_conversion_summary"]["runtime_managed_runs"] == 0
+    assert credited["decision_conversion_summary"]["non_runtime_managed_runs"] == 1
 
 
 def test_finalize_accepted_productive_partial_child_status_converts_running_snapshot_into_finalized_status():
@@ -10470,31 +10816,40 @@ def test_run_unattended_campaign_accepted_productive_partial_timeout_runs_round_
     assert round_payload["status"] == "completed"
     assert round_payload["phase"] == "completed"
     assert round_payload["campaign_validation"]["accepted_partial_timeout"] is True
-    assert round_payload["liftoff_skipped"]["reason"] == "accepted productive partial timeout bypassed liftoff"
+    assert round_payload["campaign_validation"]["passed"] is False
+    assert round_payload["campaign_validation"]["decision_credit"] == "none"
+    assert (
+        round_payload["liftoff_skipped"]["reason"]
+        == "partial timeout incomplete child run; liftoff requires complete child report"
+    )
     assert isinstance(round_payload["controller_update"], dict)
-    assert round_payload["controller_observation"]["campaign_signal"]["runtime_managed_decisions"] == 1
+    assert round_payload["controller_observation"]["campaign_signal"]["runtime_managed_decisions"] == 0
     assert round_payload["controller_observation_start"]["campaign_signal"]["runtime_managed_decisions"] == 0
     assert round_payload["next_policy"] == payload["current_policy"]
-    assert round_payload["authoritative_decision_state"]["runtime_managed_decisions"] == 1
-    assert round_payload["authoritative_decision_state"]["retained_gain_runs"] == 1
-    assert round_payload["runtime_managed_decisions"] == 1
-    assert round_payload["retained_gain_runs"] == 1
-    assert "runtime-managed retain" in round_payload["phase_detail"]
-    assert "without emitting a credited retain/reject outcome" not in round_payload["phase_detail"]
+    assert round_payload["authoritative_decision_state"]["runtime_managed_decisions"] == 0
+    assert round_payload["authoritative_decision_state"]["retained_gain_runs"] == 0
+    assert round_payload["runtime_managed_decisions"] == 0
+    assert round_payload["retained_gain_runs"] == 0
+    assert "runtime-managed retain" not in round_payload["phase_detail"]
     assert payload["rounds_completed"] == 1
-    assert payload["authoritative_decision_state"]["runtime_managed_decisions"] == 1
-    assert payload["runtime_managed_decisions"] == 1
-    assert payload["retained_gain_runs"] == 1
-    assert payload["decision_state_summary"]["run_closeout_modes"]["accepted_partial_timeout"] == 1
-    assert payload["recent_runtime_managed_decisions"][0]["decision_state"]["decision_owner"] == "controller_runtime_manager"
-    assert payload["recent_runtime_managed_decisions"][0]["decision_state"]["decision_credit"] == "accepted_partial_timeout"
-    assert payload["recent_runtime_managed_decisions"][0]["decision_state"]["closeout_mode"] == "accepted_partial_timeout"
-    assert payload["rounds"][0]["decision_state_summary"]["run_decisions"]["controller_runtime_manager"] == 1
-    assert payload["rounds"][0]["campaign_report"]["runs"][0]["decision_state"]["retention_state"] == "retain"
-    assert "runtime-managed retain" in payload["phase_detail"]
+    assert payload["authoritative_decision_state"]["runtime_managed_decisions"] == 0
+    assert payload["runtime_managed_decisions"] == 0
+    assert payload["retained_gain_runs"] == 0
+    assert payload["decision_state_summary"]["run_closeout_modes"]["partial_timeout_evidence_only"] == 1
+    assert payload["recent_runtime_managed_decisions"] == []
+    assert len(payload["partial_task_report_paths"]) == 1
+    partial_task_report = json.loads(Path(payload["partial_task_report_paths"][0]).read_text(encoding="utf-8"))
+    assert partial_task_report["report_kind"] == "unattended_task_report"
+    assert partial_task_report["task_id"] == "archive_command_seed_task_file_recovery"
+    assert partial_task_report["benchmark_family"] == "bounded"
+    assert partial_task_report["success"] is True
+    assert partial_task_report["task_metadata"]["curriculum_kind"] == "failure_recovery"
+    assert payload["rounds"][0]["decision_state_summary"]["run_decisions"]["controller_runtime_manager"] == 0
+    assert payload["rounds"][0]["campaign_report"]["runs"][0]["decision_state"]["retention_state"] == "incomplete"
+    assert "runtime-managed retain" not in payload["phase_detail"]
     assert status_payload["active_run"]["child_status"]["state"] == "interrupted"
-    assert status_payload["active_run"]["child_status"]["runtime_managed_decisions"] == 1
-    assert "runtime-managed retain" in status_payload["phase_detail"]
+    assert status_payload["active_run"]["child_status"]["runtime_managed_decisions"] == 0
+    assert "runtime-managed retain" not in status_payload["phase_detail"]
 
 
 def test_merge_mirrored_child_status_fields_preserves_credited_runtime_managed_closure():
@@ -10590,6 +10945,99 @@ def test_live_status_projection_separates_bootstrap_sampling_from_trust_reports(
     assert projected["trust_breadth_summary"]["bootstrap_sampled_required_families"] == ["project", "repository"]
 
 
+def test_live_status_projection_surfaces_open_world_provider_carryover_finalize_and_handoff_summaries():
+    module = _load_script("run_unattended_campaign.py")
+
+    projected = module._live_status_projection(
+        payload={
+            "status": "interrupted",
+            "reason": "runtime ceiling",
+            "event_log_path": "/tmp/unattended.events.jsonl",
+            "lock_path": "/tmp/unattended.lock",
+            "unattended_evidence": {
+                "external_summary": {
+                    "total": 1,
+                    "distinct_benchmark_families": 1,
+                    "benchmark_families": ["repository"],
+                },
+                "semantic_hub_summary": {
+                    "reports": 2,
+                    "distinct_benchmark_families": 2,
+                    "benchmark_families": ["integration", "project"],
+                },
+                "replay_derived_summary": {
+                    "reports": 1,
+                    "distinct_benchmark_families": 1,
+                    "benchmark_families": ["repository"],
+                },
+            },
+            "campaign_report": {
+                "recent_production_decisions": [
+                    {
+                        "cycle_id": "cycle:retrieval:1",
+                        "subsystem": "retrieval",
+                        "state": "retain",
+                        "metrics_summary": {
+                            "baseline_trusted_carryover_repair_rate": 0.25,
+                            "trusted_carryover_repair_rate": 0.5,
+                            "baseline_trusted_carryover_verified_steps": 1,
+                            "trusted_carryover_verified_steps": 2,
+                            "trusted_carryover_verified_step_delta": 1,
+                        },
+                    },
+                    {
+                        "cycle_id": "cycle:tolbert:1",
+                        "subsystem": "tolbert_model",
+                        "state": "reject",
+                        "reason": "Tolbert model candidate never entered retained Tolbert primary routing",
+                    },
+                ],
+                "trust_breadth_summary": {
+                    "required_families": ["integration", "project", "repository"],
+                    "required_families_with_reports": ["integration", "project", "repository"],
+                    "missing_required_families": [],
+                    "external_report_count": 1,
+                    "distinct_external_benchmark_families": 1,
+                    "distinct_family_gap": 0,
+                },
+            },
+        },
+        active_run={
+            "provider": "hybrid",
+            "policy": {"priority_benchmark_families": ["integration", "project", "repository"]},
+            "child_status": {"mirrored": True},
+        },
+        active_child={
+            "last_progress_phase": "metrics_finalize",
+            "last_report_path": "/tmp/campaign_report.json",
+            "sampled_families_from_progress": ["integration", "project", "repository"],
+            "active_cycle_progress": {
+                "productive_partial": True,
+                "candidate_generated": True,
+                "generated_success_started": True,
+                "generated_success_completed": False,
+                "generated_failure_completed": True,
+                "raw_phase": "metrics_finalize",
+            },
+            "pending_decision_state": "retain",
+        },
+    )
+
+    assert projected["open_world_breadth_summary"]["semantic_hub_report_count"] == 2
+    assert projected["open_world_breadth_summary"]["external_report_count"] == 1
+    assert projected["open_world_breadth_summary"]["replay_derived_report_count"] == 1
+    assert projected["provider_independence_summary"]["resolved_provider"] == "hybrid"
+    assert projected["provider_independence_summary"]["provider_signal_state"] == "retained"
+    assert projected["retrieval_carryover_summary"]["carryover_proven"] is True
+    assert projected["tolbert_retained_routing_summary"]["primary_routing_failures"] == 1
+    assert projected["long_horizon_finalize_summary"]["finalize_conversion_gap"] is False
+    assert projected["handoff_summary"]["handoff_ready"] is True
+    assert projected["closure_gap_summary"]["open_world_breadth"] == "partial"
+    assert projected["closure_gap_summary"]["decoder_runtime_independence"] == "closed"
+    assert projected["closure_gap_summary"]["retrieval_carryover"] == "closed"
+    assert projected["closure_gap_summary"]["tolbert_retained_routing"] == "partial"
+
+
 def test_controller_observation_includes_strategy_memory_and_trust_features():
     module = _load_script("run_unattended_campaign.py")
 
@@ -10650,6 +11098,9 @@ def test_controller_observation_uses_retained_and_rejected_strategy_memory_prior
                 "retained_count": 1,
                 "best_retained_gain": 0.22,
                 "recent_rejects": 2,
+                "retained_family_breadth_gain": 2.0,
+                "retained_closeout_gain": 1.0,
+                "recent_reject_closeout_failures": 1,
                 "retained_family_gains": {"integration": 0.22},
                 "recent_rejects_by_family": {"integration": 2},
             }
@@ -10664,6 +11115,129 @@ def test_controller_observation_uses_retained_and_rejected_strategy_memory_prior
     assert observation["features"]["strategy_memory_prior_strength"] > 0.0
     assert observation["features"]["strategy_memory_alignment"] > 0.0
     assert observation["features"]["strategy_memory_reject_pressure"] > 0.0
+    assert observation["features"]["strategy_memory_family_breadth_gain"] > 0.0
+    assert observation["features"]["strategy_memory_closeout_pressure"] > 0.0
+
+
+def test_finalize_completed_campaign_round_refreshes_priors_before_controller_observation(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        trajectories_root=tmp_path / "trajectories",
+        semantic_hub_root=tmp_path / "trajectories/semantic_hub",
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    config.ensure_directories()
+
+    observed_state: dict[str, object] = {}
+
+    def fake_update_strategy_memory_priors(controller_state, *, config):
+        return {
+            **dict(controller_state or {}),
+            "strategy_memory_priors": {"retained_count": 1, "best_retained_gain": 0.2},
+        }
+
+    def fake_update_repo_setting_policy_priors(controller_state, *, round_payload):
+        return {
+            **dict(controller_state or {}),
+            "repo_setting_policy_priors": {
+                "repository": {
+                    "campaign_width_unit_weight": 0.5,
+                    "adaptive_search_bonus": 0.25,
+                }
+            },
+        }
+
+    def fake_controller_observation(**kwargs):
+        observed_state.update(dict(kwargs.get("controller_state", {})))
+        return {"features": {"strategy_memory_prior_strength": 1.0}}
+
+    monkeypatch.setattr(module, "_update_strategy_memory_priors", fake_update_strategy_memory_priors)
+    monkeypatch.setattr(module, "_update_repo_setting_policy_priors", fake_update_repo_setting_policy_priors)
+    monkeypatch.setattr(module, "_controller_observation", fake_controller_observation)
+    monkeypatch.setattr(
+        module,
+        "update_controller_state",
+        lambda controller_state, **kwargs: (
+            normalize_controller_state(controller_state),
+            {"reward": 0.0, "promotion_reward": 0.0, "steering_reward": 0.0},
+        ),
+    )
+    monkeypatch.setattr(module, "_authoritative_status_decision_state", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_next_round_policy", lambda current_policy, **kwargs: dict(current_policy))
+    monkeypatch.setattr(module, "_next_policy_stall_rounds", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "_next_no_yield_rounds", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "_next_depth_runway_credit", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "_round_stop_signal", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_adaptive_stop_budget", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_mark_round", lambda round_payload, **kwargs: round_payload.update(kwargs))
+    monkeypatch.setattr(module, "_persist_semantic_round_artifacts", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_count_completed_rounds", lambda rounds: 1)
+    monkeypatch.setattr(module, "_policy_shift_summary", lambda rounds: {})
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+
+    report_path = tmp_path / "reports" / "unattended_campaign.json"
+    controller_state_path = tmp_path / "reports" / "controller_state.json"
+    event_log_path = tmp_path / "reports" / "events.jsonl"
+    report = {"rounds": [{}]}
+    round_payload = {
+        "policy": {"priority_benchmark_families": ["repository"]},
+        "campaign_report": {},
+    }
+    campaign_report = {
+        "production_yield_summary": {},
+        "phase_gate_summary": {},
+        "priority_family_yield_summary": {"priority_families": ["repository"]},
+        "trust_breadth_summary": {
+            "required_families": ["repository"],
+            "required_families_with_reports": [],
+            "missing_required_families": ["repository"],
+            "distinct_family_gap": 1,
+            "external_report_count": 0,
+            "distinct_external_benchmark_families": 0,
+        },
+    }
+
+    module._finalize_completed_campaign_round(
+        args=type(
+            "Args",
+            (),
+            {
+                "max_no_yield_rounds": 1,
+                "max_policy_stall_rounds": 1,
+                "max_cycles_per_round": 1,
+                "max_task_limit": 64,
+                "max_campaign_width": 2,
+                "max_variant_width": 2,
+            },
+        )(),
+        config=config,
+        report_path=report_path,
+        status_path=None,
+        lock_path=None,
+        event_log_path=event_log_path,
+        controller_state_path=controller_state_path,
+        run_id="run-1",
+        round_index=1,
+        report=report,
+        round_payload=round_payload,
+        campaign_report=campaign_report,
+        liftoff_payload=None,
+        controller_state=default_controller_state(),
+        current_policy={"priority_benchmark_families": ["repository"]},
+        round_planner_controls={},
+        round_curriculum_controls={"frontier_repo_setting_priority_pairs": ["repository:worker_handoff"]},
+        no_yield_rounds=0,
+        policy_stall_rounds=0,
+        depth_runway_credit=0,
+    )
+
+    assert observed_state["strategy_memory_priors"]["retained_count"] == 1
+    assert observed_state["repo_setting_policy_priors"]["repository"]["campaign_width_unit_weight"] == 0.5
 
 
 def test_strategy_memory_candidate_score_adjustment_penalizes_replay_after_rejects():
@@ -10675,6 +11249,8 @@ def test_strategy_memory_candidate_score_adjustment_penalizes_replay_after_rejec
         planner_pressure_signal={"priority_families": ["integration"]},
         strategy_memory_priors={
             "retained_family_gains": {"integration": 0.18},
+            "retained_family_breadth_gain": 2.0,
+            "retained_closeout_gain": 1.0,
             "recent_rejects_by_family": {"integration": 2},
         },
     )
@@ -10684,6 +11260,8 @@ def test_strategy_memory_candidate_score_adjustment_penalizes_replay_after_rejec
         planner_pressure_signal={"priority_families": ["integration"]},
         strategy_memory_priors={
             "retained_family_gains": {"integration": 0.18},
+            "retained_family_breadth_gain": 2.0,
+            "retained_closeout_gain": 1.0,
             "recent_rejects_by_family": {"integration": 2},
         },
     )
@@ -10691,6 +11269,8 @@ def test_strategy_memory_candidate_score_adjustment_penalizes_replay_after_rejec
     assert unchanged["score_adjustment"] < changed["score_adjustment"]
     assert unchanged["reject_alignment_pressure"] > 0.0
     assert changed["policy_change_units"] > 0.0
+    assert changed["retained_family_breadth_gain"] > 0.0
+    assert changed["retained_closeout_gain"] > 0.0
 
 
 def test_semantic_redirection_summary_requires_new_parent_after_stagnation():
@@ -10802,17 +11382,50 @@ def test_persist_semantic_round_artifacts_writes_attempt_note_and_redirect(tmp_p
     assert paths["semantic_note_path"].endswith(".json")
     assert paths["semantic_redirect_path"].endswith(".json")
     assert paths["semantic_skill_path"].endswith(".json")
+    assert paths["semantic_task_paths"]
     attempt = json.loads(Path(paths["semantic_attempt_path"]).read_text(encoding="utf-8"))
     assert attempt["semantic_redirection"]["required_new_parent"] is True
     redirect = json.loads(Path(paths["semantic_redirect_path"]).read_text(encoding="utf-8"))
     assert redirect["triggered"] is True
     skill = json.loads(Path(paths["semantic_skill_path"]).read_text(encoding="utf-8"))
     assert skill["priority_families"] == ["integration"]
+    semantic_task = json.loads(Path(paths["semantic_task_paths"][0]).read_text(encoding="utf-8"))
+    assert semantic_task["target_family"] == "integration"
+    assert semantic_task["task"]["metadata"]["benchmark_family"] == "integration"
+    assert semantic_task["task"]["metadata"]["open_world_candidate"] is True
     agent = json.loads(
         (tmp_path / "trajectories/semantic_hub/agents" / "unattended_agent_run-1.json").read_text(encoding="utf-8")
     )
     assert agent["last_attempt_id"] == "unattended_round:run-1:2"
     assert agent["last_skill_id"].startswith("skill:")
+    assert agent["last_task_ids"][0].startswith("task:")
+
+
+def test_preferred_unattended_provider_prefers_tolbert_when_retained_surfaces_exist(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    artifact_path = tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "model_surfaces": {
+                    "retrieval_surface": True,
+                    "policy_head": True,
+                    "value_head": True,
+                    "transition_head": True,
+                    "latent_state": True,
+                    "universal_runtime": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(tolbert_model_artifact_path=artifact_path)
+
+    provider = module._preferred_unattended_provider(type("Args", (), {"provider": None})(), config=config)
+
+    assert provider == "hybrid"
 
 
 def test_apply_semantic_policy_seed_uses_recent_redirects(tmp_path):

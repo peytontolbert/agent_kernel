@@ -7,8 +7,8 @@ import re
 import shlex
 from typing import TYPE_CHECKING
 
-from ...unattended_controller import discover_structural_classes, structural_class_family_aliases
-from ...syntax_motor import summarize_python_edit_step
+from ...ops.unattended_controller import discover_structural_classes, structural_class_family_aliases
+from ...extensions.syntax_motor import summarize_python_edit_step
 from ..world.rollout import rollout_action_value
 
 if TYPE_CHECKING:

@@ -7,7 +7,7 @@ from typing import Any
 from urllib import error as url_error
 from urllib import request as url_request
 
-from agent_kernel.capabilities import enabled_corpus_sources
+from agent_kernel.extensions.capabilities import enabled_corpus_sources
 from agent_kernel.config import KernelConfig
 
 

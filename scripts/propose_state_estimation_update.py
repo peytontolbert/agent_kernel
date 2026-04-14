@@ -10,7 +10,7 @@ import argparse
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementPlanner
-from agent_kernel.state_estimation_improvement import build_state_estimation_proposal_artifact
+from agent_kernel.extensions.improvement.state_estimation_improvement import build_state_estimation_proposal_artifact
 from evals.metrics import EvalMetrics
 
 

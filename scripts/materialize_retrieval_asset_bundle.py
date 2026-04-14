@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.tolbert_assets import materialize_retained_retrieval_asset_bundle
+from agent_kernel.extensions.tolbert_assets import materialize_retained_retrieval_asset_bundle
 
 
 def main() -> None:

@@ -32,6 +32,9 @@ def rollout_action_value(
     learned_progress_bonus = _float_value(rollout_policy.get("learned_world_progress_bonus_weight"), 1.25)
     learned_recovery_bonus = _float_value(rollout_policy.get("learned_world_recovery_bonus_weight"), 1.5)
     learned_continue_penalty = _float_value(rollout_policy.get("learned_world_continue_penalty_weight"), 1.25)
+    controller_continue_bonus = _float_value(rollout_policy.get("controller_belief_continue_bonus_weight"), 1.5)
+    controller_recovery_bonus = _float_value(rollout_policy.get("controller_belief_recovery_bonus_weight"), 2.0)
+    controller_stop_penalty = _float_value(rollout_policy.get("controller_belief_stop_penalty_weight"), 2.0)
     score = 0.0
     predicted_progress_gain = float(effect.get("predicted_progress_gain", 0) or 0.0)
     predicted_conflicts = float(len(effect.get("predicted_conflicts", [])))
@@ -43,6 +46,10 @@ def rollout_action_value(
     risk_band = str(latent_state_summary.get("risk_band", "stable"))
     learned_progress_signal = _learned_progress_signal(latent_state_summary)
     learned_risk_signal = _learned_risk_signal(latent_state_summary)
+    controller_belief = _controller_belief(latent_state_summary)
+    recover_belief = _float_value(controller_belief.get("recover"), 0.0)
+    continue_belief = _float_value(controller_belief.get("continue"), 0.0)
+    stop_belief = _float_value(controller_belief.get("stop"), 0.0)
     is_long_horizon = str(world_model_summary.get("horizon", "")).strip() == "long_horizon"
     if progress_band in {"advancing", "improving"}:
         score += latent_bonus
@@ -52,11 +59,14 @@ def rollout_action_value(
         score -= latent_risk_penalty
     if predicted_progress_gain > 0:
         score += learned_progress_signal * learned_progress_bonus
+        score += continue_belief * controller_continue_bonus
     if bool(latest_transition.get("no_progress", False)) and predicted_progress_gain > 0:
         score += _float_value(rollout_policy.get("recover_from_stall_bonus_weight"), 1.5)
         score += learned_risk_signal * learned_recovery_bonus
+        score += recover_belief * controller_recovery_bonus
     elif not predicted_progress_gain and learned_risk_signal > 0.0:
         score -= learned_risk_signal * learned_continue_penalty
+        score -= stop_belief * controller_stop_penalty
     if is_long_horizon:
         score += predicted_progress_gain * _float_value(
             rollout_policy.get("long_horizon_progress_bonus_weight"),
@@ -72,6 +82,7 @@ def rollout_action_value(
             score += learned_risk_signal * learned_recovery_bonus
         elif learned_risk_signal >= 0.55 and not predicted_progress_gain:
             score -= learned_risk_signal * learned_continue_penalty
+            score -= stop_belief * controller_stop_penalty
     return score
 
 
@@ -87,12 +98,19 @@ def _stop_value(
     changed_preserved = len(list(world_model_summary.get("changed_preserved_artifacts", [])))
     learned_progress_signal = _learned_progress_signal(latent_state_summary)
     learned_risk_signal = _learned_risk_signal(latent_state_summary)
+    controller_belief = _controller_belief(latent_state_summary)
+    stop_belief = _float_value(controller_belief.get("stop"), 0.0)
+    recover_belief = _float_value(controller_belief.get("recover"), 0.0)
+    continue_belief = _float_value(controller_belief.get("continue"), 0.0)
     score = completion_ratio * _float_value(rollout_policy.get("stop_completion_weight"), 8.0)
     score -= missing_expected * _float_value(rollout_policy.get("stop_missing_expected_penalty_weight"), 6.0)
     score -= present_forbidden * _float_value(rollout_policy.get("stop_forbidden_penalty_weight"), 6.0)
     score -= changed_preserved * _float_value(rollout_policy.get("stop_preserved_penalty_weight"), 4.0)
     score += learned_progress_signal * _float_value(rollout_policy.get("stop_learned_progress_weight"), 1.5)
     score -= learned_risk_signal * _float_value(rollout_policy.get("stop_learned_risk_penalty_weight"), 4.0)
+    score += stop_belief * _float_value(rollout_policy.get("controller_belief_stop_bonus_weight"), 3.0)
+    score -= recover_belief * _float_value(rollout_policy.get("controller_belief_recover_stop_penalty_weight"), 2.0)
+    score -= continue_belief * _float_value(rollout_policy.get("controller_belief_continue_stop_penalty_weight"), 1.5)
     if str(world_model_summary.get("horizon", "")).strip() == "long_horizon":
         score -= max(0.0, 1.0 - completion_ratio) * _float_value(
             rollout_policy.get("long_horizon_stop_penalty_weight"),
@@ -146,3 +164,16 @@ def _learned_risk_signal(latent_state_summary: dict[str, object]) -> float:
             ),
         ),
     )
+
+
+def _controller_belief(latent_state_summary: dict[str, object]) -> dict[str, float]:
+    learned = latent_state_summary.get("learned_world_state", {})
+    learned = learned if isinstance(learned, dict) else {}
+    controller = learned.get("controller_belief", {})
+    if not isinstance(controller, dict):
+        return {"recover": 0.0, "continue": 0.0, "stop": 0.0}
+    return {
+        "recover": _float_value(controller.get("recover"), 0.0),
+        "continue": _float_value(controller.get("continue"), 0.0),
+        "stop": _float_value(controller.get("stop"), 0.0),
+    }

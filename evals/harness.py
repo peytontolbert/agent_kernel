@@ -15,17 +15,17 @@ from agent_kernel.actors import (
     coding_actor_episode_summary,
     default_coding_actor_policy,
 )
-from agent_kernel.capabilities import capability_enabled, declared_task_capabilities
+from agent_kernel.extensions.capabilities import capability_enabled, declared_task_capabilities
 from agent_kernel.config import KernelConfig
-from agent_kernel.curriculum import CurriculumEngine
-from agent_kernel.episode_store import iter_episode_documents
+from agent_kernel.tasking.curriculum import CurriculumEngine
+from agent_kernel.ops.episode_store import iter_episode_documents
 from agent_kernel.loop import AgentKernel
-from agent_kernel.operator_policy import operator_policy_snapshot
+from agent_kernel.extensions.operator_policy import operator_policy_snapshot
 from agent_kernel.policy import Policy
-from agent_kernel.preflight import capture_workspace_snapshot, write_unattended_task_report
-from agent_kernel.runtime_supervision import atomic_write_json
+from agent_kernel.ops.preflight import capture_workspace_snapshot, write_unattended_task_report
+from agent_kernel.ops.runtime_supervision import atomic_write_json
 from agent_kernel.schemas import ActionDecision, EpisodeRecord
-from agent_kernel.task_bank import (
+from agent_kernel.tasking.task_bank import (
     build_shared_transfer_target_maps,
     load_benchmark_candidate_tasks,
     load_discovered_tasks,
@@ -193,10 +193,19 @@ def _should_emit_task_progress(index: int, total: int) -> bool:
 
 def _task_progress_label(task) -> str:
     family = "bounded"
+    task_origin = ""
+    source_task = ""
     metadata = getattr(task, "metadata", {})
     if isinstance(metadata, dict):
         family = str(metadata.get("benchmark_family", "bounded")).strip() or "bounded"
-    return f"{task.task_id} family={family}"
+        task_origin = str(metadata.get("task_origin", "")).strip()
+        source_task = str(metadata.get("source_task", "")).strip()
+    parts = [str(task.task_id).strip(), f"family={family}"]
+    if task_origin:
+        parts.append(f"task_origin={task_origin}")
+    if source_task:
+        parts.append(f"source_task={source_task}")
+    return " ".join(parts)
 
 
 def _run_tasks_with_progress(

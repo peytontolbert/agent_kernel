@@ -1,11 +1,11 @@
 import json
 from pathlib import Path
 
-import agent_kernel.preflight as preflight
-import agent_kernel.syntax_motor as syntax_motor
+import agent_kernel.ops.preflight as preflight
+import agent_kernel.extensions.syntax_motor as syntax_motor
 import pytest
 from agent_kernel.config import KernelConfig
-from agent_kernel.preflight import (
+from agent_kernel.ops.preflight import (
     PreflightCheck,
     PreflightReport,
     WorkspaceFileSnapshot,
@@ -49,7 +49,7 @@ def test_run_unattended_preflight_passes_for_mock_with_verifier_contract(tmp_pat
     }
 
 
-def test_run_unattended_preflight_rejects_tolbert_provider_alias(tmp_path):
+def test_run_unattended_preflight_accepts_tolbert_provider_alias(tmp_path):
     config = KernelConfig(
         provider="tolbert",
         use_tolbert_context=True,
@@ -63,8 +63,12 @@ def test_run_unattended_preflight_rejects_tolbert_provider_alias(tmp_path):
         expected_files=["hello.txt"],
     )
 
-    with pytest.raises(ValueError, match="unsupported provider"):
-        run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+    report = run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+    provider_check = next(check for check in report.checks if check.name == "provider_health")
+    assert provider_check.passed is True
+    assert "requires no external provider health probe" in provider_check.detail
+    assert "hybrid provider" in provider_check.detail
 
 
 def test_run_unattended_preflight_fails_when_tolbert_runtime_modules_are_missing(monkeypatch, tmp_path):
@@ -117,7 +121,7 @@ def test_run_unattended_preflight_marks_missing_execution_containment_optional(m
         sandbox_command_containment_mode="auto",
     )
     monkeypatch.setattr(
-        "agent_kernel.preflight.sandbox_containment_status",
+        "agent_kernel.ops.preflight.sandbox_containment_status",
         lambda config, cwd=None: {
             "mode": "auto",
             "available": False,
@@ -148,7 +152,7 @@ def test_run_unattended_preflight_fails_when_required_execution_containment_miss
         sandbox_command_containment_mode="required",
     )
     monkeypatch.setattr(
-        "agent_kernel.preflight.sandbox_containment_status",
+        "agent_kernel.ops.preflight.sandbox_containment_status",
         lambda config, cwd=None: {
             "mode": "required",
             "available": False,
@@ -314,7 +318,7 @@ def test_run_unattended_preflight_marks_missing_paper_research_assets_optional(m
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("agent_kernel.preflight._paper_research_runtime_paths", lambda config, repo_root: None)
+    monkeypatch.setattr("agent_kernel.ops.preflight._paper_research_runtime_paths", lambda config, repo_root: None)
     config = KernelConfig(
         provider="mock",
         use_tolbert_context=True,
@@ -376,7 +380,7 @@ def test_run_unattended_preflight_fails_when_required_paper_research_assets_miss
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("agent_kernel.preflight._paper_research_runtime_paths", lambda config, repo_root: None)
+    monkeypatch.setattr("agent_kernel.ops.preflight._paper_research_runtime_paths", lambda config, repo_root: None)
     config = KernelConfig(
         provider="mock",
         use_tolbert_context=True,

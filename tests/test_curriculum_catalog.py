@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from agent_kernel.curriculum import CurriculumEngine
-from agent_kernel.curriculum_catalog import (
+from agent_kernel.tasking.curriculum import CurriculumEngine
+from agent_kernel.tasking.curriculum_catalog import (
     load_curriculum_metadata_catalog,
     load_curriculum_template_catalog,
     render_curriculum_template,

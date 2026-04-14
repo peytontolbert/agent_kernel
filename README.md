@@ -5,6 +5,9 @@ It uses one LLM-backed policy, two actions (`respond` and `code_execute`), deter
 
 The repository is organized around two core loops.
 
+For the boundary between the actual ASI-oriented kernel and auxiliary layers that enhance it, see
+[`docs/asi_core.md`](docs/asi_core.md).
+
 Inner task loop:
 
 `observe -> estimate state -> retrieve memory -> update world model -> simulate likely transitions -> plan candidates -> choose via policy -> execute -> verify -> critique -> update memory/models -> repeat`
@@ -16,6 +19,7 @@ Outer improvement loop:
 ## Documentation
 
 - [docs/index.md](docs/index.md)
+- [docs/asi_core.md](docs/asi_core.md)
 - [docs/setup.md](docs/setup.md)
 - [docs/architecture.md](docs/architecture.md)
 - [docs/runtime.md](docs/runtime.md)
@@ -80,18 +84,40 @@ This path requires real TOLBERT assets: a native agent-kernel checkpoint, `nodes
 
 ```text
 agent_kernel/
-  config.py
-  schemas.py
-  state.py
   actions.py
+  config.py
+  loop.py
+  memory.py
   policy.py
   sandbox.py
+  schemas.py
+  state.py
   verifier.py
-  memory.py
-  task_bank.py
-  curriculum.py
-  loop.py
-  extractors.py
+  tasking/
+    benchmark_synthesis.py
+    curriculum.py
+    curriculum_catalog.py
+    task_bank.py
+    task_budget.py
+  ops/
+    job_queue.py
+    export_governance.py
+    preflight.py
+    roadmap_parallel.py
+    runtime_supervision.py
+    workspace_recovery.py
+  extensions/
+    context_budget.py
+    delegation_policy.py
+    extractors.py
+    operator_policy.py
+    runtime_modeling_adapter.py
+    syntax_motor.py
+    tolbert.py
+    tolbert_assets.py
+    trust.py
+    improvement/
+    strategy/
 evals/
   harness.py
   metrics.py

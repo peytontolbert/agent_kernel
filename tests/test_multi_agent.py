@@ -1,4 +1,4 @@
-from agent_kernel.multi_agent import RoleCoordinator
+from agent_kernel.extensions.multi_agent import RoleCoordinator
 from agent_kernel.schemas import TaskSpec
 from agent_kernel.state import AgentState
 
