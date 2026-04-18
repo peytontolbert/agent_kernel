@@ -18,12 +18,17 @@ def build_retrieval_proposal_artifact(
     current_payload: object | None = None,
 ) -> dict[str, object]:
     generation_focus = normalized_generation_focus(focus)
-    proposals = _proposals(metrics, focus=generation_focus)
     base_overrides = retained_retrieval_overrides(current_payload)
+    baseline_asset_controls = retained_retrieval_asset_controls(current_payload)
+    proposals = _adjust_noop_retrieval_proposals(
+        _proposals(metrics, focus=generation_focus),
+        focus=generation_focus,
+        baseline_overrides=base_overrides,
+    )
     asset_controls = _asset_controls(
         metrics,
         focus=generation_focus,
-        baseline=retained_retrieval_asset_controls(current_payload),
+        baseline=baseline_asset_controls,
     )
     merged_overrides = deepcopy(base_overrides)
     merged_overrides.update(_merge_overrides(proposals))
@@ -233,6 +238,56 @@ def _proposals(metrics: EvalMetrics, *, focus: str) -> list[dict[str, object]]:
             }
         )
     return proposals
+
+
+def _adjust_noop_retrieval_proposals(
+    proposals: list[dict[str, object]],
+    *,
+    focus: str,
+    baseline_overrides: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    if focus != "breadth" or not proposals or not isinstance(baseline_overrides, dict) or not baseline_overrides:
+        return proposals
+    adjusted = deepcopy(proposals)
+    for proposal in adjusted:
+        if not isinstance(proposal, dict):
+            continue
+        if str(proposal.get("proposal_id", "")).strip() != "retrieval:breadth_rebalance":
+            continue
+        overrides = proposal.get("overrides", {})
+        if not isinstance(overrides, dict) or not overrides:
+            continue
+        if any(baseline_overrides.get(key) != value for key, value in overrides.items()):
+            continue
+        current_branch_results = int(
+            baseline_overrides.get("tolbert_branch_results", overrides.get("tolbert_branch_results", 2)) or 0
+        )
+        current_context_chunks = int(
+            baseline_overrides.get("tolbert_context_max_chunks", overrides.get("tolbert_context_max_chunks", 4)) or 0
+        )
+        current_distractor_penalty = float(
+            baseline_overrides.get("tolbert_distractor_penalty", overrides.get("tolbert_distractor_penalty", 5.0)) or 0.0
+        )
+        current_top_branches = int(baseline_overrides.get("tolbert_top_branches", 3) or 0)
+        current_ancestor_levels = int(baseline_overrides.get("tolbert_ancestor_branch_levels", 2) or 0)
+        overrides.update(
+            {
+                "tolbert_branch_results": max(1, current_branch_results - 1) if current_branch_results > 0 else 1,
+                "tolbert_global_results": 1,
+                "tolbert_context_max_chunks": max(2, current_context_chunks - 1) if current_context_chunks > 0 else 3,
+                "tolbert_max_spans_per_source": 1,
+                "tolbert_distractor_penalty": round(min(8.0, max(current_distractor_penalty, 5.0) + 0.5), 1),
+                "tolbert_top_branches": max(2, current_top_branches - 1) if current_top_branches > 0 else 2,
+                "tolbert_ancestor_branch_levels": max(1, current_ancestor_levels - 1)
+                if current_ancestor_levels > 0
+                else 1,
+            }
+        )
+        proposal["reason"] = (
+            f"{str(proposal.get('reason', '')).strip()}; retained breadth profile already active, so intensify pruning to force a measurable retrieval delta"
+        ).strip('; ')
+        break
+    return adjusted
 
 
 def _merge_overrides(proposals: list[dict[str, object]]) -> dict[str, object]:

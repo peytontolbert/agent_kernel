@@ -269,7 +269,8 @@ class EpisodeMemory:
         if not candidate_episodes:
             return []
 
-        requested_paths = _normalized_semantic_strings(changed_paths or [])
+        raw_requested_paths = [str(value).strip() for value in changed_paths or [] if str(value).strip()]
+        requested_paths = _normalized_semantic_strings(raw_requested_paths)
         requested_obligations = _normalized_semantic_strings(verifier_obligations or [])
         requested_failures = _normalized_semantic_strings(failure_signals or [])
         requested_family = str(benchmark_family).strip().lower()
@@ -326,7 +327,8 @@ class EpisodeMemory:
         ]
         if not candidate_episodes:
             return []
-        requested_paths = _normalized_semantic_strings(changed_paths or [])
+        raw_requested_paths = [str(value).strip() for value in changed_paths or [] if str(value).strip()]
+        requested_paths = _normalized_semantic_strings(raw_requested_paths)
         requested_obligations = _normalized_semantic_strings(verifier_obligations or [])
         requested_failures = _normalized_semantic_strings(failure_signals or [])
         requested_family = str(benchmark_family).strip().lower()
@@ -349,9 +351,8 @@ class EpisodeMemory:
                 if score <= 0:
                     continue
             scored.append((score, prototype))
-        return [
-            prototype
-            for _, prototype in sorted(
+        recalled: list[dict[str, object]] = []
+        for _, prototype in sorted(
                 scored,
                 key=lambda item: (
                     -item[0],
@@ -359,8 +360,15 @@ class EpisodeMemory:
                     -int(item[1].get("episode_count", 0) or 0),
                     str(item[1].get("benchmark_family", "bounded")).strip(),
                 ),
-            )[: max(0, int(limit))]
-        ]
+            )[: max(0, int(limit))]:
+            payload = dict(prototype)
+            if requested_paths:
+                payload["instantiated_application_commands"] = _prototype_instantiated_application_commands(
+                    prototype,
+                    requested_paths=raw_requested_paths,
+                )
+            recalled.append(payload)
+        return recalled
 
 
 def _episode_storage_metadata_for_sqlite(
@@ -753,6 +761,12 @@ def _semantic_prototypes(episodes: list[dict[str, object]]) -> list[dict[str, ob
                 "recovery_commands": {},
                 "failed_commands": {},
                 "command_sequences": {},
+                "application_templates": {},
+                "sequence_templates": {},
+                "path_kinds": {},
+                "path_extensions": {},
+                "path_directories": {},
+                "operation_counts": {},
             },
         )
         prototype["episode_count"] = int(prototype.get("episode_count", 0) or 0) + 1
@@ -790,6 +804,49 @@ def _semantic_prototypes(episodes: list[dict[str, object]]) -> list[dict[str, ob
             command_sequences = prototype.setdefault("command_sequences", {})
             if isinstance(command_sequences, dict):
                 command_sequences[sequence_key] = int(command_sequences.get(sequence_key, 0) or 0) + 1
+        primary_target_path = _prototype_primary_target_path(episode)
+        if primary_target_path:
+            path_kinds = prototype.setdefault("path_kinds", {})
+            if isinstance(path_kinds, dict):
+                kind = _prototype_path_kind(primary_target_path)
+                if kind:
+                    path_kinds[kind] = int(path_kinds.get(kind, 0) or 0) + 1
+            path_extensions = prototype.setdefault("path_extensions", {})
+            if isinstance(path_extensions, dict):
+                extension = PurePosixPath(primary_target_path).suffix.strip().lower()
+                if extension:
+                    path_extensions[extension] = int(path_extensions.get(extension, 0) or 0) + 1
+            path_directories = prototype.setdefault("path_directories", {})
+            if isinstance(path_directories, dict):
+                parent = PurePosixPath(primary_target_path).parent.as_posix()
+                if parent and parent != ".":
+                    path_directories[parent] = int(path_directories.get(parent, 0) or 0) + 1
+        for patch in episode.get("edit_patches", []):
+            if not isinstance(patch, dict):
+                continue
+            status = str(patch.get("status", "")).strip().lower()
+            if status:
+                operation_counts = prototype.setdefault("operation_counts", {})
+                if isinstance(operation_counts, dict):
+                    operation_counts[status] = int(operation_counts.get(status, 0) or 0) + 1
+        application_templates = prototype.setdefault("application_templates", {})
+        if isinstance(application_templates, dict):
+            for command in _prototype_application_commands(prototype):
+                template = _generalize_command_template(command, primary_target_path)
+                if template:
+                    application_templates[template] = int(application_templates.get(template, 0) or 0) + 1
+        sequence_templates = prototype.setdefault("sequence_templates", {})
+        if isinstance(sequence_templates, dict):
+            for serialized, count in dict(prototype.get("command_sequences", {})).items():
+                sequence_commands = [part.strip() for part in str(serialized).split(" || ") if part.strip()]
+                if not sequence_commands:
+                    continue
+                template = " || ".join(
+                    _generalize_command_template(command, primary_target_path) or command
+                    for command in sequence_commands
+                )
+                if template:
+                    sequence_templates[template] = int(sequence_templates.get(template, 0) or 0) + int(count or 0)
 
     return [
         {
@@ -845,6 +902,21 @@ def _semantic_prototypes(episodes: list[dict[str, object]]) -> list[dict[str, ob
                 }
             ),
             "application_commands": _prototype_application_commands(item),
+            "application_command_templates": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("application_templates", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "command_sequence_templates": _sorted_count_mapping(
+                {
+                    str(key).strip(): int(value or 0)
+                    for key, value in dict(item.get("sequence_templates", {})).items()
+                    if str(key).strip()
+                }
+            ),
+            "transform_semantics": _prototype_transform_semantics(item),
         }
         for item in sorted(
             prototypes.values(),
@@ -922,6 +994,7 @@ def _semantic_prototype_query_score(
     for path in changed_paths:
         if any(candidate == path or candidate.endswith(path) or path.endswith(candidate) for candidate in prototype_paths):
             score += 5
+    score += _prototype_transform_query_score(prototype, changed_paths)
     for obligation in verifier_obligations:
         if any(
             obligation == candidate
@@ -958,6 +1031,199 @@ def _prototype_application_commands(prototype: dict[str, object]) -> list[str]:
         if command not in seen:
             seen.append(command)
     return seen[:4]
+
+
+def _prototype_primary_target_path(payload: dict[str, object]) -> str:
+    for value in payload.get("changed_paths", []):
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    for patch in payload.get("edit_patches", []):
+        if not isinstance(patch, dict):
+            continue
+        normalized = str(patch.get("path", "")).strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _prototype_path_kind(path: str) -> str:
+    normalized = str(path).strip().lower()
+    if not normalized:
+        return ""
+    if normalized.startswith("reports/") or "/reports/" in normalized or "report" in normalized:
+        return "report"
+    if normalized.startswith("generated/") or "/generated/" in normalized:
+        return "generated"
+    if normalized.startswith("tests/") or normalized.endswith("_test.py") or "/tests/" in normalized:
+        return "test"
+    if normalized.startswith("src/") or "/src/" in normalized:
+        return "source"
+    if normalized.startswith("docs/") or "/docs/" in normalized:
+        return "docs"
+    if normalized.endswith(".json"):
+        return "json"
+    if normalized.endswith(".md"):
+        return "markdown"
+    if normalized.endswith(".py"):
+        return "python"
+    return "file"
+
+
+def _path_role_bindings(path: str) -> dict[str, str]:
+    target_path = str(path).strip()
+    if not target_path:
+        return {}
+    pure = PurePosixPath(target_path)
+    parent = pure.parent.as_posix()
+    parent = "" if parent == "." else parent
+    stem = pure.stem.strip()
+    suffix = pure.suffix.strip()
+    return {
+        "target_path": target_path,
+        "target_dir": parent,
+        "target_file": pure.name,
+        "target_stem": stem,
+        "target_ext": suffix,
+    }
+
+
+def _generalize_command_template(command: str, target_path: str) -> str:
+    normalized = str(command).strip()
+    if not normalized:
+        return ""
+    bindings = _path_role_bindings(target_path)
+    if not bindings:
+        return normalized
+    template = normalized
+    for key, placeholder in (
+        ("target_path", "{target_path}"),
+        ("target_dir", "{target_dir}"),
+        ("target_file", "{target_file}"),
+    ):
+        value = str(bindings.get(key, "")).strip()
+        if value and value in template:
+            template = template.replace(value, placeholder)
+    return template
+
+
+def _instantiate_command_template(template: str, target_path: str) -> str:
+    normalized = str(template).strip()
+    if not normalized:
+        return ""
+    bindings = _path_role_bindings(target_path)
+    if not bindings:
+        return normalized
+    instantiated = normalized
+    for key, placeholder in (
+        ("target_path", "{target_path}"),
+        ("target_dir", "{target_dir}"),
+        ("target_file", "{target_file}"),
+        ("target_stem", "{target_stem}"),
+        ("target_ext", "{target_ext}"),
+    ):
+        value = str(bindings.get(key, "")).strip()
+        if placeholder in instantiated and value:
+            instantiated = instantiated.replace(placeholder, value)
+    return instantiated
+
+
+def _prototype_instantiated_application_commands(
+    prototype: dict[str, object],
+    *,
+    requested_paths: list[str],
+) -> list[str]:
+    target_path = next((str(path).strip() for path in requested_paths if str(path).strip()), "")
+    if not target_path:
+        return []
+    templates = [
+        str(value).strip()
+        for value in dict(prototype.get("application_command_templates", {})).keys()
+        if str(value).strip()
+    ]
+    commands: list[str] = []
+    for template in templates:
+        instantiated = _instantiate_command_template(template, target_path)
+        if instantiated and instantiated not in commands:
+            commands.append(instantiated)
+    for command in prototype.get("application_commands", []):
+        normalized = str(command).strip()
+        if normalized and normalized not in commands:
+            commands.append(normalized)
+    return commands[:4]
+
+
+def _prototype_transform_semantics(prototype: dict[str, object]) -> dict[str, object]:
+    return {
+        "target_kinds": _sorted_count_mapping(
+            {
+                str(key).strip(): int(value or 0)
+                for key, value in dict(prototype.get("path_kinds", {})).items()
+                if str(key).strip()
+            }
+        ),
+        "target_extensions": _sorted_count_mapping(
+            {
+                str(key).strip(): int(value or 0)
+                for key, value in dict(prototype.get("path_extensions", {})).items()
+                if str(key).strip()
+            }
+        ),
+        "target_directories": _sorted_count_mapping(
+            {
+                str(key).strip(): int(value or 0)
+                for key, value in dict(prototype.get("path_directories", {})).items()
+                if str(key).strip()
+            }
+        ),
+        "operation_counts": _sorted_count_mapping(
+            {
+                str(key).strip(): int(value or 0)
+                for key, value in dict(prototype.get("operation_counts", {})).items()
+                if str(key).strip()
+            }
+        ),
+    }
+
+
+def _prototype_transform_query_score(
+    prototype: dict[str, object],
+    changed_paths: list[str],
+) -> int:
+    semantics = prototype.get("transform_semantics", {})
+    semantics = dict(semantics) if isinstance(semantics, dict) else {}
+    kinds = {
+        str(key).strip()
+        for key in dict(semantics.get("target_kinds", {})).keys()
+        if str(key).strip()
+    }
+    extensions = {
+        str(key).strip()
+        for key in dict(semantics.get("target_extensions", {})).keys()
+        if str(key).strip()
+    }
+    directories = {
+        str(key).strip()
+        for key in dict(semantics.get("target_directories", {})).keys()
+        if str(key).strip()
+    }
+    score = 0
+    for path in changed_paths:
+        normalized = str(path).strip()
+        if not normalized:
+            continue
+        pure = PurePosixPath(normalized)
+        extension = pure.suffix.strip().lower()
+        directory = pure.parent.as_posix()
+        directory = "" if directory == "." else directory
+        kind = _prototype_path_kind(normalized)
+        if kind and kind in kinds:
+            score += 2
+        if extension and extension in extensions:
+            score += 2
+        if directory and directory in directories:
+            score += 1
+    return score
 
 
 def _learning_artifacts_path_for_memory(root: Path, *, config: KernelConfig | None = None) -> Path:
@@ -1088,6 +1354,7 @@ def _synthetic_document_from_learning_candidate(candidate: dict[str, object]) ->
         "executed_command_count": len(commands),
         "executed_commands": commands,
         "execution_source_summary": {
+            "decoder_generated": 0,
             "llm_generated": 0,
             "synthetic_plan": 0,
             "deterministic_or_other": len(commands),

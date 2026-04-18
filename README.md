@@ -20,8 +20,12 @@ Outer improvement loop:
 
 - [docs/index.md](docs/index.md)
 - [docs/asi_core.md](docs/asi_core.md)
+- [docs/kernel_gap_dashboard.md](docs/kernel_gap_dashboard.md)
+- [docs/minimal_asi_qwen_tolbert.md](docs/minimal_asi_qwen_tolbert.md)
 - [docs/setup.md](docs/setup.md)
 - [docs/architecture.md](docs/architecture.md)
+- [docs/resource_protocol.md](docs/resource_protocol.md)
+- [docs/self_evolution_protocol.md](docs/self_evolution_protocol.md)
 - [docs/runtime.md](docs/runtime.md)
 - [docs/tasks.md](docs/tasks.md)
 - [docs/scripts.md](docs/scripts.md)

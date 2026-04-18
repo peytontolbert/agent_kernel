@@ -372,6 +372,7 @@ def write_cycle_report(
     protocol_match_id: str = "",
     strategy_candidate: dict[str, object] | None = None,
     tolbert_runtime_summary: dict[str, object] | None = None,
+    govern_exports: bool = True,
 ) -> Path:
     records = planner.load_cycle_records(config.improvement_cycles_path)
     cycle_records = [record for record in records if str(record.get("cycle_id", "")) == cycle_id]
@@ -484,7 +485,7 @@ def write_cycle_report(
         "avoid_conditions": list(strategy_node.avoid_conditions),
         "execution_evidence": dict(strategy_node.execution_evidence),
     }
-    atomic_write_json(report_path, report, config=config)
+    atomic_write_json(report_path, report, config=config, govern_storage=govern_exports)
     planner.append_cycle_record(
         config.improvement_cycles_path,
         ImprovementCycleRecord(
@@ -520,5 +521,6 @@ def write_cycle_report(
                 dict(strategy_candidate or {}).get("origin", dict(strategy_candidate or {}).get("strategy_origin", ""))
             ).strip(),
         ),
+        govern_exports=govern_exports,
     )
     return report_path

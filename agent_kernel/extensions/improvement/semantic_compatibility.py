@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import re
+
+from ...config import KernelConfig
+from ...ops.episode_store import load_episode_document
+from ...tasking.task_bank import _task_contract_from_memory
 from .improvement_catalog import catalog_string_set
 from .improvement_support_validation import TaskContractCatalog
 from .state_estimation_improvement import STATE_ESTIMATION_PROPOSAL_AREAS
@@ -11,6 +16,24 @@ _DELEGATION_PROPOSAL_AREAS = catalog_string_set("improvement", "delegation_propo
 _TRANSITION_MODEL_PROPOSAL_AREAS = catalog_string_set("transition_model", "proposal_areas")
 _STATE_ESTIMATION_PROPOSAL_AREAS = set(STATE_ESTIMATION_PROPOSAL_AREAS)
 _UNIVERSE_PROPOSAL_AREAS = set(UNIVERSE_PROPOSAL_AREAS)
+_DERIVED_SOURCE_TASK_ID_SUFFIXES = (
+    "_benchmark_candidate",
+    "_verifier_candidate",
+    "_episode_replay",
+    "_verifier_replay",
+    "_discovered",
+    "_skill_replay",
+    "_tool_replay",
+    "_operator_replay",
+    "_transition_pressure",
+    "_repository_adjacent",
+    "_repository_recovery",
+    "_integration_recovery",
+    "_tool_recovery",
+    "_workflow_recovery",
+    "_path_recovery",
+)
+_PARALLEL_WORKER_TASK_DELIMITER = "__worker__"
 
 
 def is_stricter_contract(source_task, contract: dict[str, object]) -> bool:
@@ -107,6 +130,43 @@ def _normalized_semantic_value(value: dict[str, object]) -> tuple[tuple[str, obj
     return tuple(normalized)
 
 
+def _safe_worker_name(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip().replace("/", "_"))
+    return normalized.strip("_") or "worker"
+
+
+def _resolve_parallel_worker_source_task(task_catalog: TaskContractCatalog, source_task_id: str):
+    integrator_task_id, delimiter, worker_token = str(source_task_id).partition(_PARALLEL_WORKER_TASK_DELIMITER)
+    if not delimiter or not integrator_task_id.strip() or not worker_token.strip():
+        raise KeyError(source_task_id)
+    normalized_worker_token = _safe_worker_name(worker_token)
+    try:
+        worker_tasks = task_catalog.bank.parallel_worker_tasks(integrator_task_id.strip())
+    except KeyError as exc:
+        raise KeyError(source_task_id) from exc
+    for worker_task in worker_tasks:
+        if worker_task.task_id == source_task_id:
+            return worker_task
+        metadata = dict(worker_task.metadata)
+        workflow_guard = dict(metadata.get("workflow_guard", {})) if isinstance(metadata.get("workflow_guard", {}), dict) else {}
+        worker_branch = str(workflow_guard.get("worker_branch", "")).strip()
+        if worker_branch and _safe_worker_name(worker_branch) == normalized_worker_token:
+            return worker_task
+    raise KeyError(source_task_id)
+
+
+def _resolve_episode_memory_source_task(task_catalog: TaskContractCatalog, source_task_id: str):
+    config = KernelConfig()
+    try:
+        document = load_episode_document(config.trajectories_root, source_task_id, config=config)
+    except FileNotFoundError as exc:
+        raise KeyError(source_task_id) from exc
+    contract = _task_contract_from_memory(document, task_id=source_task_id, bank=task_catalog.bank)
+    if contract is None:
+        raise KeyError(source_task_id)
+    return contract
+
+
 def significant_tokens(text: str) -> list[str]:
     tokens = []
     for token in str(text).lower().replace("/", " ").replace(".", " ").replace("'", " ").replace('"', " ").split():
@@ -118,6 +178,34 @@ def significant_tokens(text: str) -> list[str]:
         if cleaned not in tokens:
             tokens.append(cleaned)
     return tokens
+
+
+def _resolve_source_task(task_catalog: TaskContractCatalog, source_task_id: str):
+    pending = [str(source_task_id).strip()]
+    seen: set[str] = set()
+    while pending:
+        candidate_task_id = str(pending.pop(0)).strip()
+        if not candidate_task_id or candidate_task_id in seen:
+            continue
+        seen.add(candidate_task_id)
+        try:
+            return task_catalog.get(candidate_task_id)
+        except KeyError:
+            pass
+        try:
+            return _resolve_episode_memory_source_task(task_catalog, candidate_task_id)
+        except KeyError:
+            pass
+        try:
+            return _resolve_parallel_worker_source_task(task_catalog, candidate_task_id)
+        except KeyError:
+            pass
+        for suffix in _DERIVED_SOURCE_TASK_ID_SUFFIXES:
+            if candidate_task_id.endswith(suffix):
+                stripped_task_id = candidate_task_id[: -len(suffix)].strip()
+                if stripped_task_id:
+                    pending.append(stripped_task_id)
+    raise KeyError(source_task_id)
 
 
 def semantic_compatibility_violations(
@@ -140,7 +228,7 @@ def semantic_compatibility_violations(
                 if not source_task_id or not isinstance(contract, dict):
                     continue
                 try:
-                    source_task = task_catalog.get(source_task_id)
+                    source_task = _resolve_source_task(task_catalog, source_task_id)
                 except KeyError:
                     violations.append(f"unknown source task for verifier proposal: {source_task_id}")
                     continue
@@ -386,7 +474,7 @@ def semantic_compatibility_violations(
                 if not source_task_id:
                     continue
                 try:
-                    source_task = task_catalog.get(source_task_id)
+                    source_task = _resolve_source_task(task_catalog, source_task_id)
                 except KeyError:
                     violations.append(f"unknown source task for {subsystem} artifact: {source_task_id}")
                     continue
@@ -435,7 +523,7 @@ def semantic_compatibility_violations(
                     violations.append("operator artifact must contain a task contract")
                 for source_task_id in source_task_ids:
                     try:
-                        source_task = task_catalog.get(source_task_id)
+                        source_task = _resolve_source_task(task_catalog, source_task_id)
                     except KeyError:
                         violations.append(f"unknown source task for operators artifact: {source_task_id}")
                         continue
@@ -460,7 +548,7 @@ def semantic_compatibility_violations(
                 if not source_task_id:
                     continue
                 try:
-                    source_task = task_catalog.get(source_task_id)
+                    source_task = _resolve_source_task(task_catalog, source_task_id)
                 except KeyError:
                     violations.append(f"unknown source task for benchmark proposal: {source_task_id}")
                     continue

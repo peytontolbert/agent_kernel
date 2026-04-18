@@ -482,6 +482,87 @@ def test_run_next_delegated_job_safe_stops_when_acceptance_verifier_fails(monkey
     assert "acceptance packet verifier did not pass" in job.last_error
 
 
+def test_run_next_delegated_job_ignores_non_promotion_acceptance_packets(monkeypatch, tmp_path):
+    from agent_kernel.ops import job_queue as job_queue_module
+    from agent_kernel.schemas import EpisodeRecord
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    queue.enqueue(task_id="hello_task")
+
+    class PassingKernel:
+        def __init__(self, config):
+            self.config = config
+
+        def run_task(self, task, checkpoint_path=None, resume=False, **kwargs):
+            del checkpoint_path
+            del resume
+            del kwargs
+            workspace = self.config.workspace_root / task.workspace_subdir
+            workspace.mkdir(parents=True, exist_ok=True)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(workspace),
+                success=True,
+                steps=[],
+                termination_reason="verification_passed",
+            )
+
+        def close(self):
+            return None
+
+    def fake_write_report(**kwargs):
+        report_path = kwargs["report_path"]
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {
+                    "report_kind": "unattended_task_report",
+                    "acceptance_packet": {
+                        "synthetic_worker": False,
+                        "expected_branch": "",
+                        "target_branch": "",
+                        "required_merged_branches": [],
+                        "diff_base_ref": "",
+                        "selected_edits": [],
+                        "candidate_edit_sets": [],
+                        "tests": [],
+                        "report_rules": [],
+                        "verifier_result": {
+                            "passed": False,
+                            "outcome": "safe_stop",
+                            "reasons": ["worker_command_failed"],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return report_path
+
+    monkeypatch.setattr(job_queue_module, "AgentKernel", PassingKernel)
+    monkeypatch.setattr(job_queue_module, "write_unattended_task_report", fake_write_report)
+
+    job = run_next_delegated_job(queue, base_config=config, repo_root=Path(__file__).resolve().parents[1])
+
+    assert job is not None
+    assert job.state == "completed"
+    assert job.outcome == "success"
+    assert "acceptance_verifier_failed" not in job.outcome_reasons
+    assert job.last_error == ""
+
+
 def test_drain_stops_after_interrupted_job(monkeypatch, tmp_path):
     from agent_kernel.ops import job_queue as job_queue_module
 

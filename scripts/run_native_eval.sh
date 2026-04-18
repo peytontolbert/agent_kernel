@@ -16,4 +16,8 @@ export AGENT_KERNEL_TOLBERT_SOURCE_SPANS_PATHS="${AGENT_KERNEL_TOLBERT_SOURCE_SP
 export AGENT_KERNEL_TOLBERT_CACHE_PATHS="${AGENT_KERNEL_TOLBERT_CACHE_PATHS:-/data/agentkernel/var/tolbert/agentkernel/retrieval_cache/agentkernel__tolbert_epoch10.pt}"
 export AGENT_KERNEL_TOLBERT_DEVICE="${AGENT_KERNEL_TOLBERT_DEVICE:-cuda}"
 
+if [[ "${AGENT_KERNEL_PROVIDER}" == "vllm" ]]; then
+  python scripts/ensure_vllm_runtime.py >/dev/stderr
+fi
+
 python scripts/run_eval.py --provider "$AGENT_KERNEL_PROVIDER" --model "$AGENT_KERNEL_MODEL" "$@"

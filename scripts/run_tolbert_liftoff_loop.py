@@ -976,6 +976,12 @@ def main() -> None:
                 max_waves=drift_max_waves,
                 eval_kwargs=_eval_kwargs(),
             ).to_dict()
+        refreshed_universal_decoder_eval = _run_universal_decoder_eval(
+            config=config,
+            candidate_artifact=candidate_artifact,
+        )
+        if refreshed_universal_decoder_eval is not None:
+            universal_decoder_eval = refreshed_universal_decoder_eval
         liftoff_report = build_liftoff_gate_report(
             candidate_metrics=candidate_metrics,
             baseline_metrics=baseline_metrics,
@@ -983,6 +989,7 @@ def main() -> None:
             candidate_trust_ledger=candidate_trust_ledger,
             baseline_trust_ledger=baseline_trust_ledger,
             takeover_drift_report=takeover_drift_report,
+            universal_decoder_eval=universal_decoder_eval,
         )
         _emit_liftoff_summary(liftoff_report)
         if args.apply_routing:
@@ -999,12 +1006,6 @@ def main() -> None:
                 candidate_artifact_path.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-        refreshed_universal_decoder_eval = _run_universal_decoder_eval(
-            config=config,
-            candidate_artifact=candidate_artifact,
-        )
-        if refreshed_universal_decoder_eval is not None:
-            universal_decoder_eval = refreshed_universal_decoder_eval
     except KeyboardInterrupt:
         base_report.update(
             {

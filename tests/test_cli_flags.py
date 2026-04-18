@@ -97,6 +97,34 @@ def test_kernel_config_executable_floor_preset():
     assert config.persist_episode_memory is True
 
 
+def test_kernel_config_qwen_tolbert_reference_implementation_preset():
+    config = KernelConfig.qwen_tolbert_reference_implementation()
+
+    assert config.provider == "vllm"
+    assert config.model_name == "Qwen/Qwen3.5-9B"
+    assert config.use_tolbert_context is True
+    assert config.use_paper_research_context is False
+    assert config.use_skills is False
+    assert config.use_graph_memory is True
+    assert config.use_world_model is True
+    assert config.use_universe_model is True
+    assert config.use_planner is False
+    assert config.use_role_specialization is False
+    assert config.use_prompt_proposals is False
+    assert config.use_curriculum_proposals is False
+    assert config.use_retrieval_proposals is False
+    assert config.use_state_estimation_proposals is False
+    assert config.use_trust_proposals is False
+    assert config.use_recovery_proposals is False
+    assert config.use_delegation_proposals is False
+    assert config.use_operator_policy_proposals is False
+    assert config.use_transition_model_proposals is False
+    assert config.use_tolbert_model_artifacts is False
+    assert config.persist_episode_memory is True
+    assert config.persist_learning_candidates is True
+    assert config.asi_coding_require_live_llm is True
+
+
 def test_kernel_config_defaults_to_vllm_runtime(monkeypatch):
     for name in ("AGENT_KERNEL_PROVIDER", "AGENT_KERNEL_MODEL", "AGENT_KERNEL_VLLM_HOST"):
         monkeypatch.delenv(name, raising=False)
@@ -295,6 +323,86 @@ def test_run_agent_cli_safe_stops_on_failed_preflight(monkeypatch, tmp_path):
     assert seen["kernel_called"] is False
     assert stream.getvalue() == ""
     assert "outcome=safe_stop report=" in err_stream.getvalue()
+
+
+def test_run_minimal_asi_cli_applies_reference_profile(monkeypatch, tmp_path):
+    module = _load_script_module("run_minimal_asi.py")
+    seen = {"closed": False}
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            seen["task_bank_config"] = config
+
+        def get(self, task_id):
+            return TaskSpec(
+                task_id=task_id,
+                prompt="create ok.txt",
+                workspace_subdir=task_id,
+                expected_files=["ok.txt"],
+            )
+
+    class FakeKernel:
+        def __init__(self, config):
+            seen["config"] = config
+
+        def run_task(self, task, **kwargs):
+            seen["task"] = task
+            seen["run_kwargs"] = kwargs
+            return type("Episode", (), {"task_id": task.task_id, "success": True, "steps": [object(), object()]})()
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(module, "AgentKernel", FakeKernel)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_minimal_asi.py",
+            "--task-id",
+            "hello_task",
+            "--state-root",
+            str(tmp_path / "fresh_state"),
+            "--use-graph-memory",
+            "0",
+            "--persist-learning-candidates",
+            "0",
+            "--print-profile",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    profile = json.loads(lines[0])
+    config = seen["config"]
+    state_root = (tmp_path / "fresh_state").resolve()
+
+    assert profile["profile"] == "qwen_tolbert_reference_implementation"
+    assert profile["provider"] == "vllm"
+    assert profile["decoder_authority"] == "external_decoder"
+    assert profile["state_root"] == str(state_root)
+    assert config.use_tolbert_context is True
+    assert config.use_graph_memory is False
+    assert config.use_world_model is True
+    assert config.use_universe_model is True
+    assert config.persist_learning_candidates is False
+    assert config.persist_episode_memory is True
+    assert config.workspace_root == state_root / "workspace"
+    assert config.capability_modules_path == state_root / "config" / "capabilities.json"
+    assert config.runtime_database_path == state_root / "var" / "runtime" / "agentkernel.sqlite3"
+    assert seen["task_bank_config"] is config
+    assert seen["run_kwargs"]["resume"] is False
+    assert seen["run_kwargs"]["checkpoint_path"] == state_root / "trajectories" / "checkpoints" / "hello_task.json"
+    assert seen["closed"] is True
+    assert (
+        lines[1]
+        == "profile=qwen_tolbert_reference_implementation runtime_shape=executable_floor "
+        "decoder_authority=external_decoder task=hello_task success=True steps=2"
+    )
 
 
 def test_run_eval_cli_applies_extended_runtime_toggles(monkeypatch):
@@ -539,6 +647,10 @@ def test_run_repeated_improvement_cycles_streams_child_output(monkeypatch, tmp_p
             self.trust_ledger_path = trust_ledger_path
             self.runtime_config = runtime_config
 
+        def incomplete_cycle_summaries(self, output_path, protocol=None):
+            del output_path, protocol
+            return []
+
         def retained_gain_summary(self, output_path):
             return type(
                 "Summary",
@@ -559,7 +671,8 @@ def test_run_repeated_improvement_cycles_streams_child_output(monkeypatch, tmp_p
         def load_cycle_records(self, output_path):
             return []
 
-        def append_cycle_record(self, output_path, record):
+        def append_cycle_record(self, output_path, record, govern_exports=True):
+            del govern_exports
             seen["record"] = record
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("", encoding="utf-8")
@@ -605,6 +718,93 @@ def test_run_repeated_improvement_cycles_streams_child_output(monkeypatch, tmp_p
     output = stream.getvalue()
     assert "[cycle:cycle-1] task 1/1 hello_task" in output
     assert "subsystem=policy final_state=retain" in output
+
+
+def test_run_repeated_improvement_cycles_semantic_only_runtime_disables_tolbert(monkeypatch, tmp_path):
+    module = _load_script_module("run_repeated_improvement_cycles.py")
+    seen = {}
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter(["subsystem=retrieval final_state=reject\n"])
+
+    class FakePopen:
+        def __init__(self, cmd, cwd, stdout, stderr, text, bufsize, env=None):
+            seen["cmd"] = cmd
+            seen["cwd"] = cwd
+            seen["env"] = env
+            self.stdout = FakeStdout()
+
+        def wait(self):
+            return 0
+
+    class FakePlanner:
+        def __init__(
+            self,
+            memory_root=None,
+            cycles_path=None,
+            prompt_proposals_path=None,
+            use_prompt_proposals=True,
+            capability_modules_path=None,
+            trust_ledger_path=None,
+            runtime_config=None,
+        ):
+            del memory_root, cycles_path, prompt_proposals_path, use_prompt_proposals
+            del capability_modules_path, trust_ledger_path, runtime_config
+
+        def incomplete_cycle_summaries(self, output_path, protocol=None):
+            del output_path, protocol
+            return []
+
+        def retained_gain_summary(self, output_path):
+            del output_path
+            return type(
+                "Summary",
+                (),
+                {
+                    "retained_cycles": 0,
+                    "rejected_cycles": 1,
+                    "total_decisions": 1,
+                    "retained_by_subsystem": {},
+                    "rejected_by_subsystem": {"retrieval": 1},
+                    "average_retained_pass_rate_delta": 0.0,
+                    "average_retained_step_delta": 0.0,
+                    "average_rejected_pass_rate_delta": 0.0,
+                    "average_rejected_step_delta": 0.0,
+                },
+            )()
+
+        def load_cycle_records(self, output_path):
+            del output_path
+            return []
+
+        def append_cycle_record(self, output_path, record, govern_exports=True):
+            del record, govern_exports
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("", encoding="utf-8")
+            return output_path
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(module, "ImprovementPlanner", FakePlanner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_repeated_improvement_cycles.py",
+            "--cycles",
+            "1",
+            "--semantic-only-runtime",
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    module.main()
+
+    exclude_indexes = [index for index, token in enumerate(seen["cmd"]) if token == "--exclude-subsystem"]
+    assert exclude_indexes
+    assert any(seen["cmd"][index + 1] == "tolbert_model" for index in exclude_indexes)
+    assert seen["env"]["AGENT_KERNEL_USE_TOLBERT_CONTEXT"] == "0"
+    assert seen["env"]["AGENT_KERNEL_USE_TOLBERT_MODEL_ARTIFACTS"] == "0"
 
 
 def test_run_repeated_improvement_cycles_emits_explicit_timeout_reason(monkeypatch, tmp_path):

@@ -22,7 +22,11 @@ from agent_kernel.ops.episode_store import iter_episode_documents
 from agent_kernel.loop import AgentKernel
 from agent_kernel.extensions.operator_policy import operator_policy_snapshot
 from agent_kernel.policy import Policy
-from agent_kernel.ops.preflight import capture_workspace_snapshot, write_unattended_task_report
+from agent_kernel.ops.preflight import (
+    capture_workspace_snapshot,
+    run_unattended_preflight,
+    write_unattended_task_report,
+)
 from agent_kernel.ops.runtime_supervision import atomic_write_json
 from agent_kernel.schemas import ActionDecision, EpisodeRecord
 from agent_kernel.tasking.task_bank import (
@@ -222,11 +226,14 @@ def _run_tasks_with_progress(
 ):
     total = len(tasks)
     results = []
+    repo_root = Path(__file__).resolve().parents[1]
     for index, task in enumerate(tasks, start=1):
         before_workspace_snapshot = None
+        preflight = None
         if report_config is not None:
             workspace_path = report_config.workspace_root / task.workspace_subdir
             before_workspace_snapshot = capture_workspace_snapshot(workspace_path)
+            preflight = run_unattended_preflight(report_config, task, repo_root=repo_root)
         if on_task_start is not None:
             on_task_start(task, index, total)
         if progress_label and _should_emit_task_progress(index, total):
@@ -259,6 +266,8 @@ def _run_tasks_with_progress(
                 "plan_candidates",
                 "transition_simulated",
                 "payload_build",
+                "llm_request",
+                "llm_response",
             }:
                 cognitive_stage = step_stage
             if progress_label and cognitive_stage:
@@ -285,11 +294,23 @@ def _run_tasks_with_progress(
                     )
                 _emit_eval_progress(progress_label, " ".join(parts))
 
-        result = _run_kernel_task(
-            kernel,
-            task,
-            progress_callback=_task_progress if on_task_progress is not None else None,
-        )
+        if preflight is not None and not preflight.passed:
+            result = EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(report_config.workspace_root / task.workspace_subdir),
+                success=False,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract=task.to_dict(),
+                termination_reason="preflight_failed",
+            )
+        else:
+            result = _run_kernel_task(
+                kernel,
+                task,
+                progress_callback=_task_progress if on_task_progress is not None else None,
+            )
         # Flush completion bookkeeping before any slower report persistence so
         # partial snapshots can reflect a verified task even if later writes stall.
         if on_task_complete is not None:
@@ -302,7 +323,7 @@ def _run_tasks_with_progress(
                 task=task,
                 config=report_config,
                 episode=result,
-                preflight=None,
+                preflight=preflight,
                 before_workspace_snapshot=before_workspace_snapshot,
             )
     return results
@@ -3525,9 +3546,18 @@ def run_eval(
                 merged_controls = dict(engine._curriculum_controls() or {})
                 merged_controls.update(strategy_controls)
                 engine._curriculum_controls_cache = merged_controls
+            shared_generated_reports_dir = active_config.run_reports_dir if write_unattended_reports else None
             if include_generated:
                 _emit_eval_progress(progress_label, "phase=generated_success_schedule")
-                success_generated_config = _scoped_config(active_config, "generated_success")
+                success_generated_config = (
+                    _scoped_config(
+                        active_config,
+                        "generated_success",
+                        run_reports_dir=shared_generated_reports_dir,
+                    )
+                    if shared_generated_reports_dir is not None
+                    else _scoped_config(active_config, "generated_success")
+                )
                 success_seed_results = results
                 if not success_seed_results and allow_generated_success_seed_fallback:
                     success_seed_results = _load_generated_success_seed_episodes(
@@ -3605,7 +3635,15 @@ def run_eval(
                 _emit_eval_progress(progress_label, f"phase=generated_failure_seed total={len(tasks)}")
                 failure_seed_config = _scoped_config(active_config, "generated_failure_seed")
                 failing_kernel = AgentKernel(config=failure_seed_config, policy=_ForcedFailurePolicy())
-                failure_generated_config = _scoped_config(active_config, "generated_failure")
+                failure_generated_config = (
+                    _scoped_config(
+                        active_config,
+                        "generated_failure",
+                        run_reports_dir=shared_generated_reports_dir,
+                    )
+                    if shared_generated_reports_dir is not None
+                    else _scoped_config(active_config, "generated_failure")
+                )
                 try:
                     failure_seeds = _run_tasks_with_progress(
                         tasks,
@@ -3721,6 +3759,7 @@ def run_eval(
     low_confidence_steps = 0
     first_step_successes = 0
     first_step_confidence_total = 0.0
+    first_step_confidence_count = 0
     success_first_step_confidence_total = 0.0
     failed_first_step_confidence_total = 0.0
     success_first_step_confidence_count = 0
@@ -3841,13 +3880,14 @@ def run_eval(
         if result.steps:
             first_step_confidence = float(result.steps[0].path_confidence)
             first_step_confidence_total += first_step_confidence
+            first_step_confidence_count += 1
             if result.success:
                 success_first_step_confidence_total += first_step_confidence
                 success_first_step_confidence_count += 1
             else:
                 failed_first_step_confidence_total += first_step_confidence
                 failed_first_step_confidence_count += 1
-        if 0.0 < first_step_confidence < active_config.tolbert_low_confidence_widen_threshold:
+            if 0.0 < first_step_confidence < active_config.tolbert_low_confidence_widen_threshold:
                 low_confidence_episodes += 1
                 if result.success:
                     low_confidence_passed += 1
@@ -4069,8 +4109,8 @@ def run_eval(
         low_confidence_steps=low_confidence_steps,
         first_step_successes=first_step_successes,
         average_first_step_path_confidence=0.0
-        if not results
-        else first_step_confidence_total / len(results),
+        if first_step_confidence_count == 0
+        else first_step_confidence_total / first_step_confidence_count,
         success_first_step_path_confidence=0.0
         if success_first_step_confidence_count == 0
         else success_first_step_confidence_total / success_first_step_confidence_count,
@@ -4989,8 +5029,23 @@ def _limit_tasks_for_compare(
             task_limit,
             priority_weights=_normalize_priority_family_weights(priority_family_weights),
         )
-        for family in prioritized:
-            _consume_family(family, limit=slot_targets.get(family, 0))
+        remaining_slot_targets = {family: max(0, int(slot_targets.get(family, 0) or 0)) for family in prioritized}
+        while len(selected) < task_limit:
+            added = False
+            for family in prioritized:
+                if remaining_slot_targets.get(family, 0) <= 0:
+                    continue
+                family_tasks = grouped.get(family, [])
+                if not family_tasks:
+                    remaining_slot_targets[family] = 0
+                    continue
+                selected.append(family_tasks.pop(0))
+                remaining_slot_targets[family] -= 1
+                added = True
+                if len(selected) >= task_limit:
+                    break
+            if not added:
+                break
 
     families = prioritized + [
         family

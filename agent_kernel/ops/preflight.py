@@ -28,6 +28,7 @@ from ..extensions.syntax_motor import build_syntax_motor_summary, syntax_preflig
 from ..extensions.tolbert import _paper_research_runtime_paths
 from ..extensions.tolbert_assets import retained_tolbert_runtime_paths
 from ..extensions.trust import evaluate_unattended_trust, trust_policy_snapshot
+from .vllm_runtime import ensure_vllm_runtime
 
 
 @dataclass(slots=True)
@@ -91,13 +92,22 @@ def run_unattended_preflight(
     )
 
 
+def provider_health_check(
+    config: KernelConfig,
+    *,
+    urlopen: Callable[..., Any] | None = None,
+) -> PreflightCheck:
+    opener = urlopen or url_request.urlopen
+    return _provider_health_check(config, opener=opener)
+
+
 def classify_run_outcome(
     *,
     episode: EpisodeRecord | None,
     preflight: PreflightReport | None = None,
 ) -> tuple[str, list[str]]:
     if preflight is not None and not preflight.passed:
-        failed_checks = [check.name for check in preflight.checks if not check.passed]
+        failed_checks = _required_failed_preflight_checks(preflight)
         return "safe_stop", [f"preflight_failed:{name}" for name in failed_checks]
     if episode is None:
         return "safe_stop", ["no_episode_recorded"]
@@ -219,6 +229,7 @@ def build_unattended_task_report(
             "timed_out_steps": sum(1 for step in command_steps if _step_timed_out(step)),
             "zero_exit_steps": sum(1 for step in command_steps if _step_exit_code(step) == 0),
             "verified_steps": sum(1 for step in command_steps if _step_verified(step)),
+            "execution_source_summary": _execution_source_summary(command_steps),
             "workspace_files": len(after_workspace_snapshot),
             "created_files": len(side_effects["created_files"]),
             "modified_files": len(side_effects["modified_files"]),
@@ -443,7 +454,8 @@ def _report_supervision(
         "operator_turns": operator_turns,
         "verifier_defined": verifier_defined,
         "independent_execution": independent_execution,
-        "preflight_passed": bool(preflight.passed) if preflight is not None else True,
+        "preflight_ran": preflight is not None,
+        "preflight_passed": bool(preflight.passed) if preflight is not None else False,
         "command_steps": len(command_steps),
         "changed_files": changed_files,
         "hidden_side_effect_risk": hidden_side_effect_risk,
@@ -656,15 +668,11 @@ def _provider_health_check(
             opener=opener,
         )
     if provider == "vllm":
-        headers = {}
-        if config.vllm_api_key.strip():
-            headers["Authorization"] = f"Bearer {config.vllm_api_key.strip()}"
-        return _http_health_check(
+        status = ensure_vllm_runtime(config, opener=opener)
+        return PreflightCheck(
             name="provider_health",
-            detail_label="vllm",
-            url=f"{config.vllm_host.rstrip('/')}/v1/models",
-            opener=opener,
-            headers=headers,
+            passed=bool(status.ready),
+            detail=str(status.detail),
         )
     return PreflightCheck(
         name="provider_health",
@@ -693,6 +701,17 @@ def _execution_containment_check(config: KernelConfig) -> PreflightCheck:
         detail=detail,
         severity="optional",
     )
+
+
+def _required_failed_preflight_checks(preflight: PreflightReport) -> list[str]:
+    required_failures = [
+        check.name
+        for check in preflight.checks
+        if not check.passed and str(check.severity).strip().lower() == "required"
+    ]
+    if required_failures:
+        return required_failures
+    return [check.name for check in preflight.checks if not check.passed]
 
 
 def _http_health_check(
@@ -1048,11 +1067,85 @@ def _trust_posture_check(config: KernelConfig, task: TaskSpec) -> PreflightCheck
     )
     if breadth_detail:
         detail = f"{detail} | {breadth_detail}"
+    bootstrap_override_detail = _trust_proof_bootstrap_override_detail(evaluation=evaluation, task=task)
+    if bootstrap_override_detail:
+        return PreflightCheck(
+            name="trust_posture",
+            passed=True,
+            detail=f"{detail} | {bootstrap_override_detail}",
+            severity="required",
+        )
     return PreflightCheck(
         name="trust_posture",
         passed=bool(evaluation["passed"]),
         detail=detail,
         severity="required",
+    )
+
+
+def _trust_proof_bootstrap_override_detail(
+    *,
+    evaluation: dict[str, Any],
+    task: TaskSpec,
+) -> str:
+    if bool(evaluation.get("passed", False)) or not bool(evaluation.get("required", False)):
+        return ""
+    family_assessment = (
+        dict(evaluation.get("family_assessment", {}))
+        if isinstance(evaluation.get("family_assessment", {}), dict)
+        else {}
+    )
+    overall_assessment = (
+        dict(evaluation.get("overall_assessment", {}))
+        if isinstance(evaluation.get("overall_assessment", {}), dict)
+        else {}
+    )
+    if not bool(family_assessment.get("passed", False)) or bool(overall_assessment.get("passed", False)):
+        return ""
+    overall_failures = [
+        str(value).strip()
+        for value in overall_assessment.get("failing_thresholds", [])
+        if str(value).strip()
+    ]
+    if not overall_failures or any(
+        "distinct_benchmark_families=" not in value or "min_distinct_families=" not in value
+        for value in overall_failures
+    ):
+        return ""
+    metadata = dict(task.metadata) if isinstance(task.metadata, dict) else {}
+    if not (
+        bool(metadata.get("decision_yield_contract_candidate", False))
+        or bool(metadata.get("light_supervision_candidate", False))
+        or str(metadata.get("task_origin", "")).strip() in {"semantic_hub", "external_manifest"}
+    ):
+        return ""
+    coverage_summary = (
+        dict(evaluation.get("coverage_summary", {}))
+        if isinstance(evaluation.get("coverage_summary", {}), dict)
+        else {}
+    )
+    family = str(evaluation.get("benchmark_family", "bounded")).strip() or "bounded"
+    missing_counted_families = {
+        str(value).strip()
+        for value in coverage_summary.get("missing_required_counted_gated_families", [])
+        if str(value).strip()
+    }
+    missing_clean_root_breadth = {
+        str(value).strip()
+        for value in coverage_summary.get("required_families_missing_clean_task_root_breadth", [])
+        if str(value).strip()
+    }
+    if family not in missing_counted_families and family not in missing_clean_root_breadth:
+        return ""
+    reasons: list[str] = []
+    if family in missing_counted_families:
+        reasons.append("counted gated evidence")
+    if family in missing_clean_root_breadth:
+        reasons.append("clean task-root breadth")
+    reasons_text = " and ".join(reasons)
+    return (
+        f"proof bootstrap override enabled for required family {family!r}; "
+        f"allowing this clean-evidence candidate to accumulate missing {reasons_text}"
     )
 
 
@@ -1290,6 +1383,30 @@ def _serialize_command_step(step: StepRecord) -> dict[str, Any]:
             if str(value).strip()
         ],
     }
+
+
+def _execution_source_summary(command_steps: list[StepRecord]) -> dict[str, int]:
+    summary = {
+        "decoder_generated": 0,
+        "llm_generated": 0,
+        "bounded_decoder_generated": 0,
+        "synthetic_plan": 0,
+        "deterministic_or_other": 0,
+        "total_executed_commands": len(command_steps),
+    }
+    for step in command_steps:
+        decision_source = str(step.decision_source).strip()
+        if decision_source == "llm":
+            summary["decoder_generated"] += 1
+            summary["llm_generated"] += 1
+        elif decision_source.endswith("_decoder"):
+            summary["decoder_generated"] += 1
+            summary["bounded_decoder_generated"] += 1
+        elif decision_source == "synthetic_edit_plan_direct":
+            summary["synthetic_plan"] += 1
+        else:
+            summary["deterministic_or_other"] += 1
+    return summary
 
 
 def _step_non_committal_failure(step: StepRecord) -> bool:

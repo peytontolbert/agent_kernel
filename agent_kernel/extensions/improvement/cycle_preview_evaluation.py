@@ -17,6 +17,26 @@ from .artifacts import (
     payload_with_active_artifact_context,
     retention_gate_for_payload,
 )
+from .cycle_preview_support import retrieval_bounded_preview_required
+
+
+def _allow_payload_priority_overrides(
+    *,
+    subsystem: str,
+    payload: dict[str, object] | None,
+    restrict_to_priority_families: bool,
+    explicit_priority_families: list[str] | None,
+    capability_modules_path: Path | None,
+) -> bool:
+    if not restrict_to_priority_families or not explicit_priority_families:
+        return True
+    # Retrieval retention previews need their artifact-defined discrimination probe
+    # families even when the parent campaign is running with a restricted proof lane.
+    return retrieval_bounded_preview_required(
+        subsystem,
+        payload=payload,
+        capability_modules_path=capability_modules_path,
+    )
 
 
 def compare_to_prior_retained(
@@ -96,11 +116,18 @@ def compare_to_prior_retained(
     preserve_generated_lanes = bool(scoped_flags.get("include_generated", False)) or bool(
         scoped_flags.get("include_failure_generated", False)
     )
+    allow_payload_overrides = _allow_payload_priority_overrides(
+        subsystem=subsystem,
+        payload=payload,
+        restrict_to_priority_families=restrict_to_priority_families,
+        explicit_priority_families=explicit_priority_families,
+        capability_modules_path=config.capability_modules_path,
+    )
     merged_priority_families, merged_priority_family_weights = merge_priority_families_fn(
         explicit_priority_families,
         explicit_priority_weights,
         payload,
-        allow_payload_overrides=not restrict_to_priority_families,
+        allow_payload_overrides=allow_payload_overrides,
     )
     if isinstance(comparison_task_limit, int) and comparison_task_limit > 0:
         scoped_flags["task_limit"] = comparison_task_limit
@@ -274,13 +301,20 @@ def preview_candidate_retention(
         payload=artifact_payload,
         capability_modules_path=config.capability_modules_path,
     )
+    allow_payload_overrides = _allow_payload_priority_overrides(
+        subsystem=subsystem,
+        payload=artifact_payload,
+        restrict_to_priority_families=(
+            restrict_to_priority_benchmark_families and bool(priority_benchmark_families)
+        ),
+        explicit_priority_families=priority_benchmark_families,
+        capability_modules_path=config.capability_modules_path,
+    )
     merged_priority_families, merged_priority_family_weights = merge_priority_families_fn(
         priority_benchmark_families,
         priority_benchmark_family_weights,
         artifact_payload,
-        allow_payload_overrides=not (
-            restrict_to_priority_benchmark_families and bool(priority_benchmark_families)
-        ),
+        allow_payload_overrides=allow_payload_overrides,
     )
     managed_active_artifact_path = (
         active_artifact_path if active_artifact_path is not None else active_artifact_path_for_subsystem(config, subsystem)

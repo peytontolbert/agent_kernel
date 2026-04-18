@@ -33,6 +33,7 @@ _DEFAULT_TOLBERT_BUILD_POLICY: dict[str, object] = kernel_catalog_mapping("tolbe
 _TOLBERT_SHARED_STORE_GROUPS = tuple(kernel_catalog_string_list("tolbert_model", "shared_store_groups"))
 _TOLBERT_HARD_PROPOSAL_FAMILIES = kernel_catalog_string_set("tolbert_model", "hard_proposal_families")
 _TOLBERT_MEDIUM_PROPOSAL_FAMILIES = kernel_catalog_string_set("tolbert_model", "medium_proposal_families")
+_TOLBERT_MIN_FREE_CUDA_MEMORY_MIB = 4096
 
 
 def build_tolbert_model_candidate_artifact(
@@ -121,6 +122,14 @@ def build_tolbert_model_candidate_artifact(
         universal_decoder_training_controls=universal_decoder_training_controls,
         current_payload=current_payload,
         progress=progress,
+    )
+    _ensure_required_tolbert_runtime_materialization(
+        dataset_manifest=dataset_manifest,
+        universal_dataset_manifest=universal_dataset_manifest,
+        hybrid_manifest=hybrid_manifest,
+        hybrid_job_records=hybrid_job_records,
+        universal_manifest=universal_manifest,
+        universal_job_records=universal_job_records,
     )
     if progress is not None:
         progress("stage=tolbert_runtime_bundle start")
@@ -644,6 +653,77 @@ def _run_tolbert_generation_pipelines(
         universal_manifest,
         universal_job_records,
     )
+
+
+def _ensure_required_tolbert_runtime_materialization(
+    *,
+    dataset_manifest: dict[str, object],
+    universal_dataset_manifest: dict[str, object],
+    hybrid_manifest: dict[str, object] | None,
+    hybrid_job_records: list[dict[str, object]],
+    universal_manifest: dict[str, object] | None,
+    universal_job_records: list[dict[str, object]],
+) -> None:
+    failures: list[str] = []
+    actionable_families = _tolbert_actionable_benchmark_families(dataset_manifest)
+    if _tolbert_hybrid_runtime_required(dataset_manifest) and not isinstance(hybrid_manifest, dict):
+        required_scope = "primary and shadow runtime" if actionable_families else "shadow runtime"
+        failures.append(
+            "tolbert hybrid runtime did not materialize required "
+            f"{required_scope} bundle ({_tolbert_job_record_failure_summary(hybrid_job_records)})"
+        )
+    if _tolbert_universal_decoder_required(universal_dataset_manifest) and not isinstance(universal_manifest, dict):
+        failures.append(
+            "tolbert universal decoder runtime did not materialize required bundle "
+            f"({_tolbert_job_record_failure_summary(universal_job_records)})"
+        )
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def _tolbert_hybrid_runtime_required(dataset_manifest: dict[str, object]) -> bool:
+    return (
+        int(dataset_manifest.get("policy_examples", 0) or 0) > 0
+        and int(dataset_manifest.get("transition_examples", 0) or 0) > 0
+        and int(dataset_manifest.get("value_examples", 0) or 0) > 0
+        and int(dataset_manifest.get("stop_examples", 0) or 0) > 0
+    )
+
+
+def _tolbert_universal_decoder_required(universal_dataset_manifest: dict[str, object]) -> bool:
+    return int(universal_dataset_manifest.get("train_examples", 0) or 0) > 0
+
+
+def _tolbert_job_record_failure_summary(job_records: list[dict[str, object]]) -> str:
+    failures: list[str] = []
+    for record in job_records:
+        if not isinstance(record, dict):
+            continue
+        state = str(record.get("state", "")).strip()
+        outcome = str(record.get("outcome", "")).strip()
+        if state == "completed" and outcome == "success":
+            continue
+        job_id = str(record.get("job_id", "")).strip() or "unknown_job"
+        last_error = str(record.get("last_error", "")).strip()
+        raw_reasons = record.get("outcome_reasons", [])
+        reasons = (
+            [str(value).strip() for value in raw_reasons if str(value).strip()]
+            if isinstance(raw_reasons, list)
+            else []
+        )
+        fragments = [
+            job_id,
+            f"state={state or 'unknown_state'}",
+            f"outcome={outcome or 'unknown_outcome'}",
+        ]
+        if reasons:
+            fragments.append(f"reasons={','.join(reasons)}")
+        if last_error:
+            fragments.append(f"last_error={last_error}")
+        failures.append(" ".join(fragments))
+    if failures:
+        return "; ".join(failures)
+    return "missing delegated job failure detail"
 
 
 def _materialize_tolbert_model_shared_store(
@@ -1717,6 +1797,7 @@ def run_tolbert_finetune_pipeline(
     train_timeout_seconds = _tolbert_finetune_timeout_seconds(
         config=config,
         num_epochs=num_epochs,
+        training_inputs=training_inputs,
     )
     cache_command = [
         config.tolbert_python_bin,
@@ -1806,11 +1887,27 @@ def run_tolbert_finetune_pipeline(
     ]
 
 
-def _tolbert_finetune_timeout_seconds(*, config: KernelConfig, num_epochs: int) -> int:
+def _tolbert_finetune_timeout_seconds(
+    *,
+    config: KernelConfig,
+    num_epochs: int,
+    training_inputs: dict[str, object] | None = None,
+) -> int:
     epochs = max(1, int(num_epochs))
     # Tolbert fine-tunes are materially longer than normal shell tasks, especially on
     # two-epoch recovery-alignment lanes. Budget them separately from the generic command timeout.
-    return max(int(config.command_timeout_seconds), 180, 120 * epochs + 60)
+    timeout_seconds = max(int(config.command_timeout_seconds), 180, 120 * epochs + 60)
+    if isinstance(training_inputs, dict):
+        max_head_examples = max(
+            int(training_inputs.get("policy_examples", 0) or 0),
+            int(training_inputs.get("transition_examples", 0) or 0),
+            int(training_inputs.get("value_examples", 0) or 0),
+            int(training_inputs.get("stop_examples", 0) or 0),
+        )
+        if max_head_examples > 2000:
+            extra_timeout_seconds = min(900, ((max_head_examples - 2001) // 1000 + 1) * 60)
+            timeout_seconds += extra_timeout_seconds
+    return timeout_seconds
 
 
 def _delegated_job_failure_summary(job: object) -> str:
@@ -2175,6 +2272,10 @@ def _tolbert_liftoff_gate(dataset_manifest: dict[str, object]) -> dict[str, obje
         "min_pass_rate_delta": 0.0,
         "max_step_regression": 0.0,
         "max_regressed_families": 0,
+        "require_universal_decoder_eval": True,
+        "min_universal_decoder_exact_match_delta": 0.0,
+        "min_universal_decoder_token_f1_delta": 0.0,
+        "min_universal_decoder_win_rate_delta": 0.0,
         "require_generated_lane_non_regression": True,
         "require_failure_recovery_non_regression": True,
         "require_long_horizon_non_regression": True,
@@ -2562,6 +2663,50 @@ def _tolbert_cuda_device_count(config: KernelConfig) -> int:
         return 1
 
 
+def _tolbert_cuda_device_inventory(config: KernelConfig) -> list[dict[str, object]]:
+    requested = str(config.tolbert_device).strip().lower() or "cpu"
+    if not requested.startswith("cuda"):
+        return []
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    devices: list[dict[str, object]] = []
+    for raw_line in str(completed.stdout).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        index_text, separator, free_memory_text = line.partition(",")
+        if not separator:
+            continue
+        try:
+            index = int(index_text.strip())
+            free_memory_mib = int(free_memory_text.strip())
+        except ValueError:
+            continue
+        devices.append(
+            {
+                "index": index,
+                "device": f"cuda:{index}",
+                "free_memory_mib": free_memory_mib,
+            }
+        )
+    devices.sort(key=lambda item: (-int(item["free_memory_mib"]), int(item["index"])))
+    return devices
+
+
 def _tolbert_generation_device_plan(config: KernelConfig) -> dict[str, object]:
     requested = str(config.tolbert_device).strip() or "cpu"
     normalized = requested.lower()
@@ -2578,6 +2723,27 @@ def _tolbert_generation_device_plan(config: KernelConfig) -> dict[str, object]:
             "finetune": requested,
             "hybrid": requested,
             "universal": requested,
+        }
+    inventory = _tolbert_cuda_device_inventory(config)
+    healthy_devices = [
+        str(device.get("device", "")).strip()
+        for device in inventory
+        if int(device.get("free_memory_mib", 0) or 0) >= _TOLBERT_MIN_FREE_CUDA_MEMORY_MIB
+    ]
+    if len(healthy_devices) >= 3:
+        return {
+            "parallel": True,
+            "finetune": healthy_devices[0],
+            "hybrid": healthy_devices[1],
+            "universal": healthy_devices[2],
+        }
+    if inventory:
+        resolved = str(inventory[0].get("device", "")).strip() or requested
+        return {
+            "parallel": False,
+            "finetune": resolved,
+            "hybrid": resolved,
+            "universal": resolved,
         }
     available = _tolbert_cuda_device_count(config)
     if available >= 3:
@@ -2649,6 +2815,13 @@ def _job_record(job: Any) -> dict[str, object]:
         "job_id": str(getattr(job, "job_id", "")).strip(),
         "state": str(getattr(job, "state", "")).strip(),
         "outcome": str(getattr(job, "outcome", "")).strip(),
+        "outcome_reasons": [
+            str(value).strip()
+            for value in getattr(job, "outcome_reasons", [])
+            if str(value).strip()
+        ]
+        if isinstance(getattr(job, "outcome_reasons", []), list)
+        else [],
         "last_error": str(getattr(job, "last_error", "")).strip(),
         "report_path": str(getattr(job, "report_path", "")).strip(),
         "checkpoint_path": str(getattr(job, "checkpoint_path", "")).strip(),

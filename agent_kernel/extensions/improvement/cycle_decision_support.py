@@ -216,6 +216,7 @@ def apply_decision_and_persist(
                 ).strip(),
                 active_artifact_path=str(managed_active_artifact_path),
             ),
+            govern_exports=False,
         )
     strategy_candidate_payload = dict(strategy_candidate or {})
     strategy_candidate_id = str(strategy_candidate_payload.get("strategy_candidate_id", "")).strip()
@@ -267,6 +268,7 @@ def apply_decision_and_persist(
             artifact_snapshot_path=str(artifact_update["artifact_snapshot_path"]),
             compatibility=dict(artifact_update["compatibility"]),
         ),
+        govern_exports=False,
     )
     planner.append_cycle_record(
         config.improvement_cycles_path,
@@ -307,8 +309,10 @@ def apply_decision_and_persist(
             artifact_snapshot_path=str(artifact_update["artifact_snapshot_path"]),
             compatibility=dict(artifact_update["compatibility"]),
         ),
+        govern_exports=False,
     )
-    write_cycle_report_fn(
+    _emit(f"finalize phase=write_cycle_report subsystem={subsystem}")
+    report_path = write_cycle_report_fn(
         config=config,
         planner=planner,
         cycle_id=cycle_id,
@@ -329,7 +333,22 @@ def apply_decision_and_persist(
         protocol_match_id=protocol_match_id,
         strategy_candidate=strategy_candidate,
         tolbert_runtime_summary=tolbert_runtime_summary,
+        govern_exports=False,
     )
+    include_cycle_exports = bool(getattr(config, "storage_write_cycle_exports", True))
+    if include_cycle_exports or report_path.exists():
+        from ...ops.export_governance import govern_improvement_export_storage
+
+        _emit(f"finalize phase=govern_exports subsystem={subsystem}")
+        govern_improvement_export_storage(
+            config,
+            preserve_paths=(config.improvement_cycles_path, report_path),
+            include_cycle_exports=include_cycle_exports,
+            include_report_exports=report_path.exists(),
+            include_candidate_exports=False,
+            include_run_reports=False,
+            include_run_checkpoints=False,
+        )
     if state == "reject" and retention_reason_code:
         _emit(
             f"finalize phase=decision_reject_reason subsystem={subsystem} "

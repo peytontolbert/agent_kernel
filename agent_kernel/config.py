@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from pathlib import Path
 import os
+import sys
 
 from .extensions.strategy.kernel_catalog import kernel_catalog_string_list
+from .modeling.model_python import preferred_model_python_path
 
 
 _DEFAULT_UNATTENDED_ALLOWED_BENCHMARK_FAMILIES = tuple(
@@ -114,6 +116,13 @@ def current_storage_governance_config() -> "KernelConfig":
     )
 
 
+def _default_vllm_python_bin() -> str:
+    preferred = preferred_model_python_path()
+    if preferred is not None:
+        return str(preferred)
+    return sys.executable
+
+
 @dataclass(slots=True)
 class KernelConfig:
     provider: str = os.getenv("AGENT_KERNEL_PROVIDER", "vllm")
@@ -121,6 +130,33 @@ class KernelConfig:
     ollama_host: str = os.getenv("AGENT_KERNEL_OLLAMA_HOST", "http://127.0.0.1:11434")
     vllm_host: str = os.getenv("AGENT_KERNEL_VLLM_HOST", "http://127.0.0.1:8000")
     vllm_api_key: str = os.getenv("AGENT_KERNEL_VLLM_API_KEY", "")
+    vllm_autostart: bool = os.getenv("AGENT_KERNEL_VLLM_AUTOSTART", "1") == "1"
+    vllm_start_command: str = os.getenv("AGENT_KERNEL_VLLM_START_COMMAND", "")
+    vllm_start_extra_args: str = os.getenv("AGENT_KERNEL_VLLM_START_EXTRA_ARGS", "")
+    vllm_python_bin: str = os.getenv("AGENT_KERNEL_VLLM_PYTHON_BIN", _default_vllm_python_bin())
+    vllm_tensor_parallel_size: int = int(os.getenv("AGENT_KERNEL_VLLM_TENSOR_PARALLEL_SIZE", "1"))
+    vllm_max_model_len: int = int(os.getenv("AGENT_KERNEL_VLLM_MAX_MODEL_LEN", "4096"))
+    vllm_gpu_memory_utilization: float = float(
+        os.getenv("AGENT_KERNEL_VLLM_GPU_MEMORY_UTILIZATION", "0.92")
+    )
+    vllm_enforce_eager: bool = os.getenv("AGENT_KERNEL_VLLM_ENFORCE_EAGER", "1") == "1"
+    vllm_reasoning_parser: str = os.getenv("AGENT_KERNEL_VLLM_REASONING_PARSER", "")
+    vllm_language_model_only: bool = os.getenv("AGENT_KERNEL_VLLM_LANGUAGE_MODEL_ONLY", "1") == "1"
+    vllm_autostart_timeout_seconds: int = int(
+        os.getenv("AGENT_KERNEL_VLLM_AUTOSTART_TIMEOUT_SECONDS", "180")
+    )
+    vllm_autostart_poll_interval_seconds: float = float(
+        os.getenv("AGENT_KERNEL_VLLM_AUTOSTART_POLL_INTERVAL_SECONDS", "1")
+    )
+    vllm_runtime_log_path: Path = Path(
+        os.getenv("AGENT_KERNEL_VLLM_RUNTIME_LOG_PATH", "var/runtime/vllm_runtime.log")
+    )
+    vllm_runtime_state_path: Path = Path(
+        os.getenv("AGENT_KERNEL_VLLM_RUNTIME_STATE_PATH", "var/runtime/vllm_runtime.json")
+    )
+    vllm_runtime_lock_path: Path = Path(
+        os.getenv("AGENT_KERNEL_VLLM_RUNTIME_LOCK_PATH", "var/runtime/vllm_runtime.lock")
+    )
     use_tolbert_context: bool = os.getenv("AGENT_KERNEL_USE_TOLBERT_CONTEXT", "1") == "1"
     tolbert_mode: str = os.getenv("AGENT_KERNEL_TOLBERT_MODE", "full")
     use_skills: bool = os.getenv("AGENT_KERNEL_USE_SKILLS", "1") == "1"
@@ -138,6 +174,7 @@ class KernelConfig:
     use_tolbert_model_artifacts: bool = os.getenv("AGENT_KERNEL_USE_TOLBERT_MODEL_ARTIFACTS", "1") == "1"
     use_planner: bool = os.getenv("AGENT_KERNEL_USE_PLANNER", "1") == "1"
     use_role_specialization: bool = os.getenv("AGENT_KERNEL_USE_ROLE_SPECIALIZATION", "1") == "1"
+    asi_coding_require_live_llm: bool = os.getenv("AGENT_KERNEL_ASI_CODING_REQUIRE_LIVE_LLM", "0") == "1"
     use_prompt_proposals: bool = os.getenv("AGENT_KERNEL_USE_PROMPT_PROPOSALS", "1") == "1"
     use_curriculum_proposals: bool = os.getenv("AGENT_KERNEL_USE_CURRICULUM_PROPOSALS", "1") == "1"
     use_retrieval_proposals: bool = os.getenv("AGENT_KERNEL_USE_RETRIEVAL_PROPOSALS", "1") == "1"
@@ -614,11 +651,96 @@ class KernelConfig:
         floor_defaults.update(overrides)
         return cls(**floor_defaults)
 
+    @classmethod
+    def qwen_tolbert_reference_implementation(cls, **overrides: object) -> "KernelConfig":
+        reference_defaults: dict[str, object] = {
+            "provider": "vllm",
+            "model_name": "Qwen/Qwen3.5-9B",
+            "use_tolbert_context": True,
+            "use_paper_research_context": False,
+            "use_skills": False,
+            "use_graph_memory": True,
+            "use_world_model": True,
+            "use_universe_model": True,
+            "use_state_estimation_proposals": False,
+            "use_trust_proposals": False,
+            "use_recovery_proposals": False,
+            "use_delegation_proposals": False,
+            "use_operator_policy_proposals": False,
+            "use_transition_model_proposals": False,
+            "use_tolbert_model_artifacts": False,
+            "use_planner": False,
+            "use_role_specialization": False,
+            "use_prompt_proposals": False,
+            "use_curriculum_proposals": False,
+            "use_retrieval_proposals": False,
+            "persist_episode_memory": True,
+            "persist_learning_candidates": True,
+            "asi_coding_require_live_llm": True,
+        }
+        reference_defaults.update(overrides)
+        return cls(**reference_defaults)
+
     def normalized_provider(self) -> str:
         return self.normalize_provider_name(self.provider)
 
+    def decoder_runtime_posture(self) -> dict[str, object]:
+        provider = self.normalized_provider()
+        runtime: dict[str, object] = {}
+        surfaces: dict[str, object] = {}
+        if bool(self.use_tolbert_model_artifacts):
+            from .modeling.artifacts import (
+                retained_tolbert_active_decoder_runtime,
+                load_model_artifact,
+                retained_tolbert_model_surfaces,
+            )
+
+            payload = load_model_artifact(self.tolbert_model_artifact_path)
+            runtime = retained_tolbert_active_decoder_runtime(payload)
+            surfaces = retained_tolbert_model_surfaces(payload)
+        manifest_raw = str(runtime.get("bundle_manifest_path", "")).strip()
+        manifest_path = Path(manifest_raw) if manifest_raw else Path()
+        if manifest_raw and not manifest_path.is_absolute():
+            manifest_path = (self.tolbert_model_artifact_path.parent / manifest_path).resolve()
+        manifest_exists = bool(manifest_raw) and manifest_path.exists()
+        runtime_key = str(runtime.get("runtime_key", "hybrid_runtime")).strip() or "hybrid_runtime"
+        runtime_ready = (
+            bool(runtime.get("materialized", False))
+            if runtime_key == "universal_decoder_runtime"
+            else bool(runtime.get("primary_enabled", False))
+        )
+        native_decoder_ready = (
+            provider == "hybrid"
+            and bool(self.use_tolbert_model_artifacts)
+            and runtime_ready
+            and bool(runtime.get("supports_decoder_surface", False))
+            and bool(surfaces.get("decoder_surface", False))
+            and manifest_exists
+        )
+        if native_decoder_ready:
+            authority = "retained_native_decoder"
+        elif provider in {"ollama", "vllm"}:
+            authority = "external_decoder"
+        elif provider == "mock":
+            authority = "mock_decoder"
+        else:
+            authority = "unavailable_decoder"
+        return {
+            "provider": provider,
+            "authority": authority,
+            "native_decoder_ready": native_decoder_ready,
+            "runtime_key": runtime_key,
+            "training_objective": str(runtime.get("training_objective", "")).strip(),
+            "bundle_manifest_path": str(manifest_path) if manifest_raw else "",
+            "bundle_manifest_exists": manifest_exists,
+            "primary_enabled": bool(runtime.get("primary_enabled", False)),
+            "materialized": bool(runtime.get("materialized", False)),
+            "supports_decoder_surface": bool(runtime.get("supports_decoder_surface", False)),
+            "declares_decoder_surface": bool(surfaces.get("decoder_surface", False)),
+        }
+
     def claimed_runtime_shape(self) -> str:
-        if bool(self.use_universe_model):
+        if bool(self.use_universe_model) and bool(self.decoder_runtime_posture().get("native_decoder_ready", False)):
             return "bounded_autonomous"
         return "executable_floor"
 
@@ -630,6 +752,8 @@ class KernelConfig:
             raise ValueError("ollama_host must be non-empty when provider='ollama'")
         if provider == "vllm" and not self.vllm_host.strip():
             raise ValueError("vllm_host must be non-empty when provider='vllm'")
+        if provider == "vllm" and self.vllm_autostart and not self.vllm_python_bin.strip():
+            raise ValueError("vllm_python_bin must be non-empty when vllm autostart is enabled")
         if not self.model_name.strip():
             raise ValueError("model_name must be non-empty")
 
@@ -649,6 +773,14 @@ class KernelConfig:
         _require_positive_int("llm_timeout_seconds", self.llm_timeout_seconds)
         _require_non_negative_int("llm_retry_attempts", self.llm_retry_attempts)
         _require_non_negative_float("llm_retry_backoff_seconds", self.llm_retry_backoff_seconds)
+        _require_positive_int("vllm_tensor_parallel_size", self.vllm_tensor_parallel_size)
+        _require_positive_int("vllm_max_model_len", self.vllm_max_model_len)
+        _require_positive_int("vllm_autostart_timeout_seconds", self.vllm_autostart_timeout_seconds)
+        _require_non_negative_float(
+            "vllm_autostart_poll_interval_seconds",
+            self.vllm_autostart_poll_interval_seconds,
+        )
+        _require_probability("vllm_gpu_memory_utilization", self.vllm_gpu_memory_utilization)
 
         _require_positive_int("delegated_job_max_concurrency", self.delegated_job_max_concurrency)
         _require_positive_int("delegated_job_max_subprocesses_per_job", self.delegated_job_max_subprocesses_per_job)
@@ -756,6 +888,9 @@ class KernelConfig:
         self.delegated_job_queue_path.parent.mkdir(parents=True, exist_ok=True)
         self.delegated_job_runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.runtime_database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vllm_runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vllm_runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vllm_runtime_lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.unattended_workspace_snapshot_root.mkdir(parents=True, exist_ok=True)
         self.unattended_trust_ledger_path.parent.mkdir(parents=True, exist_ok=True)
 

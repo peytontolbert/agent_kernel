@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 from typing import Callable
 import json
@@ -33,16 +34,28 @@ def _supports_export_governance(config: object) -> bool:
     return all(hasattr(config, field) for field in required_fields)
 
 
+def _matches_cycle_export_path(target: Path, improvement_cycles_path: Path) -> bool:
+    try:
+        resolved_cycles_path = improvement_cycles_path.resolve()
+    except OSError:
+        resolved_cycles_path = improvement_cycles_path
+    if target == resolved_cycles_path:
+        return True
+    return target.parent == resolved_cycles_path.parent and fnmatch.fnmatch(target.name, "cycles*.jsonl")
+
+
 def _maybe_govern_improvement_exports(path: Path, *, config: KernelConfig | None = None) -> None:
     resolved_config = config or current_storage_governance_config()
     if not _supports_export_governance(resolved_config):
         return
     target = path.resolve()
     root_matches: dict[str, Path] = {}
+    matched_roots: set[str] = set()
 
     improvement_cycles_path = getattr(resolved_config, "improvement_cycles_path", None)
     if improvement_cycles_path is not None:
-        root_matches["cycle_exports"] = Path(improvement_cycles_path).parent.resolve()
+        if _matches_cycle_export_path(target, Path(improvement_cycles_path)):
+            matched_roots.add("cycle_exports")
 
     improvement_reports_dir = getattr(resolved_config, "improvement_reports_dir", None)
     if improvement_reports_dir is not None:
@@ -60,11 +73,11 @@ def _maybe_govern_improvement_exports(path: Path, *, config: KernelConfig | None
     if run_checkpoints_dir is not None:
         root_matches["run_checkpoints"] = Path(run_checkpoints_dir).resolve()
 
-    matched_roots = {
+    matched_roots.update({
         name
         for name, root in root_matches.items()
         if root == target or root in target.parents
-    }
+    })
     if not matched_roots:
         return
     unattended_trust_ledger_path = getattr(resolved_config, "unattended_trust_ledger_path", None)

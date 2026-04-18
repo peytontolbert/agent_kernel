@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import os
+import pytest
 import threading
 import time
 from types import SimpleNamespace
@@ -331,6 +332,256 @@ def test_tolbert_model_candidate_artifact_runs_independent_generation_pipelines_
 
     assert max_active >= 2
     assert [record["job_id"] for record in artifact["job_records"]] == ["train", "hybrid", "universal"]
+
+
+def test_tolbert_model_candidate_artifact_fails_closed_when_required_hybrid_runtime_bundle_is_missing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
+
+    output_dir = tmp_path / "candidate"
+    config = KernelConfig(
+        trajectories_root=tmp_path / "episodes",
+        tolbert_model_artifact_path=tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    assets_dir = tmp_path / "assets"
+    training_dir = output_dir / "training"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    training_dir.mkdir(parents=True, exist_ok=True)
+    config_path = assets_dir / "tolbert_config.json"
+    config_path.write_text(json.dumps({"base_model_name": "bert-base-uncased"}), encoding="utf-8")
+    nodes_path = assets_dir / "nodes.jsonl"
+    nodes_path.write_text("", encoding="utf-8")
+    label_map_path = assets_dir / "label_map.json"
+    label_map_path.write_text("{}", encoding="utf-8")
+    source_spans_path = assets_dir / "source_spans.jsonl"
+    source_spans_path.write_text("", encoding="utf-8")
+    model_spans_path = assets_dir / "model_spans.jsonl"
+    model_spans_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        module,
+        "build_agentkernel_tolbert_assets",
+        lambda **kwargs: SimpleNamespace(
+            config_path=config_path,
+            nodes_path=nodes_path,
+            label_map_path=label_map_path,
+            source_spans_path=source_spans_path,
+            model_spans_path=model_spans_path,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_tolbert_supervised_dataset_manifest",
+        lambda **kwargs: {
+            "total_examples": 10,
+            "synthetic_trajectory_examples": 2,
+            "policy_examples": 4,
+            "transition_examples": 4,
+            "value_examples": 4,
+            "stop_examples": 2,
+            "benchmark_families": ["repository"],
+            "action_generation_summary": {
+                "positive_example_count": 2,
+                "template_preferences": {
+                    "repository": [
+                        {
+                            "template_kind": "structured_edit",
+                            "support": 2,
+                            "success_count": 1,
+                            "pass_rate": 0.5,
+                            "provenance": ["repository_audit_packet_task"],
+                        }
+                    ]
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "materialize_universal_decoder_dataset",
+        lambda **kwargs: {
+            "artifact_kind": "tolbert_universal_decoder_dataset",
+            "train_dataset_path": str(output_dir / "universal_dataset" / "train.jsonl"),
+            "train_examples": 8,
+            "total_examples": 8,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_finetune_pipeline",
+        lambda **kwargs: (
+            training_dir / "checkpoint.pt",
+            output_dir / "retrieval_cache" / "cache.pt",
+            [{"job_id": "train", "state": "completed", "outcome": "success"}],
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_hybrid_runtime_pipeline",
+        lambda **kwargs: (
+            None,
+            [
+                {
+                    "job_id": "hybrid",
+                    "state": "safe_stop",
+                    "outcome": "safe_stop",
+                    "outcome_reasons": ["worker_command_failed"],
+                    "last_error": "acceptance packet verifier did not pass",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_universal_decoder_pipeline",
+        lambda **kwargs: (
+            {
+                "artifact_kind": "tolbert_hybrid_runtime_bundle",
+                "model_family": "tolbert_ssm_v1",
+                "config_path": str(output_dir / "universal_runtime" / "hybrid_config.json"),
+                "checkpoint_path": str(output_dir / "universal_runtime" / "hybrid_checkpoint.pt"),
+                "relative_config_path": "hybrid_config.json",
+                "relative_checkpoint_path": "hybrid_checkpoint.pt",
+            },
+            [{"job_id": "universal", "state": "completed", "outcome": "success"}],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="tolbert hybrid runtime did not materialize required primary and shadow runtime bundle"):
+        module.build_tolbert_model_candidate_artifact(
+            config=config,
+            repo_root=Path(__file__).resolve().parents[1],
+            output_dir=output_dir,
+            metrics=EvalMetrics(total=10, passed=8),
+        )
+
+
+def test_tolbert_model_candidate_artifact_fails_closed_when_required_universal_decoder_bundle_is_missing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
+
+    output_dir = tmp_path / "candidate"
+    config = KernelConfig(
+        trajectories_root=tmp_path / "episodes",
+        tolbert_model_artifact_path=tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json",
+    )
+    config.trajectories_root.mkdir(parents=True, exist_ok=True)
+    assets_dir = tmp_path / "assets"
+    training_dir = output_dir / "training"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    training_dir.mkdir(parents=True, exist_ok=True)
+    config_path = assets_dir / "tolbert_config.json"
+    config_path.write_text(json.dumps({"base_model_name": "bert-base-uncased"}), encoding="utf-8")
+    nodes_path = assets_dir / "nodes.jsonl"
+    nodes_path.write_text("", encoding="utf-8")
+    label_map_path = assets_dir / "label_map.json"
+    label_map_path.write_text("{}", encoding="utf-8")
+    source_spans_path = assets_dir / "source_spans.jsonl"
+    source_spans_path.write_text("", encoding="utf-8")
+    model_spans_path = assets_dir / "model_spans.jsonl"
+    model_spans_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        module,
+        "build_agentkernel_tolbert_assets",
+        lambda **kwargs: SimpleNamespace(
+            config_path=config_path,
+            nodes_path=nodes_path,
+            label_map_path=label_map_path,
+            source_spans_path=source_spans_path,
+            model_spans_path=model_spans_path,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_tolbert_supervised_dataset_manifest",
+        lambda **kwargs: {
+            "total_examples": 10,
+            "synthetic_trajectory_examples": 2,
+            "policy_examples": 4,
+            "transition_examples": 4,
+            "value_examples": 4,
+            "stop_examples": 2,
+            "benchmark_families": ["repository"],
+            "action_generation_summary": {
+                "positive_example_count": 2,
+                "template_preferences": {
+                    "repository": [
+                        {
+                            "template_kind": "structured_edit",
+                            "support": 2,
+                            "success_count": 1,
+                            "pass_rate": 0.5,
+                            "provenance": ["repository_audit_packet_task"],
+                        }
+                    ]
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "materialize_universal_decoder_dataset",
+        lambda **kwargs: {
+            "artifact_kind": "tolbert_universal_decoder_dataset",
+            "train_dataset_path": str(output_dir / "universal_dataset" / "train.jsonl"),
+            "train_examples": 8,
+            "total_examples": 8,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_finetune_pipeline",
+        lambda **kwargs: (
+            training_dir / "checkpoint.pt",
+            output_dir / "retrieval_cache" / "cache.pt",
+            [{"job_id": "train", "state": "completed", "outcome": "success"}],
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_hybrid_runtime_pipeline",
+        lambda **kwargs: (
+            {
+                "artifact_kind": "tolbert_hybrid_runtime_bundle",
+                "model_family": "tolbert_ssm_v1",
+                "config_path": str(output_dir / "hybrid_runtime" / "hybrid_config.json"),
+                "checkpoint_path": str(output_dir / "hybrid_runtime" / "hybrid_checkpoint.pt"),
+                "relative_config_path": "hybrid_config.json",
+                "relative_checkpoint_path": "hybrid_checkpoint.pt",
+            },
+            [{"job_id": "hybrid", "state": "completed", "outcome": "success"}],
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_tolbert_universal_decoder_pipeline",
+        lambda **kwargs: (
+            None,
+            [
+                {
+                    "job_id": "universal",
+                    "state": "safe_stop",
+                    "outcome": "safe_stop",
+                    "outcome_reasons": ["worker_command_failed"],
+                    "last_error": "acceptance packet verifier did not pass",
+                }
+            ],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="tolbert universal decoder runtime did not materialize required bundle"):
+        module.build_tolbert_model_candidate_artifact(
+            config=config,
+            repo_root=Path(__file__).resolve().parents[1],
+            output_dir=output_dir,
+            metrics=EvalMetrics(total=10, passed=8),
+        )
 
 
 def test_tolbert_build_policy_requires_long_horizon_head_coverage_when_present() -> None:
@@ -883,6 +1134,26 @@ def test_tolbert_finetune_timeout_scales_with_epochs() -> None:
     assert module._tolbert_finetune_timeout_seconds(config=config, num_epochs=4) == 540
 
 
+def test_tolbert_finetune_timeout_scales_with_training_volume() -> None:
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
+
+    config = KernelConfig(command_timeout_seconds=20)
+
+    assert (
+        module._tolbert_finetune_timeout_seconds(
+            config=config,
+            num_epochs=2,
+            training_inputs={
+                "policy_examples": 6117,
+                "transition_examples": 6114,
+                "value_examples": 6117,
+                "stop_examples": 6117,
+            },
+        )
+        == 600
+    )
+
+
 def test_tolbert_runtime_delegated_jobs_verify_absolute_manifest_paths(monkeypatch, tmp_path: Path) -> None:
     from agent_kernel.extensions.improvement import tolbert_model_improvement as module
 
@@ -1021,4 +1292,35 @@ def test_tolbert_generation_device_plan_serializes_generic_cuda_when_gpu_count_i
         "finetune": "cuda:0",
         "hybrid": "cuda:0",
         "universal": "cuda:0",
+    }
+
+
+def test_tolbert_generation_device_plan_prefers_freest_gpu_when_fixed_cuda_zero_is_congested(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_kernel.extensions.improvement import tolbert_model_improvement as module
+
+    config = KernelConfig(
+        workspace_root=tmp_path / "workspace",
+        run_reports_dir=tmp_path / "reports",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        delegated_job_queue_path=tmp_path / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "jobs" / "runtime.json",
+        tolbert_device="cuda",
+    )
+
+    def _fake_run(command, **kwargs):
+        del kwargs
+        if command[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="0, 1600\n1, 24100\n2, 11900\n")
+        return SimpleNamespace(returncode=0, stdout="3\n")
+
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
+
+    assert module._tolbert_generation_device_plan(config) == {
+        "parallel": False,
+        "finetune": "cuda:1",
+        "hybrid": "cuda:1",
+        "universal": "cuda:1",
     }

@@ -1226,6 +1226,62 @@ def test_run_unattended_preflight_surfaces_repository_task_root_breadth_detail(t
     assert "roots=[repo_sync_matrix_task]" in trust_check.detail
 
 
+def test_run_unattended_preflight_allows_proof_bootstrap_for_missing_required_family(tmp_path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True)
+    reports_dir.joinpath("integration_clean.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "generated_at": "2026-04-03T00:00:00+00:00",
+                "task_id": "integration_adjacent_task",
+                "benchmark_family": "integration",
+                "outcome": "success",
+                "success": True,
+                "trust_scope": "gated",
+                "task_metadata": {"source_task": "integration_probe_task"},
+                "summary": {"unexpected_change_files": 0, "command_steps": 1},
+                "commands": [{}],
+                "side_effects": {"hidden_side_effect_risk": False},
+                "recovery": {"rollback_performed": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        run_reports_dir=reports_dir,
+        unattended_trust_enforce=True,
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("integration", "project"),
+        unattended_trust_min_distinct_families=2,
+    )
+    task = TaskSpec(
+        task_id="semantic_project_task",
+        prompt="prepare project proof task",
+        workspace_subdir="semantic_project_task",
+        expected_files=["reports/project.txt"],
+        metadata={
+            "benchmark_family": "project",
+            "task_origin": "semantic_hub",
+            "light_supervision_candidate": True,
+            "decision_yield_contract_candidate": True,
+        },
+    )
+
+    report = run_unattended_preflight(config, task, repo_root=Path(__file__).resolve().parents[1])
+
+    trust_check = next(check for check in report.checks if check.name == "trust_posture")
+    assert report.passed is True
+    assert trust_check.passed is True
+    assert "proof bootstrap override enabled" in trust_check.detail
+    assert "missing counted gated evidence" in trust_check.detail
+
+
 def test_run_unattended_preflight_fails_when_recent_trust_is_restricted(tmp_path):
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
@@ -1277,6 +1333,27 @@ def test_run_unattended_preflight_fails_when_recent_trust_is_restricted(tmp_path
     assert report.passed is False
     assert trust_check.passed is False
     assert "restricted unattended execution" in trust_check.detail
+
+
+def test_classify_run_outcome_ignores_optional_preflight_failures_when_required_check_fails():
+    preflight = PreflightReport(
+        passed=False,
+        checked_at="2026-03-24T00:00:00+00:00",
+        checks=[
+            PreflightCheck(
+                name="execution_containment",
+                passed=False,
+                detail="containment unavailable",
+                severity="optional",
+            ),
+            PreflightCheck(name="trust_posture", passed=False, detail="restricted"),
+        ],
+    )
+
+    outcome, reasons = classify_run_outcome(episode=None, preflight=preflight)
+
+    assert outcome == "safe_stop"
+    assert reasons == ["preflight_failed:trust_posture"]
 
 
 def test_classify_run_outcome_marks_nonzero_failures_as_safe_stop(tmp_path):
@@ -1543,7 +1620,8 @@ def test_build_unattended_task_report_surfaces_light_supervision_summary(tmp_pat
         "operator_turns": 1,
         "verifier_defined": True,
         "independent_execution": True,
-        "preflight_passed": True,
+        "preflight_ran": False,
+        "preflight_passed": False,
         "command_steps": 1,
         "changed_files": 1,
         "hidden_side_effect_risk": False,
@@ -1772,6 +1850,14 @@ def test_build_unattended_task_report_serializes_command_route_metadata(tmp_path
 
     assert payload["commands"][0]["decision_source"] == "deterministic_fallback"
     assert payload["commands"][0]["tolbert_route_mode"] == "shadow"
+    assert payload["summary"]["execution_source_summary"] == {
+        "decoder_generated": 0,
+        "llm_generated": 0,
+        "bounded_decoder_generated": 0,
+        "synthetic_plan": 0,
+        "deterministic_or_other": 1,
+        "total_executed_commands": 1,
+    }
 
 
 def test_build_unattended_task_report_marks_nonacting_retrieval_companion_as_coverage_only(tmp_path):

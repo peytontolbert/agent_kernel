@@ -208,6 +208,63 @@ def test_build_unattended_trust_ledger_summarizes_recent_reports(tmp_path: Path)
     assert ledger["coverage_summary"]["distinct_family_gap"] == 0
 
 
+def test_build_unattended_trust_ledger_recursively_counts_nested_reports_but_skips_generated_failure_seed(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    nested_reports_dir = reports_dir / "cycle_retrieval_preview"
+    generated_failure_seed_dir = nested_reports_dir / "generated_failure_seed"
+    generated_failure_seed_dir.mkdir(parents=True)
+    _write_report(
+        nested_reports_dir,
+        "project_success.json",
+        generated_at="2026-03-25T00:00:01+00:00",
+        benchmark_family="project",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        trust_scope="gated",
+    )
+    _write_report(
+        nested_reports_dir,
+        "repository_success.json",
+        generated_at="2026-03-25T00:00:02+00:00",
+        benchmark_family="repository",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        trust_scope="gated",
+    )
+    _write_report(
+        generated_failure_seed_dir,
+        "repository_seed_failure.json",
+        generated_at="2026-03-25T00:00:03+00:00",
+        benchmark_family="repository",
+        outcome="unsafe_ambiguous",
+        success=False,
+        hidden_side_effect_risk=False,
+        trust_scope="gated",
+    )
+    config = KernelConfig(
+        run_reports_dir=reports_dir,
+        use_trust_proposals=False,
+        unattended_trust_recent_report_limit=10,
+        unattended_trust_bootstrap_min_reports=2,
+        unattended_trust_breadth_min_reports=2,
+        unattended_trust_required_benchmark_families=("project", "repository"),
+        unattended_trust_min_distinct_families=2,
+    )
+
+    ledger = build_unattended_trust_ledger(config)
+
+    assert ledger["reports_considered"] == 2
+    assert ledger["overall_summary"]["total"] == 2
+    assert ledger["family_summaries"]["project"]["success_count"] == 1
+    assert ledger["family_summaries"]["repository"]["success_count"] == 1
+    assert ledger["coverage_summary"]["required_families_with_reports"] == ["project", "repository"]
+    assert ledger["coverage_summary"]["missing_required_families"] == []
+
+
 def test_build_unattended_trust_ledger_distinguishes_open_world_and_replay_task_yield(tmp_path: Path):
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()

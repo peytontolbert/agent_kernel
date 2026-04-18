@@ -106,6 +106,20 @@ _DEFAULT_TOLBERT_HYBRID_RUNTIME: dict[str, object] = {
     "supports_stop_head": True,
     "supports_universal_runtime": True,
 }
+_DEFAULT_TOLBERT_UNIVERSAL_DECODER_RUNTIME: dict[str, object] = {
+    "model_family": "tolbert_ssm_v1",
+    "materialized": False,
+    "bundle_manifest_path": "",
+    "checkpoint_path": "",
+    "config_path": "",
+    "training_objective": "universal_decoder_only",
+    "dataset_manifest_path": "",
+    "preferred_device": "cpu",
+    "preferred_backend": "selective_scan",
+    "supports_decoder_surface": True,
+    "supports_prompt_completion_surface": True,
+    "supports_state_conditioned_generation": True,
+}
 _DEFAULT_TOLBERT_HYBRID_SCORING_POLICY: dict[str, object] = {
     "learned_score_weight": 1.5,
     "policy_weight": 1.0,
@@ -138,6 +152,10 @@ _DEFAULT_TOLBERT_LIFTOFF_GATE: dict[str, object] = {
     "min_pass_rate_delta": 0.0,
     "max_step_regression": 0.0,
     "max_regressed_families": 0,
+    "require_universal_decoder_eval": False,
+    "min_universal_decoder_exact_match_delta": 0.0,
+    "min_universal_decoder_token_f1_delta": 0.0,
+    "min_universal_decoder_win_rate_delta": 0.0,
     "require_generated_lane_non_regression": True,
     "require_failure_recovery_non_regression": True,
     "require_unsafe_ambiguous_non_regression": True,
@@ -314,6 +332,89 @@ def retained_tolbert_hybrid_runtime(payload: object) -> dict[str, object]:
     return normalized
 
 
+def retained_tolbert_universal_decoder_runtime(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return dict(_DEFAULT_TOLBERT_UNIVERSAL_DECODER_RUNTIME)
+    if str(payload.get("artifact_kind", "")).strip() != "tolbert_model_bundle":
+        return dict(_DEFAULT_TOLBERT_UNIVERSAL_DECODER_RUNTIME)
+    runtime = payload.get("universal_decoder_runtime", {})
+    normalized = dict(_DEFAULT_TOLBERT_UNIVERSAL_DECODER_RUNTIME)
+    if isinstance(runtime, dict):
+        normalized.update(runtime)
+    normalized["model_family"] = str(normalized.get("model_family", "tolbert_ssm_v1")).strip() or "tolbert_ssm_v1"
+    normalized["bundle_manifest_path"] = str(normalized.get("bundle_manifest_path", "")).strip()
+    normalized["checkpoint_path"] = str(normalized.get("checkpoint_path", "")).strip()
+    normalized["config_path"] = str(normalized.get("config_path", "")).strip()
+    normalized["training_objective"] = (
+        str(normalized.get("training_objective", "universal_decoder_only")).strip() or "universal_decoder_only"
+    )
+    normalized["dataset_manifest_path"] = str(normalized.get("dataset_manifest_path", "")).strip()
+    normalized["preferred_device"] = str(normalized.get("preferred_device", "cpu")).strip() or "cpu"
+    normalized["preferred_backend"] = (
+        str(normalized.get("preferred_backend", "selective_scan")).strip() or "selective_scan"
+    )
+    for key in (
+        "materialized",
+        "supports_decoder_surface",
+        "supports_prompt_completion_surface",
+        "supports_state_conditioned_generation",
+    ):
+        normalized[key] = bool(normalized.get(key, _DEFAULT_TOLBERT_UNIVERSAL_DECODER_RUNTIME[key]))
+    return normalized
+
+
+def retained_tolbert_active_decoder_runtime(payload: object) -> dict[str, object]:
+    hybrid_runtime = retained_tolbert_hybrid_runtime(payload)
+    universal_runtime = retained_tolbert_universal_decoder_runtime(payload)
+    active_runtime = dict(hybrid_runtime)
+    active_runtime["runtime_key"] = "hybrid_runtime"
+    active_runtime["runtime_role"] = "hybrid_runtime"
+    active_runtime["materialized"] = bool(str(active_runtime.get("bundle_manifest_path", "")).strip())
+    active_runtime["training_objective"] = "state_conditioned_hybrid_runtime"
+    active_runtime["dataset_manifest_path"] = ""
+    active_runtime["supports_prompt_completion_surface"] = True
+    active_runtime["supports_state_conditioned_generation"] = bool(
+        active_runtime.get("supports_decoder_surface", False)
+    )
+    if bool(universal_runtime.get("materialized", False)) and str(universal_runtime.get("bundle_manifest_path", "")).strip():
+        active_runtime.update(
+            {
+                "model_family": str(
+                    universal_runtime.get("model_family", active_runtime.get("model_family", "tolbert_ssm_v1"))
+                ).strip()
+                or str(active_runtime.get("model_family", "tolbert_ssm_v1")),
+                "bundle_manifest_path": str(universal_runtime.get("bundle_manifest_path", "")).strip(),
+                "checkpoint_path": str(universal_runtime.get("checkpoint_path", "")).strip(),
+                "config_path": str(universal_runtime.get("config_path", "")).strip(),
+                "preferred_device": str(
+                    universal_runtime.get("preferred_device", active_runtime.get("preferred_device", "cpu"))
+                ).strip()
+                or str(active_runtime.get("preferred_device", "cpu")),
+                "preferred_backend": str(
+                    universal_runtime.get(
+                        "preferred_backend",
+                        active_runtime.get("preferred_backend", "selective_scan"),
+                    )
+                ).strip()
+                or str(active_runtime.get("preferred_backend", "selective_scan")),
+                "supports_decoder_surface": bool(universal_runtime.get("supports_decoder_surface", True)),
+                "materialized": bool(universal_runtime.get("materialized", False)),
+                "training_objective": str(universal_runtime.get("training_objective", "universal_decoder_only")).strip()
+                or "universal_decoder_only",
+                "dataset_manifest_path": str(universal_runtime.get("dataset_manifest_path", "")).strip(),
+                "supports_prompt_completion_surface": bool(
+                    universal_runtime.get("supports_prompt_completion_surface", True)
+                ),
+                "supports_state_conditioned_generation": bool(
+                    universal_runtime.get("supports_state_conditioned_generation", True)
+                ),
+                "runtime_key": "universal_decoder_runtime",
+                "runtime_role": "universal_decoder_runtime",
+            }
+        )
+    return active_runtime
+
+
 def retained_tolbert_liftoff_gate(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         return dict(_DEFAULT_TOLBERT_LIFTOFF_GATE)
@@ -334,6 +435,12 @@ def retained_tolbert_liftoff_gate(payload: object) -> dict[str, object]:
     normalized["max_regressed_families"] = _int_value(
         normalized.get("max_regressed_families"),
         int(_DEFAULT_TOLBERT_LIFTOFF_GATE["max_regressed_families"]),
+    )
+    normalized["require_universal_decoder_eval"] = bool(
+        normalized.get(
+            "require_universal_decoder_eval",
+            _DEFAULT_TOLBERT_LIFTOFF_GATE["require_universal_decoder_eval"],
+        )
     )
     normalized["require_generated_lane_non_regression"] = bool(
         normalized.get(
@@ -473,6 +580,9 @@ def retained_tolbert_liftoff_gate(payload: object) -> dict[str, object]:
             ),
         )
     for key in (
+        "min_universal_decoder_exact_match_delta",
+        "min_universal_decoder_token_f1_delta",
+        "min_universal_decoder_win_rate_delta",
         "max_takeover_drift_pass_rate_regression",
         "max_takeover_drift_unsafe_ambiguous_rate_regression",
         "max_takeover_drift_hidden_side_effect_rate_regression",

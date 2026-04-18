@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from ..config import KernelConfig
 from ..schemas import EpisodeRecord, TaskSpec
+from .vllm_runtime import ensure_vllm_runtime
 
 
 def build_default_policy(
@@ -19,7 +20,7 @@ def build_default_policy(
     ollama_client_cls,
     vllm_client_cls,
     mock_client_factory: Callable[[], object],
-    hybrid_client_factory: Callable[[], object],
+    hybrid_client_factory: Callable[..., object],
 ):
     provider = config.normalized_provider()
     context_provider = context_provider_factory(config=config, repo_root=repo_root)
@@ -41,6 +42,9 @@ def build_default_policy(
             retry_backoff_seconds=config.llm_retry_backoff_seconds,
         )
     elif provider == "vllm":
+        status = ensure_vllm_runtime(config)
+        if not status.ready:
+            raise RuntimeError(status.detail)
         client = vllm_client_cls(
             host=config.vllm_host,
             model_name=config.model_name,
@@ -52,7 +56,7 @@ def build_default_policy(
     elif provider == "mock":
         client = mock_client_factory()
     elif provider == "hybrid":
-        client = hybrid_client_factory()
+        client = hybrid_client_factory(config=config, repo_root=repo_root)
     else:
         raise ValueError(f"Unsupported provider: {config.provider}")
 

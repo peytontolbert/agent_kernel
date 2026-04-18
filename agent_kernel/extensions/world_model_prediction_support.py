@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ..ops.episode_store import iter_episode_documents
+from ..modeling.world import build_causal_state_signature
 
 
 def score_command(model, summary: dict[str, object], command: str) -> int:
@@ -133,7 +134,7 @@ def simulate_command_effect(model, summary: dict[str, object], command: str) -> 
     empirical = empirical_command_prediction(model, summary, command)
     empirical_progress_gain = float(empirical.get("predicted_progress_gain", 0.0) or 0.0)
     predicted_progress_gain = max(predicted_progress_gain, empirical_progress_gain)
-    return {
+    effect = {
         "predicted_outputs": predicted_outputs,
         "predicted_conflicts": predicted_conflicts,
         "predicted_preserved": predicted_preserved,
@@ -144,6 +145,19 @@ def simulate_command_effect(model, summary: dict[str, object], command: str) -> 
         "empirical_prior": empirical,
         "score": score_command(model, summary, command),
     }
+    rolled_summary = _rolled_summary_after_effect(summary, effect)
+    latent_transition = _latent_transition_effect(
+        model,
+        summary=summary,
+        rolled_summary=rolled_summary,
+        commands=[normalized],
+        predicted_changed_paths=effect["predicted_changed_paths"],
+        predicted_progress_gain=float(predicted_progress_gain or 0.0),
+        predicted_verifier_delta=float(effect.get("predicted_verifier_delta", 0.0) or 0.0),
+    )
+    effect["latent_transition"] = latent_transition
+    effect["latent_transition_score"] = round(float(latent_transition.get("predicted_value", 0.0) or 0.0), 4)
+    return effect
 
 
 def simulate_command_sequence_effect(
@@ -160,6 +174,8 @@ def simulate_command_sequence_effect(
             "predicted_changed_paths": [],
             "score": 0.0,
             "sequence_alignment_bonus": 0.0,
+            "latent_transition_score": 0.0,
+            "latent_transition": {},
         }
     rolled_summary = dict(summary)
     predicted_changed_paths: list[str] = []
@@ -178,6 +194,15 @@ def simulate_command_sequence_effect(
         rolled_summary = _rolled_summary_after_effect(rolled_summary, effect)
     sequence_alignment_bonus = _semantic_sequence_alignment_bonus(summary, sequence)
     total_score += sequence_alignment_bonus
+    latent_transition = _latent_transition_effect(
+        model,
+        summary=summary,
+        rolled_summary=rolled_summary,
+        commands=sequence,
+        predicted_changed_paths=predicted_changed_paths,
+        predicted_progress_gain=predicted_progress_gain,
+        predicted_verifier_delta=predicted_verifier_delta,
+    )
     return {
         "sequence": sequence,
         "predicted_progress_gain": round(predicted_progress_gain, 4),
@@ -185,6 +210,8 @@ def simulate_command_sequence_effect(
         "predicted_changed_paths": predicted_changed_paths,
         "score": round(total_score, 4),
         "sequence_alignment_bonus": round(sequence_alignment_bonus, 4),
+        "latent_transition_score": round(float(latent_transition.get("predicted_value", 0.0) or 0.0), 4),
+        "latent_transition": latent_transition,
     }
 
 
@@ -548,11 +575,7 @@ def semantic_prototype_prediction(summary: dict[str, object], command: str) -> d
         if not isinstance(raw, dict):
             continue
         prototype = dict(raw)
-        application_commands = [
-            str(value).strip()
-            for value in prototype.get("application_commands", [])
-            if str(value).strip()
-        ]
+        application_commands = _prototype_candidate_commands(summary, prototype)
         failed_commands = (
             dict(prototype.get("failed_commands", {}))
             if isinstance(prototype.get("failed_commands", {}), dict)
@@ -723,11 +746,173 @@ def _semantic_sequence_alignment_bonus(summary: dict[str, object], sequence: lis
             if isinstance(raw.get("command_sequences", {}), dict)
             else {}
         )
+        sequence_templates = (
+            dict(raw.get("command_sequence_templates", {}))
+            if isinstance(raw.get("command_sequence_templates", {}), dict)
+            else {}
+        )
         for serialized, count in sequences.items():
             commands = [part.strip() for part in str(serialized).split(" || ") if part.strip()]
             if commands and normalized_sequence == commands[: len(normalized_sequence)]:
                 bonus = max(bonus, 0.75 * float(count or 0))
+        if sequence_templates:
+            for serialized, count in sequence_templates.items():
+                templates = [part.strip() for part in str(serialized).split(" || ") if part.strip()]
+                if not templates:
+                    continue
+                for path in _target_candidate_paths(summary, dict(raw)):
+                    commands = [
+                        _instantiate_template_command(template, path)
+                        for template in templates
+                    ]
+                    commands = [command for command in commands if command]
+                    if commands and normalized_sequence == commands[: len(normalized_sequence)]:
+                        bonus = max(bonus, 0.75 * float(count or 0))
     return bonus
+
+
+def _latent_transition_effect(
+    model,
+    *,
+    summary: dict[str, object],
+    rolled_summary: dict[str, object],
+    commands: list[str],
+    predicted_changed_paths: list[str],
+    predicted_progress_gain: float,
+    predicted_verifier_delta: float,
+) -> dict[str, object]:
+    current_signature = str(model._summary_state_signature(summary) or "").strip()
+    future_signature = str(model._summary_state_signature(rolled_summary) or "").strip()
+    current_fragments = list(model._summary_state_fragments(summary))
+    future_fragments = list(model._summary_state_fragments(rolled_summary))
+    causal_fragments = [
+        *future_fragments,
+        *[f"command:{command_pattern(command)}" for command in commands if str(command).strip()],
+        *[f"changed_path:{path}" for path in predicted_changed_paths if str(path).strip()],
+        *[
+            f"prototype_kind:{kind}"
+            for kind in _summary_transform_kinds(summary)
+        ],
+    ]
+    current_signature_vector, current_tokens = build_causal_state_signature(current_fragments, sketch_dim=12)
+    future_signature_vector, future_tokens = build_causal_state_signature(causal_fragments, sketch_dim=12)
+    similarity = 0.0
+    if len(current_signature_vector) == len(future_signature_vector) and len(current_signature_vector) > 0:
+        similarity = float(sum(float(a) * float(b) for a, b in zip(current_signature_vector, future_signature_vector)))
+    current_unresolved = _summary_unresolved_count(summary)
+    future_unresolved = _summary_unresolved_count(rolled_summary)
+    unresolved_delta = current_unresolved - future_unresolved
+    completion_delta = float(rolled_summary.get("completion_ratio", 0.0) or 0.0) - float(
+        summary.get("completion_ratio", 0.0) or 0.0
+    )
+    predicted_value = (
+        (2.0 * float(unresolved_delta))
+        + (4.0 * float(completion_delta))
+        + (1.5 * float(predicted_verifier_delta))
+        + (1.0 * float(predicted_progress_gain))
+        + max(0.0, 1.0 - similarity)
+    )
+    if future_signature and current_signature and future_signature != current_signature:
+        predicted_value += 0.5
+    return {
+        "current_state_signature": current_signature,
+        "future_state_signature": future_signature,
+        "state_novelty": round(max(0.0, 1.0 - similarity), 4),
+        "current_signature_token_count": int(current_tokens or 0),
+        "future_signature_token_count": int(future_tokens or 0),
+        "unresolved_delta": int(unresolved_delta),
+        "completion_delta": round(completion_delta, 4),
+        "predicted_value": round(predicted_value, 4),
+    }
+
+
+def _summary_unresolved_count(summary: dict[str, object]) -> int:
+    return sum(
+        len(list(summary.get(key, [])))
+        for key in (
+            "missing_expected_artifacts",
+            "unsatisfied_expected_contents",
+            "present_forbidden_artifacts",
+            "changed_preserved_artifacts",
+            "workflow_expected_changed_paths",
+            "workflow_generated_paths",
+            "workflow_report_paths",
+        )
+    )
+
+
+def _summary_transform_kinds(summary: dict[str, object]) -> list[str]:
+    semantic_prototypes = summary.get("semantic_prototypes", [])
+    if not isinstance(semantic_prototypes, list):
+        return []
+    kinds: list[str] = []
+    for raw in semantic_prototypes:
+        if not isinstance(raw, dict):
+            continue
+        transform_semantics = raw.get("transform_semantics", {})
+        transform_semantics = dict(transform_semantics) if isinstance(transform_semantics, dict) else {}
+        for kind in dict(transform_semantics.get("target_kinds", {})).keys():
+            normalized = str(kind).strip()
+            if normalized and normalized not in kinds:
+                kinds.append(normalized)
+    return kinds
+
+
+def _target_candidate_paths(summary: dict[str, object], prototype: dict[str, object]) -> list[str]:
+    ordered: list[str] = []
+    for source in (
+        summary.get("missing_expected_artifacts", []),
+        summary.get("expected_artifacts", []),
+        summary.get("workflow_expected_changed_paths", []),
+        summary.get("workflow_generated_paths", []),
+        summary.get("workflow_report_paths", []),
+        prototype.get("changed_paths", []),
+    ):
+        if not isinstance(source, list):
+            continue
+        for raw in source:
+            normalized = str(raw).strip()
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+    return ordered[:4]
+
+
+def _instantiate_template_command(template: str, target_path: str) -> str:
+    normalized = str(template).strip()
+    if not normalized:
+        return ""
+    target_path = str(target_path).strip()
+    if not target_path:
+        return normalized
+    target_file = target_path.rsplit("/", 1)[-1]
+    target_dir = target_path.rsplit("/", 1)[0] if "/" in target_path else ""
+    return (
+        normalized
+        .replace("{target_path}", target_path)
+        .replace("{target_dir}", target_dir)
+        .replace("{target_file}", target_file)
+    )
+
+
+def _prototype_candidate_commands(summary: dict[str, object], prototype: dict[str, object]) -> list[str]:
+    commands: list[str] = []
+    for key in ("instantiated_application_commands", "application_commands"):
+        values = prototype.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            normalized = str(raw).strip()
+            if normalized and normalized not in commands:
+                commands.append(normalized)
+    templates = prototype.get("application_command_templates", {})
+    templates = dict(templates) if isinstance(templates, dict) else {}
+    if templates:
+        for template in templates.keys():
+            for path in _target_candidate_paths(summary, prototype):
+                instantiated = _instantiate_template_command(str(template), path)
+                if instantiated and instantiated not in commands:
+                    commands.append(instantiated)
+    return commands[:6]
 
 
 def bootstrap_step_priors(model) -> dict[tuple[str, str, str], dict[str, object]]:

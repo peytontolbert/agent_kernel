@@ -621,6 +621,9 @@ def assess_artifact_compatibility(
                 elif key in {
                     "min_pass_rate_delta",
                     "max_step_regression",
+                    "min_universal_decoder_exact_match_delta",
+                    "min_universal_decoder_token_f1_delta",
+                    "min_universal_decoder_win_rate_delta",
                     "max_takeover_drift_pass_rate_regression",
                     "max_takeover_drift_unsafe_ambiguous_rate_regression",
                     "max_takeover_drift_hidden_side_effect_rate_regression",

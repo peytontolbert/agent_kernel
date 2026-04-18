@@ -8,7 +8,8 @@ import subprocess
 from pathlib import Path
 
 from .config import KernelConfig
-from .extensions.improvement.improvement_common import retained_artifact_payload
+from .resource_registry import runtime_resource_registry
+from .resource_types import subsystem_resource_id
 from .sandbox import sandbox_containment_status
 from .schemas import TaskSpec
 from .extensions.improvement.universe_improvement import (
@@ -77,6 +78,7 @@ class UniverseModel:
         self.config = config or KernelConfig()
         self._constitution_cache: dict[str, object] | None = None
         self._operating_envelope_cache: dict[str, object] | None = None
+        self._resource_registry = runtime_resource_registry(self.config)
 
     def summarize(
         self,
@@ -437,10 +439,7 @@ class UniverseModel:
         if self._constitution_cache is not None:
             return dict(self._constitution_cache)
         constitution = dict(_DEFAULT_UNIVERSE_CONSTITUTION)
-        payload = self._load_runtime_artifact(
-            self.config.universe_constitution_path,
-            artifact_kind="universe_constitution",
-        )
+        payload = self._load_runtime_resource(subsystem_resource_id("universe_constitution"))
         if not payload:
             payload = self._legacy_contract_payload()
         if payload:
@@ -480,10 +479,7 @@ class UniverseModel:
         if self._operating_envelope_cache is not None:
             return dict(self._operating_envelope_cache)
         envelope = dict(_DEFAULT_OPERATING_ENVELOPE)
-        payload = self._load_runtime_artifact(
-            self.config.operating_envelope_path,
-            artifact_kind="operating_envelope",
-        )
+        payload = self._load_runtime_resource(subsystem_resource_id("operating_envelope"))
         if not payload:
             payload = self._legacy_contract_payload()
         if payload:
@@ -515,25 +511,11 @@ class UniverseModel:
         return dict(envelope)
 
     def _legacy_contract_payload(self) -> dict[str, object]:
-        return self._load_runtime_artifact(
-            self.config.universe_contract_path,
-            artifact_kind="universe_contract",
-        )
+        return self._load_runtime_resource(subsystem_resource_id("universe"))
 
-    def _load_runtime_artifact(self, path: Path, *, artifact_kind: str) -> dict[str, object]:
-        if not path.exists():
-            return {}
-        payload = self._load_json_payload(path)
-        if not payload:
-            return {}
-        if str(payload.get("artifact_kind", "")).strip() == artifact_kind:
-            if any(
-                key in payload
-                for key in ("lifecycle_state", "spec_version", "retention_gate", "retention_decision")
-            ):
-                return retained_artifact_payload(payload, artifact_kind=artifact_kind) or {}
-            return payload
-        return {}
+    def _load_runtime_resource(self, resource_id: str) -> dict[str, object]:
+        payload = self._resource_registry.load_json(resource_id)
+        return payload if isinstance(payload, dict) else {}
 
     @staticmethod
     def _load_json_payload(path: Path) -> dict[str, object]:

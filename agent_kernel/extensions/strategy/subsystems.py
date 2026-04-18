@@ -34,6 +34,8 @@ from ...extensions.improvement.universe_improvement import (
 )
 from ...extensions.improvement.verifier_improvement import synthesize_verifier_contracts
 from ...extensions.improvement.world_model_improvement import build_world_model_proposal_artifact
+from ...resource_registry import runtime_resource_registry
+from ...resource_types import subsystem_resource_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,10 @@ def base_subsystem_for(subsystem: str, capability_modules_path: Path | None = No
 
 def active_artifact_path_for_subsystem(config: KernelConfig, subsystem: str) -> Path:
     spec = resolved_subsystem_spec(subsystem, config.capability_modules_path)
+    registry = runtime_resource_registry(config)
+    resource_id = subsystem_resource_id(spec.subsystem)
+    if registry.has(resource_id):
+        return registry.active_path(resource_id)
     return getattr(config, spec.artifact_path_attr)
 
 
@@ -494,7 +500,7 @@ def generate_candidate_artifact(
     elif spec.generator_kind == "tolbert_model":
         candidate_payload = build_tolbert_model_candidate_artifact(
             config=config,
-            repo_root=Path(__file__).resolve().parents[1],
+            repo_root=Path(__file__).resolve().parents[3],
             output_dir=candidate_artifact_path.parent / candidate_artifact_path.stem,
             metrics=metrics,
             current_payload=current_payload,
@@ -511,7 +517,7 @@ def generate_candidate_artifact(
     elif spec.generator_kind == "qwen_adapter":
         candidate_payload = build_qwen_adapter_candidate_artifact(
             config=config,
-            repo_root=Path(__file__).resolve().parents[1],
+            repo_root=Path(__file__).resolve().parents[3],
             output_dir=candidate_artifact_path.parent / candidate_artifact_path.stem,
             current_payload=current_payload,
             **generation_kwargs,

@@ -180,6 +180,95 @@ def test_maybe_govern_improvement_exports_limits_checkpoint_scope(tmp_path, monk
     assert captured["include_run_checkpoints"] is True
 
 
+def test_maybe_govern_improvement_exports_skips_strategy_memory_snapshots_under_improvement_root(tmp_path, monkeypatch):
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        candidate_artifacts_root=tmp_path / "candidates",
+        strategy_memory_snapshots_path=tmp_path / "improvement" / "strategy_memory" / "snapshots.json",
+    )
+    config.ensure_directories()
+    target = config.strategy_memory_snapshots_path
+    target.write_text("{}", encoding="utf-8")
+
+    calls: list[dict[str, object]] = []
+
+    def fake_govern(
+        runtime_config: KernelConfig,
+        *,
+        preserve_paths=(),
+        include_cycle_exports=True,
+        include_report_exports=True,
+        include_candidate_exports=True,
+        include_run_reports=True,
+        include_run_checkpoints=True,
+    ) -> dict[str, object]:
+        calls.append(
+            {
+                "config": runtime_config,
+                "preserve_paths": preserve_paths,
+                "include_cycle_exports": include_cycle_exports,
+                "include_report_exports": include_report_exports,
+                "include_candidate_exports": include_candidate_exports,
+                "include_run_reports": include_run_reports,
+                "include_run_checkpoints": include_run_checkpoints,
+            }
+        )
+        return {}
+
+    monkeypatch.setattr(runtime_supervision, "govern_improvement_export_storage", fake_govern)
+
+    runtime_supervision._maybe_govern_improvement_exports(target, config=config)
+
+    assert calls == []
+
+
+def test_maybe_govern_improvement_exports_matches_cycle_export_siblings_only(tmp_path, monkeypatch):
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        candidate_artifacts_root=tmp_path / "candidates",
+    )
+    config.ensure_directories()
+    target = config.improvement_cycles_path.parent / "cycles.archive.jsonl"
+    target.write_text("{}", encoding="utf-8")
+    config.unattended_trust_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    config.unattended_trust_ledger_path.write_text("{}", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_govern(
+        runtime_config: KernelConfig,
+        *,
+        preserve_paths=(),
+        include_cycle_exports=True,
+        include_report_exports=True,
+        include_candidate_exports=True,
+        include_run_reports=True,
+        include_run_checkpoints=True,
+    ) -> dict[str, object]:
+        captured["config"] = runtime_config
+        captured["preserve_paths"] = preserve_paths
+        captured["include_cycle_exports"] = include_cycle_exports
+        captured["include_report_exports"] = include_report_exports
+        captured["include_candidate_exports"] = include_candidate_exports
+        captured["include_run_reports"] = include_run_reports
+        captured["include_run_checkpoints"] = include_run_checkpoints
+        return {}
+
+    monkeypatch.setattr(runtime_supervision, "govern_improvement_export_storage", fake_govern)
+
+    runtime_supervision._maybe_govern_improvement_exports(target, config=config)
+
+    assert captured["config"] == config
+    assert captured["preserve_paths"] == (target, config.unattended_trust_ledger_path)
+    assert captured["include_cycle_exports"] is True
+    assert captured["include_report_exports"] is False
+    assert captured["include_candidate_exports"] is False
+    assert captured["include_run_reports"] is False
+    assert captured["include_run_checkpoints"] is False
+
+
 def test_append_jsonl_surfaces_governance_failures_for_managed_paths(tmp_path, monkeypatch):
     config = KernelConfig(
         improvement_reports_dir=tmp_path / "reports",

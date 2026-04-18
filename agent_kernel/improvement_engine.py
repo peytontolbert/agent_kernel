@@ -379,6 +379,8 @@ def has_measurable_runtime_influence(context: RetentionDecisionContext) -> bool:
     positive_int_fields = (
         "proposal_selected_steps_delta",
         "trusted_retrieval_delta",
+        "retrieval_influenced_steps_delta",
+        "retrieval_selected_steps_delta",
         "novel_command_steps_delta",
         "tolbert_primary_episodes_delta",
         "trusted_carryover_verified_step_delta",
@@ -402,6 +404,34 @@ def has_measurable_runtime_influence(context: RetentionDecisionContext) -> bool:
             value = 0
         if value < 0:
             return True
+    try:
+        baseline_trusted_carryover_repair_rate = float(
+            context.evidence.get("baseline_trusted_carryover_repair_rate", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        baseline_trusted_carryover_repair_rate = 0.0
+    try:
+        trusted_carryover_repair_rate = float(context.evidence.get("trusted_carryover_repair_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        trusted_carryover_repair_rate = 0.0
+    try:
+        baseline_trusted_carryover_verified_steps = int(
+            context.evidence.get("baseline_trusted_carryover_verified_steps", 0) or 0
+        )
+    except (TypeError, ValueError):
+        baseline_trusted_carryover_verified_steps = 0
+    try:
+        trusted_carryover_verified_steps = int(context.evidence.get("trusted_carryover_verified_steps", 0) or 0)
+    except (TypeError, ValueError):
+        trusted_carryover_verified_steps = 0
+    if (
+        baseline_trusted_carryover_repair_rate > 0.0
+        and trusted_carryover_repair_rate >= baseline_trusted_carryover_repair_rate
+        and trusted_carryover_verified_steps >= baseline_trusted_carryover_verified_steps
+        and context.candidate_metrics.pass_rate >= context.baseline_metrics.pass_rate
+        and context.candidate_metrics.average_steps <= context.baseline_metrics.average_steps
+    ):
+        return True
     learning_summary = context.evidence.get("learning_evidence", {})
     if isinstance(learning_summary, dict) and has_actionable_learning_support(learning_summary):
         return True

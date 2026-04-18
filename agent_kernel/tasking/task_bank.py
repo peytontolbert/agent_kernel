@@ -24,6 +24,104 @@ _TASK_BANK_SYNTHESIS_RULES_PATH = (
 )
 
 
+def _printf_write_text_command(*, relpath: str, text: str) -> str:
+    parent = Path(relpath).parent.as_posix()
+    lines = text.splitlines()
+    if not lines:
+        lines = [""]
+    quoted_lines = " ".join(shlex.quote(line) for line in lines)
+    return (
+        f"mkdir -p {shlex.quote(parent)} && "
+        f"printf '%s\\n' {quoted_lines} > {shlex.quote(relpath)}"
+    )
+
+
+def _semantic_materialization_command(
+    *,
+    report_relpath: str,
+    report_text: str,
+    contract_relpath: str,
+    contract_payload: dict[str, object],
+) -> str:
+    report_command = _printf_write_text_command(relpath=report_relpath, text=report_text)
+    contract_command = _printf_write_text_command(
+        relpath=contract_relpath,
+        text=json.dumps(contract_payload, indent=2),
+    )
+    return f"{report_command} && {contract_command}"
+
+
+def _semantic_success_command(*, contract_relpath: str, report_relpath: str, family: str) -> str:
+    task_id_token = shlex.quote('"task_id":')
+    prompt_token = shlex.quote('"prompt":')
+    workspace_subdir_token = shlex.quote('"workspace_subdir":')
+    family_token = shlex.quote(f'"benchmark_family": "{family}"')
+    open_world_token = shlex.quote('"open_world_candidate": true')
+    semantic_source_token = shlex.quote('"semantic_source":')
+    contract_path = shlex.quote(contract_relpath)
+    report_path = shlex.quote(report_relpath)
+    checks = [
+        f"test -f {contract_path}",
+        f"test -f {report_path}",
+        f"grep -q {task_id_token} {contract_path}",
+        f"grep -q {prompt_token} {contract_path}",
+        f"grep -q {workspace_subdir_token} {contract_path}",
+        f"grep -q {family_token} {contract_path}",
+        f"grep -q {open_world_token} {contract_path}",
+        f"grep -q {semantic_source_token} {contract_path}",
+    ]
+    return " && ".join(checks)
+
+
+def _normalize_semantic_open_world_task(task: dict[str, object]) -> dict[str, object]:
+    normalized = dict(task)
+    metadata = dict(normalized.get("metadata", {})) if isinstance(normalized.get("metadata", {}), dict) else {}
+    task_id = str(normalized.get("task_id", "")).strip()
+    if not task_id.startswith("semantic_open_world_"):
+        return normalized
+    if not bool(metadata.get("open_world_candidate", False)):
+        return normalized
+    family = str(metadata.get("benchmark_family", "")).strip().lower()
+    if not family:
+        return normalized
+    report_relpath = f"semantic_open_world/{family}_evidence.md"
+    contract_relpath = f"semantic_open_world/{family}_task.json"
+    report_text = f"# {family} open-world evidence\n"
+    attempt_id = str(metadata.get("semantic_parent_attempt_id", "")).strip() or "semantic_hub_legacy"
+    contract_payload = {
+        "task_id": f"{task_id}_candidate",
+        "prompt": f"Describe a repo-specific {family} task.",
+        "workspace_subdir": f"{task_id}_candidate",
+        "metadata": {
+            "benchmark_family": family,
+            "capability": "semantic_open_world",
+            "open_world_candidate": True,
+            "semantic_source": attempt_id,
+        },
+    }
+    normalized["suggested_commands"] = [
+        _semantic_materialization_command(
+            report_relpath=report_relpath,
+            report_text=report_text,
+            contract_relpath=contract_relpath,
+            contract_payload=contract_payload,
+        ),
+    ]
+    normalized["success_command"] = _semantic_success_command(
+        contract_relpath=contract_relpath,
+        report_relpath=report_relpath,
+        family=family,
+    )
+    expected_files = [str(value).strip() for value in normalized.get("expected_files", []) if str(value).strip()]
+    if contract_relpath not in expected_files:
+        expected_files.append(contract_relpath)
+    if report_relpath not in expected_files:
+        expected_files.append(report_relpath)
+    normalized["expected_files"] = expected_files
+    normalized["metadata"] = metadata
+    return normalized
+
+
 def _task_acceptance_contract_defined(task: TaskSpec) -> bool:
     metadata = dict(task.metadata)
     verifier = dict(metadata.get("semantic_verifier", {})) if isinstance(metadata.get("semantic_verifier", {}), dict) else {}
@@ -493,12 +591,12 @@ class TaskBank:
             return []
         task = parsed.get("task")
         if isinstance(task, dict):
-            return [task]
+            return [_normalize_semantic_open_world_task(task)]
         task_contract = parsed.get("task_contract")
         if isinstance(task_contract, dict):
-            return [task_contract]
+            return [_normalize_semantic_open_world_task(task_contract)]
         if "task_id" in parsed and "prompt" in parsed and "workspace_subdir" in parsed:
-            return [parsed]
+            return [_normalize_semantic_open_world_task(parsed)]
         return []
 
     def parallel_worker_tasks(

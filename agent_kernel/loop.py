@@ -5,7 +5,7 @@ import subprocess
 from urllib import error as url_error
 
 from .config import KernelConfig
-from .llm import HybridFallbackClient, MockLLMClient, OllamaClient, VLLMClient
+from .llm import HybridDecoderClient, MockLLMClient, OllamaClient, VLLMClient
 from .memory import EpisodeMemory, GraphMemory
 from .extensions.planner_recovery import (
     build_planner_recovery_artifact,
@@ -94,7 +94,7 @@ class AgentKernel:
             ollama_client_cls=OllamaClient,
             vllm_client_cls=VLLMClient,
             mock_client_factory=MockLLMClient,
-            hybrid_client_factory=HybridFallbackClient,
+            hybrid_client_factory=HybridDecoderClient,
         )
 
     @staticmethod

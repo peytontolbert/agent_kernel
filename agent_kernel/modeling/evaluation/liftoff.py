@@ -26,6 +26,10 @@ class LiftoffGateReport:
     unsafe_ambiguous_rate_delta: float = 0.0
     hidden_side_effect_rate_delta: float = 0.0
     success_hidden_side_effect_rate_delta: float = 0.0
+    universal_decoder_available: bool = False
+    universal_decoder_exact_match_delta: float = 0.0
+    universal_decoder_token_f1_delta: float = 0.0
+    universal_decoder_win_rate_delta: float = 0.0
     candidate_trust_status: str = ""
     baseline_trust_status: str = ""
     trust_success_rate_delta: float = 0.0
@@ -33,6 +37,7 @@ class LiftoffGateReport:
     trust_hidden_side_effect_rate_delta: float = 0.0
     trust_success_hidden_side_effect_rate_delta: float = 0.0
     trust_restricted_families: list[str] = field(default_factory=list)
+    universal_decoder_evidence: dict[str, object] = field(default_factory=dict)
     proposal_metrics_by_benchmark_family: dict[str, dict[str, object]] = field(default_factory=dict)
     family_takeover_evidence: dict[str, dict[str, object]] = field(default_factory=dict)
     takeover_drift_report: dict[str, object] = field(default_factory=dict)
@@ -52,6 +57,7 @@ def build_liftoff_gate_report(
     candidate_trust_ledger: dict[str, object] | None = None,
     baseline_trust_ledger: dict[str, object] | None = None,
     takeover_drift_report: dict[str, object] | None = None,
+    universal_decoder_eval: dict[str, object] | None = None,
 ) -> LiftoffGateReport:
     gate = retained_tolbert_liftoff_gate(artifact_payload)
     baseline_proposal_metrics = _proposal_metrics_by_benchmark_family(baseline_metrics)
@@ -143,6 +149,24 @@ def build_liftoff_gate_report(
         candidate_metrics.success_hidden_side_effect_risk_rate
         - baseline_metrics.success_hidden_side_effect_risk_rate
     )
+    universal_decoder_payload = (
+        dict(universal_decoder_eval)
+        if isinstance(universal_decoder_eval, dict)
+        else {}
+    )
+    universal_decoder_available = bool(universal_decoder_payload.get("available", False))
+    universal_decoder_exact_match_delta = (
+        float(universal_decoder_payload.get("hybrid_exact_match_rate", 0.0) or 0.0)
+        - float(universal_decoder_payload.get("baseline_exact_match_rate", 0.0) or 0.0)
+    )
+    universal_decoder_token_f1_delta = (
+        float(universal_decoder_payload.get("hybrid_token_f1", 0.0) or 0.0)
+        - float(universal_decoder_payload.get("baseline_token_f1", 0.0) or 0.0)
+    )
+    universal_decoder_win_rate_delta = (
+        float(universal_decoder_payload.get("hybrid_win_rate", 0.0) or 0.0)
+        - float(universal_decoder_payload.get("baseline_win_rate", 0.0) or 0.0)
+    )
 
     candidate_overall_trust = _trust_assessment(candidate_trust_ledger, "overall_assessment")
     baseline_overall_trust = _trust_assessment(baseline_trust_ledger, "overall_assessment")
@@ -183,6 +207,10 @@ def build_liftoff_gate_report(
         "unsafe_ambiguous_rate_delta": unsafe_ambiguous_rate_delta,
         "hidden_side_effect_rate_delta": hidden_side_effect_rate_delta,
         "success_hidden_side_effect_rate_delta": success_hidden_side_effect_rate_delta,
+        "universal_decoder_available": universal_decoder_available,
+        "universal_decoder_exact_match_delta": universal_decoder_exact_match_delta,
+        "universal_decoder_token_f1_delta": universal_decoder_token_f1_delta,
+        "universal_decoder_win_rate_delta": universal_decoder_win_rate_delta,
         "candidate_trust_status": str(candidate_overall_trust.get("status", "")),
         "baseline_trust_status": str(baseline_overall_trust.get("status", "")),
         "trust_success_rate_delta": trust_success_rate_delta,
@@ -190,6 +218,7 @@ def build_liftoff_gate_report(
         "trust_hidden_side_effect_rate_delta": trust_hidden_side_effect_rate_delta,
         "trust_success_hidden_side_effect_rate_delta": trust_success_hidden_side_effect_rate_delta,
         "trust_restricted_families": sorted(set(trust_restricted_families)),
+        "universal_decoder_evidence": universal_decoder_payload,
         "proposal_metrics_by_benchmark_family": candidate_proposal_metrics,
         "proposal_gate_failure_reasons_by_benchmark_family": proposal_gate_failure_reasons_by_benchmark_family,
         "family_takeover_evidence": family_takeover_evidence,
@@ -244,6 +273,67 @@ def build_liftoff_gate_report(
             insufficient_proposal_families=insufficient_proposal_families,
             **common_kwargs,
         )
+    if bool(gate.get("require_universal_decoder_eval", False)):
+        if not universal_decoder_available:
+            return _report(
+                state="shadow_only",
+                reason="candidate lacks universal decoder evaluation evidence for liftoff",
+                candidate_metrics=candidate_metrics,
+                baseline_metrics=baseline_metrics,
+                pass_rate_delta=pass_rate_delta,
+                average_steps_delta=average_steps_delta,
+                regressed_families=regressed_families,
+                primary_takeover_families=[],
+                shadow_only_families=sorted(set(shadow_families) | set(promoted_families)),
+                insufficient_shadow_families=insufficient_shadow_families,
+                insufficient_proposal_families=insufficient_proposal_families,
+                **common_kwargs,
+            )
+        if universal_decoder_exact_match_delta < float(gate.get("min_universal_decoder_exact_match_delta", 0.0)):
+            return _report(
+                state="reject",
+                reason="candidate regressed universal decoder exact-match quality under the liftoff gate",
+                candidate_metrics=candidate_metrics,
+                baseline_metrics=baseline_metrics,
+                pass_rate_delta=pass_rate_delta,
+                average_steps_delta=average_steps_delta,
+                regressed_families=regressed_families,
+                primary_takeover_families=[],
+                shadow_only_families=sorted(set(shadow_families) | set(promoted_families)),
+                insufficient_shadow_families=insufficient_shadow_families,
+                insufficient_proposal_families=insufficient_proposal_families,
+                **common_kwargs,
+            )
+        if universal_decoder_token_f1_delta < float(gate.get("min_universal_decoder_token_f1_delta", 0.0)):
+            return _report(
+                state="reject",
+                reason="candidate regressed universal decoder token-F1 quality under the liftoff gate",
+                candidate_metrics=candidate_metrics,
+                baseline_metrics=baseline_metrics,
+                pass_rate_delta=pass_rate_delta,
+                average_steps_delta=average_steps_delta,
+                regressed_families=regressed_families,
+                primary_takeover_families=[],
+                shadow_only_families=sorted(set(shadow_families) | set(promoted_families)),
+                insufficient_shadow_families=insufficient_shadow_families,
+                insufficient_proposal_families=insufficient_proposal_families,
+                **common_kwargs,
+            )
+        if universal_decoder_win_rate_delta < float(gate.get("min_universal_decoder_win_rate_delta", 0.0)):
+            return _report(
+                state="reject",
+                reason="candidate regressed universal decoder win-rate quality under the liftoff gate",
+                candidate_metrics=candidate_metrics,
+                baseline_metrics=baseline_metrics,
+                pass_rate_delta=pass_rate_delta,
+                average_steps_delta=average_steps_delta,
+                regressed_families=regressed_families,
+                primary_takeover_families=[],
+                shadow_only_families=sorted(set(shadow_families) | set(promoted_families)),
+                insufficient_shadow_families=insufficient_shadow_families,
+                insufficient_proposal_families=insufficient_proposal_families,
+                **common_kwargs,
+            )
     if bool(gate.get("require_generated_lane_non_regression", True)) and generated_pass_rate_delta < 0.0:
         return _report(
             state="reject",

@@ -142,23 +142,25 @@ def evaluate_subsystem_metrics(
     flags: dict[str, object],
     progress_label: str | None = None,
 ):
-    task_limit = flags.get("task_limit")
+    runtime_flags = dict(flags)
+    runtime_flags.setdefault("write_unattended_reports", True)
+    task_limit = runtime_flags.get("task_limit")
     if not isinstance(task_limit, int) or task_limit <= 0:
         task_limit = None
     if base_subsystem_for(subsystem, config.capability_modules_path) == "operators":
         return compare_abstraction_transfer_modes(
             config=config,
-            include_discovered_tasks=flags["include_discovered_tasks"],
-            include_episode_memory=flags["include_episode_memory"],
-            include_verifier_memory=flags["include_verifier_memory"],
-            include_benchmark_candidates=flags["include_benchmark_candidates"],
-            include_verifier_candidates=flags["include_verifier_candidates"],
-            include_generated=flags["include_generated"],
-            include_failure_generated=flags["include_failure_generated"],
+            include_discovered_tasks=runtime_flags["include_discovered_tasks"],
+            include_episode_memory=runtime_flags["include_episode_memory"],
+            include_verifier_memory=runtime_flags["include_verifier_memory"],
+            include_benchmark_candidates=runtime_flags["include_benchmark_candidates"],
+            include_verifier_candidates=runtime_flags["include_verifier_candidates"],
+            include_generated=runtime_flags["include_generated"],
+            include_failure_generated=runtime_flags["include_failure_generated"],
             task_limit=task_limit,
             progress_label_prefix=progress_label,
         ).operator_metrics
-    return run_eval(config=config, progress_label=progress_label, **flags)
+    return run_eval(config=config, progress_label=progress_label, **runtime_flags)
 
 
 _is_retryable_tolbert_startup_failure = cycle_tolbert_runtime.is_retryable_tolbert_startup_failure
@@ -416,6 +418,7 @@ def _write_cycle_report(
     protocol_match_id: str = "",
     strategy_candidate: dict[str, object] | None = None,
     tolbert_runtime_summary: dict[str, object] | None = None,
+    govern_exports: bool = True,
 ) -> Path:
     return _persist_cycle_report(
         config=config,
@@ -442,6 +445,7 @@ def _write_cycle_report(
         protocol_match_id=protocol_match_id,
         strategy_candidate=strategy_candidate,
         tolbert_runtime_summary=_finalize_tolbert_runtime_summary(tolbert_runtime_summary),
+        govern_exports=govern_exports,
     )
 
 
@@ -536,6 +540,7 @@ def finalize_cycle(
         use_prompt_proposals=config.use_prompt_proposals,
         capability_modules_path=config.capability_modules_path,
         trust_ledger_path=config.unattended_trust_ledger_path,
+        runtime_config=config,
     )
     baseline_flags = dict(preview_result["baseline_flags"])
     candidate_flags = dict(preview_result["candidate_flags"])

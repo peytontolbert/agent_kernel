@@ -109,6 +109,12 @@ def retention_evidence(
         evidence["trusted_retrieval_delta"] = (
             candidate_metrics.trusted_retrieval_steps - baseline_metrics.trusted_retrieval_steps
         )
+        evidence["retrieval_influenced_steps_delta"] = (
+            candidate_metrics.retrieval_influenced_steps - baseline_metrics.retrieval_influenced_steps
+        )
+        evidence["retrieval_selected_steps_delta"] = (
+            candidate_metrics.retrieval_selected_steps - baseline_metrics.retrieval_selected_steps
+        )
         evidence["low_confidence_episode_delta"] = (
             candidate_metrics.low_confidence_episodes - baseline_metrics.low_confidence_episodes
         )

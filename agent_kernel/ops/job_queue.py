@@ -2306,6 +2306,8 @@ def _acceptance_promotion_gate(report_path: Path) -> tuple[bool, str]:
     packet = payload.get("acceptance_packet", {})
     if not isinstance(packet, dict) or not packet:
         return False, ""
+    if not _acceptance_packet_requires_promotion(packet):
+        return False, ""
     verifier = packet.get("verifier_result", {})
     if not isinstance(verifier, dict):
         verifier = {}
@@ -2318,6 +2320,23 @@ def _acceptance_promotion_gate(report_path: Path) -> tuple[bool, str]:
         "acceptance packet verifier did not pass"
         + ("" if not target_branch and not expected_branch else f" target_branch={target_branch or '-'} expected_branch={expected_branch or '-'}"),
     )
+
+
+def _acceptance_packet_requires_promotion(packet: dict[str, object]) -> bool:
+    for key in ("target_branch", "expected_branch", "diff_base_ref"):
+        if str(packet.get(key, "")).strip():
+            return True
+    for key in (
+        "required_merged_branches",
+        "selected_edits",
+        "candidate_edit_sets",
+        "tests",
+        "report_rules",
+    ):
+        values = packet.get(key, [])
+        if isinstance(values, list) and values:
+            return True
+    return False
 
 
 def _active_budget_group_counts(leases: list[DelegatedJobLease]) -> dict[str, int]:

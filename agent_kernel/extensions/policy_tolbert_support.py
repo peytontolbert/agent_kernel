@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ..actions import CODE_EXECUTE
@@ -11,7 +12,11 @@ from ..extensions.policy_runtime_support import SkillLibrary
 from ..extensions.runtime_modeling_adapter import (
     decode_action_generation_candidates,
     decode_bounded_action_candidates,
+    generate_hybrid_decoder_text,
 )
+from ..llm import coerce_decoder_text_decision
+from ..modeling.policy.decoder import DecodedActionCandidate
+from ..modeling.world.rollout import rollout_action_value
 from ..schemas import ActionDecision
 from ..state import AgentState
 
@@ -208,6 +213,155 @@ def can_execute_direct_retrieval_command(
     return True
 
 
+def _resolved_decoder_bundle_manifest_path(
+    policy: Any,
+    runtime: dict[str, object],
+) -> Path:
+    manifest_raw = str(runtime.get("bundle_manifest_path", "")).strip()
+    if not manifest_raw:
+        policy.runtime_support.last_hybrid_runtime_error = "missing bundle_manifest_path"
+        raise RuntimeError("retained decoder runtime is enabled but bundle_manifest_path is missing")
+    manifest_path = Path(manifest_raw)
+    if not manifest_path.is_absolute():
+        manifest_path = policy.runtime_support.repo_root / manifest_path
+    if not manifest_path.exists():
+        policy.runtime_support.last_hybrid_runtime_error = f"bundle manifest does not exist: {manifest_path}"
+        raise RuntimeError(f"retained decoder bundle manifest does not exist: {manifest_path}")
+    return manifest_path
+
+
+def _decoder_runtime_ready_for_primary(runtime: dict[str, object]) -> bool:
+    runtime_key = str(runtime.get("runtime_key", "hybrid_runtime")).strip() or "hybrid_runtime"
+    if runtime_key == "universal_decoder_runtime":
+        return bool(runtime.get("materialized", False))
+    return bool(runtime.get("primary_enabled", False))
+
+
+def _decoder_generation_source(runtime: dict[str, object]) -> str:
+    runtime_key = str(runtime.get("runtime_key", "hybrid_runtime")).strip() or "hybrid_runtime"
+    if runtime_key == "universal_decoder_runtime":
+        return "universal_decoder_generation"
+    return "hybrid_decoder_generation"
+
+
+def _hybrid_generated_candidate(
+    policy: Any,
+    state: AgentState,
+    *,
+    runtime_policy: dict[str, object],
+    decoder_runtime: dict[str, object],
+    top_skill: dict[str, object] | None,
+    retrieval_guidance: dict[str, list[str]],
+    blocked_commands: list[str],
+    existing_candidates: list[DecodedActionCandidate],
+) -> DecodedActionCandidate | None:
+    if not _decoder_runtime_ready_for_primary(decoder_runtime):
+        return None
+    if not bool(decoder_runtime.get("supports_decoder_surface", False)):
+        return None
+    try:
+        manifest_path = _resolved_decoder_bundle_manifest_path(policy, decoder_runtime)
+        policy.runtime_support.last_hybrid_runtime_error = ""
+        generated = generate_hybrid_decoder_text(
+            state=state,
+            bundle_manifest_path=manifest_path,
+            device=str(decoder_runtime.get("preferred_device", "cpu")).strip() or "cpu",
+            max_new_tokens=64,
+        )
+    except Exception as exc:
+        policy.runtime_support.last_hybrid_runtime_error = str(exc).strip() or exc.__class__.__name__
+        return None
+    generation_source = _decoder_generation_source(decoder_runtime)
+    runtime_key = str(decoder_runtime.get("runtime_key", "hybrid_runtime")).strip() or "hybrid_runtime"
+    decision = coerce_decoder_text_decision(
+        str(generated.get("generated_text", "")),
+        default_command_thought="Execute the retained Tolbert decoder generation.",
+        default_response_thought="Stop because the retained Tolbert decoder emitted a terminal response.",
+    )
+    if decision is None:
+        return None
+    action = str(decision.get("action", CODE_EXECUTE)).strip() or CODE_EXECUTE
+    content = str(decision.get("content", "")).strip()
+    if action == CODE_EXECUTE:
+        content = _normalize_command_for_workspace(content, state.task.workspace_subdir)
+        normalized = _canonicalize_command(content)
+        blocked = {_canonicalize_command(command) for command in blocked_commands}
+        if not normalized or normalized in blocked:
+            return None
+        existing_commands = {
+            _canonicalize_command(candidate.content)
+            for candidate in existing_candidates
+            if candidate.action == CODE_EXECUTE
+        }
+        proposal_policy = policy._tolbert_action_generation_policy()
+        score = float(policy._command_control_score(state, content))
+        score += rollout_action_value(
+            world_model_summary=state.world_model_summary,
+            latent_state_summary=state.latent_state_summary,
+            latest_transition=state.latest_state_transition,
+            action=CODE_EXECUTE,
+            content=content,
+            rollout_policy=policy._tolbert_rollout_policy(),
+            world_model=policy.world_model,
+        )
+        score += float(proposal_policy.get("proposal_score_bias", 0.0) or 0.0)
+        proposal_novel = normalized not in existing_commands
+        if proposal_novel:
+            score += float(proposal_policy.get("novel_command_bonus", 0.0) or 0.0)
+        matched_span_id = policy._matching_retrieval_span_id(
+            content,
+            retrieval_guidance.get("recommended_command_spans", []),
+        )
+        return DecodedActionCandidate(
+            action=CODE_EXECUTE,
+            content=content,
+            thought=str(decision.get("thought", "")).strip() or "Execute the retained Tolbert decoder generation.",
+            score=score,
+            reason=generation_source,
+            selected_skill_id=None,
+            selected_retrieval_span_id=matched_span_id,
+            retrieval_influenced=matched_span_id is not None,
+            retrieval_ranked_skill=False,
+            proposal_source=generation_source,
+            proposal_novel=proposal_novel,
+            proposal_metadata={
+                "decoder_model_family": str(generated.get("model_family", "")).strip(),
+                "decoder_generated_text": str(generated.get("generated_text", "")).strip(),
+                "decoder_avg_logprob": float(generated.get("avg_logprob", 0.0) or 0.0),
+                "decoder_bundle_manifest_path": str(manifest_path),
+                "decoder_runtime_key": runtime_key,
+                "decoder_training_objective": str(decoder_runtime.get("training_objective", "")).strip(),
+            },
+        )
+    score = rollout_action_value(
+        world_model_summary=state.world_model_summary,
+        latent_state_summary=state.latent_state_summary,
+        latest_transition=state.latest_state_transition,
+        action="respond",
+        content=content,
+        rollout_policy=policy._tolbert_rollout_policy(),
+        world_model=policy.world_model,
+    )
+    score += max(0.0, float(runtime_policy.get("primary_min_command_score", 2) or 2))
+    return DecodedActionCandidate(
+        action="respond",
+        content=content,
+        thought=str(decision.get("thought", "")).strip() or "Stop because the retained Tolbert decoder emitted a terminal response.",
+        score=score,
+        reason=generation_source,
+        proposal_source=generation_source,
+        proposal_novel=False,
+        proposal_metadata={
+            "decoder_model_family": str(generated.get("model_family", "")).strip(),
+            "decoder_generated_text": str(generated.get("generated_text", "")).strip(),
+            "decoder_avg_logprob": float(generated.get("avg_logprob", 0.0) or 0.0),
+            "decoder_bundle_manifest_path": str(manifest_path),
+            "decoder_runtime_key": runtime_key,
+            "decoder_training_objective": str(decoder_runtime.get("training_objective", "")).strip(),
+        },
+    )
+
+
 def tolbert_primary_decision(
     policy: Any,
     state: AgentState,
@@ -250,12 +404,25 @@ def tolbert_primary_decision(
             match_span_fn=policy._matching_retrieval_span_id,
             normalize_command_fn=_normalize_command_for_workspace,
             canonicalize_command_fn=_canonicalize_command,
-        )
     )
+    )
+    hybrid_runtime = policy._tolbert_hybrid_runtime()
+    decoder_runtime = policy._tolbert_active_decoder_runtime()
+    generated_candidate = _hybrid_generated_candidate(
+        policy,
+        state,
+        runtime_policy=runtime_policy,
+        decoder_runtime=decoder_runtime,
+        top_skill=top_skill,
+        retrieval_guidance=screened_retrieval_guidance,
+        blocked_commands=blocked_commands,
+        existing_candidates=candidates,
+    )
+    if generated_candidate is not None:
+        candidates.append(generated_candidate)
     candidates = sorted(candidates, key=lambda item: (-item.score, item.action, item.content))
     if not candidates:
         return None
-    hybrid_runtime = policy._tolbert_hybrid_runtime()
     require_trusted_retrieval = bool(runtime_policy.get("require_trusted_retrieval", True))
     allow_direct_primary = bool(runtime_policy.get("allow_direct_command_primary", True))
     allow_skill_primary = bool(runtime_policy.get("allow_skill_primary", True))
@@ -333,10 +500,16 @@ def tolbert_primary_decision(
         proposal_novel=best.proposal_novel,
         proposal_metadata=dict(best.proposal_metadata or {}),
         decision_source=(
+            "tolbert_retained_proposal_decoder"
+            if best.proposal_source
+            and str(decoder_runtime.get("runtime_key", "hybrid_runtime")).strip() == "universal_decoder_runtime"
+            else
             "tolbert_hybrid_proposal_decoder"
             if best.proposal_source and bool(hybrid_runtime.get("primary_enabled", False))
             else "tolbert_proposal_decoder"
             if best.proposal_source
+            else "tolbert_retained_decoder"
+            if str(decoder_runtime.get("runtime_key", "hybrid_runtime")).strip() == "universal_decoder_runtime"
             else "tolbert_hybrid_decoder"
             if bool(hybrid_runtime.get("primary_enabled", False))
             else "tolbert_decoder"

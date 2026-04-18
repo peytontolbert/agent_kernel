@@ -8,6 +8,8 @@ import time
 
 import evals.harness as harness_module
 from agent_kernel.config import KernelConfig
+from agent_kernel.extensions.extractors import build_episode_summary
+from agent_kernel.ops.preflight import PreflightCheck, PreflightReport
 from agent_kernel.schemas import EpisodeRecord, StepRecord, TaskSpec
 from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.extensions.trust import build_unattended_trust_ledger
@@ -230,6 +232,92 @@ def test_eval_reports_capability_breakdown(tmp_path):
     assert metrics.generated_total == 0
 
 
+def test_run_eval_ignores_zero_step_tasks_in_first_step_confidence_metrics(monkeypatch, tmp_path):
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="preflight_safe_stop_task",
+                    prompt="no steps",
+                    workspace_subdir="preflight_safe_stop_task",
+                    metadata={"benchmark_family": "repository"},
+                ),
+                TaskSpec(
+                    task_id="low_confidence_task",
+                    prompt="one step",
+                    workspace_subdir="low_confidence_task",
+                    metadata={"benchmark_family": "repository"},
+                ),
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            if task.task_id == "preflight_safe_stop_task":
+                return EpisodeRecord(
+                    task_id=task.task_id,
+                    prompt=task.prompt,
+                    workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                    success=False,
+                    steps=[],
+                    task_metadata=dict(task.metadata),
+                    task_contract={"metadata": dict(task.metadata)},
+                    termination_reason="preflight_failed",
+                )
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="complete",
+                        action="code_execute",
+                        content="printf 'ok\\n' > ok.txt",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                        path_confidence=0.2,
+                        decision_source="llm",
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories",
+            tolbert_low_confidence_widen_threshold=0.5,
+        ),
+        task_limit=2,
+    )
+
+    assert metrics.total == 2
+    assert metrics.average_first_step_path_confidence == 0.2
+    assert metrics.success_first_step_path_confidence == 0.2
+    assert metrics.failed_first_step_path_confidence == 0.0
+    assert metrics.low_confidence_episodes == 1
+    assert metrics.low_confidence_passed == 1
+
+
 def test_run_tasks_with_progress_flushes_callbacks_before_unattended_report_write(monkeypatch, tmp_path):
     task = TaskSpec(
         task_id="report_order_task",
@@ -285,6 +373,168 @@ def test_run_tasks_with_progress_flushes_callbacks_before_unattended_report_writ
 
     assert len(results) == 1
     assert events == ["task_complete", "result", "report"]
+
+
+def test_run_tasks_with_progress_emits_llm_request_and_response_progress(monkeypatch, tmp_path):
+    task = TaskSpec(
+        task_id="decoder_visibility_task",
+        prompt="show decoder boundary",
+        workspace_subdir="decoder_visibility_task",
+        metadata={"benchmark_family": "integration", "task_origin": "semantic_hub"},
+    )
+    emitted: list[str] = []
+
+    class FakeKernel:
+        def run_task(self, task, progress_callback=None):
+            assert progress_callback is not None
+            progress_callback({"event": "decision_progress", "step_stage": "llm_request", "step_index": 1})
+            progress_callback({"event": "decision_progress", "step_stage": "llm_response", "step_index": 1})
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="complete",
+                        action="code_execute",
+                        content="printf 'ok\\n' > ok.txt",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                        decision_source="llm",
+                    )
+                ],
+                task_metadata=dict(task.metadata),
+                task_contract={"metadata": dict(task.metadata)},
+                termination_reason="success",
+            )
+
+    monkeypatch.setattr(harness_module, "_emit_eval_progress", lambda _label, line: emitted.append(line))
+
+    results = harness_module._run_tasks_with_progress(
+        [task],
+        FakeKernel(),
+        progress_label="decoder-visibility",
+        on_task_progress=lambda *_args: None,
+    )
+
+    assert len(results) == 1
+    assert any("cognitive_stage=llm_request" in line for line in emitted)
+    assert any("cognitive_stage=llm_response" in line for line in emitted)
+
+
+def test_run_tasks_with_progress_blocks_execution_when_unattended_preflight_fails(monkeypatch, tmp_path):
+    task = TaskSpec(
+        task_id="provider_health_guard_task",
+        prompt="should not execute",
+        workspace_subdir="provider_health_guard_task",
+        metadata={"benchmark_family": "repository"},
+    )
+    captured_report = {}
+
+    class FakeKernel:
+        def run_task(self, task, progress_callback=None):
+            del task, progress_callback
+            raise AssertionError("kernel execution should be skipped when preflight fails")
+
+    monkeypatch.setattr(
+        harness_module,
+        "run_unattended_preflight",
+        lambda config, task, *, repo_root: PreflightReport(
+            passed=False,
+            checks=[PreflightCheck(name="provider_health", passed=False, detail="vllm probe failed")],
+            checked_at="2026-04-14T00:00:00+00:00",
+        ),
+    )
+    monkeypatch.setattr(
+        harness_module,
+        "write_unattended_task_report",
+        lambda **kwargs: captured_report.update(kwargs) or (tmp_path / "reports" / "task_report.json"),
+    )
+
+    results = harness_module._run_tasks_with_progress(
+        [task],
+        FakeKernel(),
+        progress_label=None,
+        report_config=KernelConfig(
+            provider="vllm",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            run_reports_dir=tmp_path / "reports",
+        ),
+    )
+
+    assert len(results) == 1
+    assert results[0].success is False
+    assert results[0].termination_reason == "preflight_failed"
+    assert results[0].steps == []
+    assert captured_report["preflight"].passed is False
+    assert captured_report["episode"].termination_reason == "preflight_failed"
+
+
+def test_build_episode_summary_distinguishes_decoder_and_deterministic_execution_sources():
+    episode = EpisodeRecord(
+        task_id="execution_source_task",
+        prompt="summarize execution provenance",
+        workspace="/tmp/execution_source_task",
+        success=True,
+        steps=[
+            StepRecord(
+                index=1,
+                thought="decoder llm",
+                action="code_execute",
+                content="printf 'llm\\n' > llm.txt",
+                selected_skill_id=None,
+                command_result=None,
+                verification={"passed": True},
+                decision_source="llm",
+            ),
+            StepRecord(
+                index=2,
+                thought="decoder tolbert",
+                action="code_execute",
+                content="printf 'tolbert\\n' > tolbert.txt",
+                selected_skill_id=None,
+                command_result=None,
+                verification={"passed": True},
+                decision_source="tolbert_decoder",
+            ),
+            StepRecord(
+                index=3,
+                thought="synthetic plan",
+                action="code_execute",
+                content="printf 'synthetic\\n' > synthetic.txt",
+                selected_skill_id=None,
+                command_result=None,
+                verification={"passed": True},
+                decision_source="synthetic_edit_plan_direct",
+            ),
+            StepRecord(
+                index=4,
+                thought="fallback",
+                action="code_execute",
+                content="printf 'fallback\\n' > fallback.txt",
+                selected_skill_id=None,
+                command_result=None,
+                verification={"passed": True},
+                decision_source="deterministic_fallback",
+            ),
+        ],
+        termination_reason="success",
+    )
+
+    summary = build_episode_summary(episode)
+
+    assert summary["execution_source_summary"] == {
+        "decoder_generated": 2,
+        "llm_generated": 1,
+        "bounded_decoder_generated": 1,
+        "synthetic_plan": 1,
+        "deterministic_or_other": 1,
+        "total_executed_commands": 4,
+    }
 
 
 def test_run_eval_can_write_unattended_reports_for_trust(monkeypatch, tmp_path):
@@ -366,6 +616,121 @@ def test_run_eval_can_write_unattended_reports_for_trust(monkeypatch, tmp_path):
     ledger = build_unattended_trust_ledger(config)
     assert ledger["reports_considered"] == 1
     assert ledger["overall_assessment"]["status"] == "trusted"
+
+
+def test_run_eval_routes_generated_unattended_reports_to_parent_root(monkeypatch, tmp_path):
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="repository_guardrail_sync_task",
+                    prompt="Sync repository guardrail docs.",
+                    workspace_subdir="repository_guardrail_sync_task",
+                    expected_files=["guardrails.md"],
+                    metadata={"benchmark_family": "repository", "capability": "file_write"},
+                )
+            ]
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            self.config = config
+            self.policy = policy
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            workspace = Path(self.config.workspace_root) / task.workspace_subdir
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace.joinpath("guardrails.md").write_text("ok\n", encoding="utf-8")
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(workspace),
+                success=not isinstance(self.policy, harness_module._ForcedFailurePolicy),
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="write file",
+                        action="code_execute",
+                        content="printf 'ok\\n' > guardrails.md",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": not isinstance(self.policy, harness_module._ForcedFailurePolicy)},
+                    )
+                ],
+                termination_reason="success",
+                task_metadata=dict(task.metadata),
+            )
+
+        def close(self):
+            return None
+
+    class FakeCurriculumEngine:
+        def __init__(self, memory_root=None, config=None):
+            del memory_root, config
+            self._curriculum_controls_cache = {}
+
+        def _curriculum_controls(self):
+            return {}
+
+        def schedule_generated_seed_episodes(self, results, curriculum_kind=""):
+            return [
+                {
+                    "seed_task_id": result.task_id,
+                    "curriculum_kind": curriculum_kind,
+                }
+                for result in results
+            ]
+
+        def generate_followup_task(self, seed):
+            curriculum_kind = str(seed.get("curriculum_kind", "")).strip()
+            suffix = "repository_adjacent" if curriculum_kind == "adjacent_success" else "repository_recovery"
+            return TaskSpec(
+                task_id=f"{seed['seed_task_id']}_{suffix}",
+                prompt=f"followup:{curriculum_kind}",
+                workspace_subdir=f"{seed['seed_task_id']}_{curriculum_kind}",
+                expected_files=["guardrails.md"],
+                metadata={"benchmark_family": "repository", "capability": "file_write"},
+            )
+
+    captured: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+    monkeypatch.setattr(harness_module, "CurriculumEngine", FakeCurriculumEngine)
+    monkeypatch.setattr(
+        harness_module,
+        "write_unattended_task_report",
+        lambda *, task, config, **kwargs: captured.append((task.task_id, str(config.run_reports_dir))),
+    )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "episodes",
+        run_reports_dir=tmp_path / "reports",
+    )
+
+    run_eval(
+        config=config,
+        task_limit=1,
+        include_generated=True,
+        include_failure_generated=True,
+        write_unattended_reports=True,
+    )
+
+    assert captured == [
+        ("repository_guardrail_sync_task", str(config.run_reports_dir)),
+        ("repository_guardrail_sync_task_repository_adjacent", str(config.run_reports_dir)),
+        (
+            "repository_guardrail_sync_task",
+            str(config.run_reports_dir / "generated_failure_seed"),
+        ),
+        ("repository_guardrail_sync_task_repository_recovery", str(config.run_reports_dir)),
+    ]
 
 
 def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
@@ -1118,6 +1483,84 @@ def test_limit_tasks_for_compare_keeps_prioritized_families_at_front_of_round_ro
         "project",
         "repository",
         "bounded",
+    ]
+
+
+def test_limit_tasks_for_compare_interleaves_priority_family_frontier_wave():
+    tasks = [
+        TaskSpec(
+            task_id="integration_a",
+            prompt="integration a",
+            workspace_subdir="integration_a",
+            success_command="true",
+            metadata={"benchmark_family": "integration"},
+        ),
+        TaskSpec(
+            task_id="integration_b",
+            prompt="integration b",
+            workspace_subdir="integration_b",
+            success_command="true",
+            metadata={"benchmark_family": "integration"},
+        ),
+        TaskSpec(
+            task_id="project_a",
+            prompt="project a",
+            workspace_subdir="project_a",
+            success_command="true",
+            metadata={"benchmark_family": "project"},
+        ),
+        TaskSpec(
+            task_id="project_b",
+            prompt="project b",
+            workspace_subdir="project_b",
+            success_command="true",
+            metadata={"benchmark_family": "project"},
+        ),
+        TaskSpec(
+            task_id="repository_a",
+            prompt="repository a",
+            workspace_subdir="repository_a",
+            success_command="true",
+            metadata={"benchmark_family": "repository"},
+        ),
+        TaskSpec(
+            task_id="repository_b",
+            prompt="repository b",
+            workspace_subdir="repository_b",
+            success_command="true",
+            metadata={"benchmark_family": "repository"},
+        ),
+        TaskSpec(
+            task_id="repo_chore_a",
+            prompt="repo chore a",
+            workspace_subdir="repo_chore_a",
+            success_command="true",
+            metadata={"benchmark_family": "repo_chore"},
+        ),
+        TaskSpec(
+            task_id="repo_chore_b",
+            prompt="repo chore b",
+            workspace_subdir="repo_chore_b",
+            success_command="true",
+            metadata={"benchmark_family": "repo_chore"},
+        ),
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        8,
+        priority_families=["integration", "project", "repository", "repo_chore"],
+    )
+
+    assert [task.metadata["benchmark_family"] for task in selected] == [
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
     ]
 
 

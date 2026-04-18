@@ -334,6 +334,7 @@ def retention_reason_code_for_text(reason: str) -> str:
         "retrieval candidate showed no retrieval influence during autonomous evaluation": "autonomous_retrieval_influence_missing",
         "retrieval candidate showed no retrieval selection or skill ranking during autonomous evaluation": "autonomous_retrieval_selection_missing",
         "failure-recovery lane regressed under autonomous phase gates": "autonomous_failure_recovery_regressed",
+        "candidate produced no measurable runtime influence against the retained baseline": "candidate_runtime_influence_missing",
     }.get(normalized, "")
 
 

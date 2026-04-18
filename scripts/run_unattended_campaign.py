@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -11,11 +12,13 @@ import math
 import os
 import re
 import selectors
+import shlex
 import shutil
 import socket
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -67,6 +70,7 @@ _EXTERNAL_LEASE_STATE: dict[str, object] = {
     "backend": "",
     "token": "",
 }
+_REPORT_PERSIST_LOCK = threading.RLock()
 _PRIORITY_BENCHMARK_FAMILY_ORDER = (
     "project",
     "repository",
@@ -91,14 +95,104 @@ _PRIORITY_FAMILY_LOW_RETURN_MIN_DECISIONS = 2
 _PRIORITY_FAMILY_LOW_RETURN_MIN_ESTIMATED_COST = 4.0
 _PRIORITY_FAMILY_EXPLORATION_WEIGHT = 0.05
 _POST_PRODUCTIVE_GENERATED_FAILURE_DECISION_WINDOW_FRACTION = 0.8
+_POST_PRODUCTIVE_PREVIEW_LINGER_MIN_SILENCE_SECONDS = 5.0
+_MINIMUM_FRESH_PROOF_REQUIRED_FAMILIES = ("integration", "project", "repository", "repo_chore")
+_AUTONOMY_LEVELS = tuple(f"A{index}" for index in range(9))
+_AUTONOMY_LEVEL_ORDER = {level: index for index, level in enumerate(_AUTONOMY_LEVELS)}
+_PHASE_A_LANE_ORDER = (
+    "lane_campaign_steward",
+    "lane_runtime_authority",
+    "lane_decision_closure",
+    "lane_strategy_invention",
+    "lane_ontology_expansion",
+    "lane_repo_generalization",
+    "lane_strategy_memory",
+    "lane_trust_and_carryover",
+)
 
 
 def _progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def _write_report(report_path: Path, payload: dict[str, object], *, config: KernelConfig | None = None) -> None:
-    atomic_write_json(report_path, payload, config=config)
+def _runtime_claim_snapshot(config: KernelConfig | None) -> dict[str, object]:
+    if config is None:
+        return {}
+    decoder_runtime_posture = config.decoder_runtime_posture()
+    authority = str(decoder_runtime_posture.get("authority", "")).strip()
+    return {
+        "claimed_runtime_shape": config.claimed_runtime_shape(),
+        "decoder_runtime_posture": decoder_runtime_posture,
+        "asi_coding_require_live_llm": bool(config.asi_coding_require_live_llm),
+        "live_llm_provider_capable": authority == "external_decoder",
+    }
+
+
+def _asi_coding_decoder_contract_preflight(config: KernelConfig | None) -> dict[str, object]:
+    runtime_claim = _runtime_claim_snapshot(config)
+    if not runtime_claim:
+        return {
+            "passed": True,
+            "detail": "runtime claim unavailable",
+            "claimed_runtime_shape": "",
+            "decoder_runtime_posture": {},
+            "asi_coding_require_live_llm": False,
+            "live_llm_provider_capable": False,
+        }
+    strict_live_llm_required = bool(runtime_claim.get("asi_coding_require_live_llm", False))
+    live_llm_provider_capable = bool(runtime_claim.get("live_llm_provider_capable", False))
+    decoder_runtime_posture = runtime_claim.get("decoder_runtime_posture", {})
+    if not isinstance(decoder_runtime_posture, dict):
+        decoder_runtime_posture = {}
+    authority = str(decoder_runtime_posture.get("authority", "")).strip() or "unknown_decoder"
+    provider = str(decoder_runtime_posture.get("provider", "")).strip() or "unknown"
+    passed = not strict_live_llm_required or live_llm_provider_capable
+    if strict_live_llm_required and not live_llm_provider_capable:
+        detail = (
+            "strict live llm coding campaign requires external decoder authority; "
+            f"got authority={authority} provider={provider}"
+        )
+    elif strict_live_llm_required:
+        detail = f"strict live llm coding contract satisfied with authority={authority} provider={provider}"
+    else:
+        detail = f"strict live llm coding contract disabled; authority={authority} provider={provider}"
+    return {
+        "passed": passed,
+        "detail": detail,
+        **runtime_claim,
+    }
+
+
+def _minimum_fresh_proof_trust_gap(
+    trust_breadth_summary: Mapping[str, object] | None,
+) -> dict[str, object]:
+    trust = trust_breadth_summary if isinstance(trust_breadth_summary, Mapping) else {}
+    proof_required_families = list(_MINIMUM_FRESH_PROOF_REQUIRED_FAMILIES)
+    required_families_with_reports = set(
+        _normalize_benchmark_families(trust.get("required_families_with_reports", []))
+    )
+    proof_required_families_with_reports = [
+        family for family in proof_required_families if family in required_families_with_reports
+    ]
+    proof_missing_required_families = [
+        family for family in proof_required_families if family not in required_families_with_reports
+    ]
+    return {
+        "required_families": proof_required_families,
+        "required_families_with_reports": proof_required_families_with_reports,
+        "missing_required_families": proof_missing_required_families,
+        "distinct_family_gap": len(proof_missing_required_families),
+    }
+
+
+def _write_report(
+    report_path: Path,
+    payload: dict[str, object],
+    *,
+    config: KernelConfig | None = None,
+    govern_storage: bool = True,
+) -> None:
+    atomic_write_json(report_path, payload, config=config, govern_storage=govern_storage)
 
 
 def _cleanup_bootstrap_artifacts(paths: list[Path]) -> None:
@@ -116,6 +210,7 @@ def _write_status(
     report_path: Path,
     payload: dict[str, object],
     config: KernelConfig | None = None,
+    govern_storage: bool = True,
 ) -> None:
     if status_path is None:
         return
@@ -131,10 +226,39 @@ def _write_status(
     if not isinstance(active_run, dict):
         active_run = {}
     existing_active_run = existing_status.get("active_run", {})
-    if isinstance(existing_active_run, dict):
-        active_run = {
-            **existing_active_run,
-            **active_run,
+    payload_phase = str(payload.get("phase", "")).strip()
+    if isinstance(existing_active_run, dict) and existing_active_run:
+        current_identity = _active_run_identity(active_run)
+        existing_identity = _active_run_identity(existing_active_run)
+        if active_run and current_identity and current_identity == existing_identity:
+            active_run = {
+                **existing_active_run,
+                **active_run,
+            }
+        elif not active_run and payload_phase == "campaign":
+            active_run = dict(existing_active_run)
+    runtime_claim = existing_status.get("runtime_claim", {})
+    if not isinstance(runtime_claim, dict):
+        runtime_claim = {}
+    configured_runtime_claim = _runtime_claim_snapshot(config)
+    if configured_runtime_claim:
+        runtime_claim = {
+            **runtime_claim,
+            **configured_runtime_claim,
+        }
+    payload_runtime_claim = payload.get("runtime_claim", {})
+    if isinstance(payload_runtime_claim, dict) and payload_runtime_claim:
+        runtime_claim = {
+            **runtime_claim,
+            **payload_runtime_claim,
+        }
+    if active_run and runtime_claim:
+        active_run_runtime_claim = active_run.get("runtime_claim", {})
+        if not isinstance(active_run_runtime_claim, dict):
+            active_run_runtime_claim = {}
+        active_run["runtime_claim"] = {
+            **runtime_claim,
+            **active_run_runtime_claim,
         }
     active_run_policy = active_run.get("policy")
     if not isinstance(active_run_policy, dict):
@@ -151,6 +275,8 @@ def _write_status(
         )
     if active_child:
         active_run["child_status"] = dict(active_child)
+    elif active_run and "child_status" in active_run and payload_phase != "campaign":
+        active_run.pop("child_status", None)
     projected_active_child = (
         dict(active_child)
         if active_child
@@ -227,6 +353,15 @@ def _write_status(
         ),
         "policy_shift_summary": payload.get("policy_shift_summary", {}),
         "policy_shift_alert_subscriptions": policy_shift_subscriptions,
+        "runtime_claim": runtime_claim,
+        "claimed_runtime_shape": str(runtime_claim.get("claimed_runtime_shape", "")).strip(),
+        "decoder_runtime_posture": (
+            dict(runtime_claim.get("decoder_runtime_posture", {}))
+            if isinstance(runtime_claim.get("decoder_runtime_posture", {}), Mapping)
+            else {}
+        ),
+        "asi_coding_require_live_llm": bool(runtime_claim.get("asi_coding_require_live_llm", False)),
+        "live_llm_provider_capable": bool(runtime_claim.get("live_llm_provider_capable", False)),
         "latest_round_policy_shift_rationale": latest_round.get("policy_shift_rationale", {})
         if isinstance(latest_round, dict)
         else {},
@@ -258,13 +393,52 @@ def _write_status(
         "lock_path": str(payload.get("lock_path", "")).strip(),
         "event_log_path": str(payload.get("event_log_path", "")).strip(),
     }
-    status_payload.update(
-        _live_status_projection(
-            payload=payload,
-            active_run=active_run,
-            active_child=projected_active_child,
-        )
+    projection = _live_status_projection(
+        payload=payload,
+        active_run=active_run,
+        active_child=projected_active_child,
     )
+    status_payload.update(projection)
+    final_active_child = _project_active_child_from_live_projection(projected_active_child, projection)
+    final_active_run = status_payload.get("active_run", {})
+    if not isinstance(final_active_run, Mapping):
+        final_active_run = {}
+    else:
+        final_active_run = dict(final_active_run)
+    if final_active_child:
+        final_active_run["child_status"] = dict(final_active_child)
+        reprojection_payload = dict(payload)
+        reprojection_payload["active_child"] = dict(final_active_child)
+        reprojection = _live_status_projection(
+            payload=reprojection_payload,
+            active_run=final_active_run,
+            active_child=final_active_child,
+        )
+        status_payload.update(reprojection)
+    if status_payload["status"] == "completed" and status_payload["phase"] == "completed":
+        now = time.time()
+        completed_progress_state = semantic_progress_state(
+            phase="done",
+            now=now,
+            started_at=now,
+            last_progress_at=now,
+            max_progress_stall_seconds=0.0,
+        )
+        completed_progress_state["detail"] = "campaign completed"
+        completed_progress_state["recorded_at"] = now
+        status_payload["last_progress_phase"] = "done"
+        status_payload["canonical_progress_state"] = dict(completed_progress_state)
+        status_payload["semantic_progress_state"] = dict(completed_progress_state)
+    final_active_child = _project_active_child_from_live_projection(final_active_child, status_payload)
+    if final_active_child:
+        status_payload["active_child"] = dict(final_active_child)
+        status_payload["active_child_controller_intervention"] = (
+            dict(final_active_child.get("controller_intervention", {}))
+            if isinstance(final_active_child.get("controller_intervention", {}), Mapping)
+            else {}
+        )
+        final_active_run["child_status"] = dict(final_active_child)
+        status_payload["active_run"] = final_active_run
     for key in (
         "campaign_round_index",
         "last_progress_phase",
@@ -284,7 +458,7 @@ def _write_status(
     ):
         if key in existing_status and status_payload.get(key) in ({}, [], "", None):
             status_payload[key] = existing_status[key]
-    atomic_write_json(status_path, status_payload, config=config)
+    atomic_write_json(status_path, status_payload, config=config, govern_storage=govern_storage)
 
 
 def _live_status_projection(
@@ -365,13 +539,40 @@ def _live_status_projection(
     adaptive_progress_state = child.get("adaptive_progress_state", {})
     if not isinstance(adaptive_progress_state, Mapping):
         adaptive_progress_state = {}
+    raw_last_progress_phase = str(child.get("last_progress_phase", "")).strip()
     if not canonical_progress_state:
         canonical_progress_state = _select_preferred_child_progress_state(
             semantic_state=semantic_progress_state,
             adaptive_state=adaptive_progress_state,
             current_task=current_task,
-            last_progress_phase=str(child.get("last_progress_phase", "")).strip(),
+            last_progress_phase=raw_last_progress_phase,
         )
+    semantic_progress_phase = str(
+        canonical_progress_state.get("phase")
+        or semantic_progress_state.get("phase")
+        or adaptive_progress_state.get("phase")
+        or ""
+    ).strip()
+    current_task_phase = str(current_task.get("phase", "")).strip()
+    if current_task and semantic_progress_phase and (
+        not current_task_phase
+        or (
+            current_task_phase in {"campaign", "sampling", "observe", "observe_hypothesis", "campaign_select"}
+            and semantic_progress_phase not in {"campaign", "sampling", "observe", "observe_hypothesis", "campaign_select"}
+        )
+    ):
+        current_task = {**dict(current_task), "phase": semantic_progress_phase}
+        current_task_phase = semantic_progress_phase
+    resolved_last_progress_phase = raw_last_progress_phase or current_task_phase
+    if current_task_phase and semantic_progress_phase == current_task_phase and resolved_last_progress_phase in {
+        "",
+        "campaign",
+        "sampling",
+        "observe",
+        "observe_hypothesis",
+        "campaign_select",
+    }:
+        resolved_last_progress_phase = current_task_phase
     child_trust_breadth_summary = child.get("trust_breadth_summary", {})
     if not isinstance(child_trust_breadth_summary, Mapping):
         child_trust_breadth_summary = {}
@@ -379,6 +580,7 @@ def _live_status_projection(
     if not isinstance(report_trust_breadth_summary, Mapping):
         report_trust_breadth_summary = {}
     trusted_breadth = child_trust_breadth_summary or report_trust_breadth_summary
+    proof_trust_gap = _minimum_fresh_proof_trust_gap(trusted_breadth)
     trusted_required_families = _normalize_benchmark_families(
         trusted_breadth.get("required_families", required_families)
     )
@@ -410,14 +612,27 @@ def _live_status_projection(
     unattended_evidence = report_payload.get("unattended_evidence", {})
     if not isinstance(unattended_evidence, Mapping):
         unattended_evidence = {}
-    open_world_breadth_summary = _open_world_evidence_snapshot(unattended_evidence)
+    child_open_world_breadth_summary = child.get("open_world_breadth_summary", {})
+    if not isinstance(child_open_world_breadth_summary, Mapping):
+        child_open_world_breadth_summary = {}
+    report_open_world_breadth_summary = _open_world_evidence_snapshot(unattended_evidence)
+    open_world_breadth_summary = (
+        dict(child_open_world_breadth_summary)
+        if child_open_world_breadth_summary
+        else report_open_world_breadth_summary
+    )
+    tolbert_retained_routing_summary = _tolbert_retained_routing_summary_from_campaign_report(campaign_report)
     provider_independence_summary = _provider_independence_summary(
         payload=report_payload,
         active_run=active_run_payload,
         authoritative_decision_state=authoritative_decision_state,
+        tolbert_retained_routing_summary=tolbert_retained_routing_summary,
     )
-    tolbert_retained_routing_summary = _tolbert_retained_routing_summary_from_campaign_report(campaign_report)
     retrieval_carryover_summary = _retrieval_carryover_summary_from_campaign_report(campaign_report)
+    protocol_resource_lineage_summary = _protocol_resource_lineage_summary(
+        active_child=child,
+        campaign_report=campaign_report,
+    )
     long_horizon_finalize_summary = _long_horizon_finalize_summary(
         active_child=child,
         authoritative_decision_state=authoritative_decision_state,
@@ -444,22 +659,83 @@ def _live_status_projection(
         long_horizon_finalize_summary=long_horizon_finalize_summary,
         handoff_summary=handoff_summary,
     )
+    benchmark_dominance_summary = _benchmark_dominance_summary(
+        required_families=trusted_required_families or required_families,
+        trust_breadth_summary=trusted_breadth,
+        open_world_breadth_summary=open_world_breadth_summary,
+        closure_gap_summary=closure_gap_summary,
+    )
+    verification_outcome_summary = (
+        dict(child.get("verification_outcome_summary", {}))
+        if isinstance(child.get("verification_outcome_summary", {}), Mapping)
+        else {}
+    )
+    successful_task_count = int(verification_outcome_summary.get("successful_task_count", 0) or 0)
+    successful_families = _normalize_benchmark_families(verification_outcome_summary.get("successful_families", []))
+    autonomy_required_families = _normalize_benchmark_families(
+        benchmark_dominance_summary.get("required_families", trusted_required_families or required_families)
+    )
+    autonomy_missing_required_families = _normalize_benchmark_families(
+        benchmark_dominance_summary.get(
+            "open_families",
+            trusted_missing_required_families
+            if trusted_missing_required_families or trusted_required_families_with_reports
+            else missing_required_families,
+        )
+    )
+    autonomy_level_assessment = _autonomy_level_assessment(
+        successful_task_count=successful_task_count,
+        successful_families=successful_families,
+        required_families=autonomy_required_families,
+        missing_required_families=autonomy_missing_required_families,
+        runtime_managed_decisions=runtime_managed_decisions,
+        retained_gain_runs=retained_gain_runs,
+        authoritative_decision_state=authoritative_decision_state,
+        retrieval_carryover_summary=retrieval_carryover_summary,
+        tolbert_retained_routing_summary=tolbert_retained_routing_summary,
+        closure_gap_summary=closure_gap_summary,
+        open_world_breadth_summary=open_world_breadth_summary,
+        handoff_summary=handoff_summary,
+        protocol_resource_lineage_summary=protocol_resource_lineage_summary,
+    )
+    asi_campaign_lane_recommendation = _asi_campaign_lane_recommendation(
+        autonomy_level_assessment=autonomy_level_assessment,
+        closure_gap_summary=closure_gap_summary,
+    )
+    codex_input_packet_summary = _codex_input_packet_summary(
+        payload=report_payload,
+        active_child=child,
+        latest_generated_run_report_path=latest_generated_run_report_path,
+        benchmark_dominance_summary=benchmark_dominance_summary,
+        closure_gap_summary=closure_gap_summary,
+        open_world_breadth_summary=open_world_breadth_summary,
+        retrieval_carryover_summary=retrieval_carryover_summary,
+        tolbert_retained_routing_summary=tolbert_retained_routing_summary,
+        protocol_resource_lineage_summary=protocol_resource_lineage_summary,
+        asi_campaign_lane_recommendation=asi_campaign_lane_recommendation,
+    )
+    coding_capability_ramp_summary = _coding_capability_ramp_summary(
+        current_policy=current_policy,
+        active_run_policy=active_run_policy,
+        autonomy_level_assessment=autonomy_level_assessment,
+        closure_gap_summary=closure_gap_summary,
+        benchmark_dominance_summary=benchmark_dominance_summary,
+        long_horizon_finalize_summary=long_horizon_finalize_summary,
+        codex_input_packet_summary=codex_input_packet_summary,
+        asi_campaign_lane_recommendation=asi_campaign_lane_recommendation,
+    )
     return {
         "campaign_round_index": int(
             child.get("round_index", report_payload.get("rounds_completed", 0) or 0) or 0
         ),
-        "last_progress_phase": str(
-            child.get(
-                "last_progress_phase",
-                current_task.get("phase", ""),
-            )
-        ).strip(),
+        "last_progress_phase": resolved_last_progress_phase,
         "current_task": dict(current_task),
         "current_cognitive_stage": dict(child.get("current_cognitive_stage", {}))
         if isinstance(child.get("current_cognitive_stage", {}), Mapping)
         else {},
         "canonical_progress_state": dict(canonical_progress_state),
         "semantic_progress_state": dict(canonical_progress_state or semantic_progress_state),
+        "verification_outcome_summary": verification_outcome_summary,
         "runtime_managed_decisions": runtime_managed_decisions,
         "non_runtime_managed_decisions": non_runtime_managed_decisions,
         "execution_source_summary": (
@@ -502,6 +778,16 @@ def _live_status_projection(
                 if trusted_missing_required_families or trusted_required_families_with_reports
                 else missing_required_families
             ),
+            "proof_required_families": _normalize_benchmark_families(
+                proof_trust_gap.get("required_families", [])
+            ),
+            "proof_required_families_with_reports": _normalize_benchmark_families(
+                proof_trust_gap.get("required_families_with_reports", [])
+            ),
+            "proof_missing_required_families": _normalize_benchmark_families(
+                proof_trust_gap.get("missing_required_families", [])
+            ),
+            "proof_distinct_family_gap": int(proof_trust_gap.get("distinct_family_gap", 0) or 0),
             "distinct_external_benchmark_families": int(
                 trusted_breadth.get("distinct_external_benchmark_families", 0) or 0
             ),
@@ -521,9 +807,23 @@ def _live_status_projection(
         "provider_independence_summary": provider_independence_summary,
         "tolbert_retained_routing_summary": tolbert_retained_routing_summary,
         "retrieval_carryover_summary": retrieval_carryover_summary,
+        "protocol_resource_lineage_summary": protocol_resource_lineage_summary,
         "long_horizon_finalize_summary": long_horizon_finalize_summary,
         "handoff_summary": handoff_summary,
         "closure_gap_summary": closure_gap_summary,
+        "benchmark_dominance_summary": benchmark_dominance_summary,
+        "autonomy_level_assessment": autonomy_level_assessment,
+        "asi_campaign_lane_recommendation": asi_campaign_lane_recommendation,
+        "codex_input_packets": (
+            dict(report_payload.get("codex_input_packets", {}))
+            if isinstance(report_payload.get("codex_input_packets", {}), Mapping)
+            else {}
+        ),
+        "codex_input_packet_summary": codex_input_packet_summary,
+        "coding_capability_ramp_summary": coding_capability_ramp_summary,
+        "current_autonomy_level": str(autonomy_level_assessment.get("current_level", "A2")).strip(),
+        "frontier_autonomy_level": str(autonomy_level_assessment.get("frontier_level", "A2")).strip(),
+        "next_autonomy_level": str(autonomy_level_assessment.get("next_level", "A3")).strip(),
     }
 
 
@@ -536,6 +836,9 @@ def _authoritative_status_decision_state(
     report = campaign_report if isinstance(campaign_report, Mapping) else {}
     report_runs = report.get("runs", [])
     first_run = report_runs[0] if isinstance(report_runs, list) and report_runs and isinstance(report_runs[0], Mapping) else {}
+    run_decision_state = first_run.get("decision_state", {})
+    if not isinstance(run_decision_state, Mapping):
+        run_decision_state = {}
     child_decision_records_considered, _ = _effective_live_decision_record_count(child)
     child_retained_gain_runs = _effective_live_retained_gain_runs(child)
     runtime_managed_decisions = max(
@@ -563,11 +866,25 @@ def _authoritative_status_decision_state(
     pending_decision_state = str(
         child.get("pending_decision_state")
         or first_run.get("final_state")
+        or run_decision_state.get("retention_state")
         or ""
     ).strip()
     decision_conversion_state = str(
         first_run.get("decision_conversion_state")
+        or run_decision_state.get("decision_conversion_state")
         or ("runtime_managed" if runtime_managed_decisions > 0 else "")
+    ).strip()
+    decision_owner = str(
+        child.get("decision_owner")
+        or first_run.get("decision_owner")
+        or run_decision_state.get("decision_owner")
+        or ""
+    ).strip()
+    closeout_mode = str(
+        child.get("closeout_mode")
+        or first_run.get("closeout_mode")
+        or run_decision_state.get("closeout_mode")
+        or ""
     ).strip()
     return {
         "decision_records_considered": decision_records_considered,
@@ -576,6 +893,1330 @@ def _authoritative_status_decision_state(
         "retained_gain_runs": retained_gain_runs,
         "pending_decision_state": pending_decision_state,
         "decision_conversion_state": decision_conversion_state,
+        "decision_owner": decision_owner,
+        "closeout_mode": closeout_mode,
+    }
+
+
+def _autonomy_level_assessment(
+    *,
+    successful_task_count: int,
+    successful_families: list[str],
+    required_families: list[str],
+    missing_required_families: list[str],
+    runtime_managed_decisions: int,
+    retained_gain_runs: int,
+    authoritative_decision_state: Mapping[str, object] | None,
+    retrieval_carryover_summary: Mapping[str, object] | None,
+    tolbert_retained_routing_summary: Mapping[str, object] | None,
+    closure_gap_summary: Mapping[str, object] | None = None,
+    open_world_breadth_summary: Mapping[str, object] | None = None,
+    handoff_summary: Mapping[str, object] | None = None,
+    protocol_resource_lineage_summary: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    decision_state = authoritative_decision_state if isinstance(authoritative_decision_state, Mapping) else {}
+    retrieval_summary = retrieval_carryover_summary if isinstance(retrieval_carryover_summary, Mapping) else {}
+    tolbert_summary = (
+        tolbert_retained_routing_summary if isinstance(tolbert_retained_routing_summary, Mapping) else {}
+    )
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    open_world = open_world_breadth_summary if isinstance(open_world_breadth_summary, Mapping) else {}
+    handoff = handoff_summary if isinstance(handoff_summary, Mapping) else {}
+    protocol_lineage = (
+        protocol_resource_lineage_summary if isinstance(protocol_resource_lineage_summary, Mapping) else {}
+    )
+
+    evidence = ["tool_mediated_bounded_execution"]
+    decision_owner = str(decision_state.get("decision_owner", "")).strip()
+    closeout_mode = str(decision_state.get("closeout_mode", "")).strip()
+    successful_families = _normalize_benchmark_families(successful_families)
+    required_families = _normalize_benchmark_families(required_families)
+    missing_required_families = _normalize_benchmark_families(missing_required_families)
+    successful_family_set = set(successful_families)
+    required_family_set = set(required_families)
+    clean_task_root_gap = [family for family in required_families if family not in successful_family_set]
+    child_native_runtime_decision = runtime_managed_decisions > 0 and decision_owner == "child_native"
+
+    a3_blockers: list[str] = []
+    if successful_task_count > 0:
+        evidence.append(f"bounded_task_successes={successful_task_count}")
+    else:
+        a3_blockers.append("no_successful_bounded_task_evidence")
+
+    a4_blockers: list[str] = []
+    if runtime_managed_decisions <= 0:
+        a4_blockers.append("no_runtime_managed_decisions")
+    if decision_owner != "child_native":
+        a4_blockers.append(f"decision_owner={decision_owner or 'missing'}")
+    if closeout_mode != "natural":
+        a4_blockers.append(f"closeout_mode={closeout_mode or 'missing'}")
+    if missing_required_families:
+        a4_blockers.append("missing_counted_trusted_breadth:" + ",".join(missing_required_families))
+    if required_family_set and clean_task_root_gap:
+        a4_blockers.append("missing_clean_task_root_breadth:" + ",".join(clean_task_root_gap))
+    if child_native_runtime_decision:
+        evidence.append(f"runtime_managed_decisions={runtime_managed_decisions}")
+    if not a4_blockers and child_native_runtime_decision:
+        evidence.append("child_native_natural_decision_closure")
+
+    a5_blockers: list[str] = []
+    if str(handoff.get("closure_state", "")).strip() != "ready":
+        a5_blockers.append("continuity_handoff_not_ready")
+    if not bool(handoff.get("postmortem_ready", False)):
+        a5_blockers.append("postmortem_reconstruction_not_ready")
+    if str(closure.get("evidence_hygiene_handoff", "open")).strip() != "closed":
+        a5_blockers.append("evidence_hygiene_handoff_not_closed")
+    a5_blockers.append("successful_resume_after_interruption_not_proven")
+    if str(closure.get("trust_breadth", "open")).strip() != "closed":
+        a5_blockers.append("stable_trust_posture_not_proven")
+
+    carryover_signals: list[str] = []
+    for summary, prefix in ((retrieval_summary, "retrieval"), (tolbert_summary, "tolbert")):
+        for key, value in summary.items():
+            if isinstance(value, bool) and value:
+                carryover_signals.append(f"{prefix}:{key}")
+            elif isinstance(value, (int, float)) and float(value) > 0.0:
+                carryover_signals.append(f"{prefix}:{key}={float(value):.4f}")
+
+    a6_blockers: list[str] = []
+    if retained_gain_runs <= 0:
+        a6_blockers.append("no_retained_gain_runs")
+    if str(closure.get("retained_conversion", "open")).strip() != "closed":
+        a6_blockers.append("retained_conversion_not_closed")
+    if not bool(protocol_lineage.get("versioned_edit_plan", False)):
+        a6_blockers.append("no_versioned_resource_edit_lineage")
+    if str(closure.get("retrieval_carryover", "open")).strip() == "open" and str(
+        closure.get("tolbert_retained_routing", "open")
+    ).strip() == "open":
+        a6_blockers.append("no_verified_carryover_runtime_delta")
+    a6_blockers.append("autonomous_compounding_not_yet_proven")
+
+    open_world_report_count = max(
+        int(open_world.get("open_world_report_count", 0) or 0),
+        int(open_world.get("semantic_hub_report_count", 0) or 0),
+    )
+    a7_blockers: list[str] = []
+    if str(closure.get("open_world_breadth", "open")).strip() != "closed":
+        a7_blockers.append("unfamiliar_environment_transfer_not_closed")
+    if open_world_report_count <= 0:
+        a7_blockers.append("no_unfamiliar_environment_reports")
+    if missing_required_families or clean_task_root_gap:
+        a7_blockers.append("coding_domain_generality_not_closed")
+    a7_blockers.append("human_level_broad_task_universe_not_proven")
+
+    a8_blockers: list[str] = []
+    a8_blockers.append("no_superhuman_benchmark_evidence")
+    a8_blockers.append("no_recursive_compounding_proof")
+    a8_blockers.append("no_verified_strategic_superiority_signal")
+    if str(closure.get("retained_conversion", "open")).strip() != "closed":
+        a8_blockers.append("retained_conversion_not_closed")
+
+    level_gates = {
+        "A3": {"met": not a3_blockers, "blockers": a3_blockers},
+        "A4": {"met": not a4_blockers and not a3_blockers, "blockers": a4_blockers},
+        "A5": {"met": not a5_blockers and not a4_blockers and not a3_blockers, "blockers": a5_blockers},
+        "A6": {"met": not a6_blockers and not a5_blockers and not a4_blockers and not a3_blockers, "blockers": a6_blockers},
+        "A7": {"met": not a7_blockers and not a6_blockers and not a5_blockers and not a4_blockers and not a3_blockers, "blockers": a7_blockers},
+        "A8": {"met": not a8_blockers and not a7_blockers and not a6_blockers and not a5_blockers and not a4_blockers and not a3_blockers, "blockers": a8_blockers},
+    }
+
+    current_level = "A2"
+    for level in ("A3", "A4", "A5", "A6", "A7", "A8"):
+        if bool(level_gates[level]["met"]):
+            current_level = level
+
+    frontier_level = current_level
+    if child_native_runtime_decision and _AUTONOMY_LEVEL_ORDER[frontier_level] < _AUTONOMY_LEVEL_ORDER["A4"]:
+        frontier_level = "A4"
+
+    next_level_index = min(_AUTONOMY_LEVEL_ORDER[current_level] + 1, len(_AUTONOMY_LEVELS) - 1)
+    next_level = _AUTONOMY_LEVELS[next_level_index]
+    next_level_blockers = list(dict.fromkeys(level_gates.get(next_level, {}).get("blockers", [])))
+
+    higher_level_signals: list[str] = []
+    if retained_gain_runs > 0:
+        higher_level_signals.append(f"retained_gain_runs={retained_gain_runs}")
+    if carryover_signals:
+        higher_level_signals.extend(carryover_signals[:4])
+    if bool(protocol_lineage.get("versioned_edit_plan", False)):
+        higher_level_signals.append("versioned_edit_plan")
+    if bool(protocol_lineage.get("resource_id")):
+        higher_level_signals.append(f"resource_id={str(protocol_lineage.get('resource_id', '')).strip()}")
+
+    return {
+        "current_level": current_level,
+        "frontier_level": frontier_level,
+        "next_level": next_level,
+        "evidence": evidence,
+        "next_level_blockers": next_level_blockers,
+        "successful_task_count": int(successful_task_count),
+        "successful_families": successful_families,
+        "required_families": required_families,
+        "missing_required_families": missing_required_families,
+        "decision_owner": decision_owner,
+        "closeout_mode": closeout_mode,
+        "retained_gain_runs": int(retained_gain_runs),
+        "higher_level_signals": higher_level_signals,
+        "level_gates": {
+            level: {
+                "met": bool(payload.get("met", False)),
+                "blockers": list(dict.fromkeys([str(item).strip() for item in payload.get("blockers", []) if str(item).strip()])),
+            }
+            for level, payload in level_gates.items()
+        },
+    }
+
+
+def _asi_campaign_lane_recommendation(
+    *,
+    autonomy_level_assessment: Mapping[str, object] | None,
+    closure_gap_summary: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    assessment = autonomy_level_assessment if isinstance(autonomy_level_assessment, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    next_level = str(assessment.get("next_level", "A3")).strip() or "A3"
+    level_gates = assessment.get("level_gates", {})
+    if not isinstance(level_gates, Mapping):
+        level_gates = {}
+    next_level_payload = level_gates.get(next_level, {})
+    if not isinstance(next_level_payload, Mapping):
+        next_level_payload = {}
+    blockers = [
+        str(item).strip()
+        for item in next_level_payload.get("blockers", [])
+        if str(item).strip()
+    ]
+
+    def _has_prefix(prefix: str) -> bool:
+        return any(blocker.startswith(prefix) for blocker in blockers)
+
+    def _lane_sort_key(lane: str) -> tuple[int, str]:
+        try:
+            return (_PHASE_A_LANE_ORDER.index(lane), lane)
+        except ValueError:
+            return (len(_PHASE_A_LANE_ORDER), lane)
+
+    supporting_lanes: list[str] = []
+
+    def _add_support(lane: str) -> None:
+        if lane and lane not in supporting_lanes:
+            supporting_lanes.append(lane)
+
+    decision_closure_gap = (
+        "no_runtime_managed_decisions" in blockers
+        or _has_prefix("decision_owner=")
+        or _has_prefix("closeout_mode=")
+    )
+    trust_breadth_gap = _has_prefix("missing_counted_trusted_breadth:") or _has_prefix(
+        "missing_clean_task_root_breadth:"
+    )
+    handoff_gap = any(
+        blocker in {
+            "continuity_handoff_not_ready",
+            "postmortem_reconstruction_not_ready",
+            "evidence_hygiene_handoff_not_closed",
+            "successful_resume_after_interruption_not_proven",
+            "stable_trust_posture_not_proven",
+        }
+        for blocker in blockers
+    )
+    retained_conversion_gap = any(
+        blocker in {"no_retained_gain_runs", "retained_conversion_not_closed"} for blocker in blockers
+    )
+    carryover_gap = "no_verified_carryover_runtime_delta" in blockers
+    versioned_lineage_gap = "no_versioned_resource_edit_lineage" in blockers
+    open_world_gap = any(
+        blocker in {"unfamiliar_environment_transfer_not_closed", "coding_domain_generality_not_closed"}
+        for blocker in blockers
+    )
+    strategic_superiority_gap = any(
+        blocker in {
+            "no_superhuman_benchmark_evidence",
+            "no_recursive_compounding_proof",
+            "no_verified_strategic_superiority_signal",
+        }
+        for blocker in blockers
+    )
+
+    primary_lane = "lane_runtime_authority"
+    primary_batch_goal = "authoritative_runtime_state"
+    rationale = "runtime state still needs to stay authoritative before deeper proof claims are trustworthy"
+
+    if next_level == "A3":
+        primary_lane = "lane_runtime_authority"
+        primary_batch_goal = "bounded_task_success"
+        rationale = "A3 is blocked on successful bounded-task evidence, so runtime-authoritative task execution is still the first gate."
+    elif next_level == "A4":
+        if decision_closure_gap:
+            primary_lane = "lane_decision_closure"
+            primary_batch_goal = "retained_conversion"
+            rationale = "A4 is blocked on child-native runtime-managed natural closure, so decision closure is the primary lane."
+            if trust_breadth_gap:
+                _add_support("lane_trust_and_carryover")
+        elif trust_breadth_gap:
+            primary_lane = "lane_trust_and_carryover"
+            primary_batch_goal = "counted_trust_breadth"
+            rationale = "A4 is blocked on counted trusted breadth / clean task-root breadth, so trust and carryover is the primary lane."
+            _add_support("lane_decision_closure")
+    elif next_level == "A5":
+        primary_lane = "lane_runtime_authority"
+        primary_batch_goal = "evidence_hygiene_handoff"
+        rationale = "A5 is blocked on interruption-resume and evidence hygiene handoff, so runtime authority remains the primary lane."
+        if handoff_gap and str(closure.get("trust_breadth", "open")).strip() != "closed":
+            _add_support("lane_trust_and_carryover")
+    elif next_level == "A6":
+        if retained_conversion_gap:
+            primary_lane = "lane_decision_closure"
+            primary_batch_goal = "retained_conversion"
+            rationale = "A6 is still blocked on retained conversion, so decision closure remains the primary lane."
+            _add_support("lane_trust_and_carryover")
+        elif carryover_gap:
+            primary_lane = "lane_trust_and_carryover"
+            primary_batch_goal = "retrieval_and_memory_carryover"
+            rationale = "A6 is blocked on verified carryover deltas, so trust and carryover is the primary lane."
+            _add_support("lane_decision_closure")
+        elif versioned_lineage_gap:
+            primary_lane = "lane_strategy_memory"
+            primary_batch_goal = "versioned_resource_edit_lineage"
+            rationale = "A6 needs versioned retained mutation lineage, so strategy memory becomes the primary lane."
+            _add_support("lane_decision_closure")
+    elif next_level == "A7":
+        primary_lane = "lane_repo_generalization"
+        primary_batch_goal = "open_world_transfer"
+        rationale = "A7 is blocked on unfamiliar-environment transfer and broader coding-domain generality, so repo generalization is the primary lane."
+        _add_support("lane_trust_and_carryover")
+    elif next_level == "A8":
+        if retained_conversion_gap:
+            primary_lane = "lane_decision_closure"
+            primary_batch_goal = "retained_conversion"
+            rationale = "A8 claims remain invalid until retained conversion is closed, so decision closure still dominates."
+            _add_support("lane_trust_and_carryover")
+        elif strategic_superiority_gap or open_world_gap:
+            primary_lane = "lane_repo_generalization"
+            primary_batch_goal = "strategic_superiority_proof"
+            rationale = "A8 needs broad transfer and strategic-superiority proof, so repo generalization becomes the primary lane."
+            _add_support("lane_strategy_memory")
+            _add_support("lane_trust_and_carryover")
+
+    if primary_lane != "lane_runtime_authority" and "no_successful_bounded_task_evidence" in blockers:
+        _add_support("lane_runtime_authority")
+    if primary_lane != "lane_trust_and_carryover" and trust_breadth_gap and next_level not in {"A5"}:
+        _add_support("lane_trust_and_carryover")
+    if primary_lane != "lane_decision_closure" and decision_closure_gap and next_level in {"A4", "A6", "A8"}:
+        _add_support("lane_decision_closure")
+
+    supporting_lanes = sorted(supporting_lanes, key=_lane_sort_key)
+    return {
+        "primary_lane": primary_lane,
+        "primary_batch_goal": primary_batch_goal,
+        "supporting_lanes": supporting_lanes,
+        "target_level": next_level,
+        "blockers": blockers,
+        "rationale": rationale,
+    }
+
+
+def _codex_input_packet_summary(
+    *,
+    payload: Mapping[str, object] | None,
+    active_child: Mapping[str, object] | None,
+    latest_generated_run_report_path: str,
+    benchmark_dominance_summary: Mapping[str, object] | None = None,
+    closure_gap_summary: Mapping[str, object] | None = None,
+    open_world_breadth_summary: Mapping[str, object] | None = None,
+    retrieval_carryover_summary: Mapping[str, object] | None = None,
+    tolbert_retained_routing_summary: Mapping[str, object] | None = None,
+    protocol_resource_lineage_summary: Mapping[str, object] | None = None,
+    asi_campaign_lane_recommendation: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    report_payload = payload if isinstance(payload, Mapping) else {}
+    child = active_child if isinstance(active_child, Mapping) else {}
+    benchmark = benchmark_dominance_summary if isinstance(benchmark_dominance_summary, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    open_world = open_world_breadth_summary if isinstance(open_world_breadth_summary, Mapping) else {}
+    retrieval = retrieval_carryover_summary if isinstance(retrieval_carryover_summary, Mapping) else {}
+    tolbert = tolbert_retained_routing_summary if isinstance(tolbert_retained_routing_summary, Mapping) else {}
+    protocol_lineage = (
+        protocol_resource_lineage_summary if isinstance(protocol_resource_lineage_summary, Mapping) else {}
+    )
+    lane = asi_campaign_lane_recommendation if isinstance(asi_campaign_lane_recommendation, Mapping) else {}
+    codex_input_packets = report_payload.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    official_anchor = codex_input_packets.get("official_anchor", {})
+    if not isinstance(official_anchor, Mapping):
+        official_anchor = {}
+
+    report_path = str(official_anchor.get("report_path", report_payload.get("report_path", ""))).strip()
+    status_path = str(official_anchor.get("status_path", report_payload.get("status_path", ""))).strip()
+    event_log_path = str(report_payload.get("event_log_path", "")).strip()
+    child_report_path = str(
+        official_anchor.get("child_report_path")
+        or latest_generated_run_report_path
+        or child.get("report_path")
+        or child.get("pending_report_path")
+        or report_payload.get("campaign_report_path")
+        or report_payload.get("liftoff_report_path")
+        or ""
+    ).strip()
+    repeated_status_path = str(
+        official_anchor.get("repeated_status_path")
+        or report_payload.get("repeated_status_path")
+        or ""
+    ).strip()
+    repeated_status_present = bool(repeated_status_path) or (
+        str(child.get("report_kind", "")).strip() == "repeated_improvement_status"
+    )
+    batch_packet_path = str(codex_input_packets.get("batch_packet_path", "")).strip()
+    frontier_packet_path = str(codex_input_packets.get("frontier_packet_path", "")).strip()
+    baseline_packet_path = str(codex_input_packets.get("baseline_packet_path", "")).strip()
+    raw_lane_packet_paths = codex_input_packets.get("lane_packet_paths", {})
+    lane_packet_paths = (
+        {
+            str(key).strip(): str(value).strip()
+            for key, value in raw_lane_packet_paths.items()
+            if str(key).strip() and str(value).strip()
+        }
+        if isinstance(raw_lane_packet_paths, Mapping)
+        else {}
+    )
+
+    batch_blockers: list[str] = []
+    if not report_path:
+        batch_blockers.append("missing_official_anchor_report_path")
+    if not status_path:
+        batch_blockers.append("missing_official_anchor_status_path")
+    if not child_report_path:
+        batch_blockers.append("missing_official_anchor_child_report_path")
+    if not repeated_status_present:
+        batch_blockers.append("missing_repeated_status_surface")
+    if not event_log_path:
+        batch_blockers.append("missing_event_log_path")
+    if not benchmark:
+        batch_blockers.append("missing_closure_scoreboard")
+    if not lane:
+        batch_blockers.append("missing_lane_recommendation")
+    if codex_input_packets and not batch_packet_path:
+        batch_blockers.append("missing_frozen_batch_packet_path")
+    batch_packet = {
+        "ready": not batch_blockers,
+        "packet_path": batch_packet_path,
+        "report_path": report_path,
+        "status_path": status_path,
+        "child_report_path": child_report_path,
+        "repeated_status_path": repeated_status_path,
+        "event_log_path": event_log_path,
+        "repeated_status_present": repeated_status_present,
+        "blockers": batch_blockers,
+    }
+
+    external_summary = open_world.get("external_summary", {})
+    if not isinstance(external_summary, Mapping):
+        external_summary = {}
+    external_report_count = int(open_world.get("external_report_count", external_summary.get("total", 0)) or 0)
+    unfamiliar_domain_slice_ready = int(open_world.get("open_world_report_count", 0) or 0) > 0
+    strong_baseline_slice_ready = (
+        bool(str(report_payload.get("liftoff_report_path", "")).strip())
+        or int(retrieval.get("decisions_with_carryover_metrics", 0) or 0) > 0
+        or int(tolbert.get("tolbert_decision_count", 0) or 0) > 0
+    )
+    long_horizon_transfer_slice_ready = str(closure.get("long_horizon_finalize_execution", "open")).strip() in {
+        "partial",
+        "closed",
+    }
+    conservative_comparison_ready = external_report_count > 0 and isinstance(
+        external_summary.get("success_rate_confidence_interval", {}), Mapping
+    )
+    frontier_blockers: list[str] = []
+    if not unfamiliar_domain_slice_ready:
+        frontier_blockers.append("missing_unfamiliar_domain_slice")
+    if not strong_baseline_slice_ready:
+        frontier_blockers.append("missing_strong_baseline_comparison_slice")
+    if not long_horizon_transfer_slice_ready:
+        frontier_blockers.append("missing_long_horizon_transfer_slice")
+    if not conservative_comparison_ready:
+        frontier_blockers.append("missing_conservative_comparison_report")
+    if codex_input_packets and not frontier_packet_path:
+        frontier_blockers.append("missing_frozen_frontier_packet_path")
+    frontier_packet = {
+        "ready": not frontier_blockers,
+        "packet_path": frontier_packet_path,
+        "unfamiliar_domain_slice_ready": unfamiliar_domain_slice_ready,
+        "strong_baseline_slice_ready": strong_baseline_slice_ready,
+        "long_horizon_transfer_slice_ready": long_horizon_transfer_slice_ready,
+        "conservative_comparison_ready": conservative_comparison_ready,
+        "blockers": frontier_blockers,
+    }
+
+    baseline_artifact_ready = bool(child_report_path or str(report_payload.get("liftoff_report_path", "")).strip())
+    baseline_metrics_ready = strong_baseline_slice_ready
+    baseline_trust_ready = bool(benchmark)
+    baseline_versioned_resource_ready = bool(protocol_lineage.get("resource_id")) or bool(
+        protocol_lineage.get("versioned_resource", False)
+    )
+    baseline_blockers: list[str] = []
+    if not baseline_artifact_ready:
+        baseline_blockers.append("missing_baseline_artifact_anchor")
+    if not baseline_metrics_ready:
+        baseline_blockers.append("missing_baseline_comparison_metrics")
+    if not baseline_trust_ready:
+        baseline_blockers.append("missing_baseline_trust_summary")
+    if codex_input_packets and not baseline_packet_path:
+        baseline_blockers.append("missing_frozen_baseline_packet_path")
+    baseline_packet = {
+        "ready": not baseline_blockers,
+        "packet_path": baseline_packet_path,
+        "artifact_anchor_ready": baseline_artifact_ready,
+        "comparison_metrics_ready": baseline_metrics_ready,
+        "trust_summary_ready": baseline_trust_ready,
+        "versioned_resource_identity_ready": baseline_versioned_resource_ready,
+        "blockers": baseline_blockers,
+    }
+
+    primary_lane = str(lane.get("primary_lane", "")).strip()
+    supporting_lanes = [
+        str(item).strip()
+        for item in lane.get("supporting_lanes", [])
+        if str(item).strip()
+    ]
+    lane_blockers: list[str] = []
+    if not primary_lane:
+        lane_blockers.append("missing_primary_lane")
+    if codex_input_packets and primary_lane and primary_lane not in lane_packet_paths:
+        lane_blockers.append("missing_primary_lane_packet_path")
+    lane_packets = {
+        "ready": not lane_blockers,
+        "primary_lane": primary_lane,
+        "supporting_lanes": supporting_lanes,
+        "lane_packet_count": (1 if primary_lane else 0) + len(supporting_lanes),
+        "lane_packet_paths": lane_packet_paths,
+        "blockers": lane_blockers,
+    }
+
+    packet_set_blockers: list[str] = []
+    if not batch_packet["ready"]:
+        packet_set_blockers.append("CodexBatchPacket")
+    if not frontier_packet["ready"]:
+        packet_set_blockers.append("CodexFrontierPacket")
+    if not baseline_packet["ready"]:
+        packet_set_blockers.append("CodexBaselinePacket")
+    if not lane_packets["ready"]:
+        packet_set_blockers.append("CodexLanePacket")
+
+    suggested_actions: list[str] = []
+    if not batch_packet["ready"]:
+        suggested_actions.append("freeze_codex_batch_packet")
+    if not frontier_packet["ready"]:
+        if not unfamiliar_domain_slice_ready:
+            suggested_actions.append("add_held_out_unfamiliar_domain_slice")
+        if not strong_baseline_slice_ready:
+            suggested_actions.append("add_strong_baseline_comparison_slice")
+        if not long_horizon_transfer_slice_ready:
+            suggested_actions.append("add_long_horizon_transfer_slice")
+        if not conservative_comparison_ready:
+            suggested_actions.append("add_conservative_comparison_report")
+        suggested_actions.append("freeze_codex_frontier_packet")
+    if not baseline_packet["ready"]:
+        suggested_actions.append("freeze_codex_baseline_packet")
+    if not lane_packets["ready"]:
+        suggested_actions.append("freeze_codex_lane_packets")
+
+    return {
+        "packet_set_ready": not packet_set_blockers,
+        "packet_set_blockers": list(dict.fromkeys(packet_set_blockers)),
+        "batch_packet": batch_packet,
+        "frontier_packet": frontier_packet,
+        "baseline_packet": baseline_packet,
+        "lane_packets": lane_packets,
+        "suggested_actions": list(dict.fromkeys(suggested_actions)),
+        "a8_minimum_frontier_inputs_ready": frontier_packet["ready"],
+    }
+
+
+def _codex_lane_packet_spec(lane_id: str) -> dict[str, object]:
+    specs: dict[str, dict[str, object]] = {
+        "lane_campaign_steward": {
+            "owned_paths": ["scripts/run_unattended_campaign.py", "docs/codex_asi_campaign_lanes.md"],
+            "relevant_tests": ["tests/test_unattended_campaign.py"],
+            "done_when": "official integrated rerun is classified and the next batch recommendation is updated",
+        },
+        "lane_runtime_authority": {
+            "owned_paths": ["scripts/run_unattended_campaign.py", "tests/test_unattended_campaign.py"],
+            "relevant_tests": ["tests/test_unattended_campaign.py"],
+            "done_when": "status and report surfaces no longer disagree about live runtime state",
+        },
+        "lane_decision_closure": {
+            "owned_paths": [
+                "agent_kernel/cycle_runner.py",
+                "scripts/run_repeated_improvement_cycles.py",
+                "tests/test_finalize_cycle.py",
+            ],
+            "relevant_tests": ["tests/test_finalize_cycle.py"],
+            "done_when": "child-native natural decisions convert into retained gains more often under unattended runs",
+        },
+        "lane_strategy_invention": {
+            "owned_paths": [
+                "agent_kernel/improvement.py",
+                "agent_kernel/extensions/improvement/universe_improvement.py",
+                "datasets/improvement_catalog.json",
+            ],
+            "relevant_tests": ["tests/test_improvement.py"],
+            "done_when": "new discovered strategies remain attributable through retain or reject",
+        },
+        "lane_ontology_expansion": {
+            "owned_paths": [
+                "agent_kernel/extensions/strategy/kernel_catalog.py",
+                "datasets/kernel_metadata.json",
+            ],
+            "relevant_tests": ["tests/test_improvement.py"],
+            "done_when": "retained ontology extensions reload cleanly and fail closed on unsafe unknown keys",
+        },
+        "lane_repo_generalization": {
+            "owned_paths": [
+                "agent_kernel/ops/unattended_controller.py",
+                "agent_kernel/modeling/policy/decoder.py",
+                "scripts/run_job_queue.py",
+            ],
+            "relevant_tests": ["tests/test_unattended_controller.py"],
+            "done_when": "routing generalizes beyond fixed family labels toward broader coding work classes",
+        },
+        "lane_strategy_memory": {
+            "owned_paths": [
+                "agent_kernel/strategy_memory/",
+                "agent_kernel/actors/coding.py",
+                "evals/harness.py",
+            ],
+            "relevant_tests": ["tests/test_strategy_memory.py"],
+            "done_when": "later batches can consume retained nodes and lessons without manual reconstruction",
+        },
+        "lane_trust_and_carryover": {
+            "owned_paths": [
+                "agent_kernel/extensions/trust.py",
+                "agent_kernel/tasking/task_bank.py",
+                "agent_kernel/tasking/curriculum.py",
+                "agent_kernel/extensions/improvement/retrieval_improvement.py",
+                "scripts/run_autonomous_compounding_check.py",
+            ],
+            "relevant_tests": [
+                "tests/test_unattended_campaign.py",
+                "tests/test_unattended_controller.py",
+            ],
+            "done_when": "counted trusted breadth and at least one carryover surface change later repair or verification behavior",
+        },
+    }
+    return dict(specs.get(lane_id, {}))
+
+
+def _codex_input_packet_paths(
+    report_path: Path,
+    *,
+    status_path: Path | None,
+    payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report_payload = payload if isinstance(payload, Mapping) else {}
+    lane = report_payload.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    primary_lane = str(lane.get("primary_lane", "")).strip()
+    supporting_lanes = [
+        str(item).strip()
+        for item in lane.get("supporting_lanes", [])
+        if str(item).strip()
+    ]
+    lane_ids: list[str] = []
+    for lane_id in [primary_lane, *supporting_lanes]:
+        if lane_id and lane_id not in lane_ids:
+            lane_ids.append(lane_id)
+    stem = report_path.name[: -len(report_path.suffix)] if report_path.suffix else report_path.name
+    parent = report_path.parent
+    latest_generated_run_report_path = str(report_payload.get("latest_generated_run_report_path", "")).strip()
+    active_child = report_payload.get("active_child", {})
+    if not isinstance(active_child, Mapping):
+        active_child = {}
+    child_report_path = str(
+        latest_generated_run_report_path
+        or active_child.get("report_path")
+        or active_child.get("pending_report_path")
+        or report_payload.get("campaign_report_path")
+        or report_payload.get("liftoff_report_path")
+        or ""
+    ).strip()
+    repeated_status_path = str(_child_improvement_reports_dir(report_path) / "repeated_improvement_status.json")
+    now = datetime.now(timezone.utc)
+    return {
+        "generated_at": now.isoformat(),
+        "official_anchor": {
+            "report_path": str(report_path),
+            "status_path": "" if status_path is None else str(status_path),
+            "repeated_status_path": repeated_status_path,
+            "child_report_path": child_report_path,
+            "anchor_date": now.date().isoformat(),
+        },
+        "batch_packet_path": str(parent / f"{stem}.codex_batch_packet.json"),
+        "frontier_packet_path": str(parent / f"{stem}.codex_frontier_packet.json"),
+        "baseline_packet_path": str(parent / f"{stem}.codex_baseline_packet.json"),
+        "lane_packet_paths": {
+            lane_id: str(parent / f"{stem}.{lane_id}.codex_lane_packet.json")
+            for lane_id in lane_ids
+        },
+    }
+
+
+def _build_codex_batch_packet(
+    *,
+    report_path: Path,
+    status_path: Path | None,
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    codex_input_packets = payload.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    official_anchor = codex_input_packets.get("official_anchor", {})
+    if not isinstance(official_anchor, Mapping):
+        official_anchor = {}
+    lane = payload.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    coding_ramp = payload.get("coding_capability_ramp_summary", {})
+    if not isinstance(coding_ramp, Mapping):
+        coding_ramp = {}
+    active_run = payload.get("active_run", {})
+    if not isinstance(active_run, Mapping):
+        active_run = {}
+    active_run_policy = active_run.get("policy", {})
+    if not isinstance(active_run_policy, Mapping):
+        active_run_policy = {}
+    current_policy = payload.get("current_policy", {})
+    if not isinstance(current_policy, Mapping):
+        current_policy = {}
+    benchmark = payload.get("benchmark_dominance_summary", {})
+    if not isinstance(benchmark, Mapping):
+        benchmark = {}
+    closure = payload.get("closure_gap_summary", {})
+    if not isinstance(closure, Mapping):
+        closure = {}
+    trust_summary = payload.get("trust_breadth_summary", {})
+    if not isinstance(trust_summary, Mapping):
+        trust_summary = {}
+    allowed_lanes = [
+        str(lane.get("primary_lane", "")).strip(),
+        *[
+            str(item).strip()
+            for item in lane.get("supporting_lanes", [])
+            if str(item).strip()
+        ],
+    ]
+    allowed_lanes = [item for index, item in enumerate(allowed_lanes) if item and item not in allowed_lanes[:index]]
+    return {
+        "packet_kind": "CodexBatchPacket",
+        "packet_id": f"CodexBatchPacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "batch_goal": str(coding_ramp.get("recommended_batch_goal", lane.get("primary_batch_goal", ""))).strip(),
+        "batch_scope": str(coding_ramp.get("specialization_mode", "coding_campaign")).strip() or "coding_campaign",
+        "official_anchor": {
+            "status_path": "" if status_path is None else str(status_path),
+            "report_path": str(report_path),
+            "repeated_status_path": str(official_anchor.get("repeated_status_path", "")).strip(),
+            "child_report_path": str(official_anchor.get("child_report_path", "")).strip(),
+            "anchor_date": str(official_anchor.get("anchor_date", "")).strip(),
+        },
+        "non_upgrading_runs": [],
+        "top_live_bottlenecks": [
+            str(coding_ramp.get("primary_gap_id", "")).strip(),
+            *[
+                str(item.get("gap_id", "")).strip()
+                for item in coding_ramp.get("prioritized_gaps", [])
+                if isinstance(item, Mapping) and bool(item.get("open", False))
+            ][:3],
+        ],
+        "top_substantive_gaps": [
+            {
+                "gap_id": str(item.get("gap_id", "")).strip(),
+                "rationale": str(item.get("rationale", "")).strip(),
+                "recommended_lane": str(item.get("recommended_lane", "")).strip(),
+            }
+            for item in coding_ramp.get("prioritized_gaps", [])
+            if isinstance(item, Mapping)
+        ][:4],
+        "closure_scoreboard": {
+            "retained_conversion": str(closure.get("retained_conversion", "")).strip(),
+            "trust_breadth": str(closure.get("trust_breadth", "")).strip(),
+            "retrieval_carryover": str(closure.get("retrieval_carryover", "")).strip(),
+            "long_horizon_finalize_execution": str(closure.get("long_horizon_finalize_execution", "")).strip(),
+            "required_families": _normalize_benchmark_families(benchmark.get("required_families", [])),
+            "contract_state": str(benchmark.get("contract_state", "")).strip(),
+        },
+        "frontier_scoreboard": {
+            "a8_coding_frontier_ready": bool(coding_ramp.get("a8_coding_frontier_ready", False)),
+            "packet_set_ready": bool(coding_ramp.get("packet_set_ready", False)),
+            "frontier_packet_path": str(codex_input_packets.get("frontier_packet_path", "")).strip(),
+            "baseline_packet_path": str(codex_input_packets.get("baseline_packet_path", "")).strip(),
+        },
+        "reflection_records": [],
+        "selection_records": [],
+        "top_retained_reports": [],
+        "top_rejected_reports": [],
+        "trust_summary": dict(trust_summary),
+        "strategy_memory_summary": {
+            "versioned_resource_lineage": bool(
+                isinstance(payload.get("protocol_resource_lineage_summary", {}), Mapping)
+                and payload.get("protocol_resource_lineage_summary", {})
+            ),
+        },
+        "frontier_packet_path": str(codex_input_packets.get("frontier_packet_path", "")).strip(),
+        "baseline_packet_path": str(codex_input_packets.get("baseline_packet_path", "")).strip(),
+        "allowed_lanes": allowed_lanes,
+        "merge_order": [lane_id for lane_id in _PHASE_A_LANE_ORDER if lane_id in allowed_lanes],
+        "compute_budget": {
+            "cycles": int(active_run_policy.get("cycles", current_policy.get("cycles", 0)) or 0),
+            "campaign_width": int(active_run_policy.get("campaign_width", current_policy.get("campaign_width", 0)) or 0),
+            "variant_width": int(active_run_policy.get("variant_width", current_policy.get("variant_width", 0)) or 0),
+            "task_limit": int(active_run_policy.get("task_limit", current_policy.get("task_limit", 0)) or 0),
+            "task_step_floor": int(active_run_policy.get("task_step_floor", current_policy.get("task_step_floor", 0)) or 0),
+        },
+        "rerun_budget": {
+            "rounds_requested": int(payload.get("rounds_requested", 0) or 0),
+            "child_failure_recovery_budget": int(payload.get("child_failure_recovery_budget", 0) or 0),
+        },
+    }
+
+
+def _build_codex_frontier_packet(*, report_path: Path, payload: Mapping[str, object]) -> dict[str, object]:
+    codex_input_packets = payload.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    open_world = payload.get("open_world_breadth_summary", {})
+    if not isinstance(open_world, Mapping):
+        open_world = {}
+    external_summary = open_world.get("external_summary", {})
+    if not isinstance(external_summary, Mapping):
+        external_summary = {}
+    closure = payload.get("closure_gap_summary", {})
+    if not isinstance(closure, Mapping):
+        closure = {}
+    long_horizon = payload.get("long_horizon_finalize_summary", {})
+    if not isinstance(long_horizon, Mapping):
+        long_horizon = {}
+    retrieval = payload.get("retrieval_carryover_summary", {})
+    if not isinstance(retrieval, Mapping):
+        retrieval = {}
+    tolbert = payload.get("tolbert_retained_routing_summary", {})
+    if not isinstance(tolbert, Mapping):
+        tolbert = {}
+    packet_summary = payload.get("codex_input_packet_summary", {})
+    if not isinstance(packet_summary, Mapping):
+        packet_summary = {}
+    frontier_summary = packet_summary.get("frontier_packet", {})
+    if not isinstance(frontier_summary, Mapping):
+        frontier_summary = {}
+    return {
+        "packet_kind": "CodexFrontierPacket",
+        "packet_id": f"CodexFrontierPacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "frontier_version": report_path.stem,
+        "held_out_task_manifest": {
+            "benchmark_families": _normalize_benchmark_families(open_world.get("benchmark_families", [])),
+            "external_benchmark_families": _normalize_benchmark_families(open_world.get("external_benchmark_families", [])),
+            "semantic_hub_report_count": int(open_world.get("semantic_hub_report_count", 0) or 0),
+            "external_report_count": int(open_world.get("external_report_count", 0) or 0),
+        },
+        "max_packet_age_seconds": 86400,
+        "slice_freeze_window": "freeze until next official unattended persist",
+        "unfamiliar_domain_slices": {
+            "open_world_report_count": int(open_world.get("open_world_report_count", 0) or 0),
+            "benchmark_families": _normalize_benchmark_families(open_world.get("benchmark_families", [])),
+        },
+        "withheld_rotation_policy": "refresh only when the next official batch starts",
+        "train_exclusion_manifest": [],
+        "novelty_audit": {
+            "distinct_external_benchmark_families": int(open_world.get("distinct_external_benchmark_families", 0) or 0),
+            "distinct_open_world_benchmark_families": int(open_world.get("distinct_open_world_benchmark_families", 0) or 0),
+        },
+        "long_horizon_transfer_slices": {
+            "finalize_active": bool(long_horizon.get("finalize_active", False)),
+            "candidate_generated": bool(long_horizon.get("candidate_generated", False)),
+            "generated_success_started": bool(long_horizon.get("generated_success_started", False)),
+        },
+        "baseline_bundle": {
+            "retained_kernel_baseline": str(codex_input_packets.get("baseline_packet_path", "")).strip(),
+            "current_codex_guided_baseline": str(payload.get("report_path", "")).strip(),
+            "artifact_anchor": str(
+                payload.get("latest_generated_run_report_path")
+                or payload.get("campaign_report_path")
+                or payload.get("liftoff_report_path")
+                or ""
+            ).strip(),
+        },
+        "comparison_commands": {
+            "retained_baseline_compare": ["python", "scripts/compare_retained_baseline.py"],
+            "liftoff_compare": ["python", "scripts/evaluate_tolbert_liftoff.py"],
+            "frontier_eval": ["python", "scripts/run_autonomous_compounding_check.py"],
+        },
+        "family_conservative_bounds": {
+            "external_summary": dict(external_summary),
+        },
+        "paired_task_trace_report": "",
+        "paired_trajectory_report": "",
+        "transfer_alignment_evidence": {
+            "retrieval_carryover": dict(retrieval),
+            "tolbert_retained_routing": dict(tolbert),
+        },
+        "long_horizon_evidence": dict(long_horizon),
+        "frontier_acceptance_policy": {
+            "minimum_non_regression_rate": 1.0,
+            "minimum_baseline_win_rate": 0.0,
+            "maximum_allowed_regressions": 0,
+        },
+        "blockers": [
+            str(item).strip()
+            for item in frontier_summary.get("blockers", [])
+            if str(item).strip()
+        ],
+    }
+
+
+def _build_codex_baseline_packet(*, report_path: Path, payload: Mapping[str, object]) -> dict[str, object]:
+    protocol_lineage = payload.get("protocol_resource_lineage_summary", {})
+    if not isinstance(protocol_lineage, Mapping):
+        protocol_lineage = {}
+    active_run = payload.get("active_run", {})
+    if not isinstance(active_run, Mapping):
+        active_run = {}
+    runtime_claim = active_run.get("runtime_claim", {})
+    if not isinstance(runtime_claim, Mapping):
+        runtime_claim = {}
+    benchmark = payload.get("benchmark_dominance_summary", {})
+    if not isinstance(benchmark, Mapping):
+        benchmark = {}
+    packet_summary = payload.get("codex_input_packet_summary", {})
+    if not isinstance(packet_summary, Mapping):
+        packet_summary = {}
+    baseline_summary = packet_summary.get("baseline_packet", {})
+    if not isinstance(baseline_summary, Mapping):
+        baseline_summary = {}
+    return {
+        "packet_kind": "CodexBaselinePacket",
+        "packet_id": f"CodexBaselinePacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "baseline_type": (
+            "retained_kernel"
+            if bool(protocol_lineage.get("versioned_resource", False))
+            else "codex_guided_kernel"
+        ),
+        "artifact_paths": {
+            "report_path": str(report_path),
+            "child_report_path": str(
+                payload.get("latest_generated_run_report_path")
+                or payload.get("campaign_report_path")
+                or payload.get("liftoff_report_path")
+                or ""
+            ).strip(),
+            "active_resource_path": str(protocol_lineage.get("active_resource_path", "")).strip(),
+            "candidate_artifact_path": str(protocol_lineage.get("candidate_artifact_path", "")).strip(),
+        },
+        "compare_commands": {
+            "retained_baseline_compare": ["python", "scripts/compare_retained_baseline.py"],
+            "frontier_eval": ["python", "scripts/run_autonomous_compounding_check.py"],
+        },
+        "baseline_metrics": {
+            "runtime_managed_decisions": int(payload.get("runtime_managed_decisions", 0) or 0),
+            "retained_gain_runs": int(payload.get("authoritative_decision_state", {}).get("retained_gain_runs", 0) or 0)
+            if isinstance(payload.get("authoritative_decision_state", {}), Mapping)
+            else 0,
+        },
+        "baseline_task_outcomes": dict(payload.get("verification_outcome_summary", {}))
+        if isinstance(payload.get("verification_outcome_summary", {}), Mapping)
+        else {},
+        "baseline_trajectory_signature_summary": {
+            "execution_source_summary": dict(payload.get("execution_source_summary", {}))
+            if isinstance(payload.get("execution_source_summary", {}), Mapping)
+            else {},
+            "long_horizon_finalize_summary": dict(payload.get("long_horizon_finalize_summary", {}))
+            if isinstance(payload.get("long_horizon_finalize_summary", {}), Mapping)
+            else {},
+        },
+        "baseline_trust_summary": dict(payload.get("trust_breadth_summary", {}))
+        if isinstance(payload.get("trust_breadth_summary", {}), Mapping)
+        else {},
+        "baseline_frontier_summary": dict(packet_summary.get("frontier_packet", {}))
+        if isinstance(packet_summary.get("frontier_packet", {}), Mapping)
+        else {},
+        "matched_budget_policy": {
+            "priority_benchmark_families": _normalize_benchmark_families(
+                active_run.get("policy", {}).get("priority_benchmark_families", [])
+                if isinstance(active_run.get("policy", {}), Mapping)
+                else []
+            ),
+        },
+        "baseline_freeze_window": "freeze until next official unattended persist",
+        "tool_permission_profile": {
+            "claimed_runtime_shape": str(runtime_claim.get("claimed_runtime_shape", "")).strip(),
+            "decoder_runtime_posture": dict(runtime_claim.get("decoder_runtime_posture", {}))
+            if isinstance(runtime_claim.get("decoder_runtime_posture", {}), Mapping)
+            else {},
+            "required_families": _normalize_benchmark_families(benchmark.get("required_families", [])),
+        },
+        "blockers": [
+            str(item).strip()
+            for item in baseline_summary.get("blockers", [])
+            if str(item).strip()
+        ],
+    }
+
+
+def _build_codex_lane_packets(*, report_path: Path, payload: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    codex_input_packets = payload.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    lane_packet_paths = codex_input_packets.get("lane_packet_paths", {})
+    if not isinstance(lane_packet_paths, Mapping):
+        lane_packet_paths = {}
+    lane = payload.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    coding_ramp = payload.get("coding_capability_ramp_summary", {})
+    if not isinstance(coding_ramp, Mapping):
+        coding_ramp = {}
+    lanes: list[str] = []
+    for lane_id in [
+        str(lane.get("primary_lane", "")).strip(),
+        *[
+            str(item).strip()
+            for item in lane.get("supporting_lanes", [])
+            if str(item).strip()
+        ],
+    ]:
+        if lane_id and lane_id not in lanes:
+            lanes.append(lane_id)
+    packets: dict[str, dict[str, object]] = {}
+    for lane_id in lanes:
+        spec = _codex_lane_packet_spec(lane_id)
+        packets[lane_id] = {
+            "packet_kind": "CodexLanePacket",
+            "packet_id": f"CodexLanePacket:{lane_id}:{report_path.stem}",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "lane_id": lane_id,
+            "question": str(coding_ramp.get("primary_gap_rationale", lane.get("rationale", ""))).strip(),
+            "owned_paths": list(spec.get("owned_paths", [])) if isinstance(spec.get("owned_paths", []), list) else [],
+            "explicitly_not_owned": [
+                other_lane
+                for other_lane in _PHASE_A_LANE_ORDER
+                if other_lane != lane_id and other_lane in lanes
+            ],
+            "relevant_tests": list(spec.get("relevant_tests", [])) if isinstance(spec.get("relevant_tests", []), list) else [],
+            "relevant_reports": [
+                str(report_path),
+                str(payload.get("report_path", "")).strip(),
+                str(payload.get("latest_generated_run_report_path", "")).strip(),
+            ],
+            "relevant_reflection_records": [],
+            "relevant_selection_records": [],
+            "relevant_strategy_memory_nodes": [],
+            "failure_motifs": [
+                str(item).strip()
+                for item in lane.get("blockers", [])
+                if str(item).strip()
+            ],
+            "expected_signals": [
+                str(coding_ramp.get("recommended_batch_goal", "")).strip(),
+                str(coding_ramp.get("primary_gap_id", "")).strip(),
+            ],
+            "done_when": str(spec.get("done_when", "")).strip(),
+            "verification_plan": {
+                "targeted_tests": list(spec.get("relevant_tests", []))
+                if isinstance(spec.get("relevant_tests", []), list)
+                else [],
+                "official_rerun_required": True,
+            },
+            "restart_requirement": "official integrated rerun required",
+            "packet_path": str(lane_packet_paths.get(lane_id, "")).strip(),
+        }
+    return packets
+
+
+def _prepare_codex_input_packets(
+    *,
+    report_path: Path,
+    status_path: Path | None,
+    payload: dict[str, object],
+) -> None:
+    payload["codex_input_packets"] = _codex_input_packet_paths(
+        report_path,
+        status_path=status_path,
+        payload=payload,
+    )
+
+
+def _prune_stale_codex_lane_packets(
+    report_path: Path,
+    lane_packet_paths: Mapping[str, object],
+) -> None:
+    expected_paths = {
+        str(Path(str(path).strip()))
+        for path in lane_packet_paths.values()
+        if str(path).strip()
+    }
+    pattern = f"{report_path.stem}.*.codex_lane_packet.json"
+    for candidate in report_path.parent.glob(pattern):
+        if str(candidate) not in expected_paths:
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+
+
+def _write_codex_input_packets(
+    *,
+    report_path: Path,
+    status_path: Path | None,
+    payload: Mapping[str, object],
+    config: KernelConfig | None = None,
+    govern_storage: bool = True,
+) -> None:
+    codex_input_packets = payload.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping) or not codex_input_packets:
+        return
+    batch_packet_path = str(codex_input_packets.get("batch_packet_path", "")).strip()
+    frontier_packet_path = str(codex_input_packets.get("frontier_packet_path", "")).strip()
+    baseline_packet_path = str(codex_input_packets.get("baseline_packet_path", "")).strip()
+    lane_packet_paths = codex_input_packets.get("lane_packet_paths", {})
+    if not isinstance(lane_packet_paths, Mapping):
+        lane_packet_paths = {}
+    _prune_stale_codex_lane_packets(report_path, lane_packet_paths)
+    if batch_packet_path:
+        atomic_write_json(
+            Path(batch_packet_path),
+            _build_codex_batch_packet(report_path=report_path, status_path=status_path, payload=payload),
+            config=config,
+            govern_storage=govern_storage,
+        )
+    if frontier_packet_path:
+        atomic_write_json(
+            Path(frontier_packet_path),
+            _build_codex_frontier_packet(report_path=report_path, payload=payload),
+            config=config,
+            govern_storage=govern_storage,
+        )
+    if baseline_packet_path:
+        atomic_write_json(
+            Path(baseline_packet_path),
+            _build_codex_baseline_packet(report_path=report_path, payload=payload),
+            config=config,
+            govern_storage=govern_storage,
+        )
+    lane_packets = _build_codex_lane_packets(report_path=report_path, payload=payload)
+    for lane_id, packet in lane_packets.items():
+        lane_path = str(lane_packet_paths.get(lane_id, "")).strip()
+        if lane_path:
+            atomic_write_json(
+                Path(lane_path),
+                packet,
+                config=config,
+                govern_storage=govern_storage,
+            )
+
+
+def _coding_capability_ramp_summary(
+    *,
+    current_policy: Mapping[str, object] | None,
+    active_run_policy: Mapping[str, object] | None,
+    autonomy_level_assessment: Mapping[str, object] | None,
+    closure_gap_summary: Mapping[str, object] | None = None,
+    benchmark_dominance_summary: Mapping[str, object] | None = None,
+    long_horizon_finalize_summary: Mapping[str, object] | None = None,
+    codex_input_packet_summary: Mapping[str, object] | None = None,
+    asi_campaign_lane_recommendation: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    current = current_policy if isinstance(current_policy, Mapping) else {}
+    active = active_run_policy if isinstance(active_run_policy, Mapping) else {}
+    assessment = autonomy_level_assessment if isinstance(autonomy_level_assessment, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    benchmark = benchmark_dominance_summary if isinstance(benchmark_dominance_summary, Mapping) else {}
+    finalize = long_horizon_finalize_summary if isinstance(long_horizon_finalize_summary, Mapping) else {}
+    packet_summary = codex_input_packet_summary if isinstance(codex_input_packet_summary, Mapping) else {}
+    lane = asi_campaign_lane_recommendation if isinstance(asi_campaign_lane_recommendation, Mapping) else {}
+
+    semantic_only_runtime = bool(active.get("semantic_only_runtime", current.get("semantic_only_runtime", False)))
+    current_level = str(assessment.get("current_level", "A2")).strip() or "A2"
+    next_level = str(assessment.get("next_level", "A3")).strip() or "A3"
+    required_families = _normalize_benchmark_families(assessment.get("required_families", []))
+    declared_task_universe = "coding"
+    specialization_mode = "semantic_only_runtime" if semantic_only_runtime else "coding_campaign"
+
+    retained_conversion_open = str(closure.get("retained_conversion", "open")).strip() != "closed"
+    trust_breadth_open = str(closure.get("trust_breadth", "open")).strip() != "closed" or str(
+        benchmark.get("contract_state", "open")
+    ).strip() != "closed"
+    retrieval_to_action_open = str(closure.get("retrieval_carryover", "open")).strip() != "closed"
+    long_horizon_open = str(closure.get("long_horizon_finalize_execution", "open")).strip() != "closed" or bool(
+        finalize.get("finalize_conversion_gap", False)
+    )
+
+    prioritized_gaps = [
+        {
+            "gap_id": "runtime_managed_conversion",
+            "priority": 1,
+            "open": retained_conversion_open,
+            "recommended_lane": "lane_decision_closure",
+            "recommended_batch_goal": "retained_conversion",
+            "rationale": "natural child-owned decisions still are not converting into retained coding gains at the required rate.",
+        },
+        {
+            "gap_id": "trust_breadth_and_family_coverage",
+            "priority": 2,
+            "open": trust_breadth_open,
+            "recommended_lane": "lane_trust_and_carryover",
+            "recommended_batch_goal": "counted_trust_breadth",
+            "rationale": "coding specialization still needs counted trusted breadth and clean task-root breadth across the required coding families.",
+        },
+        {
+            "gap_id": "retrieval_to_action_carryover",
+            "priority": 3,
+            "open": retrieval_to_action_open,
+            "recommended_lane": "lane_trust_and_carryover",
+            "recommended_batch_goal": "retrieval_and_memory_carryover",
+            "rationale": "retrieval changes still are not broadly proven to alter later trusted repair or verification behavior.",
+        },
+        {
+            "gap_id": "long_horizon_repo_execution",
+            "priority": 4,
+            "open": long_horizon_open,
+            "recommended_lane": "lane_repo_generalization",
+            "recommended_batch_goal": "long_horizon_repo_execution",
+            "rationale": "the kernel still needs stronger long-horizon repository execution and finalize quality for unattended coding work.",
+        },
+    ]
+
+    primary_gap = next((gap for gap in prioritized_gaps if bool(gap.get("open", False))), None)
+    if primary_gap is None:
+        primary_gap = prioritized_gaps[-1]
+    recommended_primary_lane = str(lane.get("primary_lane", "")).strip() or str(primary_gap.get("recommended_lane", "")).strip()
+    recommended_batch_goal = str(lane.get("primary_batch_goal", "")).strip() or str(
+        primary_gap.get("recommended_batch_goal", "")
+    ).strip()
+    supporting_lanes = [
+        str(item).strip()
+        for item in lane.get("supporting_lanes", [])
+        if str(item).strip()
+    ]
+
+    suggested_actions: list[str] = []
+    if not semantic_only_runtime:
+        suggested_actions.append("enable_semantic_only_runtime")
+    for action in packet_summary.get("suggested_actions", []):
+        token = str(action).strip()
+        if token and token not in suggested_actions:
+            suggested_actions.append(token)
+
+    return {
+        "declared_task_universe": declared_task_universe,
+        "specialization_mode": specialization_mode,
+        "specialized_campaign": bool(required_families),
+        "semantic_only_runtime": semantic_only_runtime,
+        "current_transition": f"{current_level}->{next_level}",
+        "current_level": current_level,
+        "next_level": next_level,
+        "required_coding_families": required_families,
+        "primary_gap_id": str(primary_gap.get("gap_id", "")).strip(),
+        "primary_gap_rationale": str(primary_gap.get("rationale", "")).strip(),
+        "recommended_primary_lane": recommended_primary_lane,
+        "recommended_batch_goal": recommended_batch_goal,
+        "supporting_lanes": supporting_lanes,
+        "prioritized_gaps": prioritized_gaps,
+        "a8_coding_frontier_ready": bool(packet_summary.get("a8_minimum_frontier_inputs_ready", False)),
+        "packet_set_ready": bool(packet_summary.get("packet_set_ready", False)),
+        "suggested_actions": suggested_actions,
+    }
+
+
+def _protocol_resource_lineage_summary(
+    *,
+    active_child: Mapping[str, object] | None,
+    campaign_report: Mapping[str, object] | None,
+) -> dict[str, object]:
+    child = active_child if isinstance(active_child, Mapping) else {}
+    report = campaign_report if isinstance(campaign_report, Mapping) else {}
+    active_cycle_run = child.get("active_cycle_run", {})
+    if not isinstance(active_cycle_run, Mapping):
+        active_cycle_run = {}
+    candidate_artifact_path = str(
+        active_cycle_run.get("last_candidate_artifact_path")
+        or child.get("last_candidate_artifact_path")
+        or ""
+    ).strip()
+    active_artifact_path = str(
+        active_cycle_run.get("active_artifact_path")
+        or child.get("active_artifact_path")
+        or child.get("artifact_path")
+        or ""
+    ).strip()
+    protocol_match_id = str(
+        active_cycle_run.get("protocol_match_id")
+        or child.get("protocol_match_id")
+        or report.get("protocol_match_id")
+        or ""
+    ).strip()
+    report_runs = report.get("runs", [])
+    first_run = report_runs[0] if isinstance(report_runs, list) and report_runs and isinstance(report_runs[0], Mapping) else {}
+    if not candidate_artifact_path:
+        candidate_artifact_path = str(first_run.get("candidate_artifact_path", "") or "").strip()
+    if not active_artifact_path:
+        active_artifact_path = str(
+            first_run.get("active_artifact_path", "") or first_run.get("artifact_path", "") or ""
+        ).strip()
+    if not protocol_match_id:
+        protocol_match_id = str(first_run.get("protocol_match_id", "") or "").strip()
+
+    generation_context = {}
+    candidate_payload = {}
+    if candidate_artifact_path:
+        candidate_payload = _read_json(Path(candidate_artifact_path))
+        if isinstance(candidate_payload.get("generation_context", {}), Mapping):
+            generation_context = dict(candidate_payload.get("generation_context", {}))
+    selection_record = generation_context.get("selection_record", {})
+    if not isinstance(selection_record, Mapping):
+        selection_record = {}
+    edit_plan = selection_record.get("edit_plan", {})
+    if not isinstance(edit_plan, Mapping):
+        edit_plan = {}
+    resource_id = str(
+        generation_context.get("resource_id")
+        or selection_record.get("resource_id")
+        or edit_plan.get("resource_id")
+        or ""
+    ).strip()
+    active_version_id = str(
+        edit_plan.get("active_version_id")
+        or selection_record.get("active_version_id")
+        or ""
+    ).strip()
+    active_resource_path = str(
+        edit_plan.get("active_resource_path")
+        or generation_context.get("active_artifact_path")
+        or active_artifact_path
+        or ""
+    ).strip()
+    selection_id = str(
+        generation_context.get("selection_id")
+        or selection_record.get("selection_id")
+        or ""
+    ).strip()
+    cycle_id = str(generation_context.get("cycle_id") or selection_record.get("cycle_id") or "").strip()
+    prior_retained_cycle_id = str(generation_context.get("prior_retained_cycle_id") or "").strip()
+    artifact_kind = str(candidate_payload.get("artifact_kind", "") or "").strip()
+    return {
+        "resource_id": resource_id,
+        "active_version_id": active_version_id,
+        "active_resource_path": active_resource_path,
+        "candidate_artifact_path": candidate_artifact_path,
+        "active_artifact_path": active_artifact_path,
+        "selection_id": selection_id,
+        "cycle_id": cycle_id,
+        "protocol_match_id": protocol_match_id,
+        "prior_retained_cycle_id": prior_retained_cycle_id,
+        "artifact_kind": artifact_kind,
+        "versioned_resource": bool(resource_id),
+        "versioned_edit_plan": bool(resource_id and active_version_id),
     }
 
 
@@ -683,10 +2324,12 @@ def _provider_independence_summary(
     payload: Mapping[str, object] | None,
     active_run: Mapping[str, object] | None,
     authoritative_decision_state: Mapping[str, object] | None,
+    tolbert_retained_routing_summary: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     report_payload = payload if isinstance(payload, Mapping) else {}
     active_run_payload = active_run if isinstance(active_run, Mapping) else {}
     decision_state = authoritative_decision_state if isinstance(authoritative_decision_state, Mapping) else {}
+    tolbert = tolbert_retained_routing_summary if isinstance(tolbert_retained_routing_summary, Mapping) else {}
     resolved_provider = str(active_run_payload.get("provider", "")).strip()
     active_run_policy = active_run_payload.get("policy", {})
     if not isinstance(active_run_policy, Mapping):
@@ -700,6 +2343,15 @@ def _provider_independence_summary(
             provider_signal_state = "decision_bearing"
         if retained_gain_runs > 0:
             provider_signal_state = "retained"
+    native_decoder_decision_signal = (
+        resolved_provider == "hybrid"
+        and int(tolbert.get("tolbert_decision_count", 0) or 0) > 0
+    )
+    native_decoder_retained_control = (
+        native_decoder_decision_signal
+        and provider_signal_state == "retained"
+        and bool(tolbert.get("retained_routing_proven", False))
+    )
     return {
         "resolved_provider": resolved_provider,
         "active_run_provider": resolved_provider,
@@ -709,6 +2361,8 @@ def _provider_independence_summary(
         "provider_signal_state": provider_signal_state,
         "decision_bearing_provider_signal": decision_records_considered > 0,
         "retained_provider_signal": retained_gain_runs > 0,
+        "native_decoder_decision_signal": native_decoder_decision_signal,
+        "native_decoder_retained_control": native_decoder_retained_control,
         "provider_requested_by_policy": str(active_run_policy.get("provider", "")).strip(),
         "report_status": str(report_payload.get("status", "")).strip(),
     }
@@ -803,6 +2457,7 @@ def _closure_gap_summary(
     handoff_summary: Mapping[str, object] | None,
 ) -> dict[str, object]:
     trust = trust_breadth_summary if isinstance(trust_breadth_summary, Mapping) else {}
+    proof_trust_gap = _minimum_fresh_proof_trust_gap(trust)
     open_world = open_world_breadth_summary if isinstance(open_world_breadth_summary, Mapping) else {}
     provider = provider_independence_summary if isinstance(provider_independence_summary, Mapping) else {}
     tolbert = tolbert_retained_routing_summary if isinstance(tolbert_retained_routing_summary, Mapping) else {}
@@ -811,8 +2466,8 @@ def _closure_gap_summary(
     handoff = handoff_summary if isinstance(handoff_summary, Mapping) else {}
     trust_closed = (
         int(trust.get("external_report_count", 0) or 0) > 0
-        and not _normalize_benchmark_families(trust.get("missing_required_families", []))
-        and int(trust.get("distinct_family_gap", 0) or 0) <= 0
+        and not _normalize_benchmark_families(proof_trust_gap.get("missing_required_families", []))
+        and int(proof_trust_gap.get("distinct_family_gap", 0) or 0) <= 0
     )
     open_world_reports = int(open_world.get("open_world_report_count", 0) or 0)
     open_world_retained_gain = bool(open_world.get("retained_open_world_gain", False))
@@ -826,9 +2481,10 @@ def _closure_gap_summary(
         ),
         "decoder_runtime_independence": (
             "closed"
-            if bool(provider.get("hybrid_provider_active", False)) and provider_state == "retained"
+            if bool(provider.get("native_decoder_retained_control", False))
             else "partial"
-            if bool(provider.get("hybrid_provider_active", False)) and provider_state in {"started", "decision_bearing"}
+            if bool(provider.get("native_decoder_decision_signal", False))
+            and provider_state in {"decision_bearing", "retained"}
             else "open"
         ),
         "tolbert_retained_routing": (
@@ -857,6 +2513,70 @@ def _closure_gap_summary(
         "evidence_hygiene_handoff": (
             "closed" if handoff_state == "ready" else "partial" if handoff_state == "partial" else "open"
         ),
+    }
+
+
+def _benchmark_dominance_summary(
+    *,
+    required_families: object,
+    trust_breadth_summary: Mapping[str, object] | None,
+    open_world_breadth_summary: Mapping[str, object] | None,
+    closure_gap_summary: Mapping[str, object] | None,
+) -> dict[str, object]:
+    required = _normalize_benchmark_families(required_families)
+    trust = trust_breadth_summary if isinstance(trust_breadth_summary, Mapping) else {}
+    open_world = open_world_breadth_summary if isinstance(open_world_breadth_summary, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    proof_required_family_set = set(
+        _normalize_benchmark_families(_minimum_fresh_proof_trust_gap(trust).get("required_families", []))
+    )
+    effective_required = (
+        [family for family in required if family in proof_required_family_set]
+        if proof_required_family_set
+        else list(required)
+    )
+    if not effective_required:
+        effective_required = list(required)
+    trusted_with_reports = set(_normalize_benchmark_families(trust.get("required_families_with_reports", [])))
+    open_world_families = set(
+        _normalize_benchmark_families(
+            open_world.get("benchmark_families", open_world.get("open_world_benchmark_families", []))
+        )
+    )
+    required_family_statuses = {
+        family: (
+            "closed"
+            if family in trusted_with_reports or family in open_world_families
+            else "open"
+        )
+        for family in effective_required
+    }
+    closed_surfaces = sorted(
+        key
+        for key, value in closure.items()
+        if str(value).strip() == "closed"
+    )
+    open_surfaces = sorted(
+        key
+        for key, value in closure.items()
+        if str(value).strip() != "closed"
+    )
+    closed_families = sorted(family for family, state in required_family_statuses.items() if state == "closed")
+    open_families = sorted(family for family, state in required_family_statuses.items() if state != "closed")
+    contract_state = "closed" if not open_surfaces and not open_families else "open"
+    return {
+        "suite_kind": (
+            "minimum_fresh_proof_suite"
+            if effective_required != required
+            else "fixed_required_family_suite"
+        ),
+        "required_families": effective_required,
+        "required_family_statuses": required_family_statuses,
+        "closed_families": closed_families,
+        "open_families": open_families,
+        "closed_surfaces": closed_surfaces,
+        "open_surfaces": open_surfaces,
+        "contract_state": contract_state,
     }
 
 
@@ -1439,7 +3159,7 @@ def _append_event(
 
 
 def _write_controller_state(path: Path, payload: dict[str, object], *, config: KernelConfig | None = None) -> None:
-    atomic_write_json(path, payload, config=config)
+    atomic_write_json(path, payload, config=config, govern_storage=False)
 
 
 def _process_alive(pid: int) -> bool:
@@ -1757,6 +3477,160 @@ def _persist_emergency_state(
     return emergency_path
 
 
+def _sync_active_child_into_active_run(payload: dict[str, object]) -> None:
+    active_run = payload.get("active_run", {})
+    if not isinstance(active_run, Mapping):
+        return
+    updated_active_run = dict(active_run)
+    active_child = payload.get("active_child", {})
+    payload_phase = str(payload.get("phase", "")).strip()
+    if isinstance(active_child, Mapping) and active_child:
+        updated_active_run["child_status"] = dict(active_child)
+    elif "child_status" in updated_active_run and payload_phase != "campaign":
+        updated_active_run.pop("child_status", None)
+    payload["active_run"] = updated_active_run
+
+
+
+def _align_persist_payload_with_existing_status(
+    *,
+    persist_payload: dict[str, object],
+    status_path: Path | None,
+) -> None:
+    if status_path is None:
+        return
+    existing_status = _read_json(status_path)
+    if not existing_status:
+        return
+    existing_active_child = existing_status.get("active_child", {})
+    if not isinstance(existing_active_child, Mapping) or not existing_active_child:
+        return
+    persisted_active_run = persist_payload.get("active_run", {})
+    if not isinstance(persisted_active_run, Mapping):
+        persisted_active_run = {}
+    existing_active_run = existing_status.get("active_run", {})
+    if not isinstance(existing_active_run, Mapping):
+        existing_active_run = {}
+    persisted_identity = _active_run_identity(persisted_active_run)
+    existing_identity = _active_run_identity(existing_active_run)
+    if persisted_identity and existing_identity and persisted_identity != existing_identity:
+        return
+    persisted_active_child = persist_payload.get("active_child", {})
+    if not isinstance(persisted_active_child, Mapping):
+        persisted_active_child = {}
+    persisted_progress_recorded_at = _child_progress_recorded_at(persisted_active_child)
+    existing_progress_recorded_at = _child_progress_recorded_at(existing_active_child)
+    if persisted_active_child and existing_progress_recorded_at <= persisted_progress_recorded_at + 1e-6:
+        return
+    persist_payload["active_child"] = dict(existing_active_child)
+    _sync_active_child_into_active_run(persist_payload)
+    phase_detail = _preferred_active_child_phase_detail(
+        str(persist_payload.get("phase_detail", "")).strip(),
+        persist_payload.get("active_child", {}),
+    )
+    if phase_detail:
+        persist_payload["phase_detail"] = phase_detail
+    rounds = persist_payload.get("rounds", [])
+    if not isinstance(rounds, list) or not rounds:
+        return
+    last_round = rounds[-1]
+    if not isinstance(last_round, dict) or str(last_round.get("status", "")).strip() != "running":
+        return
+    last_round["active_child"] = dict(persist_payload["active_child"])
+    if phase_detail:
+        last_round["phase_detail"] = phase_detail
+
+
+def _project_active_child_from_live_projection(
+    active_child: Mapping[str, object] | None,
+    projection: Mapping[str, object] | None,
+) -> dict[str, object]:
+    projected_child = dict(active_child) if isinstance(active_child, Mapping) else {}
+    live_projection = projection if isinstance(projection, Mapping) else {}
+    for key in (
+        "current_task",
+        "current_cognitive_stage",
+        "canonical_progress_state",
+        "semantic_progress_state",
+        "verification_outcome_summary",
+        "trust_breadth_summary",
+        "open_world_breadth_summary",
+        "execution_source_summary",
+    ):
+        value = live_projection.get(key, {})
+        if isinstance(value, Mapping) and value:
+            projected_child[key] = dict(value)
+    projected_last_progress_phase = str(live_projection.get("last_progress_phase", "")).strip()
+    if projected_last_progress_phase:
+        projected_child["last_progress_phase"] = projected_last_progress_phase
+    projected_phase = str(
+        (
+            projected_child.get("current_task", {}).get("phase", "")
+            if isinstance(projected_child.get("current_task", {}), Mapping)
+            else ""
+        )
+        or (
+            projected_child.get("semantic_progress_state", {}).get("phase", "")
+            if isinstance(projected_child.get("semantic_progress_state", {}), Mapping)
+            else ""
+        )
+        or projected_last_progress_phase
+    ).strip()
+    if projected_phase:
+        projected_child["phase"] = projected_phase
+    return projected_child
+
+
+def _project_live_report_payload(
+    *,
+    persist_payload: dict[str, object],
+) -> None:
+    active_run = persist_payload.get("active_run", {})
+    if not isinstance(active_run, Mapping):
+        active_run = {}
+    raw_active_child = persist_payload.get("active_child", {})
+    active_child = raw_active_child if isinstance(raw_active_child, Mapping) else {}
+    mirrored_child_status = active_run.get("child_status", {})
+    if not isinstance(mirrored_child_status, Mapping):
+        mirrored_child_status = {}
+    if active_child and mirrored_child_status:
+        active_child = _merge_mirrored_child_status_fields(
+            dict(active_child),
+            mirrored_child_status,
+        )
+    elif mirrored_child_status:
+        active_child = dict(mirrored_child_status)
+    projection = _live_status_projection(
+        payload=persist_payload,
+        active_run=active_run,
+        active_child=active_child,
+    )
+    if projection:
+        persist_payload.update(deepcopy(projection))
+    final_active_child = _project_active_child_from_live_projection(active_child, projection)
+    if final_active_child:
+        persist_payload["active_child"] = final_active_child
+        updated_active_run = dict(active_run)
+        updated_active_run["child_status"] = dict(final_active_child)
+        persist_payload["active_run"] = updated_active_run
+    phase_detail = _preferred_active_child_phase_detail(
+        str(persist_payload.get("phase_detail", "")).strip(),
+        persist_payload.get("active_child", {}),
+    )
+    if phase_detail:
+        persist_payload["phase_detail"] = phase_detail
+    rounds = persist_payload.get("rounds", [])
+    if not isinstance(rounds, list) or not rounds:
+        return
+    last_round = rounds[-1]
+    if not isinstance(last_round, dict) or str(last_round.get("status", "")).strip() != "running":
+        return
+    if final_active_child:
+        last_round["active_child"] = dict(final_active_child)
+    if phase_detail:
+        last_round["phase_detail"] = phase_detail
+
+
 def _persist_report_state(
     report_path: Path,
     payload: dict[str, object],
@@ -1767,6 +3641,7 @@ def _persist_report_state(
     external_lease_backend: str = "",
     external_lease_endpoint: str = "",
     external_lease_token: str = "",
+    govern_storage: bool = True,
 ) -> None:
     if not str(external_lease_backend).strip():
         external_lease_backend = str(_EXTERNAL_LEASE_STATE.get("backend", "")).strip()
@@ -1774,44 +3649,77 @@ def _persist_report_state(
         external_lease_endpoint = str(_EXTERNAL_LEASE_STATE.get("endpoint", "")).strip()
     if not str(external_lease_token).strip():
         external_lease_token = str(_EXTERNAL_LEASE_STATE.get("token", "")).strip()
-    try:
-        _write_report(report_path, payload, config=config)
-        _write_status(status_path, report_path=report_path, payload=payload, config=config)
-        _refresh_campaign_lock(
-            lock_path,
-            pid=os.getpid(),
-            report_path=report_path,
-            status_path=status_path,
-            payload=payload,
-        )
-        if str(external_lease_backend).strip() == "http" and str(external_lease_endpoint).strip():
-            _refresh_external_campaign_lease(
-                str(external_lease_endpoint).strip(),
-                token=str(external_lease_token or ""),
+    persist_payload = deepcopy(payload)
+    _sync_active_child_into_active_run(persist_payload)
+    _align_persist_payload_with_existing_status(
+        persist_payload=persist_payload,
+        status_path=status_path,
+    )
+    _project_live_report_payload(persist_payload=persist_payload)
+    _prepare_codex_input_packets(
+        report_path=report_path,
+        status_path=status_path,
+        payload=persist_payload,
+    )
+    _project_live_report_payload(persist_payload=persist_payload)
+    with _REPORT_PERSIST_LOCK:
+        try:
+            _write_report(report_path, persist_payload, config=config, govern_storage=govern_storage)
+            _write_status(
+                status_path,
+                report_path=report_path,
+                payload=persist_payload,
+                config=config,
+                govern_storage=govern_storage,
+            )
+            _write_codex_input_packets(
                 report_path=report_path,
                 status_path=status_path,
-                payload=payload,
+                payload=persist_payload,
+                config=config,
+                govern_storage=govern_storage,
             )
-        return {"primary_report_path": str(report_path), "emergency_report_path": ""}
-    except OSError as exc:
-        emergency_path = _persist_emergency_state(
-            report_path,
-            payload,
-            config=config,
-            status_path=status_path,
-            error=exc,
-        )
-        if emergency_path is not None:
-            payload["emergency_report_path"] = str(emergency_path)
-            try:
-                _write_status(status_path, report_path=emergency_path, payload=payload, config=config)
-            except OSError:
-                pass
-        return {
-            "primary_report_path": str(report_path),
-            "emergency_report_path": "" if emergency_path is None else str(emergency_path),
-            "error": str(exc),
-        }
+            _refresh_campaign_lock(
+                lock_path,
+                pid=os.getpid(),
+                report_path=report_path,
+                status_path=status_path,
+                payload=persist_payload,
+            )
+            if str(external_lease_backend).strip() == "http" and str(external_lease_endpoint).strip():
+                _refresh_external_campaign_lease(
+                    str(external_lease_endpoint).strip(),
+                    token=str(external_lease_token or ""),
+                    report_path=report_path,
+                    status_path=status_path,
+                    payload=persist_payload,
+                )
+            return {"primary_report_path": str(report_path), "emergency_report_path": ""}
+        except OSError as exc:
+            emergency_path = _persist_emergency_state(
+                report_path,
+                persist_payload,
+                config=config,
+                status_path=status_path,
+                error=exc,
+            )
+            if emergency_path is not None:
+                payload["emergency_report_path"] = str(emergency_path)
+                try:
+                    _write_status(
+                        status_path,
+                        report_path=emergency_path,
+                        payload=persist_payload,
+                        config=config,
+                        govern_storage=False,
+                    )
+                except OSError:
+                    pass
+            return {
+                "primary_report_path": str(report_path),
+                "emergency_report_path": "" if emergency_path is None else str(emergency_path),
+                "error": str(exc),
+            }
 
 
 def _count_completed_rounds(rounds: list[dict[str, object]]) -> int:
@@ -1874,6 +3782,30 @@ def _phase_from_progress_line(line: str) -> str:
     return ""
 
 
+def _progress_phase_clears_active_task(phase_name: str, line: str) -> bool:
+    phase = str(phase_name).strip()
+    if not phase:
+        return False
+    if _task_from_progress_line(line):
+        return False
+    return phase in {
+        "observe",
+        "observe_hypothesis",
+        "metrics_finalize",
+        "campaign_select",
+        "variant_search",
+        "variant_generate",
+        "preview_baseline_eval",
+        "preview_candidate_eval",
+        "preview_complete",
+        "holdout_eval",
+        "apply_decision",
+        "decision_reject_reason",
+        "decision_retain_reason",
+        "done",
+    }
+
+
 def _task_from_progress_line(line: str) -> dict[str, object]:
     normalized = str(line).strip()
     if re.search(
@@ -1918,7 +3850,9 @@ _UNATTENDED_CHILD_GENERATED_FAILURE_ACTIVE_GRACE_SECONDS = 180.0
 _UNATTENDED_CHILD_GENERATED_FAILURE_COMPLETION_GRACE_SECONDS = 180.0
 _UNATTENDED_CHILD_METRICS_FINALIZE_GRACE_SECONDS = 120.0
 _UNATTENDED_CHILD_FINALIZE_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_PREVIEW_ACTIVE_GRACE_SECONDS = 120.0
 _UNATTENDED_CHILD_PREVIEW_COMPLETION_GRACE_SECONDS = 120.0
+_UNATTENDED_CHILD_OBSERVE_HANDOFF_GRACE_SECONDS = 120.0
 _UNATTENDED_CHILD_HOLDOUT_MIN_PROGRESS_SAMPLES = 3
 _UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_TASKS = 5
 _UNATTENDED_CHILD_HOLDOUT_MIN_OBSERVED_SECONDS = 30.0
@@ -1927,15 +3861,23 @@ _UNATTENDED_CHILD_HOLDOUT_RUNTIME_SAFETY_MULTIPLIER = 1.15
 _UNATTENDED_CHILD_RUNTIME_EMERGENCY_MULTIPLIER = 2.0
 
 
-def _child_runtime_extension_plan(*, last_progress_phase: str, current_task: object) -> tuple[str, float]:
+def _child_runtime_extension_plan(
+    *,
+    last_progress_phase: str,
+    current_task: object,
+    active_finalize_phase: str = "",
+) -> tuple[str, float]:
     task = current_task if isinstance(current_task, dict) else {}
     task_index = int(task.get("index", 0) or 0)
     task_total = int(task.get("total", 0) or 0)
     phase = str(last_progress_phase).strip()
+    finalize_phase = str(active_finalize_phase).strip()
     task_phase = str(task.get("phase", "")).strip() or phase
     task_completed = task_total > 0 and task_index >= task_total
-    if phase in {"variant_search", "variant_generate"}:
+    if phase in {"variant_search", "variant_generate"} or finalize_phase in {"variant_search", "variant_generate"}:
         return ("", 0.0)
+    if phase == "observe" and (not task or task_completed):
+        return ("observe_handoff", _UNATTENDED_CHILD_OBSERVE_HANDOFF_GRACE_SECONDS)
     if phase in {"preview_baseline_complete", "preview_candidate_complete", "preview_complete"}:
         return ("preview_completion", _UNATTENDED_CHILD_PREVIEW_COMPLETION_GRACE_SECONDS)
     if phase == "generated_success" and task_total > 0 and task_index >= task_total:
@@ -1958,6 +3900,8 @@ def _child_runtime_extension_plan(*, last_progress_phase: str, current_task: obj
         return ("metrics_finalize", _UNATTENDED_CHILD_METRICS_FINALIZE_GRACE_SECONDS)
     if phase == "finalize":
         return ("finalize", _UNATTENDED_CHILD_FINALIZE_GRACE_SECONDS)
+    if finalize_phase in {"preview_baseline_eval", "preview_candidate_eval"}:
+        return ("preview_active", _UNATTENDED_CHILD_PREVIEW_ACTIVE_GRACE_SECONDS)
     return ("", 0.0)
 
 
@@ -1994,10 +3938,16 @@ def _should_block_post_productive_runtime_grace(
     } or task_phase == "generated_failure"
 
 
-def _child_runtime_extension_seconds(*, last_progress_phase: str, current_task: object) -> float:
+def _child_runtime_extension_seconds(
+    *,
+    last_progress_phase: str,
+    current_task: object,
+    active_finalize_phase: str = "",
+) -> float:
     return _child_runtime_extension_plan(
         last_progress_phase=last_progress_phase,
         current_task=current_task,
+        active_finalize_phase=active_finalize_phase,
     )[1]
 
 
@@ -2138,7 +4088,7 @@ def _adaptive_child_progress_state(
     cognitive_payload = current_cognitive_stage if isinstance(current_cognitive_stage, Mapping) else {}
     current_phase = str(task_payload.get("phase", "")).strip()
     phase_for_state = phase
-    if current_phase.startswith("generated_success"):
+    if current_phase in {"primary", "observe"} or current_phase.startswith("generated_"):
         phase_for_state = current_phase
     elif finalize_phase and finalize_phase != "holdout_eval":
         phase_for_state = finalize_phase
@@ -2380,14 +4330,113 @@ def _normalize_subsystem_cooldowns(values: object) -> dict[str, int]:
     return normalized
 
 
+_CODING_RETAINED_GAIN_PRIORITY_FAMILIES = {"integration", "project", "repository"}
+_CODING_RETAINED_GAIN_BOOTSTRAP_EXCLUDED_SUBSYSTEMS = (
+    "trust",
+    "curriculum",
+    "state_estimation",
+    "transition_model",
+    "recovery",
+    "delegation",
+    "operator_policy",
+    "capabilities",
+    "universe",
+)
+
+
+def _active_run_identity(payload: Mapping[str, object] | None) -> tuple[object, ...]:
+    run = payload if isinstance(payload, Mapping) else {}
+    run_match_id = str(run.get("run_match_id", "")).strip()
+    if run_match_id:
+        return ("match", run_match_id)
+    run_index = int(run.get("run_index", 0) or 0)
+    if run_index > 0:
+        return ("index", run_index, str(run.get("phase", "")).strip())
+    return ()
+
+
+def _coding_first_bootstrap_active(
+    priority_families: object,
+    *,
+    runtime_managed_decisions: int = 0,
+    retained_gain_runs: int = 0,
+) -> bool:
+    if int(retained_gain_runs or 0) > 0:
+        return False
+    normalized = _normalize_benchmark_families(priority_families)
+    return any(family in _CODING_RETAINED_GAIN_PRIORITY_FAMILIES for family in normalized)
+
+
+def _apply_coding_first_bootstrap_policy(
+    policy: dict[str, object],
+    *,
+    runtime_managed_decisions: int = 0,
+    retained_gain_runs: int = 0,
+    rounds: int = 1,
+) -> dict[str, object]:
+    if not _coding_first_bootstrap_active(
+        policy.get("priority_benchmark_families", []),
+        runtime_managed_decisions=runtime_managed_decisions,
+        retained_gain_runs=retained_gain_runs,
+    ):
+        return _materialize_excluded_subsystems(policy)
+    next_policy = dict(policy)
+    exclusions = _normalize_excluded_subsystems(next_policy.get("excluded_subsystems", []))
+    cooldowns = _normalize_subsystem_cooldowns(next_policy.get("subsystem_cooldowns", {}))
+    cooldown_rounds = max(1, int(rounds or 1))
+    for subsystem in _CODING_RETAINED_GAIN_BOOTSTRAP_EXCLUDED_SUBSYSTEMS:
+        if subsystem not in exclusions:
+            exclusions.append(subsystem)
+        cooldowns[subsystem] = max(int(cooldowns.get(subsystem, 0) or 0), cooldown_rounds)
+    next_policy["excluded_subsystems"] = exclusions
+    next_policy["subsystem_cooldowns"] = cooldowns
+    return _materialize_excluded_subsystems(next_policy)
+
+
+def _apply_policy_steering_guards(
+    policy: Mapping[str, object] | None,
+    *,
+    reference_policy: Mapping[str, object] | None,
+) -> dict[str, object]:
+    next_policy = dict(policy) if isinstance(policy, Mapping) else {}
+    reference = reference_policy if isinstance(reference_policy, Mapping) else {}
+    protected_subsystems = _normalize_excluded_subsystems(reference.get("protected_subsystems", []))
+    if bool(reference.get("focus_locked", False)):
+        next_policy["focus_locked"] = True
+        locked_focus = str(reference.get("focus", "")).strip()
+        if locked_focus:
+            next_policy["focus"] = locked_focus
+        locked_priority_families = _normalize_benchmark_families(reference.get("priority_benchmark_families", []))
+        if locked_priority_families:
+            next_policy["priority_benchmark_families"] = locked_priority_families
+    if protected_subsystems:
+        next_policy["protected_subsystems"] = protected_subsystems
+        protected_set = set(protected_subsystems)
+        next_policy["excluded_subsystems"] = [
+            subsystem
+            for subsystem in _normalize_excluded_subsystems(next_policy.get("excluded_subsystems", []))
+            if subsystem not in protected_set
+        ]
+        cooldowns = _normalize_subsystem_cooldowns(next_policy.get("subsystem_cooldowns", {}))
+        for subsystem in protected_subsystems:
+            cooldowns.pop(subsystem, None)
+        next_policy["subsystem_cooldowns"] = cooldowns
+    return _materialize_excluded_subsystems(next_policy)
+
+
 def _materialize_excluded_subsystems(policy: dict[str, object]) -> dict[str, object]:
     next_policy = dict(policy)
     cooldowns = _normalize_subsystem_cooldowns(next_policy.get("subsystem_cooldowns", {}))
     exclusions = _normalize_excluded_subsystems(next_policy.get("excluded_subsystems", []))
+    persistent_exclusions = _normalize_excluded_subsystems(next_policy.get("persistent_excluded_subsystems", []))
+    for subsystem in persistent_exclusions:
+        if subsystem not in exclusions:
+            exclusions.append(subsystem)
     for subsystem in cooldowns:
         if subsystem not in exclusions:
             exclusions.append(subsystem)
     next_policy["subsystem_cooldowns"] = cooldowns
+    next_policy["persistent_excluded_subsystems"] = persistent_exclusions
     next_policy["excluded_subsystems"] = exclusions
     return next_policy
 
@@ -2428,9 +4477,9 @@ def _resume_policy_from_partial_round(
     max_task_limit: int,
     max_campaign_width: int,
 ) -> dict[str, object]:
-    next_policy = _advance_subsystem_cooldowns(current_policy)
     if not prior_rounds:
-        return _materialize_excluded_subsystems(next_policy)
+        return _materialize_excluded_subsystems(current_policy)
+    next_policy = _advance_subsystem_cooldowns(current_policy)
     last_round = prior_rounds[-1]
     if not isinstance(last_round, dict):
         return _materialize_excluded_subsystems(next_policy)
@@ -2490,6 +4539,32 @@ def _child_failure_recovery_policy(
     next_policy = _advance_subsystem_cooldowns(current_policy)
     stalled_subsystem = _stalled_subsystem_from_round(round_payload)
     normalized_reason = str(reason).strip().lower()
+    active_child = round_payload.get("active_child", {}) if isinstance(round_payload, dict) else {}
+    if not isinstance(active_child, dict):
+        active_child = {}
+    semantic_progress_state = active_child.get("semantic_progress_state", {})
+    if not isinstance(semantic_progress_state, dict):
+        semantic_progress_state = {}
+    runtime_managed_decisions = max(
+        int(active_child.get("runtime_managed_decisions", 0) or 0),
+        int((round_payload or {}).get("runtime_managed_decisions", 0) or 0)
+        if isinstance(round_payload, dict)
+        else 0,
+    )
+    retained_gain_runs = max(
+        int(active_child.get("retained_gain_runs", 0) or 0),
+        int((round_payload or {}).get("retained_gain_runs", 0) or 0) if isinstance(round_payload, dict) else 0,
+    )
+    preview_runtime_ceiling_timeout = (
+        str(phase).strip() == "campaign"
+        and "max runtime safety ceiling" in normalized_reason
+        and int(active_child.get("decision_records_considered", 0) or 0) <= 0
+        and bool(str(active_child.get("selected_subsystem", "")).strip())
+        and (
+            str(semantic_progress_state.get("phase_family", "")).strip() == "preview"
+            or str(active_child.get("finalize_phase", "")).strip().startswith("preview")
+        )
+    )
     dominant_zero_yield_subsystems: list[str] = []
     cooldown_rounds_by_subsystem: dict[str, int] = {}
     if isinstance(round_payload, dict):
@@ -2527,22 +4602,40 @@ def _child_failure_recovery_policy(
             rounds=max(2, int(cooldown_rounds_by_subsystem.get(subsystem, 2) or 2)),
         )
     next_policy["adaptive_search"] = True
-    next_policy["focus"] = "recovery_alignment"
-    next_policy["cycles"] = min(max_cycles, max(1, int(next_policy.get("cycles", 1) or 1)) + 1)
-    next_policy["task_limit"] = min(
-        max_task_limit,
-        max(1, int(next_policy.get("task_limit", 64) or 64)) * 2,
-    )
-    if str(phase).strip() == "liftoff":
+    next_policy["focus"] = "discovered_task_adaptation" if preview_runtime_ceiling_timeout else "recovery_alignment"
+    if preview_runtime_ceiling_timeout:
+        next_policy["cycles"] = min(max_cycles, max(1, int(current_policy.get("cycles", 1) or 1)))
+        next_policy["task_limit"] = min(max_task_limit, max(1, int(current_policy.get("task_limit", 64) or 64)))
+        next_policy["campaign_width"] = min(
+            max_campaign_width,
+            max(1, int(current_policy.get("campaign_width", 1) or 1)),
+        )
+        next_policy["variant_width"] = min(
+            max_variant_width,
+            max(1, int(current_policy.get("variant_width", 1) or 1)),
+        )
+    else:
+        next_policy["cycles"] = min(max_cycles, max(1, int(next_policy.get("cycles", 1) or 1)) + 1)
+        next_policy["task_limit"] = min(
+            max_task_limit,
+            max(1, int(next_policy.get("task_limit", 64) or 64)) * 2,
+        )
+    if not preview_runtime_ceiling_timeout and str(phase).strip() == "liftoff":
         next_policy["variant_width"] = min(
             max_variant_width,
             max(1, int(next_policy.get("variant_width", 1) or 1)) + 1,
         )
-    else:
+    elif not preview_runtime_ceiling_timeout:
         next_policy["campaign_width"] = min(
             max_campaign_width,
             max(1, int(next_policy.get("campaign_width", 1) or 1)) + 1,
         )
+    next_policy = _apply_coding_first_bootstrap_policy(
+        next_policy,
+        runtime_managed_decisions=runtime_managed_decisions,
+        retained_gain_runs=retained_gain_runs,
+        rounds=2 if preview_runtime_ceiling_timeout else 1,
+    )
     return _materialize_excluded_subsystems(next_policy)
 
 
@@ -3061,10 +5154,90 @@ def _recent_semantic_redirects(config: KernelConfig, *, limit: int = 12) -> list
     return redirects
 
 
+def _recent_codex_steering_payloads(config: KernelConfig, *, limit: int = 12) -> list[dict[str, object]]:
+    root = config.improvement_reports_dir
+    if not root.exists():
+        return []
+    payloads: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        name = path.name
+        if ".codex_" in name:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        lane = payload.get("asi_campaign_lane_recommendation", {})
+        ramp = payload.get("coding_capability_ramp_summary", {})
+        if not isinstance(lane, Mapping):
+            lane = {}
+        if not isinstance(ramp, Mapping):
+            ramp = {}
+        if lane or ramp:
+            payloads.append(payload)
+        if len(payloads) >= max(1, limit):
+            break
+    return payloads
+
+
+def _codex_batch_policy_seed(config: KernelConfig) -> dict[str, object]:
+    for payload in _recent_codex_steering_payloads(config):
+        lane = payload.get("asi_campaign_lane_recommendation", {})
+        ramp = payload.get("coding_capability_ramp_summary", {})
+        if not isinstance(lane, Mapping):
+            lane = {}
+        if not isinstance(ramp, Mapping):
+            ramp = {}
+        primary_lane = str(lane.get("primary_lane", "")).strip()
+        primary_gap_id = str(ramp.get("primary_gap_id", "")).strip()
+        specialization_mode = str(ramp.get("specialization_mode", "")).strip()
+        semantic_only_runtime = bool(ramp.get("semantic_only_runtime", False)) or specialization_mode == "semantic_only_runtime"
+        required_families = _normalize_benchmark_families(
+            ramp.get(
+                "required_families",
+                payload.get("trust_breadth_summary", {}).get("required_families", [])
+                if isinstance(payload.get("trust_breadth_summary", {}), Mapping)
+                else [],
+            )
+        )
+        seed: dict[str, object] = {}
+        if primary_lane == "lane_decision_closure":
+            seed["adaptive_search"] = True
+            seed["focus_locked"] = True
+            seed["protected_subsystems"] = [
+                "retrieval",
+                "state_estimation",
+                "recovery",
+                "transition_model",
+                "trust",
+            ]
+            if primary_gap_id == "runtime_managed_conversion":
+                seed["focus"] = "recovery_alignment"
+                if semantic_only_runtime:
+                    seed["excluded_subsystems"] = ["qwen_adapter"]
+                    seed["subsystem_cooldowns"] = {"qwen_adapter": 1}
+            elif primary_gap_id:
+                seed["focus"] = "discovered_task_adaptation"
+        elif primary_lane == "lane_trust_and_carryover":
+            seed["adaptive_search"] = True
+            seed["focus_locked"] = True
+            seed["focus"] = "discovered_task_adaptation"
+            seed["protected_subsystems"] = ["retrieval", "trust"]
+        elif primary_lane == "lane_runtime_authority":
+            seed["adaptive_search"] = True
+            seed["focus_locked"] = True
+            seed["focus"] = "recovery_alignment"
+        if required_families:
+            seed["priority_benchmark_families"] = required_families
+        if seed:
+            return seed
+    return {}
+
+
 def _semantic_policy_seed(config: KernelConfig) -> dict[str, object]:
     redirects = _recent_semantic_redirects(config)
-    if not redirects:
-        return {}
     subsystem_votes: dict[str, int] = {}
     priority_votes: dict[str, int] = {}
     require_new_parent = False
@@ -3104,9 +5277,16 @@ def _semantic_policy_seed(config: KernelConfig) -> dict[str, object]:
         seed["priority_benchmark_families"] = priority_benchmark_families
     if adaptive_pressure:
         seed["adaptive_search"] = True
+    if focus:
+        seed["focus"] = focus
     if require_new_parent:
         seed["required_new_parent"] = True
-    return seed
+    codex_seed = _codex_batch_policy_seed(config)
+    if not seed:
+        return codex_seed
+    if not codex_seed:
+        return seed
+    return _apply_semantic_policy_seed(codex_seed, semantic_seed=seed)
 
 
 def _apply_semantic_policy_seed(
@@ -3120,23 +5300,60 @@ def _apply_semantic_policy_seed(
         return current
     seeded = dict(current)
     seeded["excluded_subsystems"] = _normalize_excluded_subsystems(
-        seed.get("excluded_subsystems", seeded.get("excluded_subsystems", []))
+        [
+            *_normalize_excluded_subsystems(seeded.get("excluded_subsystems", [])),
+            *_normalize_excluded_subsystems(seed.get("excluded_subsystems", [])),
+        ]
     )
-    seeded["subsystem_cooldowns"] = (
-        dict(seed.get("subsystem_cooldowns", {}))
-        if isinstance(seed.get("subsystem_cooldowns", {}), dict)
-        else dict(seeded.get("subsystem_cooldowns", {}))
+    merged_cooldowns = (
+        dict(seeded.get("subsystem_cooldowns", {}))
         if isinstance(seeded.get("subsystem_cooldowns", {}), dict)
         else {}
     )
+    if isinstance(seed.get("subsystem_cooldowns", {}), dict):
+        for subsystem, rounds in seed.get("subsystem_cooldowns", {}).items():
+            token = str(subsystem).strip()
+            if not token:
+                continue
+            try:
+                merged_cooldowns[token] = max(int(merged_cooldowns.get(token, 0) or 0), int(rounds or 0))
+            except (TypeError, ValueError):
+                continue
+    seeded["subsystem_cooldowns"] = _normalize_subsystem_cooldowns(merged_cooldowns)
+    current_priority_families = _normalize_benchmark_families(seeded.get("priority_benchmark_families", []))
     priority_families = _normalize_benchmark_families(
-        seed.get("priority_benchmark_families", seeded.get("priority_benchmark_families", []))
+        seed.get("priority_benchmark_families", current_priority_families)
     )
+    minimum_fresh_proof_families = [
+        family for family in current_priority_families if family in set(_MINIMUM_FRESH_PROOF_REQUIRED_FAMILIES)
+    ]
+    if minimum_fresh_proof_families and set(_MINIMUM_FRESH_PROOF_REQUIRED_FAMILIES).issubset(current_priority_families):
+        priority_families = _normalize_benchmark_families([*priority_families, *minimum_fresh_proof_families])
     if priority_families:
         seeded["priority_benchmark_families"] = priority_families
     if "adaptive_search" in seed:
         seeded["adaptive_search"] = bool(seed.get("adaptive_search"))
-    return seeded
+    if bool(seed.get("focus_locked", False)):
+        seeded["focus_locked"] = True
+    incoming_focus = str(seed.get("focus", "")).strip()
+    if incoming_focus:
+        if not bool(seeded.get("focus_locked", False)) or bool(seed.get("focus_locked", False)):
+            seeded["focus"] = incoming_focus
+        elif not str(seeded.get("focus", "")).strip():
+            seeded["focus"] = incoming_focus
+    protected_subsystems = _normalize_excluded_subsystems(seed.get("protected_subsystems", []))
+    if protected_subsystems:
+        seeded["protected_subsystems"] = protected_subsystems
+        seeded["excluded_subsystems"] = [
+            subsystem
+            for subsystem in _normalize_excluded_subsystems(seeded.get("excluded_subsystems", []))
+            if subsystem not in set(protected_subsystems)
+        ]
+        filtered_cooldowns = _normalize_subsystem_cooldowns(seeded.get("subsystem_cooldowns", {}))
+        for subsystem in protected_subsystems:
+            filtered_cooldowns.pop(subsystem, None)
+        seeded["subsystem_cooldowns"] = filtered_cooldowns
+    return _materialize_excluded_subsystems(seeded)
 
 
 def _round_semantic_skill_payload(
@@ -3209,6 +5426,55 @@ def _safe_semantic_task_token(value: object, *, default: str) -> str:
     return normalized or default
 
 
+def _printf_write_text_command(*, relpath: str, text: str) -> str:
+    parent = Path(relpath).parent.as_posix()
+    lines = text.splitlines()
+    if not lines:
+        lines = [""]
+    quoted_lines = " ".join(shlex.quote(line) for line in lines)
+    return (
+        f"mkdir -p {shlex.quote(parent)} && "
+        f"printf '%s\\n' {quoted_lines} > {shlex.quote(relpath)}"
+    )
+
+
+def _semantic_materialization_command(
+    *,
+    report_relpath: str,
+    report_text: str,
+    contract_relpath: str,
+    contract_payload: Mapping[str, object],
+) -> str:
+    report_command = _printf_write_text_command(relpath=report_relpath, text=report_text)
+    contract_command = _printf_write_text_command(
+        relpath=contract_relpath,
+        text=json.dumps(dict(contract_payload), indent=2),
+    )
+    return f"{report_command} && {contract_command}"
+
+
+def _semantic_success_command(*, contract_relpath: str, report_relpath: str, family: str) -> str:
+    task_id_token = shlex.quote('"task_id":')
+    prompt_token = shlex.quote('"prompt":')
+    workspace_subdir_token = shlex.quote('"workspace_subdir":')
+    family_token = shlex.quote(f'"benchmark_family": "{family}"')
+    open_world_token = shlex.quote('"open_world_candidate": true')
+    semantic_source_token = shlex.quote('"semantic_source":')
+    contract_path = shlex.quote(contract_relpath)
+    report_path = shlex.quote(report_relpath)
+    checks = [
+        f"test -f {contract_path}",
+        f"test -f {report_path}",
+        f"grep -q {task_id_token} {contract_path}",
+        f"grep -q {prompt_token} {contract_path}",
+        f"grep -q {workspace_subdir_token} {contract_path}",
+        f"grep -q {family_token} {contract_path}",
+        f"grep -q {open_world_token} {contract_path}",
+        f"grep -q {semantic_source_token} {contract_path}",
+    ]
+    return " && ".join(checks)
+
+
 def _semantic_round_task_payloads(
     *,
     run_id: str,
@@ -3247,7 +5513,9 @@ def _semantic_round_task_payloads(
         semantic_redirection.get("target_priority_families", [])
     )
     if not target_families:
-        target_families = _normalize_benchmark_families(trust_breadth.get("missing_required_families", []))
+        target_families = _normalize_benchmark_families(
+            _minimum_fresh_proof_trust_gap(trust_breadth).get("missing_required_families", [])
+        )
     if not target_families:
         target_families = _normalize_benchmark_families(
             priority_family_yield.get("priority_families_with_signal_but_no_retained_gain", [])
@@ -3270,26 +5538,22 @@ def _semantic_round_task_payloads(
         workspace_subdir = f"semantic_hub/{task_stem}"
         report_relpath = f"semantic_open_world/{family_token}_evidence.md"
         contract_relpath = f"semantic_open_world/{family_token}_task.json"
-        success_command = (
-            "python - <<'PY'\n"
-            "import json\n"
-            "from pathlib import Path\n"
-            f"contract_path = Path({contract_relpath!r})\n"
-            f"report_path = Path({report_relpath!r})\n"
-            "assert contract_path.exists(), contract_path\n"
-            "assert report_path.exists(), report_path\n"
-            "payload = json.loads(contract_path.read_text(encoding='utf-8'))\n"
-            "assert isinstance(payload, dict)\n"
-            "assert str(payload.get('task_id', '')).strip()\n"
-            "assert str(payload.get('prompt', '')).strip()\n"
-            "assert str(payload.get('workspace_subdir', '')).strip()\n"
-            "metadata = payload.get('metadata', {})\n"
-            "assert isinstance(metadata, dict)\n"
-            f"assert str(metadata.get('benchmark_family', '')).strip() == {family!r}\n"
-            "assert bool(metadata.get('open_world_candidate', False)) is True\n"
-            "origin = str(metadata.get('semantic_source', metadata.get('source_task', ''))).strip().lower()\n"
-            "assert 'replay' not in origin\n"
-            "PY"
+        report_text = f"# {family} open-world evidence\n"
+        contract_payload = {
+            "task_id": f"{task_stem}_candidate",
+            "prompt": f"Describe a repo-specific {family} task.",
+            "workspace_subdir": f"{task_stem}_candidate",
+            "metadata": {
+                "benchmark_family": family,
+                "capability": "semantic_open_world",
+                "open_world_candidate": True,
+                "semantic_source": attempt_id,
+            },
+        }
+        success_command = _semantic_success_command(
+            contract_relpath=contract_relpath,
+            report_relpath=report_relpath,
+            family=family,
         )
         prompt = (
             f"Inspect this repository for a non-replay {family} task surface suggested by the latest unattended round. "
@@ -3312,17 +5576,11 @@ def _semantic_round_task_payloads(
                         "prompt": prompt,
                         "workspace_subdir": workspace_subdir,
                         "suggested_commands": [
-                            f"mkdir -p semantic_open_world && printf '# {family} open-world evidence\\n' > {report_relpath}",
-                            (
-                                "python - <<'PY'\n"
-                                "import json\n"
-                                "from pathlib import Path\n"
-                                f"payload = {{'task_id': '{task_stem}_candidate', 'prompt': 'Describe a repo-specific {family} task.', "
-                                f"'workspace_subdir': '{task_stem}_candidate', 'metadata': {{'benchmark_family': '{family}', "
-                                "'capability': 'semantic_open_world', 'open_world_candidate': True, "
-                                f"'semantic_source': '{attempt_id}'}}}}\n"
-                                f"Path({contract_relpath!r}).write_text(json.dumps(payload, indent=2), encoding='utf-8')\n"
-                                "PY"
+                            _semantic_materialization_command(
+                                report_relpath=report_relpath,
+                                report_text=report_text,
+                                contract_relpath=contract_relpath,
+                                contract_payload=contract_payload,
                             ),
                         ],
                         "success_command": success_command,
@@ -3504,6 +5762,7 @@ def _record_alert_state(
             "reason": str(payload.get("reason", "")).strip(),
         },
         config=config,
+        govern_storage=False,
     )
 
 
@@ -3645,11 +5904,14 @@ def _dispatch_alerts(
 
 
 def _alerts_enabled(args) -> bool:
+    def _configured(value: object) -> bool:
+        return bool(str(value or "").strip())
+
     return any(
         [
-            str(getattr(args, "alert_command", "")).strip(),
-            str(getattr(args, "slack_webhook_url", "")).strip(),
-            str(getattr(args, "pagerduty_routing_key", "")).strip(),
+            _configured(getattr(args, "alert_command", "")),
+            _configured(getattr(args, "slack_webhook_url", "")),
+            _configured(getattr(args, "pagerduty_routing_key", "")),
         ]
     )
 
@@ -3673,6 +5935,15 @@ def _run_and_stream(
             if isinstance(response, dict):
                 return dict(response)
         return {}
+
+    def _selector_has_registered_streams() -> bool:
+        get_map = getattr(selector, "get_map", None)
+        if not callable(get_map):
+            return True
+        try:
+            return bool(get_map())
+        except Exception:
+            return True
 
     completed_output: list[str] = []
     process = spawn_process_group(
@@ -3725,13 +5996,15 @@ def _run_and_stream(
     )
     try:
         while True:
+            stream_eof = False
             events = selector.select(timeout=1.0)
             if events:
                 for key, _ in events:
                     line = key.fileobj.readline()
                     if line == "":
                         selector.unregister(key.fileobj)
-                        break
+                        stream_eof = True
+                        continue
                     completed_output.append(line)
                     now = time.monotonic()
                     last_output_at = now
@@ -3741,6 +6014,10 @@ def _run_and_stream(
                         phase_name = _phase_from_progress_line(line)
                         if phase_name:
                             last_progress_phase = phase_name
+                            if _progress_phase_clears_active_task(phase_name, line):
+                                current_task = {}
+                                current_task_verification_passed = None
+                                current_cognitive_stage = {}
                         if line.lstrip().startswith("[cycle:") and "finalize phase=" in line:
                             active_finalize_phase = phase_name
                         parsed_task = _task_from_progress_line(line)
@@ -3787,11 +6064,16 @@ def _run_and_stream(
                                 preview_state = str(semantic_progress.get("preview_state", "")).strip()
                         cognitive_progress = _parse_cognitive_progress_fields(line)
                         if cognitive_progress:
-                            current_cognitive_stage = dict(cognitive_progress)
-                            if last_progress_phase and not str(current_cognitive_stage.get("phase", "")).strip():
-                                current_cognitive_stage["phase"] = last_progress_phase
-                            if "verification_passed" in current_cognitive_stage:
-                                current_task_verification_passed = bool(current_cognitive_stage.get("verification_passed"))
+                            previous_cognitive_stage = dict(current_cognitive_stage)
+                            next_cognitive_stage = dict(cognitive_progress)
+                            if last_progress_phase and not str(next_cognitive_stage.get("phase", "")).strip():
+                                next_cognitive_stage["phase"] = last_progress_phase
+                            current_task_verification_passed = _updated_task_verification_state(
+                                current_task_verification_passed=current_task_verification_passed,
+                                previous_cognitive_stage=previous_cognitive_stage,
+                                next_cognitive_stage=next_cognitive_stage,
+                            )
+                            current_cognitive_stage = next_cognitive_stage
                     print(line, end="", file=sys.stderr, flush=True)
                     action = _emit_event(
                         {
@@ -3821,7 +6103,14 @@ def _run_and_stream(
                             "timed_out": True,
                             "timeout_reason": reason,
                         }
+                if stream_eof:
+                    if process.poll() is not None:
+                        break
+                    if not _selector_has_registered_streams():
+                        continue
             elif process.poll() is not None:
+                break
+            if not _selector_has_registered_streams() and process.poll() is not None:
                 break
             now = time.monotonic()
             silence = now - last_output_at
@@ -3833,6 +6122,7 @@ def _run_and_stream(
                     authoritative_child_status,
                     last_progress_phase=last_progress_phase,
                     active_finalize_phase=active_finalize_phase,
+                    last_progress_at=last_progress_at,
                     current_task=current_task,
                     current_cognitive_stage=current_cognitive_stage,
                     observe_summary=observe_summary,
@@ -3962,6 +6252,7 @@ def _run_and_stream(
                     else _child_runtime_extension_plan(
                         last_progress_phase=last_progress_phase,
                         current_task=current_task,
+                        active_finalize_phase=active_finalize_phase,
                     )
                 )
                 grace_marker = _runtime_grace_marker(
@@ -4114,6 +6405,64 @@ def _mirrored_child_status_from_parent_status(status_path: Path | None) -> dict[
     return dict(child_status) if isinstance(child_status, dict) else {}
 
 
+def _preferred_child_status_snapshot(
+    *,
+    parent_status_path: Path | None,
+    mirrored_status_path: Path | None,
+) -> dict[str, object]:
+    mirrored_child_status = _mirrored_child_status_from_parent_status(mirrored_status_path)
+    parent_child_status = _mirrored_child_status_from_parent_status(parent_status_path)
+    if mirrored_child_status and parent_child_status:
+        merged = _merge_mirrored_child_status_fields(
+            dict(parent_child_status),
+            mirrored_child_status,
+        )
+        mirrored_terminal_state = str(
+            mirrored_child_status.get("state") or mirrored_child_status.get("status") or ""
+        ).strip()
+        if mirrored_terminal_state in {"interrupted", "finished", "completed", "safe_stop"}:
+            merged["state"] = mirrored_terminal_state
+            mirrored_status = str(mirrored_child_status.get("status", "")).strip()
+            if mirrored_status:
+                merged["status"] = mirrored_status
+            mirrored_reason = str(mirrored_child_status.get("reason", "")).strip()
+            if mirrored_reason:
+                merged["reason"] = mirrored_reason
+            for key in (
+                "last_progress_phase",
+                "finalize_phase",
+                "selected_subsystem",
+                "pending_decision_state",
+                "preview_state",
+                "current_task",
+                "current_cognitive_stage",
+                "current_task_progress_timeline",
+                "current_task_verification_passed",
+                "semantic_progress_state",
+                "canonical_progress_state",
+            ):
+                if key not in mirrored_child_status:
+                    continue
+                value = mirrored_child_status.get(key)
+                if isinstance(value, Mapping):
+                    merged[key] = dict(value)
+                elif isinstance(value, list):
+                    merged[key] = list(value)
+                else:
+                    merged[key] = value
+        for key in ("report_path", "last_report_path", "campaign_report_path", "liftoff_report_path"):
+            mirrored_value = str(mirrored_child_status.get(key, "")).strip()
+            parent_value = str(parent_child_status.get(key, "")).strip()
+            if mirrored_value:
+                merged[key] = mirrored_value
+            elif parent_value:
+                merged[key] = parent_value
+        return merged
+    if mirrored_child_status:
+        return mirrored_child_status
+    return parent_child_status
+
+
 def _authoritative_progress_signature(payload: Mapping[str, object] | None) -> str:
     child = payload if isinstance(payload, Mapping) else {}
     current_task = child.get("current_task", {})
@@ -4158,6 +6507,7 @@ def _authoritative_child_supervision_snapshot(
     *,
     last_progress_phase: str,
     active_finalize_phase: str,
+    last_progress_at: float,
     current_task: Mapping[str, object] | None,
     current_cognitive_stage: Mapping[str, object] | None,
     observe_summary: Mapping[str, object] | None,
@@ -4168,6 +6518,7 @@ def _authoritative_child_supervision_snapshot(
     active_child = {
         "last_progress_phase": str(last_progress_phase).strip(),
         "finalize_phase": str(active_finalize_phase).strip(),
+        "last_progress_at": float(last_progress_at or 0.0),
         "current_task": dict(current_task) if isinstance(current_task, Mapping) else {},
         "current_cognitive_stage": (
             dict(current_cognitive_stage) if isinstance(current_cognitive_stage, Mapping) else {}
@@ -4237,6 +6588,34 @@ def _task_scope_matches(left: Mapping[str, object] | None, right: Mapping[str, o
     if not any(left_identity) or not any(right_identity):
         return False
     return left_identity == right_identity
+
+
+def _cognitive_stage_lags_same_task(
+    *,
+    live_task: Mapping[str, object] | None,
+    live_cognitive_stage: Mapping[str, object] | None,
+    mirrored_task: Mapping[str, object] | None,
+    mirrored_cognitive_stage: Mapping[str, object] | None,
+) -> bool:
+    if not _task_scope_matches(live_task, mirrored_task):
+        return False
+    live_step_index = _cognitive_stage_step_index(live_cognitive_stage)
+    mirrored_step_index = _cognitive_stage_step_index(mirrored_cognitive_stage)
+    return live_step_index > 0 and mirrored_step_index > 0 and mirrored_step_index < live_step_index
+
+
+def _cognitive_stage_matches_same_task_step(
+    *,
+    live_task: Mapping[str, object] | None,
+    live_cognitive_stage: Mapping[str, object] | None,
+    mirrored_task: Mapping[str, object] | None,
+    mirrored_cognitive_stage: Mapping[str, object] | None,
+) -> bool:
+    if not _task_scope_matches(live_task, mirrored_task):
+        return False
+    live_step_index = _cognitive_stage_step_index(live_cognitive_stage)
+    mirrored_step_index = _cognitive_stage_step_index(mirrored_cognitive_stage)
+    return live_step_index > 0 and mirrored_step_index > 0 and mirrored_step_index == live_step_index
 
 
 def _semantic_state_recorded_at(state: Mapping[str, object] | None) -> float:
@@ -4527,6 +6906,32 @@ def _cognitive_stage_failed_verification(cognitive_stage: Mapping[str, object] |
     ) is False
 
 
+def _cognitive_stage_step_index(cognitive_stage: Mapping[str, object] | None) -> int:
+    payload = cognitive_stage if isinstance(cognitive_stage, Mapping) else {}
+    try:
+        return int(payload.get("step_index", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _updated_task_verification_state(
+    *,
+    current_task_verification_passed: bool | None,
+    previous_cognitive_stage: Mapping[str, object] | None,
+    next_cognitive_stage: Mapping[str, object] | None,
+) -> bool | None:
+    next_stage = next_cognitive_stage if isinstance(next_cognitive_stage, Mapping) else {}
+    if "verification_passed" in next_stage:
+        return bool(next_stage.get("verification_passed"))
+    if current_task_verification_passed is not False:
+        return current_task_verification_passed
+    previous_step_index = _cognitive_stage_step_index(previous_cognitive_stage)
+    next_step_index = _cognitive_stage_step_index(next_stage)
+    if previous_step_index > 0 and next_step_index > previous_step_index:
+        return None
+    return current_task_verification_passed
+
+
 def _merge_mirrored_child_status_fields(
     active_child: dict[str, object],
     mirrored_child_status: Mapping[str, object] | None,
@@ -4571,6 +6976,9 @@ def _merge_mirrored_child_status_fields(
     child_adaptive_state = child_status.get("adaptive_progress_state", {})
     if not isinstance(child_adaptive_state, Mapping):
         child_adaptive_state = {}
+    child_active_cycle_run = child_status.get("active_cycle_run", {})
+    if not isinstance(child_active_cycle_run, Mapping):
+        child_active_cycle_run = {}
     if not active_semantic_state:
         active_cycle_run = merged.get("active_cycle_run", {})
         if isinstance(active_cycle_run, Mapping):
@@ -4580,21 +6988,45 @@ def _merge_mirrored_child_status_fields(
                 if nested_active_semantic_state:
                     merged["semantic_progress_state"] = dict(nested_active_semantic_state)
     if not child_semantic_state:
-        child_active_cycle_run = child_status.get("active_cycle_run", {})
-        if isinstance(child_active_cycle_run, Mapping):
-            nested_child_semantic_state = child_active_cycle_run.get("semantic_progress_state", {})
-            if isinstance(nested_child_semantic_state, Mapping):
-                child_semantic_state = nested_child_semantic_state
+        nested_child_semantic_state = child_active_cycle_run.get("semantic_progress_state", {})
+        if isinstance(nested_child_semantic_state, Mapping):
+            child_semantic_state = nested_child_semantic_state
     child_current_task = child_status.get("current_task", {})
     if not isinstance(child_current_task, Mapping):
         child_current_task = {}
+    if not child_current_task:
+        nested_child_current_task = child_active_cycle_run.get("current_task", {})
+        if isinstance(nested_child_current_task, Mapping):
+            child_current_task = nested_child_current_task
     active_current_task = merged.get("current_task", {})
     if not isinstance(active_current_task, Mapping):
         active_current_task = {}
+    child_current_cognitive_stage = child_status.get("current_cognitive_stage", {})
+    if not isinstance(child_current_cognitive_stage, Mapping):
+        child_current_cognitive_stage = {}
+    if not child_current_cognitive_stage:
+        nested_child_current_cognitive_stage = child_active_cycle_run.get("current_cognitive_stage", {})
+        if isinstance(nested_child_current_cognitive_stage, Mapping):
+            child_current_cognitive_stage = nested_child_current_cognitive_stage
+    active_current_cognitive_stage = merged.get("current_cognitive_stage", {})
+    if not isinstance(active_current_cognitive_stage, Mapping):
+        active_current_cognitive_stage = {}
     active_progress_recorded_at = _child_progress_recorded_at(merged)
     mirrored_progress_recorded_at = _child_progress_recorded_at(child_status)
     mirrored_snapshot_is_newer = mirrored_progress_recorded_at > active_progress_recorded_at + 1e-6
     same_task_scope = _task_scope_matches(active_current_task, child_current_task)
+    mirrored_stage_lags_live = _cognitive_stage_lags_same_task(
+        live_task=active_current_task,
+        live_cognitive_stage=active_current_cognitive_stage,
+        mirrored_task=child_current_task,
+        mirrored_cognitive_stage=child_current_cognitive_stage,
+    )
+    mirrored_stage_matches_live_step = _cognitive_stage_matches_same_task_step(
+        live_task=active_current_task,
+        live_cognitive_stage=active_current_cognitive_stage,
+        mirrored_task=child_current_task,
+        mirrored_cognitive_stage=child_current_cognitive_stage,
+    )
     child_semantic_state = _select_preferred_child_progress_state(
         semantic_state=child_semantic_state,
         adaptive_state=child_adaptive_state,
@@ -4611,7 +7043,9 @@ def _merge_mirrored_child_status_fields(
     for key in (
         "campaign_records_considered",
         "execution_source_summary",
+        "verification_outcome_summary",
         "trust_breadth_summary",
+        "open_world_breadth_summary",
         "tolbert_runtime_summary",
         "round_index",
         "last_report_path",
@@ -4705,11 +7139,23 @@ def _merge_mirrored_child_status_fields(
     )
     child_generated_lane = child_phase.startswith("generated_")
     child_semantic_is_more_final = child_decision_distance in {"decision_emitted", "complete"} or child_progress_class == "complete"
+    child_semantic_is_healthier = child_progress_class not in {"stuck", "degraded"} and active_progress_class in {
+        "stuck",
+        "degraded",
+    }
     active_semantic_is_more_severe = active_progress_class in {"stuck", "degraded"} and child_progress_class not in {
         "stuck",
         "degraded",
     }
     child_semantic_conflicts_with_live_generated_lane = active_generated_lane and not child_generated_lane
+    child_semantic_conflicts_with_live_task_scope = bool(active_current_task) and bool(child_current_task) and not same_task_scope
+    child_semantic_conflicts_with_live_same_task_step = bool(active_semantic_state) and (
+        mirrored_stage_lags_live
+        or (
+            mirrored_stage_matches_live_step
+            and not (child_semantic_is_more_final or child_semantic_is_healthier)
+        )
+    )
     child_semantic_recorded_at = _semantic_state_recorded_at(child_semantic_state)
     active_semantic_recorded_at = _semantic_state_recorded_at(active_semantic_state)
     child_semantic_is_newer = child_semantic_recorded_at > active_semantic_recorded_at + 1e-6
@@ -4717,12 +7163,19 @@ def _merge_mirrored_child_status_fields(
         str(active_current_task.get("phase", "")).strip(),
         str(merged.get("last_progress_phase", "")).strip(),
     }
-    if child_semantic_state and not child_semantic_conflicts_with_live_generated_lane and (
+    if (
+        child_semantic_state
+        and not child_semantic_conflicts_with_live_generated_lane
+        and not child_semantic_conflicts_with_live_task_scope
+        and not child_semantic_conflicts_with_live_same_task_step
+        and (
         child_semantic_is_more_final
+        or child_semantic_is_healthier
         or not active_semantic_is_more_severe
         or child_semantic_is_newer
         or child_semantic_matches_live_phase
         or not active_semantic_state
+        )
     ):
         merged["semantic_progress_state"] = dict(child_semantic_state)
     for key in ("pending_decision_state", "preview_state", "current_task_verification_passed"):
@@ -4735,6 +7188,15 @@ def _merge_mirrored_child_status_fields(
                 continue
             merged[key] = mirrored_value
             continue
+        if key == "current_task_verification_passed":
+            if active_current_task and child_current_task and not same_task_scope and not mirrored_snapshot_is_newer:
+                continue
+            if mirrored_stage_lags_live:
+                continue
+            if mirrored_stage_matches_live_step:
+                continue
+            if same_task_scope and not mirrored_snapshot_is_newer:
+                continue
         merged[key] = child_status.get(key)
     effective_decision_records_considered, inferred_decision_credit = _effective_live_decision_record_count(merged)
     if effective_decision_records_considered > int(merged.get("decision_records_considered", 0) or 0):
@@ -4755,6 +7217,9 @@ def _merge_mirrored_child_status_fields(
         cycle_task = active_cycle_run.get("current_task", {})
         if not isinstance(cycle_task, Mapping):
             cycle_task = {}
+        cycle_cognitive_stage = active_cycle_run.get("current_cognitive_stage", {})
+        if not isinstance(cycle_cognitive_stage, Mapping):
+            cycle_cognitive_stage = {}
         cycle_progress_line = str(
             active_cycle_run.get("last_progress_line") or active_cycle_run.get("last_output_line") or ""
         ).strip()
@@ -4763,6 +7228,18 @@ def _merge_mirrored_child_status_fields(
             cycle_progress_phase = _phase_from_progress_line(cycle_progress_line)
         cycle_same_task_scope = _task_scope_matches(cycle_task, merged.get("current_task", {}))
         active_task_scope_missing = merged.get("current_task") in ({}, [], "", None)
+        cycle_stage_lags_live = _cognitive_stage_lags_same_task(
+            live_task=merged.get("current_task", {}),
+            live_cognitive_stage=merged.get("current_cognitive_stage", {}),
+            mirrored_task=cycle_task,
+            mirrored_cognitive_stage=cycle_cognitive_stage,
+        )
+        cycle_stage_matches_live_step = _cognitive_stage_matches_same_task_step(
+            live_task=merged.get("current_task", {}),
+            live_cognitive_stage=merged.get("current_cognitive_stage", {}),
+            mirrored_task=cycle_task,
+            mirrored_cognitive_stage=cycle_cognitive_stage,
+        )
         for key in (
             "selected_subsystem",
             "finalize_phase",
@@ -4795,11 +7272,20 @@ def _merge_mirrored_child_status_fields(
                     merged[key] = mirrored_value
                 continue
             if key == "current_task":
-                if existing_value in ({}, [], "", None) or mirrored_snapshot_is_newer:
+                if mirrored_value in ({}, [], "", None):
+                    continue
+                if existing_value in ({}, [], "", None):
+                    merged[key] = mirrored_value
+                    continue
+                if _task_scope_matches(existing_value, mirrored_value) and mirrored_snapshot_is_newer:
                     merged[key] = mirrored_value
                 continue
             if key in {"current_cognitive_stage", "current_task_progress_timeline", "current_task_verification_passed"}:
                 if mirrored_value in ({}, [], "", None):
+                    continue
+                if cycle_stage_lags_live:
+                    continue
+                if cycle_stage_matches_live_step:
                     continue
                 if (cycle_same_task_scope or active_task_scope_missing) and (
                     existing_value in ({}, [], "", None)
@@ -4810,11 +7296,12 @@ def _merge_mirrored_child_status_fields(
                 continue
             if existing_value in ({}, [], "", None):
                 merged[key] = mirrored_value
-        if cycle_task and (
-            merged.get("current_task") in ({}, [], "", None)
-            or mirrored_snapshot_is_newer
-        ):
-            merged["current_task"] = dict(cycle_task)
+        if cycle_task:
+            existing_current_task = merged.get("current_task")
+            if existing_current_task in ({}, [], "", None):
+                merged["current_task"] = dict(cycle_task)
+            elif _task_scope_matches(existing_current_task, cycle_task) and mirrored_snapshot_is_newer:
+                merged["current_task"] = dict(cycle_task)
         cycle_has_task = bool(cycle_task)
         live_progress_phase = str(merged.get("last_progress_phase", "")).strip()
         cycle_phase_advances_beyond_live_task = (
@@ -4955,7 +7442,22 @@ def _mid_round_round_signal(round_payload: Mapping[str, object] | None) -> dict[
         partial_progress_summary = {}
     sampled_priority_family_count = len(set(sampled_families) & set(priority_families)) if priority_families else len(sampled_families)
     selected_subsystem = str(active_child.get("selected_subsystem", "")).strip()
-    finalize_phase = str(active_child.get("finalize_phase", active_child.get("last_progress_phase", ""))).strip()
+    last_progress_phase = str(active_child.get("last_progress_phase", "")).strip()
+    finalize_phase = str(active_child.get("finalize_phase", last_progress_phase)).strip()
+    if last_progress_phase in {
+        "preview_baseline_eval",
+        "preview_candidate_eval",
+        "preview_complete",
+        "apply_decision",
+        "decision_reject_reason",
+        "decision_retain_reason",
+        "done",
+    } and (
+        not finalize_phase
+        or finalize_phase.startswith("generated_")
+        or finalize_phase != last_progress_phase
+    ):
+        finalize_phase = last_progress_phase
     decision_records_considered, inferred_decision_credit = _effective_live_decision_record_count(active_child)
     pending_decision_state = str(active_child.get("pending_decision_state", "")).strip()
     preview_state = str(active_child.get("preview_state", "")).strip()
@@ -4995,6 +7497,7 @@ def _mid_round_round_signal(round_payload: Mapping[str, object] | None) -> dict[
     semantic_phase_family = str(semantic_progress_state_payload.get("phase_family", "")).strip()
     semantic_decision_distance = str(semantic_progress_state_payload.get("decision_distance", "")).strip()
     semantic_runtime_elapsed_seconds = float(semantic_progress_state_payload.get("runtime_elapsed_seconds", 0.0) or 0.0)
+    semantic_progress_recorded_at = _semantic_state_recorded_at(semantic_progress_state_payload)
     max_child_runtime_seconds = max(
         0.0,
         float(runtime_limits.get("max_child_runtime_seconds", 0.0) or 0.0),
@@ -5002,30 +7505,49 @@ def _mid_round_round_signal(round_payload: Mapping[str, object] | None) -> dict[
     current_task_payload = active_child.get("current_task", {})
     if not isinstance(current_task_payload, Mapping):
         current_task_payload = {}
+    semantic_progress_phase = str(semantic_progress_state_payload.get("phase", "")).strip()
     current_task_phase = str(current_task_payload.get("phase", "")).strip()
     current_task_index = int(current_task_payload.get("index", 0) or 0)
     current_task_total = int(current_task_payload.get("total", 0) or 0)
+    last_task_progress_at = float(active_child.get("last_task_progress_at", 0.0) or 0.0)
+    semantic_progress_silence_seconds = float(semantic_progress_state_payload.get("progress_silence_seconds", 0.0) or 0.0)
+    observe_live_task_progress_fresh = (
+        semantic_phase_family == "observe"
+        and current_task_phase == "observe"
+        and current_task_index > 0
+        and last_task_progress_at > 0.0
+        and last_task_progress_at >= semantic_progress_recorded_at - 1e-6
+    )
+    generated_failure_handoff_active = any(
+        phase.startswith("generated_failure")
+        for phase in (last_progress_phase, current_task_phase, semantic_progress_phase)
+        if phase
+    )
     repeated_verification_loop = _repeated_verification_loop_signal(active_child)
     semantic_progress_drift = (
         broad_observe_then_retrieval_first
         and not definitive_decision_emitted
         and semantic_phase_family in {"preview", "apply", "finalize"}
         and semantic_progress_class in {"degraded", "stuck"}
+        and semantic_progress_silence_seconds >= _POST_PRODUCTIVE_PREVIEW_LINGER_MIN_SILENCE_SECONDS
     )
+    preview_linger_before_decision = (
+        semantic_phase_family == "preview"
+        and semantic_progress_class in {"degraded", "stuck"}
+        and semantic_decision_distance in {"near", "active", ""}
+        and not generated_failure_handoff_active
+        and semantic_progress_silence_seconds >= _POST_PRODUCTIVE_PREVIEW_LINGER_MIN_SILENCE_SECONDS
+    )
+    variant_search_linger_before_decision = finalize_phase in {"variant_search", "variant_generate"} or semantic_progress_phase in {
+        "variant_search",
+        "variant_generate",
+    }
     post_productive_predecision_linger = (
         generated_success_completed
         and productive_partial
         and decision_records_considered <= 0
         and not definitive_decision_emitted
-        and (
-            (
-                semantic_phase_family == "preview"
-                and semantic_progress_class in {"degraded", "stuck"}
-                and semantic_decision_distance in {"near", "active", ""}
-            )
-            or finalize_phase in {"variant_search", "variant_generate"}
-            or str(semantic_progress_state_payload.get("phase", "")).strip() in {"variant_search", "variant_generate"}
-        )
+        and (preview_linger_before_decision or variant_search_linger_before_decision)
     )
     late_generated_failure_recovery_without_decision = (
         generated_success_completed
@@ -5061,8 +7583,10 @@ def _mid_round_round_signal(round_payload: Mapping[str, object] | None) -> dict[
         "definitive_decision_emitted": bool(definitive_decision_emitted),
         "sampled_priority_family_count": sampled_priority_family_count,
         "sampled_families": sampled_families,
+        "observe_live_task_progress_fresh": bool(observe_live_task_progress_fresh),
         "generated_success_completed": bool(generated_success_completed),
         "productive_partial": bool(productive_partial),
+        "generated_failure_handoff_active": bool(generated_failure_handoff_active),
         "broad_observe_then_retrieval_first": bool(broad_observe_then_retrieval_first),
         "live_decision_credit_gap": bool(live_decision_credit_gap),
         "canonical_progress_state": dict(semantic_progress_state_payload),
@@ -5105,7 +7629,8 @@ def _mid_round_controller_intervention_signal(round_payload: Mapping[str, object
     if (
         phase_family == "observe"
         and not bool(round_signal.get("observe_completed", False))
-        and progress_class in {"degraded", "stuck"}
+        and progress_class == "stuck"
+        and not bool(round_signal.get("observe_live_task_progress_fresh", False))
     ):
         return {
             "triggered": True,
@@ -5159,26 +7684,6 @@ def _mid_round_controller_intervention_signal(round_payload: Mapping[str, object
                 f"{phase_family or 'active'} progress drifted to {progress_class or 'unknown'} before decision emission"
             ),
             "reason_code": "semantic_progress_drift",
-            "subsystem": "retrieval",
-            "round_signal": round_signal,
-        }
-    finalize_phase = str(round_signal.get("finalize_phase", "")).strip()
-    if (
-        bool(round_signal.get("broad_observe_then_retrieval_first", False))
-        and not bool(round_signal.get("definitive_decision_emitted", False))
-        and (
-            phase_family in {"preview", "select", ""}
-            or finalize_phase.startswith("preview")
-            or finalize_phase in {"campaign_select", "variant_search"}
-        )
-    ):
-        return {
-            "triggered": True,
-            "reason": (
-                "mid-round controller intervention: broad observe covered priority families, "
-                "but retrieval still remained first before a decision was emitted"
-            ),
-            "reason_code": "broad_observe_then_retrieval_first_predecision",
             "subsystem": "retrieval",
             "round_signal": round_signal,
         }
@@ -6045,8 +8550,18 @@ def _authoritative_round_phase_detail(
     campaign_report: Mapping[str, object] | None,
 ) -> str:
     payload = round_payload if isinstance(round_payload, Mapping) else {}
+    normalized_existing_detail = str(existing_detail or "").strip()
+    active_child = payload.get("active_child", {})
+    if not isinstance(active_child, Mapping):
+        active_child = {}
+    live_child_detail = _preferred_active_child_phase_detail(
+        normalized_existing_detail,
+        active_child,
+    )
+    if str(active_child.get("state", "")).strip() == "running" and live_child_detail:
+        return live_child_detail
     authoritative_decision_state = _authoritative_status_decision_state(
-        active_child=payload.get("active_child", {}),
+        active_child=active_child,
         campaign_report=campaign_report,
     )
     runtime_managed_decisions = int(authoritative_decision_state.get("runtime_managed_decisions", 0) or 0)
@@ -6054,13 +8569,12 @@ def _authoritative_round_phase_detail(
     retained_gain_runs = int(authoritative_decision_state.get("retained_gain_runs", 0) or 0)
     pending_decision_state = str(authoritative_decision_state.get("pending_decision_state", "")).strip()
     if runtime_managed_decisions <= 0 and non_runtime_managed_decisions <= 0:
-        return str(existing_detail or "").strip()
+        return normalized_existing_detail
 
     controller_intervention = payload.get("controller_intervention", {})
     if not isinstance(controller_intervention, Mapping):
         controller_intervention = {}
     reason_code = str(controller_intervention.get("reason_code", "")).strip()
-    normalized_existing_detail = str(existing_detail or "").strip()
     no_decision_intervention = reason_code in {
         "late_generated_failure_recovery_without_decision",
         "productive_partial_preview_without_decision",
@@ -6280,6 +8794,24 @@ def _is_significant_child_output(line: str) -> bool:
     )
 
 
+def _is_progress_resumption_child_output(line: str) -> bool:
+    normalized = str(line).strip()
+    if not normalized:
+        return False
+    if "still_running silence=" in normalized:
+        return False
+    if normalized.startswith("[repeated]"):
+        return False
+    return bool(
+        normalized.startswith(("[campaign]", "[cycle:", "[eval:"))
+        or "finalize phase=" in normalized
+        or "cognitive_stage=" in normalized
+        or _parse_child_semantic_progress_fields(normalized)
+        or _phase_from_progress_line(normalized)
+        or _task_from_progress_line(normalized)
+    )
+
+
 def _safe_output_report_path(line: str) -> Path | None:
     normalized = str(line).strip()
     if not normalized or normalized.startswith("["):
@@ -6394,6 +8926,27 @@ def _make_child_progress_callback(
         event_name = str(event.get("event", "")).strip() or "unknown"
         timestamp = float(event.get("timestamp", time.time()) or time.time())
         active_child = dict(report.get("active_child", {}))
+        previous_semantic_state = active_child.get("semantic_progress_state", {})
+        if not isinstance(previous_semantic_state, Mapping):
+            previous_semantic_state = {}
+        previous_adaptive_signature = (
+            _adaptive_progress_state_signature(previous_semantic_state)
+            if previous_semantic_state
+            else ""
+        )
+        progress_resumed_after_intervention = False
+
+        def _clear_stale_controller_intervention_state() -> None:
+            active_child.pop("controller_intervention", None)
+            report.pop("controller_intervention", None)
+            report.pop("active_child_controller_intervention", None)
+            round_payload.pop("controller_intervention", None)
+
+        if event_name == "start":
+            active_child = {}
+            report.pop("controller_intervention", None)
+            report.pop("active_child_controller_intervention", None)
+            round_payload.pop("controller_intervention", None)
         previous_progress_line = str(active_child.get("last_progress_line", "")).strip()
         task_transition_detected = False
         active_child.update(
@@ -6411,6 +8964,8 @@ def _make_child_progress_callback(
         elif event_name == "output":
             line = str(event.get("line", "")).strip()
             if line:
+                if _is_progress_resumption_child_output(line):
+                    progress_resumed_after_intervention = True
                 active_child["last_output_line"] = line
                 active_child["last_output_at"] = timestamp
                 if _is_significant_child_output(line):
@@ -6425,6 +8980,8 @@ def _make_child_progress_callback(
                         if phase_name:
                             parsed_task["phase"] = phase_name
                         active_child["current_task"] = parsed_task
+                        active_child["last_task_progress_at"] = timestamp
+                        active_child["last_task_progress_line"] = line
                         if _task_progress_identity(parsed_task) != previous_task_identity:
                             task_transition_detected = True
                             active_child["current_task_verification_passed"] = None
@@ -6446,10 +9003,16 @@ def _make_child_progress_callback(
                         active_child["last_subsystem_progress_line"] = line
                 cognitive_progress = _parse_cognitive_progress_fields(line)
                 if cognitive_progress:
+                    previous_cognitive_stage = active_child.get("current_cognitive_stage", {})
+                    if not isinstance(previous_cognitive_stage, Mapping):
+                        previous_cognitive_stage = {}
                     cognitive_progress["timestamp"] = timestamp
+                    active_child["current_task_verification_passed"] = _updated_task_verification_state(
+                        current_task_verification_passed=active_child.get("current_task_verification_passed"),
+                        previous_cognitive_stage=previous_cognitive_stage,
+                        next_cognitive_stage=cognitive_progress,
+                    )
                     active_child["current_cognitive_stage"] = dict(cognitive_progress)
-                    if "verification_passed" in cognitive_progress:
-                        active_child["current_task_verification_passed"] = bool(cognitive_progress.get("verification_passed"))
                     timeline = list(active_child.get("current_task_progress_timeline", []) or [])
                     timeline.append(
                         {
@@ -6534,6 +9097,13 @@ def _make_child_progress_callback(
             active_child["ended_at"] = timestamp
             active_child["returncode"] = int(event.get("returncode", 0) or 0)
 
+        if progress_resumed_after_intervention and any(
+            isinstance(container.get("controller_intervention", {}), Mapping) and container.get("controller_intervention", {})
+            for container in (active_child, report, round_payload)
+            if isinstance(container, Mapping)
+        ):
+            _clear_stale_controller_intervention_state()
+
         active_child = _merge_mirrored_child_status_fields(
             active_child,
             _mirrored_child_status_from_parent_status(status_path),
@@ -6545,6 +9115,11 @@ def _make_child_progress_callback(
                 active_child["current_task_progress_timeline"] = timeline[-1:]
         report["active_child"] = active_child
         round_payload["active_child"] = dict(active_child)
+        active_run = report.get("active_run", {})
+        if isinstance(active_run, Mapping):
+            updated_active_run = dict(active_run)
+            updated_active_run["child_status"] = dict(active_child)
+            report["active_run"] = updated_active_run
         _append_event(
             event_log_path,
             {
@@ -6569,6 +9144,14 @@ def _make_child_progress_callback(
         output_progress_changed = significant_output and (
             str(active_child.get("last_progress_line", "")).strip() != previous_progress_line
         )
+        updated_semantic_state = active_child.get("semantic_progress_state", {})
+        if not isinstance(updated_semantic_state, Mapping):
+            updated_semantic_state = {}
+        adaptive_progress_changed = (
+            event_name == "adaptive_progress_state"
+            and bool(updated_semantic_state)
+            and _adaptive_progress_state_signature(updated_semantic_state) != previous_adaptive_signature
+        )
         intervention = _mid_round_controller_intervention_signal(round_payload)
         if bool(intervention.get("triggered", False)):
             round_payload["controller_intervention"] = dict(intervention)
@@ -6576,6 +9159,7 @@ def _make_child_progress_callback(
             active_child["controller_intervention"] = dict(intervention)
             report["active_child"] = active_child
             round_payload["active_child"] = dict(active_child)
+            _sync_active_child_into_active_run(report)
             report["active_child_controller_intervention"] = dict(intervention)
             report["phase_detail"] = str(intervention.get("reason", "")).strip()
             round_payload["phase_detail"] = report["phase_detail"]
@@ -6593,10 +9177,18 @@ def _make_child_progress_callback(
             )
             _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             return {"terminate": True, "reason": str(intervention.get("reason", "")).strip()}
-        should_persist = event_name in {"start", "heartbeat", "timeout", "exit"} or significant_output
+        should_persist = (
+            event_name in {"start", "heartbeat", "timeout", "exit"}
+            or significant_output
+            or adaptive_progress_changed
+        )
         if not should_persist:
             return None
-        if event_name == "output" and not output_progress_changed and (now - last_write_at) < max(0.0, float(min_write_interval_seconds)):
+        if (
+            event_name == "output"
+            and not output_progress_changed
+            and (now - last_write_at) < max(0.0, float(min_write_interval_seconds))
+        ):
             return None
         last_write_at = now
         _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
@@ -6794,6 +9386,7 @@ def _open_world_evidence_snapshot(unattended_evidence: Mapping[str, object] | No
     semantic_hub_summary = _task_yield_bucket_snapshot(payload.get("semantic_hub_summary", {}))
     external_summary = _trust_scope_snapshot(payload.get("external_summary", {}))
     replay_derived_summary = _task_yield_bucket_snapshot(payload.get("replay_derived_summary", {}))
+    retained_open_world_gain = bool(payload.get("retained_open_world_gain", False))
     open_world_families = _rank_priority_benchmark_families(
         list(
             {
@@ -6827,7 +9420,9 @@ def _open_world_evidence_snapshot(unattended_evidence: Mapping[str, object] | No
         "open_world_report_count": int(semantic_hub_summary.get("reports", 0) or 0)
         + int(external_summary.get("total", 0) or 0),
         "distinct_open_world_benchmark_families": len(open_world_families),
+        "benchmark_families": open_world_families,
         "open_world_benchmark_families": open_world_families,
+        "retained_open_world_gain": retained_open_world_gain,
         "open_world_task_yield_present": bool(
             int(semantic_hub_summary.get("reports", 0) or 0) > 0 or int(external_summary.get("total", 0) or 0) > 0
         ),
@@ -7042,8 +9637,6 @@ def _retained_tolbert_surfaces_available(config: KernelConfig) -> bool:
 def _preferred_unattended_provider(args: argparse.Namespace, *, config: KernelConfig) -> str:
     if str(args.provider or "").strip():
         return KernelConfig.normalize_provider_name(str(args.provider).strip())
-    if _retained_tolbert_surfaces_available(config):
-        return "hybrid"
     return config.normalized_provider()
 
 
@@ -7435,9 +10028,26 @@ def _should_run_liftoff(mode: str, campaign_report: dict[str, object]) -> bool:
     return retained_cycles > 0 and retained_phase_gates_passed
 
 
+def _apply_semantic_only_runtime_policy(policy: Mapping[str, object] | None) -> dict[str, object]:
+    next_policy = dict(policy) if isinstance(policy, Mapping) else {}
+    next_policy["semantic_only_runtime"] = True
+    next_policy["liftoff"] = "never"
+    persistent = _normalize_excluded_subsystems(
+        list(next_policy.get("persistent_excluded_subsystems", [])) + ["tolbert_model"]
+    )
+    next_policy["persistent_excluded_subsystems"] = persistent
+    return _materialize_excluded_subsystems(next_policy)
+
+
 def _initial_round_policy(args, config: KernelConfig) -> dict[str, object]:
     requested_priority_families = _normalize_benchmark_families(args.priority_benchmark_family)
-    return {
+    persistent_excluded_subsystems = _normalize_excluded_subsystems(getattr(args, "exclude_subsystem", []))
+    bootstrap_priority_families = [
+        family
+        for family in _MINIMUM_FRESH_PROOF_REQUIRED_FAMILIES
+        if family in set(config.unattended_trust_required_benchmark_families)
+    ]
+    policy = {
         "cycles": max(1, args.cycles),
         "campaign_width": max(1, args.campaign_width),
         "variant_width": max(1, args.variant_width),
@@ -7447,18 +10057,28 @@ def _initial_round_policy(args, config: KernelConfig) -> dict[str, object]:
         "priority_benchmark_families": (
             list(requested_priority_families)
             if requested_priority_families
-            else _select_priority_benchmark_families(
-                required_families=list(config.unattended_trust_required_benchmark_families),
-                missing_required_families=[],
-                current_priority_families=[],
+            else (
+                list(bootstrap_priority_families)
+                if bootstrap_priority_families
+                else _select_priority_benchmark_families(
+                    required_families=list(config.unattended_trust_required_benchmark_families),
+                    missing_required_families=[],
+                    current_priority_families=[],
+                )
             )
         ),
         "tolbert_device": config.tolbert_device,
         "focus": args.focus,
         "liftoff": args.liftoff,
-        "excluded_subsystems": [],
+        "semantic_only_runtime": bool(getattr(args, "semantic_only_runtime", False)),
+        "persistent_excluded_subsystems": persistent_excluded_subsystems,
+        "excluded_subsystems": list(persistent_excluded_subsystems),
         "subsystem_cooldowns": {},
     }
+    policy = _apply_coding_first_bootstrap_policy(policy)
+    if bool(policy.get("semantic_only_runtime", False)):
+        policy = _apply_semantic_only_runtime_policy(policy)
+    return policy
 
 
 def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
@@ -7477,6 +10097,7 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     trust_breadth = campaign_report.get("trust_breadth_summary", {})
     if not isinstance(trust_breadth, dict):
         trust_breadth = {}
+    proof_trust_gap = _minimum_fresh_proof_trust_gap(trust_breadth)
     priority_family_yield = campaign_report.get("priority_family_yield_summary", {})
     if not isinstance(priority_family_yield, dict):
         priority_family_yield = {}
@@ -7492,6 +10113,9 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     partial_progress_summary = campaign_report.get("partial_progress_summary", {})
     if not isinstance(partial_progress_summary, dict):
         partial_progress_summary = {}
+    execution_source_summary = campaign_report.get("execution_source_summary", {})
+    if not isinstance(execution_source_summary, dict):
+        execution_source_summary = {}
     runs = campaign_report.get("runs", [])
     if not isinstance(runs, list):
         runs = []
@@ -7513,6 +10137,30 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
     partial_productive_without_decision_runs = int(
         decision_conversion_summary.get("partial_productive_without_decision_runs", 0) or 0
     )
+    decoder_generated_commands = max(
+        0,
+        int(
+            execution_source_summary.get(
+                "decoder_generated",
+                execution_source_summary.get("llm_generated", 0),
+            )
+            or 0
+        ),
+    )
+    llm_generated_commands = max(0, int(execution_source_summary.get("llm_generated", 0) or 0))
+    bounded_decoder_generated_commands = max(
+        0,
+        int(
+            execution_source_summary.get(
+                "bounded_decoder_generated",
+                max(0, decoder_generated_commands - llm_generated_commands),
+            )
+            or 0
+        ),
+    )
+    synthetic_plan_commands = max(0, int(execution_source_summary.get("synthetic_plan", 0) or 0))
+    deterministic_or_other_commands = max(0, int(execution_source_summary.get("deterministic_or_other", 0) or 0))
+    total_executed_commands = max(0, int(execution_source_summary.get("total_executed_commands", 0) or 0))
     intermediate_decision_evidence = bool(
         runtime_managed_decisions > 0
         or non_runtime_managed_decisions > 0
@@ -7628,6 +10276,16 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
         "decision_runs": decision_runs,
         "non_runtime_managed_runs": non_runtime_managed_runs,
         "partial_productive_without_decision_runs": partial_productive_without_decision_runs,
+        "execution_source_summary": execution_source_summary,
+        "decoder_generated_commands": decoder_generated_commands,
+        "llm_generated_commands": llm_generated_commands,
+        "bounded_decoder_generated_commands": bounded_decoder_generated_commands,
+        "synthetic_plan_commands": synthetic_plan_commands,
+        "deterministic_or_other_commands": deterministic_or_other_commands,
+        "total_executed_commands": total_executed_commands,
+        "decoder_control_active": decoder_generated_commands > 0,
+        "llm_control_active": llm_generated_commands > 0,
+        "deterministic_only_execution": total_executed_commands > 0 and decoder_generated_commands <= 0,
         "intermediate_decision_evidence": intermediate_decision_evidence,
         "incomplete_cycle_count": int(incomplete_cycle_summary.get("count", 0) or 0),
         "observed_primary_runs": int(partial_progress_summary.get("observed_primary_runs", 0) or 0),
@@ -7652,6 +10310,14 @@ def _campaign_signal(campaign_report: dict[str, object]) -> dict[str, object]:
             trust_breadth.get("missing_required_families", [])
         ),
         "distinct_family_gap": int(trust_breadth.get("distinct_family_gap", 0) or 0),
+        "proof_required_families": _normalize_benchmark_families(proof_trust_gap.get("required_families", [])),
+        "proof_required_families_with_reports": _normalize_benchmark_families(
+            proof_trust_gap.get("required_families_with_reports", [])
+        ),
+        "proof_missing_required_families": _normalize_benchmark_families(
+            proof_trust_gap.get("missing_required_families", [])
+        ),
+        "proof_distinct_family_gap": int(proof_trust_gap.get("distinct_family_gap", 0) or 0),
         "priority_families": _normalize_benchmark_families(
             priority_family_yield.get(
                 "priority_families",
@@ -9523,16 +12189,16 @@ def _derived_controller_features(
             1.0,
             (
                 (1.0 if int(signal.get("external_report_count", 0) or 0) <= 0 else 0.0)
-                + (1.0 if _normalize_benchmark_families(signal.get("missing_required_families", [])) else 0.0)
-                + min(1.0, float(max(0, int(signal.get("distinct_family_gap", 0) or 0))) / 3.0)
+                + (1.0 if _normalize_benchmark_families(signal.get("proof_missing_required_families", [])) else 0.0)
+                + min(1.0, float(max(0, int(signal.get("proof_distinct_family_gap", 0) or 0))) / 3.0)
             )
             / 3.0,
         ),
         "claim_ready_trust_gain": 1.0
         if (
             int(signal.get("external_report_count", 0) or 0) > 0
-            and not _normalize_benchmark_families(signal.get("missing_required_families", []))
-            and int(signal.get("distinct_family_gap", 0) or 0) <= 0
+            and not _normalize_benchmark_families(signal.get("proof_missing_required_families", []))
+            and int(signal.get("proof_distinct_family_gap", 0) or 0) <= 0
         )
         else 0.0,
         "supervision_breadth_delta": min(
@@ -9914,7 +12580,10 @@ def _candidate_round_policies(
     max_variant_width: int,
     max_task_step_floor: int,
 ) -> list[dict[str, object]]:
-    base = _advance_subsystem_cooldowns(current_policy)
+    base = _apply_policy_steering_guards(
+        _advance_subsystem_cooldowns(current_policy),
+        reference_policy=current_policy,
+    )
     signal = _campaign_signal(campaign_report)
     liftoff = _liftoff_signal(liftoff_payload or {}) if liftoff_payload else {}
     planner_pressure = _planner_pressure_signal(
@@ -9950,7 +12619,10 @@ def _candidate_round_policies(
     repo_setting_priority_families = _repo_setting_focus_priority_families(
         current_priority_families=current_priority_families,
         frontier_repo_setting_families=planner_pressure.get("frontier_repo_setting_families", []),
-        missing_required_families=signal.get("missing_required_families", []),
+        missing_required_families=signal.get(
+            "proof_missing_required_families",
+            signal.get("missing_required_families", []),
+        ),
     )
     repo_setting_policy_pressure = _repo_setting_policy_pressure(
         frontier_repo_setting_priority_pairs=planner_pressure.get("frontier_repo_setting_priority_pairs", []),
@@ -9965,8 +12637,12 @@ def _candidate_round_policies(
         or int(signal.get("long_horizon_retained_cycles", 0) or 0) > 0
         or repo_setting_task_step_floor_pressure
     )
+    focus_locked = bool(current_policy.get("focus_locked", False))
+    locked_focus = str(current_policy.get("focus", "")).strip()
     focuses = ["balanced", "recovery_alignment", "discovered_task_adaptation"]
     adaptive_options = [False, True]
+    if focus_locked and locked_focus:
+        focuses = [locked_focus]
     if severe_regression:
         focuses = ["recovery_alignment", "balanced"]
         adaptive_options = [True]
@@ -10081,7 +12757,10 @@ def _candidate_round_policies(
                                         max_task_limit,
                                         max(proposal["task_limit"], current_task_limit),
                                     )
-                                proposal = _materialize_excluded_subsystems(proposal)
+                                proposal = _apply_policy_steering_guards(
+                                    _materialize_excluded_subsystems(proposal),
+                                    reference_policy=current_policy,
+                                )
                                 fingerprint = json.dumps(
                                     {
                                         "focus": proposal["focus"],
@@ -10100,7 +12779,7 @@ def _candidate_round_policies(
                                 seen.add(fingerprint)
                                 candidates.append(proposal)
     if not candidates:
-        candidates.append(_materialize_excluded_subsystems(base))
+        candidates.append(_apply_policy_steering_guards(_materialize_excluded_subsystems(base), reference_policy=current_policy))
     return candidates
 
 
@@ -10124,17 +12803,33 @@ def _validate_campaign_report(campaign_report: dict[str, object]) -> dict[str, o
         if summary:
             detail = f"{detail}: {summary}"
         return {"passed": False, "detail": detail, "signal": signal, "failure_context": failure_context}
+    if completed > 0 and int(signal["runtime_managed_decisions"]) > 0 and not bool(signal.get("llm_control_active", False)):
+        detail = (
+            "campaign report credited runtime-managed decisions without live LLM-generated execution "
+            f"(total_executed={int(signal.get('total_executed_commands', 0) or 0)} "
+            f"bounded_decoder={int(signal.get('bounded_decoder_generated_commands', 0) or 0)} "
+            f"deterministic_or_other={int(signal.get('deterministic_or_other_commands', 0) or 0)})"
+        )
+        summary = _campaign_failure_context_summary(failure_context)
+        if summary:
+            detail = f"{detail}: {summary}"
+        return {"passed": False, "detail": detail, "signal": signal, "failure_context": failure_context}
     if completed > 0 and int(signal["runtime_managed_decisions"]) <= 0:
         if bool(signal.get("intermediate_decision_evidence", False)):
+            if not bool(signal.get("llm_control_active", False)):
+                detail = (
+                    "campaign report showed decision evidence without live LLM-generated execution "
+                    f"(total_executed={int(signal.get('total_executed_commands', 0) or 0)} "
+                    f"bounded_decoder={int(signal.get('bounded_decoder_generated_commands', 0) or 0)} "
+                    f"deterministic_or_other={int(signal.get('deterministic_or_other_commands', 0) or 0)})"
+                )
+                summary = _campaign_failure_context_summary(failure_context)
+                if summary:
+                    detail = f"{detail}: {summary}"
+                return {"passed": False, "detail": detail, "signal": signal, "failure_context": failure_context}
             return {
                 "passed": True,
                 "detail": "campaign report is complete with intermediate decision evidence",
-                "signal": signal,
-            }
-        if bool(signal.get("task_success_evidence", False)):
-            return {
-                "passed": True,
-                "detail": "campaign report is complete with verified task-success evidence",
                 "signal": signal,
             }
         detail = "campaign report showed no runtime-managed decisions"
@@ -10236,7 +12931,6 @@ def _round_stop_signal(
     retained_or_liftoff_yield = (
         retained_cycles > 0
         or liftoff_state == "retain"
-        or bool(campaign_signal.get("task_success_evidence", False))
     )
     return {
         "retained_cycles": retained_cycles,
@@ -10504,7 +13198,7 @@ def _next_round_policy(
         top_candidate = adjusted_candidates[0]
         top_policy = top_candidate.get("policy", {})
         if isinstance(top_policy, dict):
-            next_policy = dict(top_policy)
+            next_policy = _apply_policy_steering_guards(dict(top_policy), reference_policy=current_policy)
             planner_diagnostics["selected_action_key"] = str(top_candidate.get("action_key", "")).strip()
             planner_diagnostics["selected_score"] = float(top_candidate.get("score", 0.0) or 0.0)
             planner_diagnostics["selected_adjusted_score"] = float(top_candidate.get("adjusted_score", 0.0) or 0.0)
@@ -10526,6 +13220,7 @@ def _next_round_policy(
             planner_diagnostics["learned_repo_setting_priors"] = dict(learned_repo_setting_priors)
             planner_diagnostics["strategy_memory_priors"] = dict(strategy_memory_priors)
             planner_diagnostics["candidates"] = adjusted_candidates[:12]
+    next_policy = _apply_policy_steering_guards(next_policy, reference_policy=current_policy)
     if isinstance(round_payload, dict):
         round_payload["controller_planner"] = planner_diagnostics
     signal = _campaign_signal(campaign_report)
@@ -10567,8 +13262,10 @@ def _next_round_policy(
         and campaign_report.get("trust_breadth_summary", {})
     )
     required_families = _normalize_benchmark_families(signal.get("required_families", []))
-    missing_required_families = _normalize_benchmark_families(signal.get("missing_required_families", []))
-    distinct_family_gap = int(signal.get("distinct_family_gap", 0) or 0)
+    missing_required_families = _normalize_benchmark_families(
+        signal.get("proof_missing_required_families", signal.get("missing_required_families", []))
+    )
+    distinct_family_gap = int(signal.get("proof_distinct_family_gap", signal.get("distinct_family_gap", 0)) or 0)
     required_family_coverage_gap = (
         trust_breadth_summary_present and (bool(missing_required_families) or distinct_family_gap > 0)
     )
@@ -11143,7 +13840,21 @@ def _next_round_policy(
                 "selection_cap": priority_family_selection_cap,
                 "available_families": priority_families_ranked_by_selection_score,
             }
-    next_policy = _materialize_excluded_subsystems(next_policy)
+    coding_first_bootstrap_applied = _coding_first_bootstrap_active(
+        next_policy.get("priority_benchmark_families", []),
+        runtime_managed_decisions=runtime_managed_decisions,
+        retained_gain_runs=retained_cycles,
+    )
+    if coding_first_bootstrap_applied:
+        next_policy = _apply_coding_first_bootstrap_policy(
+            next_policy,
+            runtime_managed_decisions=runtime_managed_decisions,
+            retained_gain_runs=retained_cycles,
+        )
+    next_policy = _apply_policy_steering_guards(
+        _materialize_excluded_subsystems(next_policy),
+        reference_policy=current_policy,
+    )
     if isinstance(round_payload, dict):
         widened_dimensions: list[str] = []
         for key in ("cycles", "task_limit", "task_step_floor", "campaign_width", "variant_width"):
@@ -11187,6 +13898,8 @@ def _next_round_policy(
             reason_codes.append("micro_step_verification_loop")
         if productive_partial_conversion_gap:
             reason_codes.append("productive_partial_conversion_gap")
+        if coding_first_bootstrap_applied:
+            reason_codes.append("coding_first_bootstrap")
         if observability_gap:
             reason_codes.append("observability_gap")
         if subsystem_robustness_gap:
@@ -11356,6 +14069,8 @@ def main() -> None:
     parser.add_argument("--campaign-width", type=int, default=2)
     parser.add_argument("--variant-width", type=int, default=1)
     parser.add_argument("--adaptive-search", action="store_true")
+    parser.add_argument("--semantic-only-runtime", action="store_true")
+    parser.add_argument("--exclude-subsystem", action="append", default=[])
     parser.add_argument("--task-limit", type=int, default=128)
     parser.add_argument("--task-step-floor", type=int, default=0)
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
@@ -11419,6 +14134,10 @@ def main() -> None:
     parser.add_argument("--global-storage-top-k", type=int, default=0)
     parser.add_argument("--report-path", default=None)
     args = parser.parse_args()
+    args.exclude_subsystem = _normalize_excluded_subsystems(args.exclude_subsystem)
+    if args.semantic_only_runtime:
+        args.exclude_subsystem = _normalize_excluded_subsystems(list(args.exclude_subsystem) + ["tolbert_model"])
+        args.liftoff = "never"
 
     repo_root = Path(__file__).resolve().parents[1]
     config = KernelConfig()
@@ -11428,7 +14147,12 @@ def main() -> None:
         config.model_name = args.model
     if args.tolbert_device:
         config.tolbert_device = args.tolbert_device
+    if args.semantic_only_runtime:
+        config.use_tolbert_context = False
+        config.use_tolbert_model_artifacts = False
+    config.asi_coding_require_live_llm = True
     config.ensure_directories()
+    runtime_claim = _runtime_claim_snapshot(config)
 
     created_at = datetime.now(timezone.utc)
     run_id = created_at.strftime("%Y%m%dT%H%M%S%fZ")
@@ -11524,6 +14248,8 @@ def main() -> None:
         max_task_limit=max(1, args.max_task_limit),
         max_campaign_width=max(1, args.max_campaign_width),
     )
+    if args.semantic_only_runtime:
+        current_policy = _apply_semantic_only_runtime_policy(current_policy)
     rounds_completed = _count_completed_rounds(prior_rounds)
     child_failure_recoveries_used = int(resume_payload.get("child_failure_recoveries_used", 0) or 0)
     child_failure_recovery_budget = max(0, int(args.max_child_failure_recovery_rounds))
@@ -11606,6 +14332,7 @@ def main() -> None:
         "alert_state_path": str(alert_state_path),
         "controller_state_path": str(controller_state_path),
         "controller_summary": controller_state_summary(controller_state),
+        "runtime_claim": runtime_claim,
         "unattended_evidence": _unattended_evidence_snapshot(config),
         "global_storage_root": str(global_storage_root),
         "global_storage_policy_path": "" if global_storage_policy_path is None else str(global_storage_policy_path),
@@ -11621,9 +14348,10 @@ def main() -> None:
         external_lease_backend=str(args.lease_backend or ""),
         external_lease_endpoint=str(args.lease_endpoint or ""),
         external_lease_token=str(args.lease_token or ""),
+        govern_storage=False,
     )
 
-    def _emit_alert_if_configured() -> None:
+    def _emit_alert_if_configured(*, govern_storage: bool = True) -> None:
         if not _alerts_enabled(args):
             return
         report["alert"] = _dispatch_alerts(
@@ -11647,6 +14375,7 @@ def main() -> None:
             external_lease_backend=str(args.lease_backend or ""),
             external_lease_endpoint=str(args.lease_endpoint or ""),
             external_lease_token=str(args.lease_token or ""),
+            govern_storage=govern_storage,
         )
 
     def _emit_policy_shift_alert_if_configured(round_payload: dict[str, object]) -> None:
@@ -11885,6 +14614,7 @@ def main() -> None:
         external_lease_backend=str(args.lease_backend or ""),
         external_lease_endpoint=str(args.lease_endpoint or ""),
         external_lease_token=str(args.lease_token or ""),
+        govern_storage=False,
     )
     _append_event(
         event_log_path,
@@ -11901,8 +14631,15 @@ def main() -> None:
         report["status"] = "safe_stop"
         report["phase"] = "preflight"
         report["reason"] = str(lock_result.get("detail", "campaign lock acquisition failed"))
-        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
-        _emit_alert_if_configured()
+        _persist_report_state(
+            report_path,
+            report,
+            config=config,
+            status_path=status_path,
+            lock_path=lock_path,
+            govern_storage=False,
+        )
+        _emit_alert_if_configured(govern_storage=False)
         print(report_path)
         raise SystemExit(2)
 
@@ -11989,7 +14726,14 @@ def main() -> None:
             }
             if not args.skip_trust_preflight:
                 trust = _trust_preflight(config)
-            round_payload["preflight"] = {"disk": disk, "gpu": gpu, "trust": trust}
+            decoder_contract = _asi_coding_decoder_contract_preflight(config)
+            round_payload["preflight"] = {
+                "disk": disk,
+                "gpu": gpu,
+                "trust": trust,
+                "decoder_contract": decoder_contract,
+                "runtime_claim": runtime_claim,
+            }
             report["preflight"] = round_payload["preflight"]
             reporting = trust.get("reporting", {}) if isinstance(trust, dict) else {}
             if isinstance(reporting, dict) and reporting:
@@ -12022,6 +14766,16 @@ def main() -> None:
                 report["phase"] = "preflight"
                 report["reason"] = str(trust["detail"])
                 _mark_round(round_payload, status="safe_stop", phase="preflight", reason=str(trust["detail"]))
+                report["rounds_completed"] = _count_completed_rounds(report["rounds"])
+                _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
+                _emit_alert_if_configured()
+                print(report_path)
+                raise SystemExit(2)
+            if not bool(decoder_contract["passed"]):
+                report["status"] = "safe_stop"
+                report["phase"] = "preflight"
+                report["reason"] = str(decoder_contract["detail"])
+                _mark_round(round_payload, status="safe_stop", phase="preflight", reason=str(decoder_contract["detail"]))
                 report["rounds_completed"] = _count_completed_rounds(report["rounds"])
                 _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
                 _emit_alert_if_configured()
@@ -12074,12 +14828,16 @@ def main() -> None:
             round_payload["phase"] = phase
             round_run_match_id = f"unattended:round:{run_id}:{round_index}"
             resolved_provider = _preferred_unattended_provider(args, config=config)
+            report.pop("controller_intervention", None)
+            report.pop("active_child_controller_intervention", None)
+            report["active_child"] = {}
             report["active_run"] = {
                 "run_index": round_index,
                 "run_match_id": round_run_match_id,
                 "phase": phase,
                 "policy": dict(current_policy),
                 "provider": resolved_provider,
+                "runtime_claim": dict(runtime_claim),
             }
             _progress(
                 f"[campaign] phase=campaign round={round_index} cycles={int(current_policy['cycles'])} "
@@ -12129,6 +14887,8 @@ def main() -> None:
                 campaign_cmd.extend(["--exclude-subsystem", excluded_subsystem])
             if bool(current_policy["adaptive_search"]):
                 campaign_cmd.append("--adaptive-search")
+            if bool(current_policy.get("semantic_only_runtime", False)):
+                campaign_cmd.append("--semantic-only-runtime")
             if resolved_provider:
                 campaign_cmd.extend(["--provider", resolved_provider])
             if args.model:
@@ -12138,6 +14898,11 @@ def main() -> None:
             campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH"] = str(status_path)
             campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX"] = str(round_index)
             campaign_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID"] = round_run_match_id
+            campaign_env["AGENT_KERNEL_RUN_REPORTS_DIR"] = str(report_path.parent)
+            campaign_env["AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH"] = str(
+                report_path.parent / "unattended_trust_ledger.json"
+            )
+            campaign_env["AGENT_KERNEL_ASI_CODING_REQUIRE_LIVE_LLM"] = "1"
             child_improvement_reports_dir = _child_improvement_reports_dir(report_path)
             campaign_env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"] = str(child_improvement_reports_dir)
             campaign_env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"] = str(
@@ -12174,7 +14939,10 @@ def main() -> None:
             report["campaign_report_path"] = round_payload["campaign_report_path"]
             _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
             if int(campaign_run["returncode"]) != 0:
-                mirrored_child_status = _mirrored_child_status_from_parent_status(status_path)
+                mirrored_child_status = _preferred_child_status_snapshot(
+                    parent_status_path=status_path,
+                    mirrored_status_path=child_improvement_reports_dir / "repeated_improvement_status.json",
+                )
                 partial_acceptance = _accept_productive_partial_child_timeout(
                     campaign_run,
                     mirrored_child_status=mirrored_child_status,
@@ -12227,6 +14995,7 @@ def main() -> None:
                         )
                         round_payload["active_child"] = finalized_active_child
                         report["active_child"] = finalized_active_child
+                        _sync_active_child_into_active_run(report)
                     round_payload["campaign_report"] = campaign_report
                     partial_decision_state = _authoritative_status_decision_state(
                         active_child=round_payload.get("active_child", {}),
@@ -12578,11 +15347,66 @@ def main() -> None:
                     phase=phase,
                     reason=interrupt_reason,
                 )
+                mirrored_child_status = _preferred_child_status_snapshot(
+                    parent_status_path=status_path,
+                    mirrored_status_path=_child_improvement_reports_dir(report_path) / "repeated_improvement_status.json",
+                )
+                if mirrored_child_status:
+                    live_active_child = last_round.get("active_child", {})
+                    merged_active_child = _merge_mirrored_child_status_fields(
+                        dict(live_active_child) if isinstance(live_active_child, Mapping) else {},
+                        mirrored_child_status,
+                    )
+                    terminal_child_state = str(
+                        mirrored_child_status.get("state") or mirrored_child_status.get("status") or ""
+                    ).strip()
+                    if terminal_child_state in {"interrupted", "finished", "completed", "safe_stop"}:
+                        merged_active_child["state"] = terminal_child_state
+                        mirrored_status = str(mirrored_child_status.get("status", "")).strip()
+                        if mirrored_status:
+                            merged_active_child["status"] = mirrored_status
+                        mirrored_reason = str(mirrored_child_status.get("reason", "")).strip()
+                        if mirrored_reason:
+                            merged_active_child["reason"] = mirrored_reason
+                        for key in (
+                            "last_progress_phase",
+                            "finalize_phase",
+                            "selected_subsystem",
+                            "pending_decision_state",
+                            "preview_state",
+                            "current_task",
+                            "current_cognitive_stage",
+                            "current_task_progress_timeline",
+                            "current_task_verification_passed",
+                            "semantic_progress_state",
+                            "canonical_progress_state",
+                            "report_path",
+                            "last_report_path",
+                        ):
+                            if key not in mirrored_child_status:
+                                continue
+                            value = mirrored_child_status.get(key)
+                            if isinstance(value, Mapping):
+                                merged_active_child[key] = dict(value)
+                            elif isinstance(value, list):
+                                merged_active_child[key] = list(value)
+                            else:
+                                merged_active_child[key] = value
+                    last_round["active_child"] = merged_active_child
+                    report["active_child"] = dict(merged_active_child)
+                    _sync_active_child_into_active_run(report)
         report["rounds_completed"] = _count_completed_rounds(
             report.get("rounds", []) if isinstance(report.get("rounds", []), list) else []
         )
-        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
-        _emit_alert_if_configured()
+        _persist_report_state(
+            report_path,
+            report,
+            config=config,
+            status_path=status_path,
+            lock_path=lock_path,
+            govern_storage=False,
+        )
+        _emit_alert_if_configured(govern_storage=False)
         _append_event(
             event_log_path,
             {
@@ -12616,8 +15440,15 @@ def main() -> None:
         report["rounds_completed"] = _count_completed_rounds(
             report.get("rounds", []) if isinstance(report.get("rounds", []), list) else []
         )
-        _persist_report_state(report_path, report, config=config, status_path=status_path, lock_path=lock_path)
-        _emit_alert_if_configured()
+        _persist_report_state(
+            report_path,
+            report,
+            config=config,
+            status_path=status_path,
+            lock_path=lock_path,
+            govern_storage=False,
+        )
+        _emit_alert_if_configured(govern_storage=False)
         _append_event(
             event_log_path,
             {

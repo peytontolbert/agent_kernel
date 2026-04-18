@@ -122,6 +122,57 @@ def test_build_liftoff_gate_report_requires_shadow_signal_for_takeover():
     assert "workflow" in report.insufficient_shadow_families
 
 
+def test_build_liftoff_gate_report_rejects_universal_decoder_regression():
+    report = build_liftoff_gate_report(
+        candidate_metrics=EvalMetrics(
+            total=10,
+            passed=9,
+            average_steps=1.0,
+            total_by_benchmark_family={"workflow": 10},
+            passed_by_benchmark_family={"workflow": 9},
+            generated_total=2,
+            generated_passed=2,
+            generated_by_kind={"failure_recovery": 1},
+            generated_passed_by_kind={"failure_recovery": 1},
+            tolbert_shadow_episodes_by_benchmark_family={"workflow": 2},
+        ),
+        baseline_metrics=EvalMetrics(
+            total=10,
+            passed=9,
+            average_steps=1.0,
+            total_by_benchmark_family={"workflow": 10},
+            passed_by_benchmark_family={"workflow": 9},
+            generated_total=2,
+            generated_passed=2,
+            generated_by_kind={"failure_recovery": 1},
+            generated_passed_by_kind={"failure_recovery": 1},
+        ),
+        artifact_payload={
+            "artifact_kind": "tolbert_model_bundle",
+            "liftoff_gate": {
+                "require_universal_decoder_eval": True,
+                "min_universal_decoder_exact_match_delta": 0.0,
+                "min_universal_decoder_token_f1_delta": 0.0,
+                "min_universal_decoder_win_rate_delta": 0.0,
+                "require_takeover_drift_eval": False,
+            },
+        },
+        universal_decoder_eval={
+            "available": True,
+            "hybrid_exact_match_rate": 0.25,
+            "baseline_exact_match_rate": 0.5,
+            "hybrid_token_f1": 0.6,
+            "baseline_token_f1": 0.8,
+            "hybrid_win_rate": 0.0,
+            "baseline_win_rate": 0.5,
+        },
+    )
+
+    assert report.state == "reject"
+    assert "universal decoder exact-match quality" in report.reason
+    assert report.universal_decoder_exact_match_delta == -0.25
+
+
 def test_build_liftoff_gate_report_demotes_family_without_novel_command_evidence():
     report = build_liftoff_gate_report(
         candidate_metrics=EvalMetrics(

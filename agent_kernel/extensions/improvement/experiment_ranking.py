@@ -48,11 +48,18 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 },
             )
         )
+    low_confidence_state_signal = 0
     if metrics.low_confidence_episodes > 0 or metrics.trusted_retrieval_steps < metrics.total // 2:
         confidence_gap = max(
             metrics.low_confidence_episodes / max(1, metrics.total),
             0.0 if metrics.total == 0 else 0.5 - (metrics.trusted_retrieval_steps / max(1, metrics.total)),
         )
+        retrieval_deficit = max(0, (metrics.total // 2) - int(metrics.trusted_retrieval_steps or 0))
+        if confidence_gap >= 0.1 or retrieval_deficit > 0:
+            low_confidence_state_signal = max(
+                int(metrics.low_confidence_episodes or 0),
+                retrieval_deficit,
+            )
         allow_qwen_support_runtime, coding_strength = planner._allow_qwen_adapter_support_runtime(metrics)
         candidates.append(
             ImprovementExperiment(
@@ -65,6 +72,9 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 evidence={
                     "low_confidence_episodes": metrics.low_confidence_episodes,
                     "trusted_retrieval_steps": metrics.trusted_retrieval_steps,
+                    "retrieval_selected_steps": metrics.retrieval_selected_steps,
+                    "retrieval_influenced_steps": metrics.retrieval_influenced_steps,
+                    "proposal_selected_steps": metrics.proposal_selected_steps,
                     "total": metrics.total,
                 },
             )
@@ -72,8 +82,8 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
         candidates.append(
             ImprovementExperiment(
                 subsystem="tolbert_model",
-                reason="retrieval weakness should be attacked at the learned Tolbert checkpoint, not only with retained thresholds",
-                priority=5,
+                reason="persistent retrieval weakness may still need a learned Tolbert checkpoint, but runtime retrieval and state controls should be repaired first",
+                priority=4,
                 expected_gain=round(max(0.02, confidence_gap), 4),
                 estimated_cost=4,
                 score=0.0,
@@ -83,6 +93,7 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                     "average_first_step_path_confidence": metrics.average_first_step_path_confidence,
                     "total": metrics.total,
                     "coding_strength": coding_strength,
+                    "cross_cycle_weight_update": True,
                 },
             )
         )
@@ -90,7 +101,7 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
             candidates.append(
                 ImprovementExperiment(
                     subsystem="qwen_adapter",
-                    reason="current coding weakness may need a stronger adapted Qwen support runtime while Tolbert remains the liftoff path",
+                    reason="current coding weakness may eventually need a stronger adapted Qwen support runtime, but prompt and state controls should lead the low-confidence repair loop",
                     priority=4,
                     expected_gain=round(max(0.015, confidence_gap * 0.6), 4),
                     estimated_cost=3,
@@ -102,6 +113,7 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                         "total": metrics.total,
                         "support_runtime_only": True,
                         "coding_strength": coding_strength,
+                        "cross_cycle_weight_update": True,
                     },
                 )
             )
@@ -244,19 +256,36 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 },
             )
         )
-    if transition_failure_counts or int(transition_summary.get("state_regression_steps", 0) or 0) > 0:
+    if (
+        transition_failure_counts
+        or int(transition_summary.get("state_regression_steps", 0) or 0) > 0
+        or low_confidence_state_signal > 0
+    ):
         state_estimation_signal = (
             transition_failure_counts.get("no_state_progress", 0)
             + transition_failure_counts.get("state_regression", 0)
             + int(transition_summary.get("state_regression_steps", 0) or 0)
+            + low_confidence_state_signal
+        )
+        state_estimation_reason = (
+            "low-confidence routing should first be repaired through runtime state summarization and recovery cues before cross-cycle weight updates"
+            if low_confidence_state_signal > 0
+            else "state summarization should separate stalls, regressions, and recovery opportunities more explicitly before policy scoring"
         )
         candidates.append(
             ImprovementExperiment(
                 subsystem="state_estimation",
-                reason="state summarization should separate stalls, regressions, and recovery opportunities more explicitly before policy scoring",
+                reason=state_estimation_reason,
                 priority=4,
                 expected_gain=round(
-                    max(0.015, min(0.04, state_estimation_signal / max(1, sum(transition_failure_counts.values()) or 1))),
+                    max(
+                        0.015,
+                        min(
+                            0.05,
+                            state_estimation_signal
+                            / max(1, (sum(transition_failure_counts.values()) or 0) + low_confidence_state_signal),
+                        ),
+                    ),
                     4,
                 ),
                 estimated_cost=2,
@@ -264,6 +293,11 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 evidence={
                     "transition_failure_counts": transition_failure_counts,
                     "transition_summary": transition_summary,
+                    "low_confidence_episodes": metrics.low_confidence_episodes,
+                    "trusted_retrieval_steps": metrics.trusted_retrieval_steps,
+                    "average_first_step_path_confidence": metrics.average_first_step_path_confidence,
+                    "total": metrics.total,
+                    "runtime_learning_priority": low_confidence_state_signal > 0,
                 },
             )
         )

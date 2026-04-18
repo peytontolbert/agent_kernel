@@ -290,7 +290,7 @@ def cold_start_low_confidence_penalty(
     if total <= 0 or low_confidence <= 0:
         return 0.0, []
     raw_score = planner._experiment_score(candidate, effective_subsystem=subsystem)
-    default_cap = 0.12 if subsystem == "retrieval" else 0.09 if subsystem == "qwen_adapter" else 0.1
+    default_cap = 0.12 if subsystem == "retrieval" else 0.07 if subsystem == "qwen_adapter" else 0.08
     cap = planner._planner_control_subsystem_float(
         planner_controls or {},
         "cold_start_low_confidence_score_cap",
@@ -449,6 +449,46 @@ def recent_promotion_failure_penalty(
     return round(penalty, 4), [f"recent_promotion_failure_penalty={penalty:.4f}"]
 
 
+def _retrieval_activation_variant_bias(
+    experiment: ImprovementExperiment,
+    variant: ImprovementVariant,
+) -> tuple[float, dict[str, object]]:
+    if str(experiment.subsystem).strip() != "retrieval":
+        return 0.0, {}
+    evidence = experiment.evidence if isinstance(experiment.evidence, dict) else {}
+    total = int(evidence.get("total", 0) or 0)
+    low_confidence = int(evidence.get("low_confidence_episodes", 0) or 0)
+    trusted_steps = int(evidence.get("trusted_retrieval_steps", 0) or 0)
+    retrieval_selected_steps = int(evidence.get("retrieval_selected_steps", 0) or 0)
+    retrieval_influenced_steps = int(evidence.get("retrieval_influenced_steps", 0) or 0)
+    proposal_selected_steps = int(evidence.get("proposal_selected_steps", 0) or 0)
+    activation_absent = (
+        total > 0
+        and trusted_steps <= 0
+        and retrieval_selected_steps <= 0
+        and retrieval_influenced_steps <= 0
+        and proposal_selected_steps <= 0
+    )
+    if not activation_absent:
+        return 0.0, {}
+    bias = 0.0
+    if str(variant.variant_id).strip() == "confidence_gating":
+        bias = 0.03
+    elif str(variant.variant_id).strip() == "breadth_rebalance":
+        bias = -0.03 if low_confidence <= 0 else -0.015
+    if bias == 0.0:
+        return 0.0, {}
+    return round(bias, 4), {
+        "activation_absent": True,
+        "low_confidence_episodes": low_confidence,
+        "trusted_retrieval_steps": trusted_steps,
+        "retrieval_selected_steps": retrieval_selected_steps,
+        "retrieval_influenced_steps": retrieval_influenced_steps,
+        "proposal_selected_steps": proposal_selected_steps,
+        "bias": round(bias, 4),
+    }
+
+
 def score_variant(
     planner: Any,
     experiment: ImprovementExperiment,
@@ -491,6 +531,7 @@ def score_variant(
         dict(experiment.evidence.get("strategy_candidate", {})) if isinstance(experiment.evidence, dict) else {},
         variant,
     )
+    activation_bias, activation_evidence = _retrieval_activation_variant_bias(experiment, variant)
     score = round(
         max(
             0.0,
@@ -500,10 +541,24 @@ def score_variant(
             + planner._recent_history_bonus(variant_recent_history, variant_specific=True)
             + exploration_bonus
             + strategy_memory_adjustment
+            + activation_bias
             + score_bias,
         ),
         4,
     )
+    activation_score_floor_evidence: dict[str, object] = {}
+    if activation_evidence.get("activation_absent") and str(experiment.subsystem).strip() == "retrieval":
+        low_confidence = int(activation_evidence.get("low_confidence_episodes", 0) or 0)
+        if str(variant.variant_id).strip() == "confidence_gating":
+            activation_score_floor = 0.01 if low_confidence <= 0 else 0.008
+            if score < activation_score_floor:
+                score = round(activation_score_floor, 4)
+                activation_score_floor_evidence = {
+                    "activation_absent": True,
+                    "low_confidence_episodes": low_confidence,
+                    "floor": round(activation_score_floor, 4),
+                    "reason": "preserve confidence-gating bootstrap priority when reject-heavy history collapses retrieval variant scores",
+                }
     controls = dict(variant.controls)
     controls["base_subsystem"] = effective_subsystem
     controls["history"] = {
@@ -517,6 +572,10 @@ def score_variant(
         controls["variant_exploration_bonus"] = round(exploration_bonus, 4)
     if strategy_memory_evidence:
         controls["strategy_memory_variant_lineage"] = strategy_memory_evidence
+    if activation_evidence:
+        controls["activation_bootstrap_bias"] = activation_evidence
+    if activation_score_floor_evidence:
+        controls["activation_bootstrap_score_floor"] = activation_score_floor_evidence
     return ImprovementVariant(
         subsystem=variant.subsystem,
         variant_id=variant.variant_id,

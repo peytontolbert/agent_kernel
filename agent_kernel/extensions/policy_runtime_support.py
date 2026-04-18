@@ -27,13 +27,17 @@ from ..extensions.policy_command_utils import canonicalize_command as _canonical
 from ..extensions.runtime_modeling_adapter import (
     load_model_artifact,
     retained_tolbert_action_generation_policy,
+    retained_tolbert_active_decoder_runtime,
     retained_tolbert_decoder_policy,
     retained_tolbert_hybrid_runtime,
     retained_tolbert_model_surfaces,
     retained_tolbert_rollout_policy,
     retained_tolbert_runtime_policy,
+    retained_tolbert_universal_decoder_runtime,
     score_hybrid_candidates,
 )
+from ..resource_registry import runtime_resource_registry
+from ..resource_types import PROMPT_RESOURCE_DECISION, PROMPT_RESOURCE_SYSTEM, subsystem_resource_id
 
 
 class SkillLibrary:
@@ -176,6 +180,7 @@ class PolicyRuntimeSupport:
     def __init__(self, *, config: KernelConfig, repo_root: Path) -> None:
         self.config = config
         self.repo_root = repo_root
+        self._resource_registry = runtime_resource_registry(config, repo_root=repo_root)
         self._policy_controls_cache: dict[str, object] | None = None
         self._role_directives_cache: dict[str, str] | None = None
         self._state_estimation_policy_controls_cache: dict[str, object] | None = None
@@ -188,8 +193,19 @@ class PolicyRuntimeSupport:
         self._tolbert_action_generation_policy_cache: dict[str, object] | None = None
         self._tolbert_rollout_policy_cache: dict[str, object] | None = None
         self._tolbert_hybrid_runtime_cache: dict[str, object] | None = None
+        self._tolbert_universal_decoder_runtime_cache: dict[str, object] | None = None
+        self._tolbert_active_decoder_runtime_cache: dict[str, object] | None = None
         self._prompt_policy_payload_cache: dict[str, object] | None = None
         self.last_hybrid_runtime_error: str = ""
+
+    def prompt_template(self, name: str) -> str:
+        resource_id = {
+            "system": PROMPT_RESOURCE_SYSTEM,
+            "decision": PROMPT_RESOURCE_DECISION,
+        }.get(str(name).strip().lower())
+        if not resource_id:
+            raise ValueError(f"unsupported prompt template: {name}")
+        return self._resource_registry.load_text(resource_id)
 
     def retrieval_overrides(self) -> dict[str, object]:
         if not self.config.use_retrieval_proposals:
@@ -297,6 +313,43 @@ class PolicyRuntimeSupport:
         self._tolbert_hybrid_runtime_cache = normalized
         return self._tolbert_hybrid_runtime_cache
 
+    def tolbert_universal_decoder_runtime(self) -> dict[str, object]:
+        if self._tolbert_universal_decoder_runtime_cache is not None:
+            return self._tolbert_universal_decoder_runtime_cache
+        self._tolbert_universal_decoder_runtime_cache = retained_tolbert_universal_decoder_runtime(
+            self.tolbert_model_payload()
+        )
+        return self._tolbert_universal_decoder_runtime_cache
+
+    def tolbert_active_decoder_runtime(self) -> dict[str, object]:
+        if self._tolbert_active_decoder_runtime_cache is not None:
+            return self._tolbert_active_decoder_runtime_cache
+        universal_runtime = self.tolbert_universal_decoder_runtime()
+        if bool(universal_runtime.get("materialized", False)) and str(
+            universal_runtime.get("bundle_manifest_path", "")
+        ).strip():
+            normalized = dict(self.tolbert_hybrid_runtime())
+            normalized.update(universal_runtime)
+            normalized["runtime_key"] = "universal_decoder_runtime"
+            normalized["runtime_role"] = "universal_decoder_runtime"
+            normalized["supports_prompt_completion_surface"] = bool(
+                universal_runtime.get("supports_prompt_completion_surface", True)
+            )
+            normalized["supports_state_conditioned_generation"] = bool(
+                universal_runtime.get("supports_state_conditioned_generation", True)
+            )
+            self._tolbert_active_decoder_runtime_cache = normalized
+            return self._tolbert_active_decoder_runtime_cache
+        normalized = retained_tolbert_active_decoder_runtime(self.tolbert_model_payload())
+        if self._tolbert_hybrid_runtime_cache is not None:
+            normalized.update(self._tolbert_hybrid_runtime_cache)
+        normalized["runtime_key"] = "hybrid_runtime"
+        normalized["runtime_role"] = "hybrid_runtime"
+        normalized["supports_prompt_completion_surface"] = True
+        normalized["supports_state_conditioned_generation"] = bool(normalized.get("supports_decoder_surface", False))
+        self._tolbert_active_decoder_runtime_cache = normalized
+        return self._tolbert_active_decoder_runtime_cache
+
     def hybrid_scored_candidates(
         self,
         *,
@@ -341,15 +394,7 @@ class PolicyRuntimeSupport:
         if not self.config.use_prompt_proposals:
             self._prompt_policy_payload_cache = {}
             return self._prompt_policy_payload_cache
-        path = self.config.prompt_proposals_path
-        if not path.exists():
-            self._prompt_policy_payload_cache = {}
-            return self._prompt_policy_payload_cache
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._prompt_policy_payload_cache = {}
-            return self._prompt_policy_payload_cache
+        payload = self._resource_registry.load_json(subsystem_resource_id("policy"))
         self._prompt_policy_payload_cache = payload if isinstance(payload, dict) else {}
         return self._prompt_policy_payload_cache
 

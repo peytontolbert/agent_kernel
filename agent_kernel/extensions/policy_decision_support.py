@@ -396,6 +396,7 @@ def transition_preview(policy, state) -> dict[str, object]:
                 if isinstance(item, dict)
             ]
     candidates: list[str] = []
+    subgoal_plan = _hierarchical_subgoal_plan(policy, state, preview_summary)
     retrieval_guidance = policy._retrieval_guidance(state)
     for item in retrieval_guidance.get("recommended_command_spans", [])[:4]:
         command = str(item.get("command", "")).strip()
@@ -419,13 +420,25 @@ def transition_preview(policy, state) -> dict[str, object]:
         preview_score = int(effect.get("score", 0) or 0)
         preview_score += int(effect.get("predicted_progress_gain", 0) or 0)
         preview_score += int(effect.get("predicted_verifier_delta", 0) or 0)
+        preview_score += int(round(float(effect.get("latent_transition_score", 0.0) or 0.0)))
         preview_score -= _semantic_failure_repeat_penalty(effect)
         if str(governance.get("decision", "")).strip().lower() == "allow":
             preview_score += 1
         else:
             preview_score -= 3
+        subgoal_bonus, best_subgoal = _best_matching_subgoal(command, subgoal_plan)
+        preview_score += subgoal_bonus
         scored_candidates.append(((-preview_score, -len(command), command), command))
-        previews.append({"command": command, **effect, "governance": governance, "preview_score": preview_score})
+        previews.append(
+            {
+                "command": command,
+                **effect,
+                "governance": governance,
+                "preview_score": preview_score,
+                "hierarchical_bonus": subgoal_bonus,
+                "best_subgoal": best_subgoal,
+            }
+        )
     preview_limit = 5 if _preview_frontier_should_expand(state) else 3
     search_branches = _adaptive_transition_search(
         policy,
@@ -433,6 +446,7 @@ def transition_preview(policy, state) -> dict[str, object]:
         preview_summary=preview_summary,
         previews=previews,
         max_depth=3 if _preview_frontier_should_expand(state) else 2,
+        subgoal_plan=subgoal_plan,
     )
     branch_command_scores: dict[str, float] = {}
     for branch in search_branches:
@@ -489,6 +503,8 @@ def transition_preview(policy, state) -> dict[str, object]:
     return {
         "candidates": previews,
         "search_branches": search_branches,
+        "subgoal_plan": subgoal_plan,
+        "planning_mode": "hierarchical" if subgoal_plan else "bounded_sequence",
         "universe_id": state.universe_summary.get("universe_id", ""),
         "completion_ratio": preview_summary.get("completion_ratio", 0.0),
         "missing_expected_artifacts": list(preview_summary.get("missing_expected_artifacts", []))[:4],
@@ -527,7 +543,15 @@ def _semantic_prototype_preview_candidates(state) -> list[str]:
     for prototype in semantic_prototypes[:4]:
         if not isinstance(prototype, dict):
             continue
-        for raw in prototype.get("application_commands", []):
+        for key in ("instantiated_application_commands", "application_commands"):
+            values = prototype.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for raw in values:
+                command = str(raw).strip()
+                if command and command not in commands:
+                    commands.append(command)
+        for raw in dict(prototype.get("application_command_templates", {})).keys():
             command = str(raw).strip()
             if command and command not in commands:
                 commands.append(command)
@@ -553,7 +577,79 @@ def _preview_frontier_should_expand(state) -> bool:
     return False
 
 
-def _adaptive_transition_search(policy, state, *, preview_summary: dict[str, object], previews: list[dict[str, object]], max_depth: int) -> list[dict[str, object]]:
+def _hierarchical_subgoal_plan(policy, state, preview_summary: dict[str, object]) -> list[dict[str, object]]:
+    hotspots = policy.world_model.prioritized_long_horizon_hotspots(
+        state.task,
+        preview_summary,
+        latest_transition=state.latest_state_transition,
+        latent_state_summary=state.latent_state_summary,
+        active_subgoal=str(state.active_subgoal or "").strip(),
+        max_items=4,
+    )
+    if hotspots:
+        return [
+            {
+                "subgoal": str(item.get("subgoal", "")).strip(),
+                "path": str(item.get("path", "")).strip(),
+                "priority": int(item.get("priority", 0) or 0),
+                "signals": [
+                    str(signal).strip()
+                    for signal in item.get("signals", [])
+                    if str(signal).strip()
+                ],
+            }
+            for item in hotspots
+            if isinstance(item, dict) and str(item.get("subgoal", "")).strip()
+        ]
+    active_subgoal = str(state.active_subgoal or "").strip()
+    if not active_subgoal:
+        return []
+    diagnosis = state.active_subgoal_diagnosis()
+    return [
+        {
+            "subgoal": active_subgoal,
+            "path": str(diagnosis.get("path", "")).strip(),
+            "priority": 100,
+            "signals": [
+                str(signal).strip()
+                for signal in diagnosis.get("signals", [])
+                if str(signal).strip()
+            ],
+        }
+    ]
+
+
+def _hierarchical_subgoal_bonus(command: str, subgoal: dict[str, object]) -> int:
+    normalized_command = str(command).strip().lower()
+    if not normalized_command:
+        return 0
+    score = 0
+    path = str(subgoal.get("path", "")).strip().lower()
+    if path and path in normalized_command:
+        score += 6
+    for token in str(subgoal.get("subgoal", "")).strip().lower().split():
+        cleaned = token.strip(".,:;()[]{}\"'")
+        if len(cleaned) >= 4 and cleaned in normalized_command:
+            score += 1
+    if "state_regression" in {str(signal).strip() for signal in subgoal.get("signals", [])} and path and path in normalized_command:
+        score += 2
+    return score
+
+
+def _best_matching_subgoal(command: str, subgoal_plan: list[dict[str, object]]) -> tuple[int, str]:
+    best_score = 0
+    best_subgoal = ""
+    for subgoal in subgoal_plan:
+        if not isinstance(subgoal, dict):
+            continue
+        score = _hierarchical_subgoal_bonus(command, subgoal)
+        if score > best_score:
+            best_score = score
+            best_subgoal = str(subgoal.get("subgoal", "")).strip()
+    return best_score, best_subgoal
+
+
+def _adaptive_transition_search(policy, state, *, preview_summary: dict[str, object], previews: list[dict[str, object]], max_depth: int, subgoal_plan: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
     allowed_previews = [
         dict(item)
         for item in previews
@@ -561,24 +657,61 @@ def _adaptive_transition_search(policy, state, *, preview_summary: dict[str, obj
     ]
     if not allowed_previews:
         return []
+    normalized_subgoal_plan = [dict(item) for item in (subgoal_plan or []) if isinstance(item, dict)]
     beam_width = 3 if max_depth >= 3 else 2
     frontier: list[dict[str, object]] = []
+    selected_seed_previews: list[dict[str, object]] = []
+    seen_seed_commands: set[str] = set()
+    if normalized_subgoal_plan:
+        for subgoal in normalized_subgoal_plan[:beam_width]:
+            ranked = sorted(
+                allowed_previews,
+                key=lambda item: (
+                    -_hierarchical_subgoal_bonus(str(item.get("command", "")), subgoal),
+                    -int(item.get("preview_score", 0) or 0),
+                    str(item.get("command", "")),
+                ),
+            )
+            if not ranked:
+                continue
+            selected = dict(ranked[0])
+            command = str(selected.get("command", "")).strip()
+            if not command or command in seen_seed_commands:
+                continue
+            seen_seed_commands.add(command)
+            selected_seed_previews.append(selected)
     for preview in sorted(
         allowed_previews,
         key=lambda item: (-int(item.get("preview_score", 0) or 0), str(item.get("command", ""))),
-    )[:beam_width]:
+    ):
+        command = str(preview.get("command", "")).strip()
+        if not command or command in seen_seed_commands:
+            continue
+        seen_seed_commands.add(command)
+        selected_seed_previews.append(dict(preview))
+        if len(selected_seed_previews) >= beam_width:
+            break
+    for preview in selected_seed_previews[:beam_width]:
         summary_after = _rolled_summary_after_effect(preview_summary, preview)
         sequence_effect = policy.world_model.simulate_command_sequence_effect(
             preview_summary,
             [str(preview.get("command", "")).strip()],
         )
+        subgoal_bonus, best_subgoal = _best_matching_subgoal(str(preview.get("command", "")), normalized_subgoal_plan)
+        failure_repeat_penalty = float(_semantic_failure_repeat_penalty(preview))
+        cumulative_score = float(sequence_effect.get("score", preview.get("preview_score", 0)) or 0.0)
+        cumulative_score += float(sequence_effect.get("latent_transition_score", 0.0) or 0.0)
+        cumulative_score += float(subgoal_bonus)
+        cumulative_score -= failure_repeat_penalty
         frontier.append(
             {
                 "sequence": [str(preview.get("command", "")).strip()],
-                "cumulative_score": float(sequence_effect.get("score", preview.get("preview_score", 0)) or 0.0),
-                "normalized_score": float(sequence_effect.get("score", preview.get("preview_score", 0)) or 0.0),
+                "cumulative_score": cumulative_score,
+                "normalized_score": cumulative_score,
                 "depth": 1,
                 "summary": summary_after,
+                "subgoal": best_subgoal,
+                "failure_repeat_penalty": failure_repeat_penalty,
             }
         )
     completed = [dict(item) for item in frontier]
@@ -597,26 +730,36 @@ def _adaptive_transition_search(policy, state, *, preview_summary: dict[str, obj
                 score = float(effect.get("score", 0) or 0)
                 score += float(effect.get("predicted_progress_gain", 0.0) or 0.0)
                 score += float(effect.get("predicted_verifier_delta", 0.0) or 0.0)
+                score += float(effect.get("latent_transition_score", 0.0) or 0.0)
                 score -= float(_semantic_failure_repeat_penalty(effect))
                 if str(governance.get("decision", "")).strip().lower() == "allow":
                     score += 1.0
                 else:
                     score -= 3.0
-                candidates.append((score, command, effect))
-            for score, command, effect in sorted(candidates, key=lambda item: (-item[0], item[1]))[:beam_width]:
+                subgoal_bonus, best_subgoal = _best_matching_subgoal(command, normalized_subgoal_plan)
+                score += float(subgoal_bonus)
+                candidates.append((score, command, effect, best_subgoal))
+            for score, command, effect, best_subgoal in sorted(candidates, key=lambda item: (-item[0], item[1]))[:beam_width]:
                 rolled_summary = _rolled_summary_after_effect(branch_summary, effect)
                 sequence = [*branch.get("sequence", []), command]
                 sequence_effect = policy.world_model.simulate_command_sequence_effect(
                     preview_summary,
                     sequence,
                 )
+                failure_repeat_penalty = float(branch.get("failure_repeat_penalty", 0.0) or 0.0)
+                failure_repeat_penalty += float(_semantic_failure_repeat_penalty(effect))
+                cumulative_score = float(sequence_effect.get("score", 0.0) or 0.0)
+                cumulative_score += float(sequence_effect.get("latent_transition_score", 0.0) or 0.0)
+                cumulative_score -= failure_repeat_penalty
                 next_branch = {
                     "sequence": sequence,
-                    "cumulative_score": float(sequence_effect.get("score", 0.0) or 0.0),
-                    "normalized_score": float(sequence_effect.get("score", 0.0) or 0.0)
+                    "cumulative_score": cumulative_score,
+                    "normalized_score": cumulative_score
                     / float(max(1, len(sequence))),
                     "depth": int(branch.get("depth", 1) or 1) + 1,
                     "summary": rolled_summary,
+                    "subgoal": best_subgoal or str(branch.get("subgoal", "")).strip(),
+                    "failure_repeat_penalty": failure_repeat_penalty,
                 }
                 next_frontier.append(next_branch)
                 completed.append(dict(next_branch))
@@ -635,6 +778,7 @@ def _adaptive_transition_search(policy, state, *, preview_summary: dict[str, obj
             "cumulative_score": round(float(item.get("cumulative_score", 0.0) or 0.0), 4),
             "normalized_score": round(float(item.get("normalized_score", 0.0) or 0.0), 4),
             "depth": int(item.get("depth", 1) or 1),
+            "subgoal": str(item.get("subgoal", "")).strip(),
         }
         for item in sorted(
             completed,

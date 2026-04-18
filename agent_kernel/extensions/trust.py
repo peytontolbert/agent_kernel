@@ -136,7 +136,7 @@ def load_unattended_reports(
 ) -> list[dict[str, Any]]:
     reports: list[tuple[datetime, dict[str, Any]]] = []
     family_filter = {family for family in (benchmark_families or set()) if family}
-    for path in sorted(reports_dir.glob("*.json")):
+    for path in _iter_unattended_report_paths(reports_dir):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -154,6 +154,19 @@ def load_unattended_reports(
     if max_reports > 0:
         payloads = payloads[:max_reports]
     return payloads
+
+
+def _iter_unattended_report_paths(reports_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in reports_dir.rglob("*.json"):
+        try:
+            relative = path.relative_to(reports_dir)
+        except ValueError:
+            relative = path
+        if "generated_failure_seed" in relative.parts:
+            continue
+        paths.append(path)
+    return sorted(paths)
 
 
 def load_improvement_campaign_reports(

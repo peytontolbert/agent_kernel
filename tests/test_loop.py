@@ -4403,6 +4403,58 @@ def test_kernel_uses_deterministic_fallback_after_retryable_tolbert_compile_fail
     assert (config.workspace_root / "tolbert_failure_fallback" / "done.txt").read_text(encoding="utf-8") == "done\n"
 
 
+def test_kernel_strict_live_llm_mode_continues_without_tolbert_context_after_retryable_compile_failure(tmp_path):
+    class RetryableTolbertContextProvider:
+        def compile(self, state):
+            del state
+            raise RuntimeError(
+                "TOLBERT service exited before startup ready with code 1. "
+                "checkpoint mismatch"
+            )
+
+    class LiveLLMClient:
+        def create_decision(self, **kwargs):
+            del kwargs
+            return {
+                "thought": "continue without Tolbert context",
+                "action": "code_execute",
+                "content": "printf 'done\\n' > done.txt",
+                "done": False,
+            }
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        asi_coding_require_live_llm=True,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=5,
+    )
+    task = TaskSpec(
+        task_id="tolbert_failure_live_llm",
+        prompt="complete a task",
+        workspace_subdir="tolbert_failure_live_llm",
+        expected_files=["done.txt"],
+        expected_file_contents={"done.txt": "done\n"},
+        max_steps=5,
+    )
+    policy = LLMDecisionPolicy(
+        LiveLLMClient(),
+        context_provider=RetryableTolbertContextProvider(),
+        config=config,
+    )
+
+    episode = AgentKernel(config=config, policy=policy).run_task(task)
+
+    assert episode.success is True
+    assert episode.termination_reason == "success"
+    assert episode.steps[0].decision_source == "llm"
+    assert episode.steps[0].failure_origin == ""
+    assert episode.steps[0].failure_signals == []
+    assert episode.steps[0].proposal_metadata["context_compile_degraded"]["reason"] == "tolbert_startup_failure"
+    assert (config.workspace_root / "tolbert_failure_live_llm" / "done.txt").read_text(encoding="utf-8") == "done\n"
+
+
 def test_kernel_uses_progressive_deterministic_fallback_for_long_horizon_retryable_tolbert_failure(tmp_path):
     class RetryableTolbertContextProvider:
         def compile(self, state):

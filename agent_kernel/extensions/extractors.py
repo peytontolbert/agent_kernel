@@ -11,6 +11,16 @@ from ..schemas import EpisodeRecord
 from ..tasking.task_bank import TaskBank
 
 
+def _is_llm_generated_decision_source(decision_source: str) -> bool:
+    normalized = str(decision_source).strip()
+    return normalized == "llm"
+
+
+def _is_bounded_decoder_generated_decision_source(decision_source: str) -> bool:
+    normalized = str(decision_source).strip()
+    return normalized.endswith("_decoder")
+
+
 def render_episode_document(episode: EpisodeRecord) -> dict[str, object]:
     document = episode.to_dict()
     summary = build_episode_summary(episode)
@@ -26,7 +36,9 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         if step.action == "code_execute" and step.content
     ]
     execution_source_counts = {
+        "decoder_generated": 0,
         "llm_generated": 0,
+        "bounded_decoder_generated": 0,
         "synthetic_plan": 0,
         "deterministic_or_other": 0,
     }
@@ -34,8 +46,12 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         if step.action != "code_execute" or not step.content:
             continue
         decision_source = str(step.decision_source).strip()
-        if decision_source == "llm":
+        if _is_llm_generated_decision_source(decision_source):
+            execution_source_counts["decoder_generated"] += 1
             execution_source_counts["llm_generated"] += 1
+        elif _is_bounded_decoder_generated_decision_source(decision_source):
+            execution_source_counts["decoder_generated"] += 1
+            execution_source_counts["bounded_decoder_generated"] += 1
         elif decision_source == "synthetic_edit_plan_direct":
             execution_source_counts["synthetic_plan"] += 1
         else:
@@ -91,7 +107,7 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         "executed_commands": executed_commands,
         "execution_source_summary": {
             **execution_source_counts,
-            "total_executed_commands": sum(execution_source_counts.values()),
+            "total_executed_commands": len(executed_commands),
         },
         "failure_types": failure_types,
         "failure_signals": failure_signals,

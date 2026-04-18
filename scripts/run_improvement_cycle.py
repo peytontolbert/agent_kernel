@@ -35,6 +35,11 @@ from agent_kernel.improvement import (
 )
 from agent_kernel.llm import VLLMClient, _extract_json_object
 from agent_kernel.ops.runtime_supervision import atomic_write_json, terminate_process_tree
+from agent_kernel.ops.vllm_runtime import ensure_vllm_runtime
+from agent_kernel.reflection import build_reflection_record
+from agent_kernel.resource_registry import runtime_resource_registry
+from agent_kernel.resource_types import subsystem_resource_id
+from agent_kernel.selection import build_selection_record
 from agent_kernel.strategy_memory import record_pending_strategy_node
 from agent_kernel.extensions.strategy.subsystems import (
     active_artifact_path_for_subsystem,
@@ -75,6 +80,7 @@ _PLANNING_STAGE_TIMEOUT_SECONDS = max(
 )
 _OBSERVE_HYPOTHESIS_MAX_SUBSYSTEMS = 3
 _OBSERVE_HYPOTHESIS_BONUS_CAP = 0.03
+_OBSERVE_HYPOTHESIS_MAX_TOKENS = 256
 
 
 class _PlanningStageTimeout(RuntimeError):
@@ -336,6 +342,15 @@ def _generate_observe_hypothesis(
             status="skipped",
             reason="observe_hypothesis_requires_vllm_and_ranked_candidates",
         )
+    runtime_status = ensure_vllm_runtime(config)
+    if not runtime_status.ready:
+        return _normalize_observe_hypothesis(
+            {},
+            allowed_subsystems=allowed_subsystems,
+            provider=provider,
+            status="error",
+            reason=runtime_status.detail,
+        )
     _progress(progress_label, "phase=observe_hypothesis start provider=vllm")
     client = VLLMClient(
         host=config.vllm_host,
@@ -353,6 +368,7 @@ def _generate_observe_hypothesis(
             ),
             prompt=_observe_hypothesis_prompt(metrics=metrics, ranked_experiments=ranked_experiments),
             use_json_schema=False,
+            max_tokens=_OBSERVE_HYPOTHESIS_MAX_TOKENS,
         )
         payload = _extract_llm_json_payload(data)
         normalized = _normalize_observe_hypothesis(
@@ -638,6 +654,7 @@ def _generate_candidate_artifact(
     candidate_artifact_path_obj: Path,
     prior_retained_cycle_id: str,
     prior_retained_snapshot_path: Path | None,
+    protocol_context: dict[str, object] | None = None,
     progress_label: str | None = None,
 ) -> dict[str, object]:
     generation_kwargs = _variant_generation_kwargs(variant, capability_modules_path=config.capability_modules_path)
@@ -680,6 +697,7 @@ def _generate_candidate_artifact(
             prior_active_artifact_path=prior_active_artifact_path,
             prior_retained_cycle_id=prior_retained_cycle_id or None,
             prior_retained_artifact_snapshot_path=prior_retained_snapshot_path,
+            extra_context=protocol_context,
             runtime_config=config,
         )
     return {
@@ -718,6 +736,40 @@ def _preview_selection_key(entry: dict[str, object]) -> tuple[int, int, float, f
         step_delta,
         variant_score,
     )
+
+
+def _search_budget_payload(budget: ImprovementSearchBudget) -> dict[str, object]:
+    return {
+        "width": budget.width,
+        "max_width": budget.max_width,
+        "strategy": budget.strategy,
+        "top_score": budget.top_score,
+        "selected_ids": list(budget.selected_ids),
+        "reasons": list(budget.reasons),
+    }
+
+
+def _protocol_trace_summary(
+    *,
+    reflection_payload: dict[str, object] | None = None,
+    selection_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    reflection = reflection_payload if isinstance(reflection_payload, dict) else {}
+    selection = selection_payload if isinstance(selection_payload, dict) else {}
+    resource_id = str(selection.get("resource_id", "") or reflection.get("resource_id", "")).strip()
+    resource_kind = str(selection.get("resource_kind", "") or reflection.get("resource_kind", "")).strip()
+    if resource_id:
+        payload["resource_id"] = resource_id
+    if resource_kind:
+        payload["resource_kind"] = resource_kind
+    reflection_id = str(reflection.get("reflection_id", "")).strip()
+    if reflection_id:
+        payload["reflection_id"] = reflection_id
+    selection_id = str(selection.get("selection_id", "")).strip()
+    if selection_id:
+        payload["selection_id"] = selection_id
+    return payload
 
 
 def _comparison_task_limit(config: KernelConfig, args: argparse.Namespace) -> int | None:
@@ -894,6 +946,7 @@ def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> 
             priority_benchmark_family_weights[family] = weight
     if priority_benchmark_family_weights:
         flags["priority_benchmark_family_weights"] = priority_benchmark_family_weights
+    flags["write_unattended_reports"] = True
     return flags
 
 
@@ -917,13 +970,19 @@ def _priority_family_allocation_summary(metrics, eval_kwargs: dict[str, object])
     raw_weights = eval_kwargs.get("priority_benchmark_family_weights", {})
     normalized_weights: dict[str, float] = {}
     if isinstance(raw_weights, dict):
+        explicit_positive_weights: dict[str, float] = {}
         for family in priority_families:
             try:
                 weight = float(raw_weights.get(family, 0.0) or 0.0)
             except (TypeError, ValueError):
                 weight = 0.0
             if weight > 0.0:
-                normalized_weights[family] = weight
+                explicit_positive_weights[family] = weight
+        if explicit_positive_weights:
+            normalized_weights = {
+                family: float(explicit_positive_weights.get(family, 0.0) or 0.0)
+                for family in priority_families
+            }
     if not normalized_weights:
         normalized_weights = {family: 1.0 for family in priority_families}
     total_weight = sum(normalized_weights.values())
@@ -1223,6 +1282,23 @@ def _partial_summary_metric_fields(summary: dict[str, object], *, current_task_i
     }
 
 
+def _resolve_reduced_primary_retry_task_limit(
+    *,
+    eval_kwargs: dict[str, object],
+    partial_summary: dict[str, object],
+) -> int:
+    requested_task_limit = max(0, int(eval_kwargs.get("task_limit", 0) or 0))
+    if requested_task_limit <= 1:
+        return 0
+    phase = str(partial_summary.get("phase", "")).strip()
+    if phase and phase != "primary":
+        return 0
+    completed_primary_tasks = max(0, int(partial_summary.get("completed_primary_tasks", 0) or 0))
+    if completed_primary_tasks <= 0 or completed_primary_tasks >= requested_task_limit:
+        return 0
+    return max(1, min(requested_task_limit - 1, completed_primary_tasks))
+
+
 def _without_generated_curriculum(eval_kwargs: dict[str, object]) -> dict[str, object]:
     degraded = dict(eval_kwargs)
     degraded["include_generated"] = False
@@ -1242,6 +1318,27 @@ def _is_retryable_tolbert_startup_failure(error_text: str) -> bool:
     if not normalized:
         return False
     return "tolbert service failed to become ready" in normalized or "tolbert service exited before startup ready" in normalized
+
+
+def _is_retryable_tolbert_context_timeout(
+    timeout_reason: str,
+    *,
+    timeout_budget_source: str = "",
+    last_progress_line: str = "",
+    partial_summary: dict[str, object] | None = None,
+) -> bool:
+    normalized_reason = str(timeout_reason).strip().lower()
+    normalized_budget_source = str(timeout_budget_source).strip().lower()
+    normalized_progress_line = str(last_progress_line).strip().lower()
+    summary = partial_summary if isinstance(partial_summary, dict) else {}
+    summary_subphase = str(summary.get("current_task_step_subphase", "")).strip().lower()
+    if normalized_budget_source == "prestep_subphase:tolbert_query":
+        return True
+    if summary_subphase == "tolbert_query":
+        return True
+    if "subphase=tolbert_query" in normalized_progress_line:
+        return True
+    return "tolbert_query" in normalized_reason and "exceeded max runtime" in normalized_reason
 
 
 def _run_observation_eval(
@@ -1605,6 +1702,100 @@ def _record_finalize_failure(
     return "reject", reason
 
 
+def _record_candidate_generation_failure(
+    *,
+    config: KernelConfig,
+    planner: ImprovementPlanner,
+    cycle_id: str,
+    subsystem: str,
+    artifact_path: Path,
+    active_artifact_path: Path,
+    exc: Exception,
+    progress_label: str | None,
+    protocol_match_id: str,
+    campaign_index: int,
+    campaign_width: int,
+    variant_rank: int,
+    variant_width: int,
+    variant,
+    strategy_candidate_id: str,
+    strategy_candidate_kind: str,
+    strategy_origin: str,
+    search_strategy: str,
+    scope_id: str,
+    protocol_trace: dict[str, object] | None = None,
+) -> str:
+    reason = (
+        f"candidate_generation_exception:{exc.__class__.__name__}:"
+        f"{str(exc).strip() or exc.__class__.__name__}"
+    )
+    metrics_summary = {
+        "protocol": "autonomous",
+        "protocol_match_id": str(protocol_match_id).strip(),
+        "candidate_generation_exception": True,
+        "exception_class": exc.__class__.__name__,
+        "exception_message": str(exc).strip(),
+        "campaign_index": campaign_index,
+        "campaign_width": campaign_width,
+        "variant_rank": variant_rank,
+        "variant_width": variant_width,
+        "selected_variant_id": str(getattr(variant, "variant_id", "")).strip(),
+        "selected_variant_score": float(getattr(variant, "score", 0.0) or 0.0),
+        "search_strategy": search_strategy,
+        "strategy_candidate_id": strategy_candidate_id,
+        "strategy_candidate_kind": strategy_candidate_kind,
+        "strategy_origin": strategy_origin,
+        "scoped_run": bool(scope_id),
+        "scope_id": str(scope_id).strip(),
+        "reconciled_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if isinstance(protocol_trace, dict):
+        metrics_summary.update(protocol_trace)
+    planner.append_cycle_record(
+        config.improvement_cycles_path,
+        ImprovementCycleRecord(
+            cycle_id=cycle_id,
+            state="reject",
+            subsystem=subsystem,
+            action="generate_candidate_artifact",
+            artifact_path=str(active_artifact_path),
+            artifact_kind="candidate_generation_failure",
+            reason=reason,
+            metrics_summary=metrics_summary,
+            strategy_candidate_id=strategy_candidate_id,
+            strategy_candidate_kind=strategy_candidate_kind,
+            strategy_origin=strategy_origin,
+            candidate_artifact_path=str(artifact_path),
+            active_artifact_path=str(active_artifact_path),
+        ),
+        govern_exports=False,
+    )
+    planner.append_cycle_record(
+        config.improvement_cycles_path,
+        ImprovementCycleRecord(
+            cycle_id=cycle_id,
+            state="record",
+            subsystem=subsystem,
+            action="persist_retention_outcome",
+            artifact_path=str(active_artifact_path),
+            artifact_kind="candidate_generation_failure",
+            reason="persisted fail-closed outcome after candidate generation exception",
+            metrics_summary=metrics_summary,
+            strategy_candidate_id=strategy_candidate_id,
+            strategy_candidate_kind=strategy_candidate_kind,
+            strategy_origin=strategy_origin,
+            candidate_artifact_path=str(artifact_path),
+            active_artifact_path=str(active_artifact_path),
+        ),
+        govern_exports=False,
+    )
+    _progress(
+        progress_label,
+        f"variant generate failed closed subsystem={subsystem} exception={exc.__class__.__name__}",
+    )
+    return reason
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", default=None)
@@ -1719,6 +1910,8 @@ def main() -> None:
     observation_retry_warning = ""
     observation_retried_without_tolbert_context = False
     observation_tolbert_retry_warning = ""
+    observation_primary_task_limit_retry_warning = ""
+    observation_primary_task_limit_retry_applied = 0
     initial_observation_timeout_reason = observation_timeout_reason
     initial_observation_last_progress_line = observation_last_progress_line
     initial_observation_last_progress_phase = observation_last_progress_phase
@@ -1774,6 +1967,58 @@ def main() -> None:
     if (
         metrics is None
         and observation_timed_out
+        and bool(config.use_tolbert_context)
+        and remaining_observation_seconds > 0.0
+        and _is_retryable_tolbert_context_timeout(
+            observation_timeout_reason,
+            timeout_budget_source=observation_current_task_timeout_budget_source,
+            last_progress_line=observation_last_progress_line,
+            partial_summary=observation_partial_summary,
+        )
+    ):
+        observation_retried_without_tolbert_context = True
+        observation_tolbert_retry_warning = (
+            "retrying observation without tolbert context after tolbert query timeout "
+            f"within remaining budget {remaining_observation_seconds:.1f}s"
+        )
+        _progress(progress_label, f"phase=observe retry={observation_tolbert_retry_warning}")
+        observation_result = _run_observation_eval(
+            config=replace(config, use_tolbert_context=False),
+            eval_kwargs=eval_kwargs,
+            progress_label=progress_label,
+            max_observation_seconds=remaining_observation_seconds,
+        )
+        observation_elapsed_seconds = round(time.monotonic() - observation_started_monotonic, 4)
+        observation_completed_at = datetime.now(timezone.utc)
+        metrics = observation_result.get("metrics")
+        observation_timed_out = bool(observation_result.get("timed_out"))
+        observation_timeout_reason = str(observation_result.get("timeout_reason", "")).strip()
+        observation_error = str(observation_result.get("error", "")).strip()
+        observation_last_progress_line = str(observation_result.get("last_progress_line", "")).strip()
+        observation_last_progress_phase = str(observation_result.get("last_progress_phase", "")).strip()
+        observation_last_progress_task_id = str(observation_result.get("last_progress_task_id", "")).strip()
+        observation_last_progress_benchmark_family = str(
+            observation_result.get("last_progress_benchmark_family", "")
+        ).strip()
+        observation_partial_summary = (
+            dict(observation_result.get("partial_summary", {}))
+            if isinstance(observation_result.get("partial_summary", {}), dict)
+            else {}
+        )
+        observation_current_task_timeout_budget_seconds = float(
+            observation_result.get("current_task_timeout_budget_seconds", 0.0) or 0.0
+        )
+        observation_current_task_timeout_budget_source = str(
+            observation_result.get("current_task_timeout_budget_source", "none")
+        ).strip() or "none"
+        remaining_observation_seconds = (
+            max(0.0, float(max_observation_seconds) - float(observation_elapsed_seconds))
+            if max_observation_seconds > 0.0
+            else 0.0
+        )
+    if (
+        metrics is None
+        and observation_timed_out
         and (bool(eval_kwargs.get("include_generated", False)) or bool(eval_kwargs.get("include_failure_generated", False)))
         and remaining_observation_seconds > 0.0
     ):
@@ -1788,6 +2033,52 @@ def main() -> None:
             eval_kwargs=_without_generated_curriculum(eval_kwargs),
             progress_label=progress_label,
             max_observation_seconds=remaining_observation_seconds,
+        )
+        observation_elapsed_seconds = round(time.monotonic() - observation_started_monotonic, 4)
+        observation_completed_at = datetime.now(timezone.utc)
+        metrics = observation_result.get("metrics")
+        observation_timed_out = bool(observation_result.get("timed_out"))
+        observation_timeout_reason = str(observation_result.get("timeout_reason", "")).strip()
+        observation_error = str(observation_result.get("error", "")).strip()
+        observation_last_progress_line = str(observation_result.get("last_progress_line", "")).strip()
+        observation_last_progress_phase = str(observation_result.get("last_progress_phase", "")).strip()
+        observation_last_progress_task_id = str(observation_result.get("last_progress_task_id", "")).strip()
+        observation_last_progress_benchmark_family = str(
+            observation_result.get("last_progress_benchmark_family", "")
+        ).strip()
+        observation_partial_summary = (
+            dict(observation_result.get("partial_summary", {}))
+            if isinstance(observation_result.get("partial_summary", {}), dict)
+            else {}
+        )
+        observation_current_task_timeout_budget_seconds = float(
+            observation_result.get("current_task_timeout_budget_seconds", 0.0) or 0.0
+        )
+        observation_current_task_timeout_budget_source = str(
+            observation_result.get("current_task_timeout_budget_source", "none")
+        ).strip() or "none"
+    reduced_primary_task_limit = _resolve_reduced_primary_retry_task_limit(
+        eval_kwargs=eval_kwargs,
+        partial_summary=observation_partial_summary,
+    )
+    if metrics is None and observation_timed_out and reduced_primary_task_limit > 0:
+        observation_primary_task_limit_retry_applied = reduced_primary_task_limit
+        observation_primary_task_limit_retry_warning = (
+            "retrying observation with reduced primary task_limit "
+            f"{reduced_primary_task_limit}/{int(eval_kwargs.get('task_limit', 0) or 0)} "
+            f"after timeout with fresh observation budget {max_observation_seconds:.1f}s"
+        )
+        retry_eval_kwargs = dict(eval_kwargs)
+        retry_eval_kwargs["task_limit"] = reduced_primary_task_limit
+        if observation_retried_without_generated_curriculum:
+            retry_eval_kwargs = _without_generated_curriculum(retry_eval_kwargs)
+        retry_config = replace(config, use_tolbert_context=False) if observation_retried_without_tolbert_context else config
+        _progress(progress_label, f"phase=observe retry={observation_primary_task_limit_retry_warning}")
+        observation_result = _run_observation_eval(
+            config=retry_config,
+            eval_kwargs=retry_eval_kwargs,
+            progress_label=progress_label,
+            max_observation_seconds=max_observation_seconds,
         )
         observation_elapsed_seconds = round(time.monotonic() - observation_started_monotonic, 4)
         observation_completed_at = datetime.now(timezone.utc)
@@ -1827,6 +2118,13 @@ def main() -> None:
             f"{initial_observation_timeout_reason}; recovered by retrying without tolbert context"
             if initial_observation_timeout_reason
             else "recovered by retrying without tolbert context"
+        )
+    if metrics is not None and observation_primary_task_limit_retry_applied > 0:
+        observation_warning = (
+            f"{initial_observation_timeout_reason}; recovered by retrying with reduced primary task_limit "
+            f"{observation_primary_task_limit_retry_applied}"
+            if initial_observation_timeout_reason
+            else f"recovered by retrying with reduced primary task_limit {observation_primary_task_limit_retry_applied}"
         )
     if not observation_warning and observation_budget_exceeded:
         observation_warning = (
@@ -1881,6 +2179,8 @@ def main() -> None:
                     "observation_retry_warning": observation_retry_warning,
                     "observation_retried_without_tolbert_context": observation_retried_without_tolbert_context,
                     "observation_tolbert_retry_warning": observation_tolbert_retry_warning,
+                    "observation_primary_task_limit_retry_warning": observation_primary_task_limit_retry_warning,
+                    "observation_primary_task_limit_retry_applied": observation_primary_task_limit_retry_applied,
                     "observation_initial_timeout_reason": initial_observation_timeout_reason,
                     "observation_initial_last_progress_line": initial_observation_last_progress_line,
                     "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
@@ -1996,6 +2296,11 @@ def main() -> None:
         _progress(progress_label, f"campaign_plan start subsystem={target.subsystem}")
         cycle_id = _cycle_id_for_experiment(target.subsystem)
         active_artifact_path_obj = active_artifact_path_for_subsystem(config, target.subsystem)
+        resource_registry = runtime_resource_registry(config)
+        resource_id = subsystem_resource_id(target.subsystem)
+        expected_artifact_kind = ""
+        if resource_registry.has(resource_id):
+            expected_artifact_kind = str(resource_registry.descriptor(resource_id).artifact_kind).strip()
         target_portfolio = dict(target.evidence.get("portfolio", {})) if isinstance(target.evidence, dict) else {}
         target_strategy = dict(target.evidence.get("strategy_candidate", {})) if isinstance(target.evidence, dict) else {}
         campaign_breadth_pressure = float(target_portfolio.get("campaign_breadth_pressure", 0.0) or 0.0)
@@ -2044,6 +2349,47 @@ def main() -> None:
             },
         )
         target_strategy["strategy_node_id"] = pending_strategy_node.strategy_node_id
+        campaign_budget_payload = _search_budget_payload(campaign_budget)
+        variant_budget_payload = _search_budget_payload(variant_budget)
+        reflection_payload = build_reflection_record(
+            cycle_id=cycle_id,
+            target_subsystem=target.subsystem,
+            reason=target.reason,
+            metrics=metrics,
+            evidence=dict(target.evidence) if isinstance(target.evidence, dict) else {},
+            observe_hypothesis=observe_hypothesis,
+            strategy_candidate=target_strategy,
+            resource_registry=resource_registry,
+        ).to_dict()
+        selection_payload = build_selection_record(
+            cycle_id=cycle_id,
+            target_subsystem=target.subsystem,
+            reason=target.reason,
+            variant_id=primary_variant.variant_id,
+            variant_description=primary_variant.description,
+            variant_expected_gain=primary_variant.expected_gain,
+            variant_estimated_cost=primary_variant.estimated_cost,
+            variant_score=primary_variant.score,
+            variant_controls=primary_variant.controls,
+            generation_kwargs=_variant_generation_kwargs(
+                primary_variant,
+                capability_modules_path=config.capability_modules_path,
+            ),
+            expected_artifact_kind=expected_artifact_kind,
+            strategy_candidate=target_strategy,
+            campaign_index=index,
+            campaign_width=len(campaign),
+            variant_rank=1,
+            variant_width=len(selected_variants),
+            search_strategy="adaptive_history" if args.adaptive_search else "fixed_width",
+            campaign_budget=campaign_budget_payload,
+            variant_budget=variant_budget_payload,
+            resource_registry=resource_registry,
+        ).to_dict()
+        protocol_trace_summary = _protocol_trace_summary(
+            reflection_payload=reflection_payload,
+            selection_payload=selection_payload,
+        )
 
         planner.append_cycle_record(
             config.improvement_cycles_path,
@@ -2083,22 +2429,8 @@ def main() -> None:
                     "requested_variant_width": max(1, args.variant_width),
                     "priority_family_allocation_summary": priority_family_allocation_summary,
                     "observe_hypothesis": observe_hypothesis,
-                    "campaign_budget": {
-                        "width": campaign_budget.width,
-                        "max_width": campaign_budget.max_width,
-                        "strategy": campaign_budget.strategy,
-                        "top_score": campaign_budget.top_score,
-                        "selected_ids": campaign_budget.selected_ids,
-                        "reasons": campaign_budget.reasons,
-                    },
-                    "variant_budget": {
-                        "width": variant_budget.width,
-                        "max_width": variant_budget.max_width,
-                        "strategy": variant_budget.strategy,
-                        "top_score": variant_budget.top_score,
-                        "selected_ids": variant_budget.selected_ids,
-                        "reasons": variant_budget.reasons,
-                    },
+                    "campaign_budget": campaign_budget_payload,
+                    "variant_budget": variant_budget_payload,
                     "variant_planning_info": dict(variant_planning_info),
                     "campaign_breadth_pressure": campaign_breadth_pressure,
                     "campaign_recent_activity": dict(target_portfolio.get("recent_activity", {}))
@@ -2150,13 +2482,15 @@ def main() -> None:
                     "observation_last_progress_phase": observation_last_progress_phase,
                     "observation_last_progress_task_id": observation_last_progress_task_id,
                     "observation_last_progress_benchmark_family": observation_last_progress_benchmark_family,
-                "observation_retried_without_generated_curriculum": observation_retried_without_generated_curriculum,
-                "observation_retry_warning": observation_retry_warning,
-                "observation_retried_without_tolbert_context": observation_retried_without_tolbert_context,
-                "observation_tolbert_retry_warning": observation_tolbert_retry_warning,
-                "observation_initial_timeout_reason": initial_observation_timeout_reason,
-                "observation_initial_last_progress_line": initial_observation_last_progress_line,
-                "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
+                    "observation_retried_without_generated_curriculum": observation_retried_without_generated_curriculum,
+                    "observation_retry_warning": observation_retry_warning,
+                    "observation_retried_without_tolbert_context": observation_retried_without_tolbert_context,
+                    "observation_tolbert_retry_warning": observation_tolbert_retry_warning,
+                    "observation_primary_task_limit_retry_warning": observation_primary_task_limit_retry_warning,
+                    "observation_primary_task_limit_retry_applied": observation_primary_task_limit_retry_applied,
+                    "observation_initial_timeout_reason": initial_observation_timeout_reason,
+                    "observation_initial_last_progress_line": initial_observation_last_progress_line,
+                    "observation_initial_last_progress_phase": initial_observation_last_progress_phase,
                     "observation_initial_last_progress_task_id": initial_observation_last_progress_task_id,
                     "observation_initial_last_progress_benchmark_family": initial_observation_last_progress_benchmark_family,
                     "observation_current_task_timeout_budget_seconds": observation_current_task_timeout_budget_seconds,
@@ -2166,6 +2500,7 @@ def main() -> None:
                     "requested_task_limit": requested_task_limit,
                     "observation_task_limit": observation_task_limit,
                     "comparison_task_limit": comparison_task_limit or 0,
+                    **protocol_trace_summary,
                     **_partial_summary_metric_fields(
                         observation_partial_summary,
                         current_task_id=observation_last_progress_task_id,
@@ -2178,13 +2513,41 @@ def main() -> None:
             config.improvement_cycles_path,
             ImprovementCycleRecord(
                 cycle_id=cycle_id,
+                state="reflect",
+                subsystem=target.subsystem,
+                action="analyze_failure_surface",
+                artifact_path=str(active_artifact_path_obj),
+                artifact_kind="reflection_record",
+                reason=str(
+                    dict(reflection_payload.get("hypothesis", {})).get("rationale", "")
+                    or target.reason
+                ).strip(),
+                metrics_summary={
+                    **protocol_trace_summary,
+                    "reflection": reflection_payload,
+                },
+                active_artifact_path=str(active_artifact_path_obj),
+                strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                strategy_origin=str(
+                    target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                ).strip(),
+            ),
+            govern_exports=False,
+        )
+        planner.append_cycle_record(
+            config.improvement_cycles_path,
+            ImprovementCycleRecord(
+                cycle_id=cycle_id,
                 state="select",
                 subsystem=target.subsystem,
-                action="choose_target",
-                artifact_path="",
-                artifact_kind="improvement_target",
-                reason=target.reason,
+                action="plan_resource_edit",
+                artifact_path=str(active_artifact_path_obj),
+                artifact_kind="selection_record",
+                reason=str(selection_payload.get("rationale", "") or target.reason).strip(),
                 metrics_summary={
+                    **protocol_trace_summary,
+                    "selection": selection_payload,
                     "priority": target.priority,
                     "strategy_candidate": target_strategy,
                     "strategy_node_id": str(target_strategy.get("strategy_node_id", "")).strip(),
@@ -2264,22 +2627,8 @@ def main() -> None:
                     "campaign_strategy": "portfolio_history",
                     "requested_campaign_width": max(1, args.campaign_width),
                     "requested_variant_width": max(1, args.variant_width),
-                    "campaign_budget": {
-                        "width": campaign_budget.width,
-                        "max_width": campaign_budget.max_width,
-                        "strategy": campaign_budget.strategy,
-                        "top_score": campaign_budget.top_score,
-                        "selected_ids": campaign_budget.selected_ids,
-                        "reasons": campaign_budget.reasons,
-                    },
-                    "variant_budget": {
-                        "width": variant_budget.width,
-                        "max_width": variant_budget.max_width,
-                        "strategy": variant_budget.strategy,
-                        "top_score": variant_budget.top_score,
-                        "selected_ids": variant_budget.selected_ids,
-                        "reasons": variant_budget.reasons,
-                    },
+                    "campaign_budget": campaign_budget_payload,
+                    "variant_budget": variant_budget_payload,
                     "variant_planning_info": dict(variant_planning_info),
                     "protocol": "autonomous",
                     "protocol_strategy": "planner_scored",
@@ -2287,6 +2636,13 @@ def main() -> None:
                     "scoped_run": bool(scope_id),
                     "scope_id": _sanitize_scope_id(scope_id) if scope_id else "",
                 },
+                selected_variant_id=primary_variant.variant_id,
+                active_artifact_path=str(active_artifact_path_obj),
+                strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                strategy_origin=str(
+                    target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                ).strip(),
             ),
             govern_exports=False,
         )
@@ -2304,7 +2660,8 @@ def main() -> None:
             if snapshot_value:
                 prior_retained_snapshot_path = Path(snapshot_value)
         generated_variants: list[dict[str, object]] = []
-        preflight_rejection_reason = ""
+        variant_rejection_reason = ""
+        variant_rejection_action = "preflight_candidate_compatibility"
         for variant_rank, variant in enumerate(selected_variants, start=1):
             _progress(
                 progress_label,
@@ -2319,19 +2676,54 @@ def main() -> None:
                 cycle_id=f"{cycle_id}:{variant.variant_id}",
             )
             variant_candidate_artifact_path_obj.parent.mkdir(parents=True, exist_ok=True)
-            generated = _generate_candidate_artifact(
-                config=config,
-                planner=planner,
-                target=target,
-                metrics=metrics,
-                variant=variant,
-                cycle_id=cycle_id,
-                active_artifact_path_obj=active_artifact_path_obj,
-                candidate_artifact_path_obj=variant_candidate_artifact_path_obj,
-                prior_retained_cycle_id=prior_retained_cycle_id,
-                prior_retained_snapshot_path=prior_retained_snapshot_path,
-                progress_label=progress_label,
-            )
+            try:
+                generated = _generate_candidate_artifact(
+                    config=config,
+                    planner=planner,
+                    target=target,
+                    metrics=metrics,
+                    variant=variant,
+                    cycle_id=cycle_id,
+                    active_artifact_path_obj=active_artifact_path_obj,
+                    candidate_artifact_path_obj=variant_candidate_artifact_path_obj,
+                    prior_retained_cycle_id=prior_retained_cycle_id,
+                    prior_retained_snapshot_path=prior_retained_snapshot_path,
+                    protocol_context={
+                        **protocol_trace_summary,
+                        "reflection_record": reflection_payload,
+                        "selection_record": selection_payload,
+                    },
+                    progress_label=progress_label,
+                )
+            except Exception as exc:
+                generation_failure_reason = _record_candidate_generation_failure(
+                    config=config,
+                    planner=planner,
+                    cycle_id=cycle_id,
+                    subsystem=target.subsystem,
+                    artifact_path=variant_candidate_artifact_path_obj,
+                    active_artifact_path=active_artifact_path_obj,
+                    exc=exc,
+                    progress_label=progress_label,
+                    protocol_match_id=protocol_match_id,
+                    campaign_index=index,
+                    campaign_width=len(campaign),
+                    variant_rank=variant_rank,
+                    variant_width=len(selected_variants),
+                    variant=variant,
+                    strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                    strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                    strategy_origin=str(
+                        target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                    ).strip(),
+                    search_strategy="adaptive_history" if args.adaptive_search else "fixed_width",
+                    scope_id=_sanitize_scope_id(scope_id) if scope_id else "",
+                    protocol_trace=protocol_trace_summary,
+                )
+                if not variant_rejection_reason:
+                    variant_rejection_reason = generation_failure_reason
+                    variant_rejection_action = "generate_candidate_artifact"
+                continue
             artifact = str(generated["artifact"])
             action = str(generated["action"])
             artifact_kind = str(generated["artifact_kind"])
@@ -2341,6 +2733,9 @@ def main() -> None:
                     f"variant generate failed subsystem={target.subsystem} "
                     f"variant={variant.variant_id} reason=no_candidate_artifact",
                 )
+                if not variant_rejection_reason:
+                    variant_rejection_reason = "candidate generation produced no artifact"
+                    variant_rejection_action = "generate_candidate_artifact"
                 planner.append_cycle_record(
                     config.improvement_cycles_path,
                     ImprovementCycleRecord(
@@ -2364,6 +2759,7 @@ def main() -> None:
                             "strategy_origin": str(
                                 target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
                             ).strip(),
+                            **protocol_trace_summary,
                         },
                         strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
                         strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
@@ -2390,13 +2786,13 @@ def main() -> None:
                     action=action,
                     artifact_path=str(active_artifact_path_obj),
                     artifact_kind=artifact_kind,
-                reason=target.reason,
-                strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
-                strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
-                strategy_origin=str(
-                    target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
-                ).strip(),
-                metrics_summary={
+                    reason=target.reason,
+                    strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
+                    strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
+                    strategy_origin=str(
+                        target_strategy.get("origin", target_strategy.get("strategy_origin", ""))
+                    ).strip(),
+                    metrics_summary={
                         "total": metrics.total,
                         "passed": metrics.passed,
                         "pass_rate": metrics.pass_rate,
@@ -2419,6 +2815,7 @@ def main() -> None:
                         "protocol_match_id": protocol_match_id,
                         "scoped_run": bool(scope_id),
                         "scope_id": _sanitize_scope_id(scope_id) if scope_id else "",
+                        **protocol_trace_summary,
                         "selected_variant": {
                             "variant_id": variant.variant_id,
                             "description": variant.description,
@@ -2440,8 +2837,9 @@ def main() -> None:
             )
             if not bool(compatibility.get("compatible", False)):
                 compatibility_reason = _compatibility_failure_reason(compatibility)
-                if not preflight_rejection_reason:
-                    preflight_rejection_reason = compatibility_reason
+                if not variant_rejection_reason:
+                    variant_rejection_reason = compatibility_reason
+                    variant_rejection_action = "preflight_candidate_compatibility"
                 _progress(
                     progress_label,
                     f"variant preflight reject subsystem={target.subsystem} "
@@ -2472,6 +2870,7 @@ def main() -> None:
                             "protocol_match_id": protocol_match_id,
                             "scoped_run": bool(scope_id),
                             "scope_id": _sanitize_scope_id(scope_id) if scope_id else "",
+                            **protocol_trace_summary,
                         },
                         strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),
                         strategy_candidate_kind=str(target_strategy.get("strategy_candidate_kind", "")).strip(),
@@ -2592,10 +2991,15 @@ def main() -> None:
             )
 
         if not generated_variants:
-            rejection_reason = preflight_rejection_reason or "all generated variants failed candidate preflight"
+            rejection_reason = variant_rejection_reason or "all generated variants failed candidate preflight"
+            rejection_action = (
+                variant_rejection_action
+                if variant_rejection_reason
+                else "preflight_candidate_compatibility"
+            )
             outputs.append(
                 f"subsystem={target.subsystem} priority={target.priority} campaign_index={index}/{len(campaign)} "
-                f"action=preflight_candidate_compatibility artifact=<none> reason={target.reason} "
+                f"action={rejection_action} artifact=<none> reason={target.reason} "
                 f"final_state=reject final_reason={rejection_reason}"
             )
             _progress(progress_label, f"finalized subsystem={target.subsystem} state=reject")

@@ -4,8 +4,12 @@ import json
 from io import StringIO
 import os
 import sys
+import threading
+from types import SimpleNamespace
 
 from agent_kernel.config import KernelConfig
+from agent_kernel.sandbox import Sandbox
+from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.ops.unattended_controller import default_controller_state, normalize_controller_state, update_controller_state
 
 
@@ -469,6 +473,62 @@ def test_run_unattended_campaign_safe_stops_on_low_disk(tmp_path, monkeypatch):
     assert payload["status"] == "safe_stop"
     assert payload["phase"] == "preflight"
     assert payload["reason"] == "disk below threshold"
+
+
+def test_run_unattended_campaign_safe_stops_when_strict_live_llm_provider_is_bounded_decoder(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement" / "reports"
+    config = KernelConfig(
+        provider="hybrid",
+        improvement_reports_dir=reports_dir,
+        candidate_artifacts_root=tmp_path / "improvement" / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(
+        module,
+        "_disk_preflight",
+        lambda path, *, min_free_gib: {
+            "path": str(path),
+            "free_bytes": 10**9,
+            "free_gib": 100.0,
+            "min_free_gib": min_free_gib,
+            "passed": True,
+            "detail": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_preflight",
+        lambda device: {"device": device, "passed": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_preflight",
+        lambda cfg: {"passed": True, "status": "pass", "detail": "ok", "reports_considered": 1, "failing_thresholds": []},
+    )
+    monkeypatch.setattr(sys, "argv", ["run_unattended_campaign.py"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    report_path = Path(stream.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "safe_stop"
+    assert payload["phase"] == "preflight"
+    assert payload["runtime_claim"]["asi_coding_require_live_llm"] is True
+    assert "requires external decoder authority" in payload["reason"]
+    assert payload["rounds"][0]["preflight"]["decoder_contract"]["passed"] is False
+    assert payload["rounds"][0]["preflight"]["decoder_contract"]["decoder_runtime_posture"]["provider"] == "hybrid"
 
 
 def test_run_unattended_campaign_safe_stops_on_unexpected_cleanup_exception(tmp_path, monkeypatch):
@@ -1021,6 +1081,92 @@ def test_run_unattended_campaign_skips_liftoff_without_retention(tmp_path, monke
     assert payload["status"] == "completed"
     assert payload["liftoff_skipped"]["reason"] == "campaign did not satisfy auto liftoff trigger"
     assert "liftoff_run" not in payload
+
+
+def test_run_unattended_campaign_semantic_only_runtime_disables_tolbert_and_skips_liftoff(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement" / "reports"
+    config = KernelConfig(
+        improvement_reports_dir=reports_dir,
+        candidate_artifacts_root=tmp_path / "improvement" / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    campaign_report_path = reports_dir / "campaign_report.json"
+    campaign_report_path.parent.mkdir(parents=True, exist_ok=True)
+    campaign_report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "improvement_campaign_report",
+                "production_yield_summary": {"retained_cycles": 1},
+                "phase_gate_summary": {"all_retained_phase_gates_passed": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen_cmds = []
+
+    def fake_run_and_stream(cmd, *, cwd, env, **kwargs):
+        del cwd, kwargs
+        seen_cmds.append((cmd, env))
+        joined = " ".join(cmd)
+        if "run_repeated_improvement_cycles.py" in joined:
+            assert "--semantic-only-runtime" in cmd
+            exclude_indexes = [index for index, token in enumerate(cmd) if token == "--exclude-subsystem"]
+            assert exclude_indexes
+            assert any(cmd[index + 1] == "tolbert_model" for index in exclude_indexes)
+            assert env["AGENT_KERNEL_USE_TOLBERT_CONTEXT"] == "0"
+            assert env["AGENT_KERNEL_USE_TOLBERT_MODEL_ARTIFACTS"] == "0"
+            return {"returncode": 0, "stdout": f"{campaign_report_path}\n"}
+        raise AssertionError(joined)
+
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(module, "_governed_cleanup_runtime_state", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(module, "_governed_global_storage_cleanup", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(
+        module,
+        "_disk_preflight",
+        lambda path, *, min_free_gib: {
+            "path": str(path),
+            "free_bytes": 1024,
+            "free_gib": 100.0,
+            "min_free_gib": min_free_gib,
+            "passed": True,
+            "detail": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_preflight",
+        lambda device: {"device": device, "passed": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_preflight",
+        lambda cfg: {"passed": True, "status": "pass", "detail": "ok", "reports_considered": 1, "failing_thresholds": []},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_unattended_campaign.py",
+            "--semantic-only-runtime",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    report_path = Path(stream.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "completed"
+    assert payload["campaign_report_path"] == str(campaign_report_path)
+    assert len(seen_cmds) == 1
+    assert payload["current_policy"]["semantic_only_runtime"] is True
+    assert payload["current_policy"]["liftoff"] == "never"
 
 
 def test_run_unattended_campaign_adapts_policy_between_rounds(tmp_path, monkeypatch):
@@ -1810,6 +1956,14 @@ def test_validate_campaign_report_accepts_intermediate_non_runtime_managed_decis
             "completed_runs": 1,
             "successful_runs": 1,
             "inheritance_summary": {"runtime_managed_decisions": 0},
+            "execution_source_summary": {
+                "decoder_generated": 1,
+                "llm_generated": 1,
+                "bounded_decoder_generated": 0,
+                "synthetic_plan": 0,
+                "deterministic_or_other": 0,
+                "total_executed_commands": 1,
+            },
             "production_yield_summary": {"retained_cycles": 0},
             "recent_production_decisions": [
                 {
@@ -1849,6 +2003,13 @@ def test_campaign_signal_promotes_non_runtime_managed_decision_summary_without_r
                 "partial_productive_without_decision_runs": 1,
                 "decision_runs": 2,
             },
+            "execution_source_summary": {
+                "decoder_generated": 2,
+                "llm_generated": 1,
+                "synthetic_plan": 0,
+                "deterministic_or_other": 1,
+                "total_executed_commands": 3,
+            },
             "production_yield_summary": {"retained_cycles": 0},
             "recent_non_runtime_decisions": [
                 {"cycle_id": "cycle:retrieval:1", "state": "reject", "subsystem": "retrieval"},
@@ -1861,7 +2022,73 @@ def test_campaign_signal_promotes_non_runtime_managed_decision_summary_without_r
     assert signal["decision_runs"] == 2
     assert signal["non_runtime_managed_runs"] == 2
     assert signal["partial_productive_without_decision_runs"] == 1
+    assert signal["decoder_generated_commands"] == 2
+    assert signal["bounded_decoder_generated_commands"] == 1
+    assert signal["deterministic_or_other_commands"] == 1
+    assert signal["decoder_control_active"] is True
+    assert signal["llm_control_active"] is True
     assert signal["intermediate_decision_evidence"] is True
+
+
+def test_validate_campaign_report_rejects_decision_signal_without_live_llm_generated_execution():
+    module = _load_script("run_unattended_campaign.py")
+
+    validation = module._validate_campaign_report(
+        {
+            "report_kind": "improvement_campaign_report",
+            "cycles_requested": 1,
+            "completed_runs": 1,
+            "successful_runs": 1,
+            "inheritance_summary": {"runtime_managed_decisions": 0},
+            "execution_source_summary": {
+                "decoder_generated": 1,
+                "llm_generated": 0,
+                "bounded_decoder_generated": 1,
+                "synthetic_plan": 0,
+                "deterministic_or_other": 1,
+                "total_executed_commands": 2,
+            },
+            "recent_production_decisions": [
+                {
+                    "cycle_id": "cycle:retrieval:1",
+                    "state": "reject",
+                    "subsystem": "retrieval",
+                }
+            ],
+        }
+    )
+
+    assert validation["passed"] is False
+    assert validation["detail"].startswith(
+        "campaign report showed decision evidence without live LLM-generated execution"
+    )
+
+
+def test_validate_campaign_report_rejects_runtime_managed_credit_without_live_llm_generated_execution():
+    module = _load_script("run_unattended_campaign.py")
+
+    validation = module._validate_campaign_report(
+        {
+            "report_kind": "improvement_campaign_report",
+            "cycles_requested": 1,
+            "completed_runs": 1,
+            "successful_runs": 1,
+            "inheritance_summary": {"runtime_managed_decisions": 1},
+            "execution_source_summary": {
+                "decoder_generated": 1,
+                "llm_generated": 0,
+                "bounded_decoder_generated": 1,
+                "synthetic_plan": 0,
+                "deterministic_or_other": 2,
+                "total_executed_commands": 3,
+            },
+        }
+    )
+
+    assert validation["passed"] is False
+    assert validation["detail"].startswith(
+        "campaign report credited runtime-managed decisions without live LLM-generated execution"
+    )
 
 
 def test_merge_mirrored_child_status_fields_promotes_decision_conversion_summary():
@@ -2004,6 +2231,82 @@ def test_preferred_active_child_phase_detail_replaces_stale_same_phase_task_line
     )
 
     assert "task 5/8 deployment_manifest_task_project_adjacent" in detail
+
+
+def test_authoritative_round_phase_detail_prefers_live_child_progress_while_running():
+    module = _load_script("run_unattended_campaign.py")
+
+    detail = module._authoritative_round_phase_detail(
+        existing_detail="runtime-managed reject recorded after productive work was already demonstrated",
+        round_payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_child": {
+                "state": "running",
+                "runtime_managed_decisions": 1,
+                "pending_decision_state": "reject",
+                "last_progress_line": (
+                    "[eval:test] phase=generated_failure task 8/8 repo_packet_review_task_safe_retry "
+                    "family=repo_chore source_task=repo_packet_review_task"
+                ),
+                "last_output_line": (
+                    "[eval:test] phase=generated_failure task 8/8 repo_packet_review_task_safe_retry "
+                    "family=repo_chore source_task=repo_packet_review_task"
+                ),
+                "last_progress_phase": "generated_failure",
+                "current_task": {
+                    "index": 8,
+                    "total": 8,
+                    "task_id": "repo_packet_review_task_safe_retry",
+                    "family": "repo_chore",
+                    "source_task": "repo_packet_review_task",
+                    "phase": "generated_failure",
+                },
+                "semantic_progress_state": {
+                    "phase": "generated_failure",
+                    "phase_family": "preview",
+                    "status": "decision_emitted",
+                    "progress_class": "healthy",
+                    "decision_distance": "decision_emitted",
+                    "detail": "decision has been emitted and is awaiting durable completion",
+                },
+            },
+        },
+        campaign_report={},
+    )
+
+    assert detail.startswith("[eval:test] phase=generated_failure task 8/8 repo_packet_review_task_safe_retry")
+
+
+def test_authoritative_round_phase_detail_summarizes_runtime_managed_outcome_after_closeout():
+    module = _load_script("run_unattended_campaign.py")
+
+    detail = module._authoritative_round_phase_detail(
+        existing_detail="[cycle:test] finalize phase=done subsystem=retrieval state=reject",
+        round_payload={
+            "status": "completed",
+            "phase": "completed",
+            "active_child": {
+                "state": "completed",
+                "runtime_managed_decisions": 1,
+                "pending_decision_state": "reject",
+                "last_progress_line": "[cycle:test] finalize phase=done subsystem=retrieval state=reject",
+                "last_output_line": "[cycle:test] finalize phase=done subsystem=retrieval state=reject",
+                "last_progress_phase": "done",
+                "semantic_progress_state": {
+                    "phase": "done",
+                    "phase_family": "apply",
+                    "status": "complete",
+                    "progress_class": "complete",
+                    "decision_distance": "complete",
+                    "detail": "finalize completed",
+                },
+            },
+        },
+        campaign_report={},
+    )
+
+    assert detail == "runtime-managed reject recorded after productive work was already demonstrated"
 
 
 def test_run_unattended_campaign_surfaces_child_failure_context_in_report_and_status(tmp_path, monkeypatch):
@@ -2365,6 +2668,203 @@ def test_run_unattended_campaign_resume_cools_down_interrupted_subsystem(tmp_pat
     assert Path(resumed_payload["controller_state_path"]) == interrupted_controller_path
 
 
+def test_run_unattended_campaign_initial_persist_skips_storage_governance(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement" / "reports"
+    report_path = reports_dir / "bootstrap_interrupt.json"
+    config = KernelConfig(
+        improvement_reports_dir=reports_dir,
+        candidate_artifacts_root=tmp_path / "improvement" / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    persisted_govern_storage: list[bool] = []
+    original_persist_report_state = module._persist_report_state
+
+    def tracking_persist_report_state(*args, **kwargs):
+        persisted_govern_storage.append(bool(kwargs.get("govern_storage", True)))
+        return original_persist_report_state(*args, **kwargs)
+
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(module, "_persist_report_state", tracking_persist_report_state)
+    monkeypatch.setattr(module, "_dispatch_alerts", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected alert dispatch")))
+    monkeypatch.setattr(module, "_disk_preflight", lambda path, *, min_free_gib: {
+        "path": str(path),
+        "free_bytes": 0,
+        "free_gib": 0.0,
+        "min_free_gib": min_free_gib,
+        "passed": False,
+        "detail": "forced failure",
+    })
+    monkeypatch.setattr(module, "_gpu_preflight", lambda device: {"device": device, "passed": True, "detail": "ok"})
+    monkeypatch.setattr(
+        module,
+        "_trust_preflight",
+        lambda cfg: {"passed": True, "status": "pass", "detail": "ok", "reports_considered": 1, "failing_thresholds": []},
+    )
+    monkeypatch.setattr(sys, "argv", ["run_unattended_campaign.py", "--report-path", str(report_path), "--liftoff", "never"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected preflight SystemExit")
+
+    assert persisted_govern_storage
+    assert persisted_govern_storage[0] is False
+
+
+
+def test_alerts_enabled_ignores_unset_transports():
+    module = _load_script("run_unattended_campaign.py")
+    args = SimpleNamespace(
+        alert_command=None,
+        slack_webhook_url=None,
+        pagerduty_routing_key=None,
+    )
+
+    assert module._alerts_enabled(args) is False
+
+
+def test_run_unattended_campaign_interrupt_refreshes_active_child_from_child_status_file(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement" / "reports"
+    report_path = reports_dir / "interrupt_refresh.json"
+    config = KernelConfig(
+        improvement_reports_dir=reports_dir,
+        candidate_artifacts_root=tmp_path / "improvement" / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+
+    def fake_run_and_stream(cmd, *, cwd, env, on_event=None, **kwargs):
+        del cmd, cwd, kwargs
+        assert on_event is not None
+        on_event(
+            {
+                "event": "start",
+                "pid": 31337,
+                "progress_label": "campaign_round_1",
+                "started_at": 1.0,
+            }
+        )
+        on_event(
+            {
+                "event": "output",
+                "pid": 31337,
+                "progress_label": "campaign_round_1",
+                "timestamp": 2.0,
+                "line": "[cycle:test] phase=generated_success_schedule",
+            }
+        )
+        child_reports_dir = Path(env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"])
+        child_reports_dir.mkdir(parents=True, exist_ok=True)
+        (child_reports_dir / "repeated_improvement_status.json").write_text(
+            json.dumps(
+                {
+                    "report_kind": "repeated_improvement_status",
+                    "state": "interrupted",
+                    "status": "interrupted",
+                    "reason": "received signal SIGHUP",
+                    "selected_subsystem": "qwen_adapter",
+                    "last_progress_phase": "holdout_eval",
+                    "current_task": {
+                        "index": 390,
+                        "total": 390,
+                        "task_id": "service_release_task",
+                        "family": "repository",
+                    },
+                    "semantic_progress_state": {
+                        "phase": "holdout_eval",
+                        "phase_family": "holdout",
+                        "status": "active",
+                        "progress_class": "healthy",
+                        "detail": "holdout task 390/390 reached the execution boundary and is awaiting verification",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        raise KeyboardInterrupt("received signal SIGHUP")
+
+    persisted_govern_storage: list[bool] = []
+    original_persist_report_state = module._persist_report_state
+
+    def tracking_persist_report_state(*args, **kwargs):
+        persisted_govern_storage.append(bool(kwargs.get("govern_storage", True)))
+        return original_persist_report_state(*args, **kwargs)
+
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(module, "_dispatch_alerts", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected alert dispatch")))
+    monkeypatch.setattr(module, "_persist_report_state", tracking_persist_report_state)
+    monkeypatch.setattr(module, "_governed_cleanup_runtime_state", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(module, "_governed_global_storage_cleanup", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(
+        module,
+        "_disk_preflight",
+        lambda path, *, min_free_gib: {
+            "path": str(path),
+            "free_bytes": 1024,
+            "free_gib": 100.0,
+            "min_free_gib": min_free_gib,
+            "passed": True,
+            "detail": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_preflight",
+        lambda device: {"device": device, "passed": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_preflight",
+        lambda cfg: {"passed": True, "status": "pass", "detail": "ok", "reports_considered": 1, "failing_thresholds": []},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_unattended_campaign.py",
+            "--report-path",
+            str(report_path),
+            "--liftoff",
+            "never",
+        ],
+    )
+
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 130
+    else:
+        raise AssertionError("expected interrupted SystemExit")
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(report_path.with_suffix(".status.json").read_text(encoding="utf-8"))
+
+    assert payload["status"] == "interrupted"
+    assert payload["rounds"][0]["status"] == "interrupted"
+    assert payload["rounds"][0]["active_child"]["state"] == "interrupted"
+    assert payload["rounds"][0]["active_child"]["last_progress_phase"] == "holdout_eval"
+    assert payload["active_child"]["state"] == "interrupted"
+    assert payload["active_child"]["last_progress_phase"] == "holdout_eval"
+    assert status_payload["active_child"]["state"] == "interrupted"
+    assert status_payload["active_run"]["child_status"]["state"] == "interrupted"
+    assert persisted_govern_storage
+    assert persisted_govern_storage[:2] == [False, False]
+    assert persisted_govern_storage[-1] is False
+
+
 def test_run_unattended_campaign_recovers_from_failed_child_with_adapted_next_round(tmp_path, monkeypatch):
     module = _load_script("run_unattended_campaign.py")
     reports_dir = tmp_path / "improvement" / "reports"
@@ -2706,6 +3206,13 @@ def test_run_unattended_campaign_accepts_intermediate_non_runtime_managed_decisi
                 "completed_runs": 1,
                 "successful_runs": 1,
                 "inheritance_summary": {"runtime_managed_decisions": 0},
+                "execution_source_summary": {
+                    "decoder_generated": 1,
+                    "llm_generated": 0,
+                    "synthetic_plan": 0,
+                    "deterministic_or_other": 0,
+                    "total_executed_commands": 1,
+                },
                 "production_yield_summary": {"retained_cycles": 0},
                 "recent_production_decisions": [
                     {
@@ -2821,8 +3328,376 @@ def test_child_failure_recovery_policy_cools_dominant_zero_yield_subsystem_after
         max_variant_width=3,
     )
 
-    assert next_policy["excluded_subsystems"] == ["retrieval"]
+    assert next_policy["excluded_subsystems"] == ["retrieval", "trust"]
     assert next_policy["subsystem_cooldowns"]["retrieval"] == 3
+    assert next_policy["subsystem_cooldowns"]["trust"] >= 1
+
+
+def test_initial_round_policy_bootstraps_coding_campaign_without_trust():
+    module = _load_script("run_unattended_campaign.py")
+
+    policy = module._initial_round_policy(
+        SimpleNamespace(
+            cycles=1,
+            campaign_width=2,
+            variant_width=1,
+            adaptive_search=True,
+            task_limit=10,
+            task_step_floor=100,
+            priority_benchmark_family=["integration", "project", "repository"],
+            focus="discovered_task_adaptation",
+            liftoff="never",
+        ),
+        KernelConfig(),
+    )
+
+    for subsystem in (
+        "trust",
+        "curriculum",
+        "state_estimation",
+        "transition_model",
+        "recovery",
+        "delegation",
+        "operator_policy",
+        "capabilities",
+        "universe",
+    ):
+        assert subsystem in policy["excluded_subsystems"]
+        assert policy["subsystem_cooldowns"][subsystem] == 1
+
+
+def test_apply_semantic_policy_seed_merges_existing_exclusions_cooldowns_and_focus():
+    module = _load_script("run_unattended_campaign.py")
+
+    seeded = module._apply_semantic_policy_seed(
+        {
+            "excluded_subsystems": ["trust"],
+            "subsystem_cooldowns": {"trust": 1},
+            "priority_benchmark_families": ["integration", "project", "repository"],
+            "adaptive_search": True,
+            "focus": "balanced",
+        },
+        semantic_seed={
+            "excluded_subsystems": ["retrieval"],
+            "subsystem_cooldowns": {"retrieval": 2},
+            "adaptive_search": True,
+            "focus": "recovery_alignment",
+        },
+    )
+
+    assert seeded["excluded_subsystems"] == ["trust", "retrieval"]
+    assert seeded["subsystem_cooldowns"] == {"trust": 1, "retrieval": 2}
+    assert seeded["focus"] == "recovery_alignment"
+
+
+
+def test_semantic_policy_seed_surfaces_discovered_task_adaptation_focus_from_redirects(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "improvement_reports",
+        semantic_hub_root=tmp_path / "semantic_hub",
+    )
+    redirects_dir = config.semantic_hub_root / "redirects"
+    redirects_dir.mkdir(parents=True, exist_ok=True)
+    (redirects_dir / "redirect.json").write_text(
+        json.dumps(
+            {
+                "reason_codes": ["weak_retention_outcome"],
+                "source_subsystems": ["retrieval", "retrieval"],
+                "target_priority_families": ["integration", "project", "repository"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "_codex_batch_policy_seed", lambda config: {})
+
+    seed = module._semantic_policy_seed(config)
+
+    assert seed["adaptive_search"] is True
+    assert seed["focus"] == "discovered_task_adaptation"
+    assert "excluded_subsystems" not in seed
+
+
+
+def test_semantic_policy_seed_uses_latest_codex_closure_packet_for_runtime_first_campaigns(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    config = KernelConfig(
+        improvement_reports_dir=reports_dir,
+        semantic_hub_root=tmp_path / "semantic_hub",
+    )
+    (reports_dir / "latest.status.json").write_text(
+        json.dumps(
+            {
+                "asi_campaign_lane_recommendation": {
+                    "primary_lane": "lane_decision_closure",
+                    "primary_batch_goal": "retained_conversion",
+                    "supporting_lanes": ["lane_trust_and_carryover"],
+                },
+                "coding_capability_ramp_summary": {
+                    "primary_gap_id": "runtime_managed_conversion",
+                    "semantic_only_runtime": True,
+                    "specialization_mode": "semantic_only_runtime",
+                    "required_families": ["integration", "project", "repository", "repo_chore"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = module._semantic_policy_seed(config)
+
+    assert seed["adaptive_search"] is True
+    assert seed["focus"] == "recovery_alignment"
+    assert seed["focus_locked"] is True
+    assert "qwen_adapter" in seed["excluded_subsystems"]
+    assert seed["subsystem_cooldowns"]["qwen_adapter"] == 1
+    assert seed["protected_subsystems"] == [
+        "retrieval",
+        "state_estimation",
+        "recovery",
+        "transition_model",
+        "trust",
+    ]
+    assert seed["priority_benchmark_families"] == ["integration", "project", "repository", "repo_chore"]
+
+
+
+def test_initial_round_policy_honors_latest_codex_closure_seed_for_semantic_runtime(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    config = KernelConfig(
+        improvement_reports_dir=reports_dir,
+        semantic_hub_root=tmp_path / "semantic_hub",
+    )
+    (reports_dir / "latest.status.json").write_text(
+        json.dumps(
+            {
+                "asi_campaign_lane_recommendation": {
+                    "primary_lane": "lane_decision_closure",
+                    "primary_batch_goal": "retained_conversion",
+                    "supporting_lanes": ["lane_trust_and_carryover"],
+                },
+                "coding_capability_ramp_summary": {
+                    "primary_gap_id": "runtime_managed_conversion",
+                    "semantic_only_runtime": True,
+                    "specialization_mode": "semantic_only_runtime",
+                    "required_families": ["integration", "project", "repository", "repo_chore"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = SimpleNamespace(
+        cycles=1,
+        campaign_width=2,
+        variant_width=1,
+        adaptive_search=False,
+        task_limit=8,
+        task_step_floor=50,
+        priority_benchmark_family=[],
+        focus="balanced",
+        liftoff="never",
+        semantic_only_runtime=True,
+        exclude_subsystem=[],
+    )
+
+    policy = module._initial_round_policy(args, config)
+    policy = module._apply_semantic_policy_seed(policy, semantic_seed=module._semantic_policy_seed(config))
+    policy = module._apply_semantic_only_runtime_policy(policy)
+
+    assert policy["focus"] == "recovery_alignment"
+    assert policy["adaptive_search"] is True
+    assert "tolbert_model" in policy["excluded_subsystems"]
+    assert "qwen_adapter" in policy["excluded_subsystems"]
+    assert "retrieval" not in policy["excluded_subsystems"]
+    assert "state_estimation" not in policy["excluded_subsystems"]
+    assert "recovery" not in policy["excluded_subsystems"]
+    assert "transition_model" not in policy["excluded_subsystems"]
+    assert "trust" not in policy["excluded_subsystems"]
+    assert policy["priority_benchmark_families"] == ["integration", "project", "repository", "repo_chore"]
+
+
+def test_candidate_round_policies_preserve_locked_focus_and_protected_subsystems():
+    module = _load_script("run_unattended_campaign.py")
+
+    candidates = module._candidate_round_policies(
+        {
+            "cycles": 1,
+            "campaign_width": 2,
+            "variant_width": 1,
+            "adaptive_search": True,
+            "task_limit": 64,
+            "task_step_floor": 50,
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            "focus": "recovery_alignment",
+            "focus_locked": True,
+            "protected_subsystems": ["retrieval", "state_estimation", "recovery", "transition_model", "trust"],
+            "excluded_subsystems": ["qwen_adapter", "retrieval", "trust"],
+            "subsystem_cooldowns": {"qwen_adapter": 1, "retrieval": 2, "trust": 2},
+        },
+        campaign_report={
+            "production_yield_summary": {
+                "retained_cycles": 0,
+                "rejected_cycles": 0,
+                "runtime_managed_decisions": 0,
+                "failed_decisions": 0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True, "failed_decisions": 0},
+        },
+        liftoff_payload=None,
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+        max_task_step_floor=4096,
+    )
+
+    assert candidates
+    assert all(candidate["focus"] == "recovery_alignment" for candidate in candidates)
+    assert all(
+        candidate["priority_benchmark_families"] == ["integration", "project", "repository", "repo_chore"]
+        for candidate in candidates
+    )
+    for subsystem in ("retrieval", "state_estimation", "recovery", "transition_model", "trust"):
+        assert all(subsystem not in candidate["excluded_subsystems"] for candidate in candidates)
+
+
+
+def test_next_round_policy_preserves_locked_focus_and_protected_subsystems(monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    monkeypatch.setattr(
+        module,
+        "plan_next_policy",
+        lambda state, current_observation, candidate_policies: (
+            {
+                "cycles": 2,
+                "campaign_width": 3,
+                "variant_width": 2,
+                "adaptive_search": True,
+                "task_limit": 128,
+                "task_step_floor": 50,
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "focus": "discovered_task_adaptation",
+                "excluded_subsystems": ["retrieval", "trust", "qwen_adapter"],
+                "subsystem_cooldowns": {"retrieval": 2, "trust": 2, "qwen_adapter": 1},
+            },
+            {"candidates": [{"policy": {"focus": "discovered_task_adaptation", "excluded_subsystems": ["retrieval", "trust", "qwen_adapter"]}, "score": 1.0, "action_key": "test"}]},
+        ),
+    )
+
+    next_policy = module._next_round_policy(
+        {
+            "cycles": 1,
+            "campaign_width": 2,
+            "variant_width": 1,
+            "adaptive_search": True,
+            "task_limit": 64,
+            "task_step_floor": 50,
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            "focus": "recovery_alignment",
+            "focus_locked": True,
+            "protected_subsystems": ["retrieval", "state_estimation", "recovery", "transition_model", "trust"],
+            "excluded_subsystems": ["qwen_adapter"],
+            "subsystem_cooldowns": {"qwen_adapter": 1},
+        },
+        campaign_report={
+            "production_yield_summary": {
+                "retained_cycles": 0,
+                "rejected_cycles": 0,
+                "runtime_managed_decisions": 0,
+                "failed_decisions": 0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True, "failed_decisions": 0},
+        },
+        liftoff_payload=None,
+        round_payload={"policy": {"focus": "recovery_alignment"}},
+        controller_state=default_controller_state(),
+        prior_rounds=[],
+        planner_controls={},
+        curriculum_controls={},
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+    )
+
+    assert next_policy["focus"] == "recovery_alignment"
+    assert next_policy["priority_benchmark_families"] == ["integration", "project", "repository", "repo_chore"]
+    assert "qwen_adapter" in next_policy["excluded_subsystems"]
+    for subsystem in ("retrieval", "state_estimation", "recovery", "transition_model", "trust"):
+        assert subsystem not in next_policy["excluded_subsystems"]
+
+
+def test_resume_policy_from_partial_round_preserves_bootstrap_exclusions_without_prior_rounds():
+    module = _load_script("run_unattended_campaign.py")
+
+    resumed = module._resume_policy_from_partial_round(
+        {
+            "excluded_subsystems": ["trust", "retrieval"],
+            "subsystem_cooldowns": {"trust": 1, "retrieval": 2},
+            "priority_benchmark_families": ["integration", "project", "repository"],
+            "cycles": 1,
+            "campaign_width": 2,
+            "task_limit": 10,
+        },
+        prior_rounds=[],
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+    )
+
+    assert resumed["excluded_subsystems"] == ["trust", "retrieval"]
+    assert resumed["subsystem_cooldowns"] == {"trust": 1, "retrieval": 2}
+
+
+def test_child_failure_recovery_policy_keeps_budget_flat_for_decisionless_preview_timeout():
+    module = _load_script("run_unattended_campaign.py")
+
+    next_policy = module._child_failure_recovery_policy(
+        {
+            "cycles": 1,
+            "campaign_width": 2,
+            "variant_width": 2,
+            "adaptive_search": True,
+            "task_limit": 10,
+            "priority_benchmark_families": ["integration", "project", "repository"],
+            "tolbert_device": "cuda",
+            "focus": "discovered_task_adaptation",
+            "liftoff": "never",
+            "excluded_subsystems": [],
+            "subsystem_cooldowns": {},
+        },
+        round_payload={
+            "active_child": {
+                "selected_subsystem": "trust",
+                "decision_records_considered": 0,
+                "runtime_managed_decisions": 0,
+                "retained_gain_runs": 0,
+                "finalize_phase": "preview_baseline_eval",
+                "semantic_progress_state": {
+                    "phase_family": "preview",
+                },
+            }
+        },
+        phase="campaign",
+        reason="child exceeded max runtime safety ceiling of 300 seconds",
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+    )
+
+    assert next_policy["focus"] == "discovered_task_adaptation"
+    assert next_policy["cycles"] == 1
+    assert next_policy["task_limit"] == 10
+    assert next_policy["campaign_width"] == 2
+    assert next_policy["variant_width"] == 2
+    assert "trust" in next_policy["excluded_subsystems"]
+    assert next_policy["subsystem_cooldowns"]["trust"] >= 2
 
 
 def test_run_unattended_campaign_safe_stops_when_lock_is_held(tmp_path, monkeypatch):
@@ -2980,7 +3855,7 @@ def test_persist_report_state_writes_emergency_copy_when_primary_write_fails(tmp
     monkeypatch.setattr(
         module,
         "_write_report",
-        lambda path, data, *, config=None: (_ for _ in ()).throw(OSError("disk full")),
+        lambda path, data, *, config=None, govern_storage=True: (_ for _ in ()).throw(OSError("disk full")),
     )
     monkeypatch.setattr(module, "_emergency_persist_path", lambda path: emergency_path)
 
@@ -3019,6 +3894,667 @@ def test_persist_report_state_projects_active_child_controller_intervention_to_s
     status_payload = json.loads(status_path.read_text(encoding="utf-8"))
     assert status_payload["active_child_controller_intervention"]["reason_code"] == "micro_step_verification_loop"
     assert status_payload["active_child"]["controller_intervention"]["reason_code"] == "micro_step_verification_loop"
+
+
+def test_write_status_does_not_carry_prior_child_status_into_new_active_run(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+
+    module._write_status(
+        status_path,
+        report_path=report_path,
+        payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 1,
+                "run_match_id": "run-1",
+                "phase": "campaign",
+            },
+            "active_child": {
+                "current_task": {"task_id": "old_task", "phase": "preview_candidate_eval"},
+                "controller_intervention": {
+                    "triggered": True,
+                    "reason_code": "productive_partial_preview_without_decision",
+                },
+            },
+        },
+    )
+
+    module._write_status(
+        status_path,
+        report_path=report_path,
+        payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 2,
+                "run_match_id": "run-2",
+                "phase": "campaign",
+            },
+            "active_child": {},
+        },
+    )
+
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_payload["active_run"]["run_match_id"] == "run-2"
+    assert status_payload["active_child"] == {}
+    assert status_payload["active_child_controller_intervention"] == {}
+
+
+def test_write_status_keeps_active_run_child_status_aligned_with_active_child(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+
+    module._write_status(
+        status_path,
+        report_path=report_path,
+        payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 1,
+                "run_match_id": "run-1",
+                "phase": "campaign",
+                "child_status": {
+                    "current_task": {"task_id": "stale_task", "phase": "preview_candidate_eval"},
+                    "last_progress_line": None,
+                    "semantic_progress_state": {
+                        "phase": "preview_candidate_eval",
+                        "detail": "preview task 2/8 is progressing",
+                    },
+                },
+            },
+            "active_child": {
+                "current_task": {
+                    "task_id": "fresh_task",
+                    "phase": "generated_failure",
+                    "index": 8,
+                    "total": 8,
+                },
+                "last_progress_line": (
+                    "[eval:cycle:retrieval:cycle-1] phase=generated_failure complete total=8"
+                ),
+                "semantic_progress_state": {
+                    "phase": "generated_failure",
+                    "phase_family": "preview",
+                    "status": "decision_emitted",
+                    "detail": "decision has been emitted and is awaiting durable completion",
+                },
+            },
+        },
+    )
+
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_payload["active_run"]["child_status"] == status_payload["active_child"]
+    assert status_payload["active_child"]["current_task"]["task_id"] == "fresh_task"
+    assert status_payload["active_child"]["last_progress_line"].endswith("complete total=8")
+
+
+def test_persist_report_state_writes_frozen_codex_input_packets(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    child_report_path = tmp_path / "improvement_reports" / "campaign_report.json"
+    child_report_path.parent.mkdir(parents=True, exist_ok=True)
+    child_report_path.write_text("{}", encoding="utf-8")
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "event_log_path": str(tmp_path / "reports" / "campaign.events.jsonl"),
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+        },
+        "active_run": {
+            "run_index": 1,
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "semantic_only_runtime": True,
+            },
+        },
+        "active_child": {
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(child_report_path),
+            "verification_outcome_summary": {
+                "successful_task_count": 1,
+                "successful_families": ["integration"],
+            },
+            "sampled_families_from_progress": ["integration"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    packet_paths = report_payload["codex_input_packets"]
+    batch_packet_path = Path(packet_paths["batch_packet_path"])
+    frontier_packet_path = Path(packet_paths["frontier_packet_path"])
+    baseline_packet_path = Path(packet_paths["baseline_packet_path"])
+    assert batch_packet_path.exists()
+    assert frontier_packet_path.exists()
+    assert baseline_packet_path.exists()
+    assert status_payload["codex_input_packets"]["batch_packet_path"] == str(batch_packet_path)
+    assert report_payload["coding_capability_ramp_summary"]["recommended_primary_lane"] == "lane_decision_closure"
+    batch_packet = json.loads(batch_packet_path.read_text(encoding="utf-8"))
+    assert batch_packet["packet_kind"] == "CodexBatchPacket"
+    assert batch_packet["batch_goal"] == "retained_conversion"
+    assert sorted(batch_packet["allowed_lanes"]) == ["lane_decision_closure", "lane_trust_and_carryover"]
+    lane_packet_paths = packet_paths["lane_packet_paths"]
+    assert Path(lane_packet_paths["lane_decision_closure"]).exists()
+    assert Path(lane_packet_paths["lane_trust_and_carryover"]).exists()
+
+
+def test_persist_report_state_prunes_stale_lane_packets_when_lane_recommendation_changes(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    child_report_path = tmp_path / "improvement_reports" / "campaign_report.json"
+    child_report_path.parent.mkdir(parents=True, exist_ok=True)
+    child_report_path.write_text("{}", encoding="utf-8")
+
+    payload_runtime_authority = {
+        "status": "running",
+        "phase": "campaign",
+        "event_log_path": str(tmp_path / "reports" / "campaign.events.jsonl"),
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+        },
+        "active_run": {
+            "run_index": 1,
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "semantic_only_runtime": True,
+            },
+        },
+        "active_child": {
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(child_report_path),
+            "verification_outcome_summary": {
+                "successful_task_count": 0,
+                "successful_families": [],
+            },
+            "sampled_families_from_progress": [],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": [],
+                "missing_required_families": ["integration", "project", "repository", "repo_chore"],
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload_runtime_authority, status_path=status_path)
+
+    runtime_authority_packet_path = (
+        report_path.parent / f"{report_path.stem}.lane_runtime_authority.codex_lane_packet.json"
+    )
+    assert runtime_authority_packet_path.exists()
+
+    payload_decision_closure = {
+        "status": "running",
+        "phase": "campaign",
+        "event_log_path": str(tmp_path / "reports" / "campaign.events.jsonl"),
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+        },
+        "active_run": {
+            "run_index": 1,
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "semantic_only_runtime": True,
+            },
+        },
+        "active_child": {
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(child_report_path),
+            "verification_outcome_summary": {
+                "successful_task_count": 2,
+                "successful_families": ["integration", "project"],
+            },
+            "sampled_families_from_progress": ["integration", "project"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload_decision_closure, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    lane_packet_paths = report_payload["codex_input_packets"]["lane_packet_paths"]
+    assert "lane_runtime_authority" not in lane_packet_paths
+    assert runtime_authority_packet_path.exists() is False
+    assert Path(lane_packet_paths["lane_decision_closure"]).exists()
+    assert Path(lane_packet_paths["lane_trust_and_carryover"]).exists()
+
+
+def test_persist_report_state_refreshes_active_run_child_status_from_active_child(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "active_run": {
+            "run_index": 1,
+            "run_match_id": "run-1",
+            "phase": "campaign",
+            "child_status": {
+                "current_task": {"task_id": "stale_task", "phase": "primary"},
+                "last_progress_line": None,
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "detail": "active task 2/4 is progressing",
+                },
+            },
+        },
+        "active_child": {
+            "current_task": {},
+            "last_progress_line": (
+                "[cycle:unattended-campaign-round-1] observe complete passed=3/4 pass_rate=0.7500"
+            ),
+            "semantic_progress_state": {
+                "phase": "observe",
+                "phase_family": "observe",
+                "status": "complete",
+                "progress_class": "complete",
+                "detail": "observe phase completed and is ready to hand off",
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert report_payload["active_run"]["child_status"] == report_payload["active_child"]
+    assert status_payload["active_run"]["child_status"] == status_payload["active_child"]
+    assert status_payload["active_child"]["semantic_progress_state"]["phase"] == "observe"
+
+
+
+def test_persist_report_state_aligns_report_with_newer_existing_status_snapshot(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    newer_line = "[eval:round-1] phase=primary task 3/128 task-3 family=integration cognitive_stage=memory_update_written step=1 verification_passed=0"
+    module._write_status(
+        status_path,
+        report_path=report_path,
+        payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 1,
+                "run_match_id": "run-1",
+                "phase": "campaign",
+            },
+            "active_child": {
+                "current_task": {
+                    "index": 3,
+                    "total": 128,
+                    "task_id": "task-3",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "last_progress_phase": "primary",
+                "last_progress_line": newer_line,
+                "last_output_line": newer_line,
+                "last_progress_at": 30.0,
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "phase_family": "active",
+                    "status": "active",
+                    "progress_class": "degraded",
+                    "decision_distance": "active",
+                    "detail": "active task 3/128 failed verification and is awaiting recovery",
+                    "recorded_at": 30.0,
+                },
+            },
+            "phase_detail": newer_line,
+        },
+    )
+
+    older_line = "[eval:round-1] phase=primary task 2/128 task-2 family=integration cognitive_stage=memory_retrieved subphase=graph_memory"
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "phase_detail": older_line,
+        "active_run": {
+            "run_index": 1,
+            "run_match_id": "run-1",
+            "phase": "campaign",
+        },
+        "active_child": {
+            "current_task": {
+                "index": 2,
+                "total": 128,
+                "task_id": "task-2",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "last_progress_phase": "primary",
+            "last_progress_line": older_line,
+            "last_output_line": older_line,
+            "last_progress_at": 20.0,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 2/128 is progressing",
+                "recorded_at": 20.0,
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert report_payload["active_child"]["current_task"]["task_id"] == "task-3"
+    assert report_payload["active_run"]["child_status"] == report_payload["active_child"]
+    assert status_payload["active_run"]["child_status"] == status_payload["active_child"]
+    assert report_payload["active_child"]["current_task"] == status_payload["active_child"]["current_task"]
+    assert report_payload["active_child"]["semantic_progress_state"] == status_payload["active_child"]["semantic_progress_state"]
+    assert report_payload["active_child"]["phase"] == status_payload["active_child"]["phase"]
+    assert report_payload["current_task"] == status_payload["current_task"]
+    assert report_payload["last_progress_phase"] == status_payload["last_progress_phase"]
+    assert report_payload["semantic_progress_state"] == status_payload["semantic_progress_state"]
+    assert report_payload["canonical_progress_state"] == status_payload["canonical_progress_state"]
+    assert report_payload["phase_detail"] == status_payload["phase_detail"]
+
+
+def test_persist_report_state_projects_live_top_level_fields_without_existing_status_snapshot(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    live_line = (
+        "[eval:round-1] phase=primary task 1/128 task-1 family=integration "
+        "cognitive_stage=llm_request step=1"
+    )
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "phase_detail": live_line,
+        "active_run": {
+            "run_index": 1,
+            "run_match_id": "run-1",
+            "phase": "campaign",
+        },
+        "active_child": {
+            "phase": "campaign",
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "task-1",
+                "family": "integration",
+            },
+            "current_cognitive_stage": {
+                "event": "cognitive_stage",
+                "cognitive_stage": "llm_request",
+                "phase": "primary",
+                "step_index": 1,
+            },
+            "last_progress_phase": "observe",
+            "last_progress_line": live_line,
+            "last_output_line": live_line,
+            "last_progress_at": 10.0,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 1/128 is progressing",
+                "recorded_at": 10.0,
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert report_payload["current_task"] == status_payload["current_task"]
+    assert report_payload["current_task"]["phase"] == "primary"
+    assert report_payload["current_cognitive_stage"] == report_payload["active_child"]["current_cognitive_stage"]
+    assert report_payload["last_progress_phase"] == "primary"
+    assert report_payload["semantic_progress_state"]["phase"] == "primary"
+    assert report_payload["canonical_progress_state"]["phase"] == "primary"
+    assert report_payload["active_child"]["phase"] == "primary"
+    assert report_payload["active_child"]["last_progress_phase"] == "primary"
+    assert report_payload["phase_detail"] == status_payload["phase_detail"]
+    assert report_payload["active_run"]["child_status"] == report_payload["active_child"]
+
+
+def test_persist_report_state_does_not_pull_forward_child_snapshot_from_prior_status_run(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    newer_line = "[eval:round-1] phase=primary task 3/128 task-3 family=integration cognitive_stage=memory_update_written step=1 verification_passed=0"
+    module._write_status(
+        status_path,
+        report_path=report_path,
+        payload={
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 1,
+                "run_match_id": "run-1",
+                "phase": "campaign",
+            },
+            "active_child": {
+                "current_task": {
+                    "index": 3,
+                    "total": 128,
+                    "task_id": "task-3",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "last_progress_phase": "primary",
+                "last_progress_line": newer_line,
+                "last_output_line": newer_line,
+                "last_progress_at": 30.0,
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "phase_family": "active",
+                    "status": "active",
+                    "progress_class": "degraded",
+                    "decision_distance": "active",
+                    "detail": "active task 3/128 failed verification and is awaiting recovery",
+                    "recorded_at": 30.0,
+                },
+            },
+            "phase_detail": newer_line,
+        },
+    )
+
+    live_line = "[eval:round-2] phase=primary task 1/128 task-1 family=integration cognitive_stage=memory_retrieved subphase=graph_memory"
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "phase_detail": live_line,
+        "active_run": {
+            "run_index": 2,
+            "run_match_id": "run-2",
+            "phase": "campaign",
+        },
+        "active_child": {
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "task-1",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "last_progress_phase": "primary",
+            "last_progress_line": live_line,
+            "last_output_line": live_line,
+            "last_progress_at": 40.0,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 1/128 is progressing",
+                "recorded_at": 40.0,
+            },
+        },
+    }
+
+    module._persist_report_state(report_path, payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report_payload["active_child"]["current_task"]["task_id"] == "task-1"
+    assert report_payload["phase_detail"] == live_line
+
+
+def test_persist_report_state_uses_frozen_payload_snapshot(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    original_payload = {
+        "status": "running",
+        "phase": "campaign",
+        "active_run": {
+            "run_index": 1,
+            "run_match_id": "run-1",
+            "phase": "campaign",
+            "child_status": {
+                "current_task": {"task_id": "task-1", "phase": "primary"},
+                "last_progress_line": "[eval:round-1] phase=primary task 1/4 task-1",
+            },
+        },
+        "active_child": {
+            "current_task": {"task_id": "task-1", "phase": "primary"},
+            "last_progress_line": "[eval:round-1] phase=primary task 1/4 task-1",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "active task 1/4 is progressing",
+            },
+        },
+    }
+
+    def fake_write_report(path, payload, *, config=None, govern_storage=True):
+        del govern_storage
+        module.atomic_write_json(path, payload, config=config)
+        original_payload["active_child"] = {
+            "current_task": {"task_id": "task-2", "phase": "primary"},
+            "last_progress_line": "[eval:round-1] phase=primary task 2/4 task-2",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "active task 2/4 is progressing",
+            },
+        }
+
+    monkeypatch.setattr(module, "_write_report", fake_write_report)
+
+    module._persist_report_state(report_path, original_payload, status_path=status_path)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert report_payload["active_child"]["current_task"]["task_id"] == "task-1"
+    assert status_payload["active_child"]["current_task"]["task_id"] == "task-1"
+    assert status_payload["active_run"]["child_status"] == status_payload["active_child"]
+
+
+def test_persist_report_state_serializes_overlapping_writes(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    report_path = tmp_path / "reports" / "campaign.json"
+    status_path = tmp_path / "reports" / "campaign.status.json"
+    first_report_written = threading.Event()
+    allow_first_to_continue = threading.Event()
+    original_write_report = module._write_report
+
+    def payload_for(task_id: str) -> dict[str, object]:
+        return {
+            "status": "running",
+            "phase": "campaign",
+            "active_run": {
+                "run_index": 1,
+                "run_match_id": "run-1",
+                "phase": "campaign",
+            },
+            "active_child": {
+                "current_task": {"task_id": task_id, "phase": "primary"},
+                "last_progress_line": f"[eval:round-1] phase=primary task {task_id}",
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "phase_family": "active",
+                    "status": "active",
+                    "progress_class": "healthy",
+                    "detail": f"active task {task_id} is progressing",
+                },
+            },
+        }
+
+    old_payload = payload_for("task-old")
+    new_payload = payload_for("task-new")
+
+    def fake_write_report(path, payload, *, config=None, govern_storage=True):
+        del govern_storage
+        original_write_report(path, payload, config=config)
+        task_id = (
+            payload.get("active_child", {}).get("current_task", {}).get("task_id")
+            if isinstance(payload.get("active_child", {}), dict)
+            else None
+        )
+        if task_id == "task-old":
+            first_report_written.set()
+            allow_first_to_continue.wait(timeout=5)
+
+    monkeypatch.setattr(module, "_write_report", fake_write_report)
+
+    def run_persist(payload):
+        module._persist_report_state(report_path, payload, status_path=status_path)
+
+    old_thread = threading.Thread(target=run_persist, args=(old_payload,))
+    new_thread = threading.Thread(target=run_persist, args=(new_payload,))
+
+    old_thread.start()
+    assert first_report_written.wait(timeout=5)
+    new_thread.start()
+    allow_first_to_continue.set()
+    old_thread.join(timeout=5)
+    new_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    assert not new_thread.is_alive()
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert report_payload["active_child"]["current_task"]["task_id"] == "task-new"
+    assert status_payload["active_child"]["current_task"]["task_id"] == "task-new"
+    assert status_payload["active_run"]["child_status"] == status_payload["active_child"]
 
 
 def test_make_child_progress_callback_forwards_explicit_config(tmp_path, monkeypatch):
@@ -3067,6 +4603,77 @@ def test_make_child_progress_callback_forwards_explicit_config(tmp_path, monkeyp
 
     assert seen_event_configs == [config]
     assert seen_report_configs == [config]
+
+
+def test_make_child_progress_callback_clears_stale_intervention_on_new_child_start(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(improvement_reports_dir=tmp_path / "reports")
+    report_path = config.improvement_reports_dir / "campaign.json"
+    status_path = config.improvement_reports_dir / "campaign.status.json"
+    event_log_path = config.improvement_reports_dir / "campaign.events.jsonl"
+    report: dict[str, object] = {
+        "active_child": {
+            "current_task": {
+                "index": 8,
+                "total": 8,
+                "task_id": "stale_preview_task",
+                "phase": "preview_candidate_eval",
+            },
+            "semantic_progress_state": {
+                "phase": "preview_candidate_eval",
+                "phase_family": "preview",
+                "progress_class": "degraded",
+                "detail": "preview task 8/8 failed verification and is awaiting recovery",
+            },
+            "controller_intervention": {
+                "triggered": True,
+                "reason_code": "productive_partial_preview_without_decision",
+            },
+        },
+        "controller_intervention": {
+            "triggered": True,
+            "reason_code": "productive_partial_preview_without_decision",
+        },
+    }
+    round_payload: dict[str, object] = {
+        "controller_intervention": {
+            "triggered": True,
+            "reason_code": "productive_partial_preview_without_decision",
+        }
+    }
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_mirrored_child_status_from_parent_status", lambda path: {})
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=tmp_path / "campaign.lock",
+        config=config,
+        round_payload=round_payload,
+        round_index=2,
+        phase="campaign",
+        child_label="campaign_round_2",
+        event_log_path=event_log_path,
+    )
+
+    callback(
+        {
+            "event": "start",
+            "pid": 123,
+            "started_at": 10.0,
+            "timestamp": 10.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert "controller_intervention" not in active_child
+    assert active_child.get("current_task", {}) == {}
+    assert "semantic_progress_state" not in active_child
+    assert "controller_intervention" not in report
+    assert "controller_intervention" not in round_payload
 
 
 def test_make_child_progress_callback_ignores_long_non_path_output(tmp_path):
@@ -3168,6 +4775,7 @@ def test_mid_round_controller_intervention_signal_detects_semantic_progress_drif
                     "phase": "preview_candidate_eval",
                     "phase_family": "preview",
                     "progress_class": "stuck",
+                    "progress_silence_seconds": 5.0,
                 },
             },
         }
@@ -3179,7 +4787,105 @@ def test_mid_round_controller_intervention_signal_detects_semantic_progress_drif
     assert signal["round_signal"]["semantic_progress_drift"] is True
 
 
-def test_mid_round_controller_intervention_signal_cuts_off_retrieval_first_before_decision():
+def test_mid_round_controller_intervention_signal_waits_for_sustained_semantic_progress_drift():
+    module = _load_script("run_unattended_campaign.py")
+
+    signal = module._mid_round_controller_intervention_signal(
+        {
+            "policy": {
+                "priority_benchmark_families": ["project", "repository", "integration", "repo_chore"],
+            },
+            "active_child": {
+                "observe_summary": {"passed": 4, "total": 4},
+                "selected_subsystem": "retrieval",
+                "finalize_phase": "preview_candidate_eval",
+                "decision_records_considered": 0,
+                "families_sampled": ["project", "repository", "integration", "repo_chore"],
+                "semantic_progress_state": {
+                    "phase": "preview_candidate_eval",
+                    "phase_family": "preview",
+                    "progress_class": "degraded",
+                    "progress_silence_seconds": 0.0,
+                },
+            },
+        }
+    )
+
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
+    assert signal["round_signal"]["semantic_progress_drift"] is False
+
+
+def test_mid_round_controller_intervention_signal_waits_for_stuck_observe_before_cutoff():
+    module = _load_script("run_unattended_campaign.py")
+
+    signal = module._mid_round_controller_intervention_signal(
+        {
+            "policy": {
+                "priority_benchmark_families": ["project", "repository", "integration", "repo_chore"],
+            },
+            "active_child": {
+                "current_task": {
+                    "index": 1,
+                    "total": 4,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "observe",
+                },
+                "observe_summary": {"passed": 0, "total": 0},
+                "decision_records_considered": 0,
+                "families_sampled": ["integration"],
+                "semantic_progress_state": {
+                    "phase": "observe",
+                    "phase_family": "observe",
+                    "progress_class": "degraded",
+                    "progress_silence_seconds": 75.0,
+                },
+            },
+        }
+    )
+
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
+
+
+def test_mid_round_controller_intervention_signal_waits_for_live_observe_task_progress_before_cutoff():
+    module = _load_script("run_unattended_campaign.py")
+
+    signal = module._mid_round_controller_intervention_signal(
+        {
+            "policy": {
+                "priority_benchmark_families": ["project", "repository", "integration", "repo_chore"],
+            },
+            "active_child": {
+                "current_task": {
+                    "index": 10,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "observe",
+                },
+                "last_task_progress_at": 100.0,
+                "observe_summary": {"passed": 0, "total": 0},
+                "decision_records_considered": 0,
+                "families_sampled": ["integration"],
+                "semantic_progress_state": {
+                    "phase": "observe",
+                    "phase_family": "observe",
+                    "progress_class": "stuck",
+                    "progress_silence_seconds": 361.0,
+                    "recorded_at": 100.0,
+                },
+            },
+        }
+    )
+
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
+    assert signal["round_signal"]["observe_live_task_progress_fresh"] is True
+
+
+def test_mid_round_controller_intervention_signal_allows_retrieval_first_to_reach_decision():
     module = _load_script("run_unattended_campaign.py")
 
     signal = module._mid_round_controller_intervention_signal(
@@ -3197,8 +4903,8 @@ def test_mid_round_controller_intervention_signal_cuts_off_retrieval_first_befor
         }
     )
 
-    assert signal["triggered"] is True
-    assert signal["reason_code"] == "broad_observe_then_retrieval_first_predecision"
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
     assert signal["round_signal"]["definitive_decision_emitted"] is False
 
 
@@ -3225,6 +4931,7 @@ def test_mid_round_controller_intervention_signal_cuts_off_preview_after_product
                     "phase_family": "preview",
                     "progress_class": "degraded",
                     "decision_distance": "near",
+                    "progress_silence_seconds": 5.0,
                 },
                 "finalize_phase": "preview_baseline_eval",
                 "families_sampled": ["project", "repository", "integration", "repo_chore"],
@@ -3236,6 +4943,44 @@ def test_mid_round_controller_intervention_signal_cuts_off_preview_after_product
     assert signal["reason_code"] == "productive_partial_preview_without_decision"
     assert signal["round_signal"]["generated_success_completed"] is True
     assert signal["round_signal"]["productive_partial"] is True
+
+
+def test_mid_round_controller_intervention_signal_waits_for_preview_linger_after_phase_transition():
+    module = _load_script("run_unattended_campaign.py")
+
+    signal = module._mid_round_controller_intervention_signal(
+        {
+            "policy": {
+                "priority_benchmark_families": ["project", "repository", "integration", "repo_chore"],
+            },
+            "active_child": {
+                "selected_subsystem": "universe_constitution",
+                "last_progress_phase": "preview_candidate_eval",
+                "decision_records_considered": 0,
+                "partial_productive_runs": 1,
+                "active_cycle_progress": {
+                    "observe_completed": True,
+                    "generated_success_completed": True,
+                    "productive_partial": True,
+                    "sampled_families_from_progress": ["integration"],
+                },
+                "semantic_progress_state": {
+                    "phase": "preview_candidate_eval",
+                    "phase_family": "preview",
+                    "progress_class": "degraded",
+                    "decision_distance": "near",
+                    "progress_silence_seconds": 0.0,
+                },
+                "finalize_phase": "preview_baseline_eval",
+                "families_sampled": ["integration"],
+            },
+        }
+    )
+
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
+    assert signal["round_signal"]["finalize_phase"] == "preview_candidate_eval"
+    assert signal["round_signal"]["post_productive_predecision_linger"] is False
 
 
 def test_mid_round_controller_intervention_signal_cuts_off_variant_generate_after_productive_generated_success():
@@ -3360,6 +5105,44 @@ def test_mid_round_controller_intervention_signal_does_not_cut_off_generated_fai
 
     assert signal["triggered"] is False
     assert signal["round_signal"]["late_generated_failure_recovery_without_decision"] is False
+
+
+def test_mid_round_controller_intervention_signal_ignores_generated_failure_handoff_before_recovery_task_arrives():
+    module = _load_script("run_unattended_campaign.py")
+
+    signal = module._mid_round_controller_intervention_signal(
+        {
+            "policy": {
+                "priority_benchmark_families": ["project", "repository", "integration", "repo_chore"],
+            },
+            "active_child": {
+                "selected_subsystem": "operating_envelope",
+                "last_progress_phase": "generated_failure",
+                "decision_records_considered": 0,
+                "partial_productive_runs": 1,
+                "active_cycle_progress": {
+                    "observe_completed": True,
+                    "generated_success_completed": True,
+                    "productive_partial": True,
+                    "sampled_families_from_progress": ["integration"],
+                },
+                "semantic_progress_state": {
+                    "phase": "generated_failure_seed",
+                    "phase_family": "preview",
+                    "progress_class": "degraded",
+                    "decision_distance": "near",
+                    "runtime_elapsed_seconds": 252.0,
+                },
+                "finalize_phase": "preview_baseline_eval",
+                "families_sampled": ["integration"],
+            },
+        }
+    )
+
+    assert signal["triggered"] is False
+    assert signal["reason"] == "no_live_decision_credit_gap"
+    assert signal["round_signal"]["generated_failure_handoff_active"] is True
+    assert signal["round_signal"]["post_productive_predecision_linger"] is False
 
 
 def test_mid_round_controller_intervention_signal_ignores_stale_recovery_drift_before_decision():
@@ -3692,13 +5475,9 @@ def test_make_child_progress_callback_requests_mid_round_controller_intervention
         }
     )
 
-    assert action == {
-        "terminate": True,
-        "reason": "mid-round controller intervention: broad observe covered priority families, but retrieval still remained first before a decision was emitted",
-    }
-    assert round_payload["controller_intervention"]["reason_code"] == "broad_observe_then_retrieval_first_predecision"
-    assert any(event.get("event_kind") == "controller_intervention" for event in seen_events)
-    assert persist_calls
+    assert action is None
+    assert "controller_intervention" not in round_payload
+    assert not any(event.get("event_kind") == "controller_intervention" for event in seen_events)
 
 
 def test_mid_round_round_signal_recovers_live_decision_credit_from_preview_state():
@@ -3754,6 +5533,7 @@ def test_make_child_progress_callback_requests_mid_round_controller_intervention
                 "phase": "preview_candidate_eval",
                 "phase_family": "preview",
                 "progress_class": "stuck",
+                "progress_silence_seconds": 10.0,
             },
             "active_cycle_run": {
                 "selected_subsystem": "retrieval",
@@ -4021,6 +5801,375 @@ def test_merge_mirrored_child_status_fields_reconciles_semantic_phase_to_live_ge
     )
 
     assert merged["semantic_progress_state"]["phase"] == "generated_failure"
+
+
+def test_merge_mirrored_child_status_fields_preserves_live_same_task_step_over_lagging_cycle_snapshot():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "last_progress_at": 200.0,
+            "last_progress_phase": "primary",
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "semantic_open_world_task",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "llm_response",
+                "phase": "primary",
+                "step_index": 2,
+            },
+            "current_task_progress_timeline": [
+                {
+                    "cognitive_stage": "verification_result",
+                    "phase": "primary",
+                    "step_index": 1,
+                    "verification_passed": False,
+                },
+                {
+                    "cognitive_stage": "llm_response",
+                    "phase": "primary",
+                    "step_index": 2,
+                },
+            ],
+            "current_task_verification_passed": None,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 1/128 is progressing",
+                "recorded_at": 200.0,
+            },
+        },
+        {
+            "report_kind": "repeated_improvement_status",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "degraded",
+                "decision_distance": "active",
+                "detail": "active task 1/128 failed verification and is awaiting recovery",
+                "recorded_at": 201.0,
+            },
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "verification_result",
+                    "phase": "primary",
+                    "step_index": 1,
+                    "verification_passed": False,
+                },
+                "current_task_progress_timeline": [
+                    {
+                        "cognitive_stage": "verification_result",
+                        "phase": "primary",
+                        "step_index": 1,
+                        "verification_passed": False,
+                    }
+                ],
+                "current_task_verification_passed": False,
+            },
+        },
+    )
+
+    assert merged["current_task"]["task_id"] == "semantic_open_world_task"
+    assert merged["current_cognitive_stage"]["cognitive_stage"] == "llm_response"
+    assert merged["current_cognitive_stage"]["step_index"] == 2
+    assert merged["current_task_progress_timeline"][-1]["cognitive_stage"] == "llm_response"
+    assert merged["current_task_progress_timeline"][-1]["step_index"] == 2
+    assert merged["current_task_verification_passed"] is None
+    assert merged["semantic_progress_state"]["progress_class"] == "healthy"
+    assert merged["semantic_progress_state"]["detail"] == "active task 1/128 is progressing"
+
+
+def test_merge_mirrored_child_status_fields_preserves_live_same_step_over_ahead_of_pipe_cycle_snapshot():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "last_progress_at": 200.0,
+            "last_progress_phase": "primary",
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "semantic_open_world_task",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "llm_response",
+                "phase": "primary",
+                "step_index": 2,
+            },
+            "current_task_progress_timeline": [
+                {
+                    "cognitive_stage": "context_compile",
+                    "phase": "primary",
+                    "step_index": 2,
+                },
+                {
+                    "cognitive_stage": "llm_response",
+                    "phase": "primary",
+                    "step_index": 2,
+                },
+            ],
+            "current_task_verification_passed": None,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 1/128 is progressing",
+                "recorded_at": 200.0,
+            },
+        },
+        {
+            "report_kind": "repeated_improvement_status",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "degraded",
+                "decision_distance": "active",
+                "detail": "active task 1/128 failed verification and is awaiting recovery",
+                "recorded_at": 201.0,
+            },
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "memory_update_written",
+                    "phase": "primary",
+                    "step_index": 2,
+                    "verification_passed": False,
+                },
+                "current_task_progress_timeline": [
+                    {
+                        "cognitive_stage": "memory_update_written",
+                        "phase": "primary",
+                        "step_index": 2,
+                        "verification_passed": False,
+                    }
+                ],
+                "current_task_verification_passed": False,
+            },
+        },
+    )
+
+    assert merged["current_task"]["task_id"] == "semantic_open_world_task"
+    assert merged["current_cognitive_stage"]["cognitive_stage"] == "llm_response"
+    assert merged["current_cognitive_stage"]["step_index"] == 2
+    assert merged["current_task_progress_timeline"][-1]["cognitive_stage"] == "llm_response"
+    assert merged["current_task_progress_timeline"][-1]["step_index"] == 2
+    assert merged["current_task_verification_passed"] is None
+    assert merged["semantic_progress_state"]["progress_class"] == "healthy"
+    assert merged["semantic_progress_state"]["detail"] == "active task 1/128 is progressing"
+
+
+def test_merge_mirrored_child_status_fields_preserves_live_task_over_ahead_of_pipe_future_task_snapshot():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "last_progress_at": 200.0,
+            "last_progress_phase": "primary",
+            "current_task": {
+                "index": 1,
+                "total": 4,
+                "task_id": "semantic_open_world_20260411T225301327576Z_round_1_integration",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "payload_build",
+                "phase": "primary",
+                "step_index": 2,
+            },
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 1/4 is progressing",
+                "recorded_at": 200.0,
+            },
+        },
+        {
+            "report_kind": "repeated_improvement_status",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 3/4 is progressing",
+                "recorded_at": 201.0,
+            },
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 3,
+                    "total": 4,
+                    "task_id": "semantic_open_world_20260411T225301327576Z_round_1_project",
+                    "family": "project",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "transition_simulated",
+                    "phase": "primary",
+                    "step_index": 1,
+                },
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "phase_family": "active",
+                    "progress_class": "healthy",
+                    "decision_distance": "active",
+                    "detail": "active task 3/4 is progressing",
+                    "recorded_at": 201.0,
+                },
+            },
+        },
+    )
+
+    assert merged["current_task"]["task_id"] == "semantic_open_world_20260411T225301327576Z_round_1_integration"
+    assert merged["current_task"]["index"] == 1
+    assert merged["semantic_progress_state"]["detail"] == "active task 1/4 is progressing"
+
+
+def test_merge_mirrored_child_status_fields_prefers_healthier_same_step_mirrored_semantic_state():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "last_progress_at": 200.0,
+            "last_progress_phase": "primary",
+            "current_task": {
+                "index": 1,
+                "total": 1,
+                "task_id": "semantic_open_world_task",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "llm_request",
+                "phase": "primary",
+                "step_index": 1,
+            },
+            "semantic_progress_state": {
+                "phase": "preview_candidate_eval",
+                "phase_family": "preview",
+                "progress_class": "degraded",
+                "decision_distance": "near",
+                "detail": "preview work is advancing slowly relative to the runtime budget",
+                "recorded_at": 200.0,
+            },
+        },
+        {
+            "report_kind": "repeated_improvement_status",
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 1,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "plan_candidates",
+                    "phase": "primary",
+                    "step_index": 1,
+                },
+                "semantic_progress_state": {
+                    "phase": "preview_candidate_eval",
+                    "phase_family": "preview",
+                    "progress_class": "healthy",
+                    "decision_distance": "near",
+                    "detail": "preview task 1/1 reached the execution boundary and is awaiting verification",
+                    "recorded_at": 199.0,
+                },
+            },
+        },
+    )
+
+    assert merged["semantic_progress_state"]["phase"] == "preview_candidate_eval"
+    assert merged["semantic_progress_state"]["progress_class"] == "healthy"
+    assert (
+        merged["semantic_progress_state"]["detail"]
+        == "preview task 1/1 reached the execution boundary and is awaiting verification"
+    )
+
+
+def test_authoritative_child_supervision_snapshot_preserves_newer_live_task_over_stale_mirrored_status():
+    module = _load_script("run_unattended_campaign.py")
+
+    snapshot = module._authoritative_child_supervision_snapshot(
+        {
+            "report_kind": "repeated_improvement_status",
+            "started_at": 100.0,
+            "current_task": {
+                "index": 4,
+                "total": 4,
+                "task_id": "repo_notice_review_task",
+                "family": "repo_chore",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "memory_update_written",
+                "phase": "primary",
+                "step_index": 1,
+                "verification_passed": False,
+            },
+            "current_task_verification_passed": False,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "degraded",
+                "decision_distance": "active",
+                "detail": "active task 4/4 failed verification and is awaiting recovery",
+                "recorded_at": 150.0,
+            },
+        },
+        last_progress_phase="primary",
+        active_finalize_phase="preview_baseline_eval",
+        last_progress_at=200.0,
+        current_task={
+            "index": 2,
+            "total": 4,
+            "task_id": "repository_guardrail_sync_task",
+            "family": "repository",
+            "phase": "primary",
+        },
+        current_cognitive_stage={
+            "cognitive_stage": "memory_retrieved",
+            "phase": "primary",
+            "step_subphase": "graph_memory",
+        },
+        observe_summary={},
+        pending_decision_state="",
+        preview_state="",
+        current_task_verification_passed=None,
+    )
+
+    assert snapshot["current_task"]["task_id"] == "repository_guardrail_sync_task"
+    assert snapshot["current_task"]["index"] == 2
+    assert snapshot["current_cognitive_stage"]["cognitive_stage"] == "memory_retrieved"
+    assert snapshot["current_task_verification_passed"] is None
 
 
 def test_merge_mirrored_child_status_fields_preserves_live_generated_success_over_stale_preview_snapshot():
@@ -5322,9 +7471,13 @@ def test_next_round_policy_prioritizes_missing_required_benchmark_families():
 
     rationale = round_payload["policy_shift_rationale"]
     assert "required_family_coverage_gap" in rationale["reason_codes"]
-    assert rationale["planner_pressure"]["missing_required_families"] == ["project", "repository", "integration"]
+    assert set(rationale["planner_pressure"]["missing_required_families"]) == {
+        "project",
+        "repository",
+        "integration",
+    }
     assert next_policy["focus"] == "discovered_task_adaptation"
-    assert next_policy["priority_benchmark_families"] == ["repository", "integration", "project"]
+    assert set(next_policy["priority_benchmark_families"]) == {"project", "repository", "integration"}
 
 
 def test_next_round_policy_reprioritizes_priority_families_without_retained_gain():
@@ -5405,6 +7558,142 @@ def test_next_round_policy_reprioritizes_priority_families_without_retained_gain
     assert next_policy["adaptive_search"] is True
     assert next_policy["focus"] == "discovered_task_adaptation"
     assert next_policy["priority_benchmark_families"] == ["repository", "integration", "project"]
+
+
+def test_next_round_policy_keeps_trust_excluded_during_coding_first_bootstrap():
+    module = _load_script("run_unattended_campaign.py")
+    current_policy = {
+        "cycles": 1,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "adaptive_search": False,
+        "task_limit": 128,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+        "tolbert_device": "cuda:2",
+        "focus": "balanced",
+        "liftoff": "auto",
+        "excluded_subsystems": [],
+        "subsystem_cooldowns": {},
+    }
+    round_payload: dict[str, object] = {}
+
+    next_policy = module._next_round_policy(
+        current_policy,
+        campaign_report={
+            "production_yield_summary": {
+                "retained_cycles": 0,
+                "rejected_cycles": 1,
+                "runtime_managed_decisions": 0,
+                "average_retained_pass_rate_delta": 0.0,
+                "average_retained_step_delta": 0.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": False, "failed_decisions": 1},
+            "trust_breadth_summary": {
+                "required_families": ["project", "repository", "integration"],
+                "required_families_with_reports": ["project", "repository", "integration"],
+                "missing_required_families": [],
+                "distinct_family_gap": 0,
+                "external_report_count": 1,
+                "distinct_external_benchmark_families": 1,
+            },
+            "priority_family_yield_summary": {
+                "priority_families": ["project", "repository", "integration"],
+                "family_summaries": {
+                    "project": {"observed_decisions": 0, "observed_estimated_cost": 0.0, "retained_positive_delta_decisions": 0},
+                    "repository": {"observed_decisions": 0, "observed_estimated_cost": 0.0, "retained_positive_delta_decisions": 0},
+                    "integration": {"observed_decisions": 0, "observed_estimated_cost": 0.0, "retained_positive_delta_decisions": 0},
+                },
+            },
+        },
+        liftoff_payload=None,
+        round_payload=round_payload,
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+    )
+
+    for subsystem in (
+        "trust",
+        "curriculum",
+        "state_estimation",
+        "transition_model",
+        "recovery",
+        "delegation",
+        "operator_policy",
+        "capabilities",
+        "universe",
+    ):
+        assert subsystem in next_policy["excluded_subsystems"]
+    assert "coding_first_bootstrap" in round_payload["policy_shift_rationale"]["reason_codes"]
+
+
+def test_next_round_policy_keeps_support_lanes_excluded_until_first_retained_gain():
+    module = _load_script("run_unattended_campaign.py")
+    current_policy = {
+        "cycles": 1,
+        "campaign_width": 2,
+        "variant_width": 2,
+        "adaptive_search": True,
+        "task_limit": 128,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+        "tolbert_device": "cuda:2",
+        "focus": "discovered_task_adaptation",
+        "liftoff": "never",
+        "excluded_subsystems": [],
+        "subsystem_cooldowns": {},
+    }
+    round_payload: dict[str, object] = {}
+
+    next_policy = module._next_round_policy(
+        current_policy,
+        campaign_report={
+            "production_yield_summary": {
+                "retained_cycles": 0,
+                "rejected_cycles": 1,
+                "runtime_managed_decisions": 3,
+                "average_retained_pass_rate_delta": 0.0,
+                "average_retained_step_delta": 0.0,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": False, "failed_decisions": 1},
+            "trust_breadth_summary": {
+                "required_families": ["project", "repository", "integration"],
+                "required_families_with_reports": ["project", "repository", "integration"],
+                "missing_required_families": [],
+                "distinct_family_gap": 0,
+                "external_report_count": 1,
+                "distinct_external_benchmark_families": 1,
+            },
+            "priority_family_yield_summary": {
+                "priority_families": ["project", "repository", "integration"],
+                "family_summaries": {
+                    "project": {"observed_decisions": 2, "observed_estimated_cost": 4.0, "retained_positive_delta_decisions": 0},
+                    "repository": {"observed_decisions": 2, "observed_estimated_cost": 4.0, "retained_positive_delta_decisions": 0},
+                    "integration": {"observed_decisions": 2, "observed_estimated_cost": 4.0, "retained_positive_delta_decisions": 0},
+                },
+            },
+        },
+        liftoff_payload=None,
+        round_payload=round_payload,
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+    )
+
+    for subsystem in (
+        "trust",
+        "curriculum",
+        "state_estimation",
+        "transition_model",
+        "recovery",
+        "delegation",
+        "operator_policy",
+        "capabilities",
+        "universe",
+    ):
+        assert subsystem in next_policy["excluded_subsystems"]
+    assert "coding_first_bootstrap" in round_payload["policy_shift_rationale"]["reason_codes"]
 
 
 def test_next_round_policy_deprioritizes_costly_low_return_priority_families():
@@ -7627,7 +9916,82 @@ def test_next_round_policy_keeps_missing_required_families_above_min_selection_s
 
     rationale = round_payload["policy_shift_rationale"]
     assert rationale["planner_pressure"]["priority_family_budget_warning"] == {}
-    assert next_policy["priority_benchmark_families"] == ["project", "repository", "integration"]
+    assert set(next_policy["priority_benchmark_families"]) == {"project", "repository", "integration"}
+
+
+def test_next_round_policy_ignores_repo_sandbox_only_gap_for_minimum_fresh_proof():
+    module = _load_script("run_unattended_campaign.py")
+    current_policy = {
+        "cycles": 1,
+        "campaign_width": 2,
+        "variant_width": 1,
+        "adaptive_search": False,
+        "task_limit": 128,
+        "priority_benchmark_families": ["project", "repository", "integration"],
+        "tolbert_device": "cuda:2",
+        "focus": "balanced",
+        "liftoff": "auto",
+        "excluded_subsystems": [],
+        "subsystem_cooldowns": {},
+    }
+    round_payload: dict[str, object] = {}
+
+    next_policy = module._next_round_policy(
+        current_policy,
+        campaign_report={
+            "production_yield_summary": {
+                "retained_cycles": 1,
+                "rejected_cycles": 0,
+                "average_retained_pass_rate_delta": 0.05,
+                "average_retained_step_delta": -0.1,
+            },
+            "phase_gate_summary": {"all_retained_phase_gates_passed": True, "failed_decisions": 0},
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore", "repo_sandbox"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": ["repo_sandbox"],
+                "distinct_family_gap": 1,
+                "external_report_count": 4,
+                "distinct_external_benchmark_families": 4,
+            },
+            "priority_family_yield_summary": {
+                "priority_families": ["project", "repository", "integration"],
+                "family_summaries": {
+                    "project": {
+                        "observed_decisions": 2,
+                        "observed_estimated_cost": 4.0,
+                        "retained_positive_delta_decisions": 1,
+                        "retained_positive_pass_rate_delta_sum": 0.08,
+                    },
+                    "repository": {
+                        "observed_decisions": 2,
+                        "observed_estimated_cost": 4.0,
+                        "retained_positive_delta_decisions": 1,
+                        "retained_positive_pass_rate_delta_sum": 0.07,
+                    },
+                    "integration": {
+                        "observed_decisions": 2,
+                        "observed_estimated_cost": 4.0,
+                        "retained_positive_delta_decisions": 1,
+                        "retained_positive_pass_rate_delta_sum": 0.06,
+                    },
+                },
+            },
+        },
+        liftoff_payload=None,
+        round_payload=round_payload,
+        planner_controls={"priority_family_min_selection_score": 0.0},
+        max_cycles=3,
+        max_task_limit=1024,
+        max_campaign_width=4,
+        max_variant_width=3,
+    )
+
+    rationale = round_payload["policy_shift_rationale"]
+    assert rationale["planner_pressure"]["missing_required_families"] == []
+    assert rationale["planner_pressure"]["distinct_family_gap"] == 0
+    assert "required_family_coverage_gap" not in rationale["reason_codes"]
+    assert "repo_sandbox" not in next_policy["priority_benchmark_families"]
 
 
 def test_next_round_policy_reports_limited_priority_family_availability():
@@ -7838,6 +10202,50 @@ def test_stop_counters_treat_productive_depth_continuation_as_non_stall():
 
     assert no_yield_rounds == 0
     assert policy_stall_rounds == 0
+
+
+def test_stop_counters_do_not_treat_non_retained_task_success_as_yield():
+    module = _load_script("run_unattended_campaign.py")
+    campaign_report = {
+        "successful_runs": 1,
+        "completed_runs": 1,
+        "inheritance_summary": {
+            "runtime_managed_decisions": 0,
+            "non_runtime_managed_decisions": 1,
+        },
+        "decision_conversion_summary": {
+            "runtime_managed_runs": 0,
+            "non_runtime_managed_runs": 1,
+            "partial_productive_without_decision_runs": 0,
+            "decision_runs": 1,
+        },
+        "execution_source_summary": {
+            "decoder_generated": 1,
+            "llm_generated": 1,
+            "bounded_decoder_generated": 0,
+            "synthetic_plan": 0,
+            "deterministic_or_other": 0,
+            "total_executed_commands": 1,
+        },
+        "production_yield_summary": {
+            "retained_cycles": 0,
+            "rejected_cycles": 1,
+            "average_retained_pass_rate_delta": 0.0,
+            "average_retained_step_delta": 0.0,
+        },
+        "phase_gate_summary": {"all_retained_phase_gates_passed": True, "failed_decisions": 0},
+        "recent_non_runtime_decisions": [
+            {"cycle_id": "cycle:retrieval:1", "state": "reject", "subsystem": "retrieval"},
+        ],
+    }
+
+    signal = module._campaign_signal(campaign_report)
+    stop_signal = module._round_stop_signal(campaign_report=campaign_report)
+    no_yield_rounds = module._next_no_yield_rounds(1, campaign_report=campaign_report)
+
+    assert signal["task_success_evidence"] is True
+    assert stop_signal["yield_resets_no_yield"] is False
+    assert no_yield_rounds == 2
 
 
 def test_stop_counters_keep_same_policy_depth_drift_as_stall():
@@ -8587,6 +10995,48 @@ def test_write_status_mirrors_active_run_policy_top_level(tmp_path):
     assert observed["active_run"]["policy"] == active_policy
 
 
+def test_write_status_surfaces_runtime_claim(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    status_path = tmp_path / "campaign.status.json"
+    report_path = tmp_path / "campaign.json"
+    config = KernelConfig(
+        provider="vllm",
+        asi_coding_require_live_llm=True,
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {"priority_benchmark_families": ["project", "repository"]},
+        "active_run": {"run_index": 1, "provider": "vllm"},
+        "policy_shift_summary": {},
+        "campaign_validation": {},
+        "liftoff_validation": {},
+        "active_child": {},
+        "preflight": {},
+        "cleanup": {},
+        "unattended_evidence": {},
+        "global_storage": {},
+    }
+
+    module._write_status(status_path, report_path=report_path, payload=payload, config=config)
+
+    observed = json.loads(status_path.read_text(encoding="utf-8"))
+    assert observed["claimed_runtime_shape"] == config.claimed_runtime_shape()
+    assert observed["runtime_claim"]["asi_coding_require_live_llm"] is True
+    assert observed["decoder_runtime_posture"]["authority"] == "external_decoder"
+    assert observed["live_llm_provider_capable"] is True
+    assert observed["active_run"]["runtime_claim"]["asi_coding_require_live_llm"] is True
+
+
 def test_write_status_projects_live_child_signal_top_level(tmp_path):
     module = _load_script("run_unattended_campaign.py")
     status_path = tmp_path / "campaign.status.json"
@@ -8658,6 +11108,116 @@ def test_write_status_projects_live_child_signal_top_level(tmp_path):
     assert observed["trust_breadth_summary"]["missing_required_families"] == ["repo_chore"]
 
 
+def test_write_status_reprojects_active_child_and_autonomy_from_live_projection(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    status_path = tmp_path / "campaign.status.json"
+    report_path = tmp_path / "campaign.json"
+    payload = {
+        "status": "running",
+        "phase": "campaign",
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {"priority_benchmark_families": ["integration", "project", "repository", "repo_chore"]},
+        "active_run": {
+            "run_index": 1,
+            "policy": {"priority_benchmark_families": ["integration", "project", "repository", "repo_chore"]},
+        },
+        "policy_shift_summary": {},
+        "campaign_validation": {},
+        "liftoff_validation": {},
+        "active_child": {
+            "current_task": {
+                "index": 1,
+                "total": 8,
+                "task_id": "semantic_task_1",
+                "family": "integration",
+                "phase": "observe",
+            },
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "active task 1/8 is progressing",
+            },
+            "verification_outcome_summary": {
+                "successful_task_count": 1,
+                "successful_families": ["integration"],
+            },
+            "sampled_families_from_progress": ["integration"],
+        },
+        "preflight": {},
+        "cleanup": {},
+        "unattended_evidence": {},
+        "global_storage": {},
+    }
+
+    module._write_status(status_path, report_path=report_path, payload=payload)
+
+    observed = json.loads(status_path.read_text(encoding="utf-8"))
+    assert observed["current_task"]["phase"] == "primary"
+    assert observed["active_child"]["current_task"]["phase"] == "primary"
+    assert observed["active_run"]["child_status"]["current_task"]["phase"] == "primary"
+    assert observed["current_autonomy_level"] == "A3"
+    assert observed["autonomy_level_assessment"]["successful_task_count"] == 1
+    assert observed["autonomy_level_assessment"]["successful_task_count"] == observed["verification_outcome_summary"]["successful_task_count"]
+
+
+def test_write_status_projects_completed_terminal_progress_state(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    status_path = tmp_path / "campaign.status.json"
+    report_path = tmp_path / "campaign.json"
+    payload = {
+        "status": "completed",
+        "phase": "completed",
+        "reason": "requested unattended rounds completed",
+        "rounds_requested": 1,
+        "rounds_completed": 1,
+        "child_failure_recovery_budget": 1,
+        "child_failure_recoveries_used": 0,
+        "active_child": {
+            "current_task": {"index": 8, "total": 8, "task_id": "semantic_task", "family": "project", "phase": "primary"},
+            "last_progress_phase": "variant_generate",
+            "canonical_progress_state": {
+                "phase": "variant_generate",
+                "phase_family": "preview",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "preview work is progressing",
+            },
+            "semantic_progress_state": {
+                "phase": "variant_generate",
+                "phase_family": "preview",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "preview work is progressing",
+            },
+        },
+        "current_policy": {"priority_benchmark_families": ["project", "repository"]},
+        "policy_shift_summary": {},
+        "campaign_validation": {},
+        "liftoff_validation": {},
+        "preflight": {},
+        "cleanup": {},
+        "unattended_evidence": {},
+        "global_storage": {},
+    }
+
+    module._write_status(status_path, report_path=report_path, payload=payload)
+
+    observed = json.loads(status_path.read_text(encoding="utf-8"))
+    assert observed["status"] == "completed"
+    assert observed["phase"] == "completed"
+    assert observed["last_progress_phase"] == "done"
+    assert observed["semantic_progress_state"]["phase"] == "done"
+    assert observed["semantic_progress_state"]["status"] == "complete"
+    assert observed["semantic_progress_state"]["detail"] == "campaign completed"
+    assert observed["canonical_progress_state"]["phase"] == "done"
+    assert observed["canonical_progress_state"]["detail"] == "campaign completed"
+
+
 def test_run_unattended_campaign_passes_parent_status_bridge_to_child(tmp_path, monkeypatch):
     module = _load_script("run_unattended_campaign.py")
     reports_dir = tmp_path / "improvement" / "reports"
@@ -8690,6 +11250,8 @@ def test_run_unattended_campaign_passes_parent_status_bridge_to_child(tmp_path, 
                 "AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH": str(env.get("AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH", "")),
                 "AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX": str(env.get("AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX", "")),
                 "AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID": str(env.get("AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID", "")),
+                "AGENT_KERNEL_RUN_REPORTS_DIR": str(env.get("AGENT_KERNEL_RUN_REPORTS_DIR", "")),
+                "AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH": str(env.get("AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH", "")),
                 "AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR": str(env.get("AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR", "")),
                 "AGENT_KERNEL_RUNTIME_DATABASE_PATH": str(env.get("AGENT_KERNEL_RUNTIME_DATABASE_PATH", "")),
             }
@@ -8739,6 +11301,8 @@ def test_run_unattended_campaign_passes_parent_status_bridge_to_child(tmp_path, 
     assert seen_env["AGENT_KERNEL_AUTONOMOUS_PARENT_STATUS_PATH"].endswith("campaign.status.json")
     assert seen_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_INDEX"] == "1"
     assert seen_env["AGENT_KERNEL_AUTONOMOUS_PARENT_RUN_MATCH_ID"].startswith("unattended:round:")
+    assert seen_env["AGENT_KERNEL_RUN_REPORTS_DIR"].endswith("reports")
+    assert seen_env["AGENT_KERNEL_UNATTENDED_TRUST_LEDGER_PATH"].endswith("reports/unattended_trust_ledger.json")
     assert seen_env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"].endswith("improvement/improvement_reports")
     assert seen_env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"].endswith("improvement/improvement_reports/agentkernel.sqlite3")
 
@@ -8761,6 +11325,26 @@ def test_initial_round_policy_preserves_requested_priority_family_order():
     policy = module._initial_round_policy(Args(), config)
 
     assert policy["priority_benchmark_families"] == ["integration", "repository", "project"]
+
+
+def test_initial_round_policy_bootstraps_minimum_fresh_proof_priority_families():
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(frontier_task_step_floor=50)
+
+    class Args:
+        cycles = 1
+        campaign_width = 2
+        variant_width = 1
+        adaptive_search = True
+        task_limit = 10
+        task_step_floor = 75
+        priority_benchmark_family = []
+        focus = "discovered_task_adaptation"
+        liftoff = "never"
+
+    policy = module._initial_round_policy(Args(), config)
+
+    assert policy["priority_benchmark_families"] == ["integration", "project", "repository", "repo_chore"]
 
 
 def test_run_unattended_campaign_no_yield_waits_for_full_round_depth_signal(tmp_path, monkeypatch):
@@ -9013,6 +11597,25 @@ def test_child_runtime_extension_seconds_grants_preview_completion_grace():
     assert grace_seconds == 120.0
 
 
+def test_child_runtime_extension_seconds_grants_preview_active_grace_from_finalize_phase():
+    module = _load_script("run_unattended_campaign.py")
+
+    grace_key, grace_seconds = module._child_runtime_extension_plan(
+        last_progress_phase="primary",
+        active_finalize_phase="preview_candidate_eval",
+        current_task={
+            "phase": "primary",
+            "index": 1,
+            "total": 1,
+            "task_id": "semantic_open_world_task",
+            "family": "integration",
+        },
+    )
+
+    assert grace_key == "preview_active"
+    assert grace_seconds == 120.0
+
+
 def test_runtime_grace_marker_requires_progress_and_allows_reentry():
     module = _load_script("run_unattended_campaign.py")
 
@@ -9137,6 +11740,39 @@ def test_adaptive_child_progress_state_classifies_holdout_health():
     assert healthy["progress_class"] == "healthy"
     assert degraded["progress_class"] == "degraded"
     assert degraded["status"] == "over_budget"
+
+
+def test_adaptive_child_progress_state_prioritizes_primary_task_over_stale_preview_finalize_phase():
+    module = _load_script("run_unattended_campaign.py")
+
+    state = module._adaptive_child_progress_state(
+        last_progress_phase="preview_baseline_eval",
+        active_finalize_phase="preview_baseline_eval",
+        current_task={
+            "index": 1,
+            "total": 4,
+            "task_id": "semantic_open_world_20260411T225301327576Z_round_1_integration",
+            "family": "integration",
+            "phase": "primary",
+            "task_origin": "semantic_hub",
+        },
+        current_cognitive_stage={
+            "cognitive_stage": "plan_candidates",
+            "step_index": 1,
+            "phase": "primary",
+        },
+        last_progress_at=100.0,
+        progress_samples=[],
+        started_at=100.0,
+        now=120.0,
+        max_runtime_seconds=400.0,
+        max_progress_stall_seconds=60.0,
+    )
+
+    assert state["phase"] == "primary"
+    assert state["phase_family"] == "active"
+    assert state["decision_distance"] == "active"
+    assert state["detail"] == "active task 1/4 is progressing"
 
 
 def test_adaptive_child_progress_state_classifies_preview_semantics():
@@ -9304,6 +11940,301 @@ def test_run_and_stream_extends_runtime_deadline_for_progressing_holdout(monkeyp
     assert int(adaptive_events[-1]["runtime_deadline_seconds"]) == 120
 
 
+def test_run_and_stream_extends_runtime_deadline_for_active_preview_candidate(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    seen_events: list[dict[str, object]] = []
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.pid = 2468
+            self.stdout = FakeStdout(lines)
+            self._idle_polls = 0
+
+        def poll(self):
+            if self.stdout._lines:
+                return None
+            self._idle_polls += 1
+            return None if self._idle_polls == 1 else 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def __init__(self, stdout, clock):
+            self._stdout = stdout
+            self._clock = clock
+
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+
+        def select(self, timeout=None):
+            del timeout
+            if self._stdout._lines:
+                return [(type("Key", (), {"fileobj": self._stdout})(), None)]
+            self._clock["now"] = 61.0
+            return []
+
+        def close(self):
+            return None
+
+    lines = [
+        "[cycle:test] finalize phase=preview_candidate_eval subsystem=operating_envelope\n",
+        "[eval:test] phase=primary task 1/1 semantic_open_world_task family=integration cognitive_stage=world_model_updated step=1\n",
+    ]
+    clock = {"now": 0.0}
+    stdout_holder: dict[str, object] = {}
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess(lines)
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    def fake_monotonic():
+        return float(clock["now"])
+
+    def fake_time():
+        return float(clock["now"])
+
+    real_readline = FakeStdout.readline
+
+    def timed_readline(self):
+        line = real_readline(self)
+        if "phase=preview_candidate_eval" in line:
+            clock["now"] = 1.0
+        elif "world_model_updated step=1" in line:
+            clock["now"] = 59.0
+        return line
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector(stdout_holder["stdout"], clock))
+    monkeypatch.setattr(module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(module.time, "time", fake_time)
+    monkeypatch.setattr(module, "terminate_process_tree", lambda process: (_ for _ in ()).throw(AssertionError(process.pid)))
+    monkeypatch.setattr(FakeStdout, "readline", timed_readline)
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        max_runtime_seconds=60.0,
+        max_silence_seconds=300.0,
+        max_progress_stall_seconds=300.0,
+        on_event=seen_events.append,
+    )
+
+    assert result["timed_out"] is False
+    grace_events = [event for event in seen_events if event.get("event") == "runtime_grace"]
+    assert grace_events
+    assert grace_events[-1]["grace_key"] == "preview_active"
+    assert int(grace_events[-1]["runtime_deadline_seconds"]) == 181
+
+
+def test_run_and_stream_exits_immediately_after_eof_when_child_already_terminated(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    seen_events: list[dict[str, object]] = []
+
+    class FakeStdout:
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.pid = 97531
+            self.stdout = FakeStdout()
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def __init__(self, stdout):
+            self._stdout = stdout
+            self._registered = True
+
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+            self._registered = False
+
+        def select(self, timeout=None):
+            del timeout
+            if self._registered:
+                return [(type("Key", (), {"fileobj": self._stdout})(), None)]
+            raise AssertionError("selector should not be polled again after EOF closeout")
+
+        def get_map(self):
+            return {0: self._stdout} if self._registered else {}
+
+        def close(self):
+            return None
+
+    stdout_holder: dict[str, object] = {}
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess()
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector(stdout_holder["stdout"]))
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        max_runtime_seconds=60.0,
+        max_silence_seconds=300.0,
+        max_progress_stall_seconds=300.0,
+        on_event=seen_events.append,
+    )
+
+    assert result == {"returncode": 0, "stdout": "", "timed_out": False}
+    assert seen_events[-1]["event"] == "exit"
+    assert seen_events[-1]["returncode"] == 0
+
+
+def test_run_and_stream_clears_stale_primary_task_before_observe_hypothesis(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    seen_events: list[dict[str, object]] = []
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.pid = 8642
+            self.stdout = FakeStdout(lines)
+
+        def poll(self):
+            if self.stdout._lines:
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def __init__(self, stdout, clock):
+            self._stdout = stdout
+            self._clock = clock
+
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+
+        def select(self, timeout=None):
+            del timeout
+            if self._stdout._lines:
+                return [(type("Key", (), {"fileobj": self._stdout})(), None)]
+            self._clock["now"] = 10.0
+            return []
+
+        def close(self):
+            return None
+
+    lines = [
+        "[eval:test] phase=primary task 1/4 semantic_open_world_task family=integration cognitive_stage=verification_result step=5 verification_passed=0\n",
+        "[eval:test] phase=metrics_finalize start\n",
+        "[cycle:test] observe complete passed=3/4 pass_rate=0.7500 generated_pass_rate=0.0000\n",
+        "[cycle:test] phase=observe_hypothesis start provider=vllm\n",
+    ]
+    clock = {"now": 0.0}
+    stdout_holder: dict[str, object] = {}
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess(lines)
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    def fake_monotonic():
+        return float(clock["now"])
+
+    def fake_time():
+        return float(clock["now"])
+
+    real_readline = FakeStdout.readline
+
+    def timed_readline(self):
+        line = real_readline(self)
+        if "verification_result" in line:
+            clock["now"] = 1.0
+        elif "metrics_finalize start" in line:
+            clock["now"] = 2.0
+        elif "observe complete passed=3/4" in line:
+            clock["now"] = 3.0
+        elif "observe_hypothesis start" in line:
+            clock["now"] = 4.0
+        return line
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector(stdout_holder["stdout"], clock))
+    monkeypatch.setattr(module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(module.time, "time", fake_time)
+    monkeypatch.setattr(module, "terminate_process_tree", lambda process: (_ for _ in ()).throw(AssertionError(process.pid)))
+    monkeypatch.setattr(FakeStdout, "readline", timed_readline)
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        max_runtime_seconds=60.0,
+        max_silence_seconds=300.0,
+        max_progress_stall_seconds=300.0,
+        on_event=seen_events.append,
+    )
+
+    assert result["timed_out"] is False
+    adaptive_events = [event for event in seen_events if event.get("event") == "adaptive_progress_state"]
+    assert adaptive_events
+    assert any(
+        event.get("phase") == "primary" and event.get("progress_class") == "degraded"
+        for event in adaptive_events
+    )
+    assert adaptive_events[-1]["phase"] == "observe_hypothesis"
+    assert adaptive_events[-1]["phase_family"] == "observe"
+    assert adaptive_events[-1]["progress_class"] == "complete"
+    assert adaptive_events[-1]["detail"] == "observe phase completed and is ready to hand off"
+
+
 def test_make_child_progress_callback_records_adaptive_progress_state(tmp_path, monkeypatch):
     module = _load_script("run_unattended_campaign.py")
     config = KernelConfig(improvement_reports_dir=tmp_path / "reports")
@@ -9349,6 +12280,148 @@ def test_make_child_progress_callback_records_adaptive_progress_state(tmp_path, 
     assert active_child["adaptive_progress_state"]["holdout_budget"]["total_tasks"] == 462
     assert active_child["semantic_progress_state"]["phase"] == "holdout_eval"
     assert active_child["semantic_progress_state"]["progress_class"] == "healthy"
+
+
+def test_make_child_progress_callback_persists_adaptive_recovery_immediately(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(improvement_reports_dir=tmp_path / "reports")
+    report_path = config.improvement_reports_dir / "campaign.json"
+    status_path = config.improvement_reports_dir / "campaign.status.json"
+    event_log_path = config.improvement_reports_dir / "campaign.events.jsonl"
+    lock_path = tmp_path / "campaign.lock"
+    report = {
+        "status": "running",
+        "phase": "campaign",
+        "rounds_requested": 1,
+        "rounds_completed": 0,
+        "child_failure_recovery_budget": 0,
+        "child_failure_recoveries_used": 0,
+        "current_policy": {},
+        "active_run": {"run_index": 1},
+        "policy_shift_summary": {},
+        "campaign_validation": {},
+        "liftoff_validation": {},
+        "active_child": {
+            "round_index": 1,
+            "phase": "campaign",
+            "state": "running",
+            "last_progress_phase": "primary",
+            "current_task": {
+                "index": 1,
+                "total": 4,
+                "task_id": "semantic_open_world_task",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "current_cognitive_stage": {
+                "cognitive_stage": "verification_result",
+                "step_index": 1,
+                "verification_passed": False,
+            },
+            "current_task_verification_passed": False,
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "status": "active",
+                "progress_class": "degraded",
+                "decision_distance": "active",
+                "detail": "active verification failed on step 1 and is still awaiting recovery",
+                "recorded_at": 10.0,
+            },
+        },
+        "preflight": {},
+        "cleanup": {},
+        "unattended_evidence": {},
+        "global_storage": {},
+    }
+    round_payload: dict[str, object] = {}
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    module._persist_report_state(
+        report_path,
+        report,
+        config=config,
+        status_path=status_path,
+        lock_path=lock_path,
+    )
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=lock_path,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=60.0,
+    )
+
+    callback(
+        {
+            "event": "adaptive_progress_state",
+            "timestamp": 20.0,
+            "phase": "primary",
+            "phase_family": "active",
+            "status": "active",
+            "progress_class": "healthy",
+            "decision_distance": "active",
+            "progress_silence_seconds": 0.0,
+            "runtime_elapsed_seconds": 120.0,
+            "detail": "active task 1/4 is progressing",
+        }
+    )
+
+    observed = json.loads(status_path.read_text(encoding="utf-8"))
+    assert observed["semantic_progress_state"]["progress_class"] == "healthy"
+    assert observed["semantic_progress_state"]["detail"] == "active task 1/4 is progressing"
+    assert observed["active_child"]["semantic_progress_state"]["progress_class"] == "healthy"
+
+
+def test_make_child_progress_callback_refreshes_active_run_child_status(tmp_path, monkeypatch):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(improvement_reports_dir=tmp_path / "reports")
+    report_path = config.improvement_reports_dir / "campaign.json"
+    status_path = config.improvement_reports_dir / "campaign.status.json"
+    event_log_path = config.improvement_reports_dir / "campaign.events.jsonl"
+    report: dict[str, object] = {"active_run": {"run_index": 1, "phase": "campaign"}}
+    round_payload: dict[str, object] = {}
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=tmp_path / "campaign.lock",
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "pid": 123,
+            "timestamp": 10.0,
+            "line": (
+                "[eval:test] phase=generated_failure_seed task 4/4 repo_notice_review_task_file_recovery "
+                "family=repo_chore source_task=repo_notice_review_task"
+            ),
+        }
+    )
+
+    active_child = report["active_child"]
+    mirrored_child = report["active_run"]["child_status"]
+    assert mirrored_child["last_progress_line"] == active_child["last_progress_line"]
+    assert mirrored_child["last_output_line"] == active_child["last_output_line"]
+    assert mirrored_child["current_task"] == active_child["current_task"]
 
 
 def test_adaptive_progress_state_signature_ignores_silence_only_changes():
@@ -9830,7 +12903,348 @@ def test_run_and_stream_clears_failed_verification_when_progress_moves_to_new_ta
     assert latest["current_task_verification_passed"] is None
 
 
-def test_validate_campaign_report_accepts_successful_runs_without_runtime_managed_decisions():
+def test_run_and_stream_clears_failed_verification_when_progress_moves_to_new_step_same_task(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    captured_calls: list[dict[str, object]] = []
+    stdout_holder: dict[str, object] = {}
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.pid = 2468
+            self.stdout = FakeStdout(lines)
+
+        def poll(self):
+            if self.stdout._lines:
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+
+        def select(self, timeout=None):
+            del timeout
+            stdout = stdout_holder["stdout"]
+            if stdout._lines:
+                return [(type("Key", (), {"fileobj": stdout})(), None)]
+            return []
+
+        def close(self):
+            return None
+
+    lines = [
+        "[eval:test] phase=primary task 3/128 semantic_open_world_task family=integration cognitive_stage=verification_result step=1 verification_passed=0\n",
+        "[eval:test] phase=primary task 3/128 semantic_open_world_task family=integration cognitive_stage=llm_request step=3\n",
+    ]
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess(lines)
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    def fake_adaptive_child_progress_state(**kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "phase": str(kwargs.get("last_progress_phase", "")).strip(),
+            "phase_family": "active",
+            "status": "active",
+            "progress_class": "healthy",
+            "decision_distance": "active",
+            "detail": "ok",
+        }
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector())
+    monkeypatch.setattr(module, "_adaptive_child_progress_state", fake_adaptive_child_progress_state)
+    monkeypatch.setattr(module, "terminate_process_tree", lambda process: None)
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        on_event=lambda event: None,
+    )
+
+    assert result["timed_out"] is False
+    assert captured_calls
+    latest = captured_calls[-1]
+    assert latest["current_task"]["task_id"] == "semantic_open_world_task"
+    assert latest["current_cognitive_stage"]["cognitive_stage"] == "llm_request"
+    assert latest["current_cognitive_stage"]["step_index"] == 3
+    assert latest["current_task_verification_passed"] is None
+
+
+def test_run_and_stream_ignores_lagging_authoritative_child_verification_snapshot(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    captured_calls: list[dict[str, object]] = []
+    stdout_holder: dict[str, object] = {}
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.pid = 2468
+            self.stdout = FakeStdout(lines)
+
+        def poll(self):
+            if self.stdout._lines:
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+
+        def select(self, timeout=None):
+            del timeout
+            stdout = stdout_holder["stdout"]
+            if stdout._lines:
+                return [(type("Key", (), {"fileobj": stdout})(), None)]
+            return []
+
+        def close(self):
+            return None
+
+    lines = [
+        "[eval:test] phase=primary task 1/128 semantic_open_world_task family=integration cognitive_stage=verification_result step=1 verification_passed=0\n",
+        "[eval:test] phase=primary task 1/128 semantic_open_world_task family=integration cognitive_stage=llm_response step=2\n",
+    ]
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess(lines)
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    def fake_adaptive_child_progress_state(**kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "phase": str(kwargs.get("last_progress_phase", "")).strip(),
+            "phase_family": "active",
+            "status": "active",
+            "progress_class": "healthy",
+            "decision_distance": "active",
+            "detail": "ok",
+        }
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector())
+    monkeypatch.setattr(module, "_adaptive_child_progress_state", fake_adaptive_child_progress_state)
+    monkeypatch.setattr(module, "terminate_process_tree", lambda process: None)
+    monkeypatch.setattr(
+        module,
+        "_mirrored_child_status_from_parent_status",
+        lambda path: {
+            "report_kind": "repeated_improvement_status",
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "verification_result",
+                    "phase": "primary",
+                    "step_index": 1,
+                    "verification_passed": False,
+                },
+                "current_task_progress_timeline": [
+                    {
+                        "cognitive_stage": "verification_result",
+                        "phase": "primary",
+                        "step_index": 1,
+                        "verification_passed": False,
+                    }
+                ],
+                "current_task_verification_passed": False,
+            },
+        },
+    )
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        on_event=lambda event: None,
+        mirrored_status_path=tmp_path / "campaign.status.json",
+    )
+
+    assert result["timed_out"] is False
+    assert captured_calls
+    latest = captured_calls[-1]
+    assert latest["current_task"]["task_id"] == "semantic_open_world_task"
+    assert latest["current_cognitive_stage"]["cognitive_stage"] == "llm_response"
+    assert latest["current_cognitive_stage"]["step_index"] == 2
+    assert latest["current_task_verification_passed"] is None
+
+
+def test_run_and_stream_preserves_live_same_step_over_ahead_of_pipe_authoritative_snapshot(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    captured_calls: list[dict[str, object]] = []
+    stdout_holder: dict[str, object] = {}
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def fileno(self):
+            return 0
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.pid = 2468
+            self.stdout = FakeStdout(lines)
+
+        def poll(self):
+            if self.stdout._lines:
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    class FakeSelector:
+        def register(self, fileobj, events):
+            del fileobj, events
+
+        def unregister(self, fileobj):
+            del fileobj
+
+        def select(self, timeout=None):
+            del timeout
+            stdout = stdout_holder["stdout"]
+            if stdout._lines:
+                return [(type("Key", (), {"fileobj": stdout})(), None)]
+            return []
+
+        def close(self):
+            return None
+
+    lines = [
+        "[eval:test] phase=primary task 1/128 semantic_open_world_task family=integration cognitive_stage=verification_result step=1 verification_passed=0\n",
+        "[eval:test] phase=primary task 1/128 semantic_open_world_task family=integration cognitive_stage=llm_response step=2\n",
+    ]
+
+    def fake_spawn_process_group(cmd, *, cwd, env, text, bufsize):
+        del cmd, cwd, env, text, bufsize
+        process = FakeProcess(lines)
+        stdout_holder["stdout"] = process.stdout
+        return process
+
+    def fake_adaptive_child_progress_state(**kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "phase": str(kwargs.get("last_progress_phase", "")).strip(),
+            "phase_family": "active",
+            "status": "active",
+            "progress_class": "healthy",
+            "decision_distance": "active",
+            "detail": "ok",
+        }
+
+    monkeypatch.setattr(module, "spawn_process_group", fake_spawn_process_group)
+    monkeypatch.setattr(module.selectors, "DefaultSelector", lambda: FakeSelector())
+    monkeypatch.setattr(module, "_adaptive_child_progress_state", fake_adaptive_child_progress_state)
+    monkeypatch.setattr(module, "terminate_process_tree", lambda process: None)
+    monkeypatch.setattr(
+        module,
+        "_mirrored_child_status_from_parent_status",
+        lambda path: {
+            "report_kind": "repeated_improvement_status",
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "memory_update_written",
+                    "phase": "primary",
+                    "step_index": 2,
+                    "verification_passed": False,
+                },
+                "current_task_progress_timeline": [
+                    {
+                        "cognitive_stage": "memory_update_written",
+                        "phase": "primary",
+                        "step_index": 2,
+                        "verification_passed": False,
+                    }
+                ],
+                "current_task_verification_passed": False,
+            },
+        },
+    )
+
+    result = module._run_and_stream(
+        ["python", "-u", "child.py"],
+        cwd=tmp_path,
+        env={},
+        progress_label="campaign_round_1",
+        on_event=lambda event: None,
+        mirrored_status_path=tmp_path / "campaign.status.json",
+    )
+
+    assert result["timed_out"] is False
+    assert captured_calls
+    latest = captured_calls[-1]
+    assert latest["current_task"]["task_id"] == "semantic_open_world_task"
+    assert latest["current_cognitive_stage"]["cognitive_stage"] == "llm_response"
+    assert latest["current_cognitive_stage"]["step_index"] == 2
+    assert latest["current_task_verification_passed"] is None
+
+
+def test_validate_campaign_report_rejects_successful_runs_without_runtime_managed_decisions():
     module = _load_script("run_unattended_campaign.py")
 
     result = module._validate_campaign_report(
@@ -9843,8 +13257,8 @@ def test_validate_campaign_report_accepts_successful_runs_without_runtime_manage
         }
     )
 
-    assert result["passed"] is True
-    assert result["detail"] == "campaign report is complete with verified task-success evidence"
+    assert result["passed"] is False
+    assert result["detail"] == "campaign report showed no runtime-managed decisions"
 
 
 def test_task_from_progress_line_clears_task_for_finalize_phase():
@@ -10579,6 +13993,31 @@ def test_finalize_accepted_productive_partial_child_status_converts_timed_out_sn
     assert finalized["retained_gain_runs"] == 1
 
 
+def test_write_controller_state_skips_storage_governance(monkeypatch, tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    seen: list[dict[str, object]] = []
+
+    def fake_atomic_write_json(path, payload, *, config=None, govern_storage=True):
+        seen.append(
+            {
+                "path": str(path),
+                "payload": dict(payload),
+                "config": config,
+                "govern_storage": govern_storage,
+            }
+        )
+
+    monkeypatch.setattr(module, "atomic_write_json", fake_atomic_write_json)
+
+    module._write_controller_state(tmp_path / "controller.json", {"round": 1}, config=None)
+
+    assert len(seen) == 1
+    assert seen[0]["path"].endswith("controller.json")
+    assert seen[0]["payload"]["round"] == 1
+    assert seen[0]["govern_storage"] is False
+
+
+
 def test_append_event_skips_storage_governance(monkeypatch, tmp_path):
     module = _load_script("run_unattended_campaign.py")
     seen: list[dict[str, object]] = []
@@ -10639,6 +14078,421 @@ def test_live_status_projection_prefers_normalized_campaign_report_for_authorita
     assert observed["decision_stream_summary"]["runtime_managed"]["retained_cycles"] == 1
     assert observed["authoritative_decision_state"]["decision_conversion_state"] == "runtime_managed"
     assert observed["authoritative_decision_state"]["pending_decision_state"] == "retain"
+
+
+def test_live_status_projection_surfaces_codex_input_packet_summary_for_closure_only_run(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={
+            "report_path": str(tmp_path / "campaign.json"),
+            "event_log_path": str(tmp_path / "campaign.events.jsonl"),
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            }
+        },
+        active_child={
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(tmp_path / "child_report.json"),
+            "verification_outcome_summary": {
+                "successful_task_count": 2,
+                "successful_families": ["integration", "project"],
+            },
+            "sampled_families_from_progress": ["integration", "project"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+        },
+    )
+
+    summary = observed["codex_input_packet_summary"]
+    assert summary["batch_packet"]["ready"] is False
+    assert "missing_official_anchor_status_path" in summary["batch_packet"]["blockers"]
+    assert summary["lane_packets"]["ready"] is True
+    assert summary["frontier_packet"]["ready"] is False
+    assert summary["baseline_packet"]["ready"] is False
+    assert "missing_unfamiliar_domain_slice" in summary["frontier_packet"]["blockers"]
+    assert "missing_strong_baseline_comparison_slice" in summary["frontier_packet"]["blockers"]
+    assert "freeze_codex_batch_packet" in summary["suggested_actions"]
+    assert "add_held_out_unfamiliar_domain_slice" in summary["suggested_actions"]
+    assert "freeze_codex_frontier_packet" in summary["suggested_actions"]
+
+
+def test_live_status_projection_surfaces_protocol_resource_lineage_summary(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    candidate_path = tmp_path / "candidates" / "policy.json"
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "artifact_kind": "prompt_proposal_set",
+                "generation_context": {
+                    "cycle_id": "cycle:policy:1",
+                    "selection_id": "select:cycle:policy:1",
+                    "resource_id": "subsystem:policy",
+                    "active_artifact_path": str(tmp_path / "active" / "policy.json"),
+                    "selection_record": {
+                        "selection_id": "select:cycle:policy:1",
+                        "resource_id": "subsystem:policy",
+                        "edit_plan": {
+                            "resource_id": "subsystem:policy",
+                            "active_version_id": "sha256:baseline",
+                            "active_resource_path": str(tmp_path / "runtime" / "policy.json"),
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    observed = module._live_status_projection(
+        payload={},
+        active_run={},
+        active_child={
+            "active_cycle_run": {
+                "last_candidate_artifact_path": str(candidate_path),
+            },
+        },
+    )
+
+    summary = observed["protocol_resource_lineage_summary"]
+    assert summary["resource_id"] == "subsystem:policy"
+    assert summary["active_version_id"] == "sha256:baseline"
+    assert summary["candidate_artifact_path"] == str(candidate_path)
+    assert summary["artifact_kind"] == "prompt_proposal_set"
+    assert summary["versioned_resource"] is True
+    assert summary["versioned_edit_plan"] is True
+    assert "versioned_edit_plan" in observed["autonomy_level_assessment"]["higher_level_signals"]
+    assert "no_retained_gain_runs" in observed["autonomy_level_assessment"]["level_gates"]["A6"]["blockers"]
+
+
+def test_live_status_projection_autonomy_assessment_uses_minimum_fresh_proof_required_families():
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={},
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            }
+        },
+        active_child={
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore", "repo_sandbox"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": ["repo_sandbox"],
+                "external_report_count": 4,
+                "distinct_external_benchmark_families": 4,
+            },
+            "verification_outcome_summary": {
+                "successful_task_count": 1,
+                "successful_families": ["integration"],
+            },
+            "sampled_families_from_progress": ["integration"],
+        },
+    )
+
+    required_families = observed["autonomy_level_assessment"]["required_families"]
+    a4_blockers = observed["autonomy_level_assessment"]["level_gates"]["A4"]["blockers"]
+    assert "repo_sandbox" not in required_families
+    assert all("repo_sandbox" not in blocker for blocker in a4_blockers)
+
+
+def test_live_status_projection_marks_codex_input_packet_set_ready_with_frontier_and_baseline_inputs(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={
+            "report_path": str(tmp_path / "campaign.json"),
+            "event_log_path": str(tmp_path / "campaign.events.jsonl"),
+            "liftoff_report_path": str(tmp_path / "liftoff_report.json"),
+            "campaign_report": {
+                "recent_production_decisions": [
+                    {
+                        "subsystem": "retrieval",
+                        "cycle_id": "retrieval:1",
+                        "metrics_summary": {
+                            "baseline_trusted_carryover_repair_rate": 0.25,
+                            "trusted_carryover_repair_rate": 0.5,
+                            "baseline_trusted_carryover_verified_steps": 2,
+                            "trusted_carryover_verified_steps": 3,
+                            "trusted_carryover_verified_step_delta": 1,
+                        },
+                    }
+                ],
+            },
+            "unattended_evidence": {
+                "semantic_hub_summary": {
+                    "reports": 6,
+                    "distinct_benchmark_families": 4,
+                    "benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                },
+                "external_summary": {
+                    "total": 3,
+                    "distinct_benchmark_families": 2,
+                    "benchmark_families": ["integration", "repository"],
+                    "success_rate_confidence_interval": {"level": 0.95, "lower": 0.3, "upper": 0.9},
+                },
+            },
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            }
+        },
+        active_child={
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(tmp_path / "child_report.json"),
+            "verification_outcome_summary": {
+                "successful_task_count": 4,
+                "successful_families": ["integration", "project", "repository", "repo_chore"],
+            },
+            "sampled_families_from_progress": ["integration", "project", "repository", "repo_chore"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+            "semantic_progress_state": {
+                "phase": "generated_success",
+                "phase_family": "preview",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "preview work is progressing",
+            },
+            "last_progress_phase": "generated_success",
+            "active_cycle_progress": {
+                "productive_partial": True,
+                "candidate_generated": True,
+                "generated_success_started": True,
+                "generated_success_completed": False,
+            },
+        },
+    )
+
+    summary = observed["codex_input_packet_summary"]
+    assert summary["packet_set_ready"] is True
+    assert summary["frontier_packet"]["ready"] is True
+    assert summary["baseline_packet"]["ready"] is True
+    assert summary["batch_packet"]["ready"] is True
+    assert summary["lane_packets"]["ready"] is True
+    assert summary["a8_minimum_frontier_inputs_ready"] is True
+
+
+def test_live_status_projection_surfaces_coding_capability_ramp_summary_for_specialized_a3_run(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={
+            "report_path": str(tmp_path / "campaign.json"),
+            "event_log_path": str(tmp_path / "campaign.events.jsonl"),
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "semantic_only_runtime": True,
+            }
+        },
+        active_child={
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(tmp_path / "child_report.json"),
+            "verification_outcome_summary": {
+                "successful_task_count": 2,
+                "successful_families": ["integration", "project"],
+            },
+            "sampled_families_from_progress": ["integration", "project"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+        },
+    )
+
+    summary = observed["coding_capability_ramp_summary"]
+    assert summary["declared_task_universe"] == "coding"
+    assert summary["specialization_mode"] == "semantic_only_runtime"
+    assert summary["current_transition"] == "A3->A4"
+    assert summary["primary_gap_id"] == "runtime_managed_conversion"
+    assert summary["recommended_primary_lane"] == "lane_decision_closure"
+    assert summary["recommended_batch_goal"] == "retained_conversion"
+    assert "freeze_codex_frontier_packet" in summary["suggested_actions"]
+
+
+def test_live_status_projection_moves_coding_ramp_to_retrieval_after_conversion_and_trust_close(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={
+            "report_path": str(tmp_path / "campaign.json"),
+            "event_log_path": str(tmp_path / "campaign.events.jsonl"),
+            "liftoff_report_path": str(tmp_path / "liftoff_report.json"),
+            "campaign_report": {
+                "runtime_managed_decisions": 1,
+                "retained_gain_runs": 1,
+                "runs": [
+                    {
+                        "decision_records_considered": 1,
+                        "runtime_managed_decisions": 1,
+                        "non_runtime_managed_decisions": 0,
+                        "decision_owner": "child_native",
+                        "closeout_mode": "natural",
+                        "final_state": "retain",
+                        "decision_conversion_state": "runtime_managed",
+                    }
+                ],
+            },
+            "unattended_evidence": {
+                "semantic_hub_summary": {
+                    "reports": 6,
+                    "distinct_benchmark_families": 4,
+                    "benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                },
+                "external_summary": {
+                    "total": 3,
+                    "distinct_benchmark_families": 4,
+                    "benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                    "success_rate_confidence_interval": {"level": 0.95, "lower": 0.3, "upper": 0.9},
+                },
+            },
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+                "semantic_only_runtime": True,
+            }
+        },
+        active_child={
+            "report_kind": "repeated_improvement_status",
+            "pending_report_path": str(tmp_path / "child_report.json"),
+            "runtime_managed_decisions": 1,
+            "retained_gain_runs": 1,
+            "verification_outcome_summary": {
+                "successful_task_count": 4,
+                "successful_families": ["integration", "project", "repository", "repo_chore"],
+            },
+            "sampled_families_from_progress": ["integration", "project", "repository", "repo_chore"],
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+                "external_report_count": 4,
+                "distinct_external_benchmark_families": 4,
+            },
+            "semantic_progress_state": {
+                "phase": "generated_success",
+                "phase_family": "preview",
+                "status": "active",
+                "progress_class": "healthy",
+                "detail": "preview work is progressing",
+            },
+            "last_progress_phase": "generated_success",
+            "active_cycle_progress": {
+                "productive_partial": True,
+                "candidate_generated": True,
+                "generated_success_started": True,
+                "generated_success_completed": False,
+            },
+        },
+    )
+
+    summary = observed["coding_capability_ramp_summary"]
+    assert summary["primary_gap_id"] == "retrieval_to_action_carryover"
+    assert summary["recommended_batch_goal"] == "retrieval_and_memory_carryover"
+    assert summary["recommended_primary_lane"] == "lane_trust_and_carryover"
+    assert summary["a8_coding_frontier_ready"] is True
+
+
+def test_live_status_projection_rates_bounded_success_as_a3():
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={},
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            }
+        },
+        active_child={
+            "verification_outcome_summary": {
+                "successful_task_count": 2,
+                "successful_families": ["integration", "project"],
+            },
+            "sampled_families_from_progress": ["integration", "project"],
+        },
+    )
+
+    assert observed["current_autonomy_level"] == "A3"
+    assert observed["frontier_autonomy_level"] == "A3"
+    assert observed["next_autonomy_level"] == "A4"
+    assert "bounded_task_successes=2" in observed["autonomy_level_assessment"]["evidence"]
+    assert observed["autonomy_level_assessment"]["level_gates"]["A3"]["met"] is True
+    assert observed["autonomy_level_assessment"]["level_gates"]["A4"]["met"] is False
+    assert "no_runtime_managed_decisions" in observed["autonomy_level_assessment"]["next_level_blockers"]
+    assert observed["asi_campaign_lane_recommendation"]["primary_lane"] == "lane_decision_closure"
+    assert observed["asi_campaign_lane_recommendation"]["primary_batch_goal"] == "retained_conversion"
+    assert "lane_trust_and_carryover" in observed["asi_campaign_lane_recommendation"]["supporting_lanes"]
+
+
+
+def test_live_status_projection_rates_child_native_natural_closure_with_breadth_as_a4():
+    module = _load_script("run_unattended_campaign.py")
+
+    observed = module._live_status_projection(
+        payload={
+            "campaign_report": {
+                "runtime_managed_decisions": 1,
+                "retained_gain_runs": 0,
+                "runs": [
+                    {
+                        "decision_records_considered": 1,
+                        "runtime_managed_decisions": 1,
+                        "non_runtime_managed_decisions": 0,
+                        "decision_owner": "child_native",
+                        "closeout_mode": "natural",
+                        "final_state": "reject",
+                        "decision_conversion_state": "runtime_managed",
+                    }
+                ],
+            },
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            }
+        },
+        active_child={
+            "runtime_managed_decisions": 1,
+            "verification_outcome_summary": {
+                "successful_task_count": 4,
+                "successful_families": ["integration", "project", "repository", "repo_chore"],
+            },
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": [],
+            },
+            "sampled_families_from_progress": ["integration", "project", "repository", "repo_chore"],
+        },
+    )
+
+    assert observed["current_autonomy_level"] == "A4"
+    assert observed["frontier_autonomy_level"] == "A4"
+    assert observed["next_autonomy_level"] == "A5"
+    assert observed["autonomy_level_assessment"]["decision_owner"] == "child_native"
+    assert observed["autonomy_level_assessment"]["closeout_mode"] == "natural"
+    assert observed["autonomy_level_assessment"]["level_gates"]["A4"]["met"] is True
+    assert observed["autonomy_level_assessment"]["level_gates"]["A5"]["met"] is False
+    assert "child_native_natural_decision_closure" in observed["autonomy_level_assessment"]["evidence"]
+    assert "successful_resume_after_interruption_not_proven" in observed["autonomy_level_assessment"]["level_gates"]["A5"]["blockers"]
+    assert observed["asi_campaign_lane_recommendation"]["primary_lane"] == "lane_runtime_authority"
+    assert observed["asi_campaign_lane_recommendation"]["primary_batch_goal"] == "evidence_hygiene_handoff"
 
 
 def test_live_status_projection_prefers_canonical_progress_state_over_stale_semantic_state():
@@ -10852,6 +14706,158 @@ def test_run_unattended_campaign_accepted_productive_partial_timeout_runs_round_
     assert "runtime-managed retain" not in status_payload["phase_detail"]
 
 
+def test_run_unattended_campaign_accepts_controller_intervention_from_child_mirrored_status_file(
+    tmp_path, monkeypatch
+):
+    module = _load_script("run_unattended_campaign.py")
+    reports_dir = tmp_path / "improvement" / "reports"
+    config = KernelConfig(improvement_reports_dir=reports_dir)
+
+    def fake_run_and_stream(cmd, *, cwd, env, on_event=None, **kwargs):
+        del cmd, kwargs
+        assert on_event is not None
+        on_event(
+            {
+                "event": "start",
+                "pid": 31337,
+                "progress_label": "campaign_round_1",
+                "started_at": 1.0,
+            }
+        )
+        on_event(
+            {
+                "event": "output",
+                "pid": 31337,
+                "progress_label": "campaign_round_1",
+                "timestamp": 2.0,
+                "line": (
+                    "[eval:test] phase=generated_failure task 8/8 archive_command_seed_task_file_recovery "
+                    "family=bounded family=bounded cognitive_stage=memory_update_written step=2 "
+                    "verification_passed=1"
+                ),
+            }
+        )
+        child_reports_dir = Path(env["AGENT_KERNEL_IMPROVEMENT_REPORTS_DIR"])
+        child_reports_dir.mkdir(parents=True, exist_ok=True)
+        campaign_report_path = child_reports_dir / "campaign_report.json"
+        campaign_report_path.write_text(
+            json.dumps(
+                {
+                    "report_kind": "improvement_campaign_report",
+                    "report_path": str(campaign_report_path),
+                    "completed_runs": 1,
+                    "successful_runs": 1,
+                    "runtime_managed_decisions": 0,
+                    "retained_gain_runs": 0,
+                    "decision_conversion_summary": {
+                        "runtime_managed_runs": 0,
+                        "non_runtime_managed_runs": 0,
+                        "partial_productive_without_decision_runs": 1,
+                        "decision_runs": 0,
+                        "no_decision_runs": 0,
+                    },
+                    "runs": [
+                        {
+                            "partial_productive": True,
+                            "generated_success_completed": True,
+                            "decision_records_considered": 0,
+                            "runtime_managed_decisions": 0,
+                            "retained_gain": False,
+                            "decision_conversion_state": "partial_productive_without_decision",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (child_reports_dir / "repeated_improvement_status.json").write_text(
+            json.dumps(
+                {
+                    "report_kind": "repeated_improvement_status",
+                    "report_path": str(campaign_report_path),
+                    "state": "running",
+                    "partial_productive_runs": 1,
+                    "runtime_managed_decisions": 0,
+                    "retained_gain_runs": 0,
+                    "active_cycle_progress": {
+                        "productive_partial": True,
+                        "generated_success_completed": True,
+                        "sampled_families_from_progress": ["integration", "project", "repository"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "returncode": -15,
+            "stdout": "",
+            "stderr": "terminated",
+            "timed_out": True,
+            "timeout_reason": "mid-round controller intervention",
+        }
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(module, "KernelConfig", lambda: config)
+    monkeypatch.setattr(module, "_run_and_stream", fake_run_and_stream)
+    monkeypatch.setattr(module, "_governed_cleanup_runtime_state", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(module, "_governed_global_storage_cleanup", lambda *args, **kwargs: {"cleanup": {}})
+    monkeypatch.setattr(module, "_load_retained_curriculum_controls", lambda cfg: {})
+    monkeypatch.setattr(module, "_load_retained_improvement_planner_controls", lambda cfg: {})
+    monkeypatch.setattr(module, "_next_round_policy", lambda current_policy, **kwargs: dict(current_policy))
+    monkeypatch.setattr(module, "_persist_semantic_round_artifacts", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_unattended_evidence_snapshot", lambda cfg: {})
+    monkeypatch.setattr(module, "_write_controller_state", lambda path, payload, *, config=None: None)
+    monkeypatch.setattr(
+        module,
+        "_disk_preflight",
+        lambda path, *, min_free_gib: {
+            "path": str(path),
+            "free_bytes": 1024,
+            "free_gib": 100.0,
+            "min_free_gib": min_free_gib,
+            "passed": True,
+            "detail": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_preflight",
+        lambda device: {"device": device, "passed": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_trust_preflight",
+        lambda cfg: {"passed": True, "status": "pass", "detail": "ok", "reports_considered": 1, "failing_thresholds": []},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_unattended_campaign.py",
+            "--liftoff",
+            "never",
+            "--rounds",
+            "1",
+            "--report-path",
+            str(tmp_path / "campaign.json"),
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    report_path = Path(stream.getvalue().strip())
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert payload["rounds_completed"] == 1
+    assert payload["child_failure_recoveries_used"] == 0
+    assert len(payload["rounds"]) == 1
+    assert payload["rounds"][0]["status"] == "completed"
+    assert payload["rounds"][0]["campaign_validation"]["accepted_partial_timeout"] is True
+    assert payload["rounds"][0]["campaign_report_path"].endswith("campaign_report.json")
+
+
 def test_merge_mirrored_child_status_fields_preserves_credited_runtime_managed_closure():
     module = _load_script("run_unattended_campaign.py")
 
@@ -11033,9 +15039,217 @@ def test_live_status_projection_surfaces_open_world_provider_carryover_finalize_
     assert projected["long_horizon_finalize_summary"]["finalize_conversion_gap"] is False
     assert projected["handoff_summary"]["handoff_ready"] is True
     assert projected["closure_gap_summary"]["open_world_breadth"] == "partial"
-    assert projected["closure_gap_summary"]["decoder_runtime_independence"] == "closed"
+    assert projected["closure_gap_summary"]["decoder_runtime_independence"] == "partial"
     assert projected["closure_gap_summary"]["retrieval_carryover"] == "closed"
     assert projected["closure_gap_summary"]["tolbert_retained_routing"] == "partial"
+
+
+def test_live_status_projection_exposes_filtered_minimum_fresh_proof_gap():
+    module = _load_script("run_unattended_campaign.py")
+
+    projected = module._live_status_projection(
+        payload={
+            "current_policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore", "repo_sandbox"]
+            },
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository", "repo_chore", "repo_sandbox"],
+                "required_families_with_reports": ["integration", "project", "repository", "repo_chore"],
+                "missing_required_families": ["repo_sandbox"],
+                "external_report_count": 4,
+                "distinct_external_benchmark_families": 4,
+                "distinct_family_gap": 1,
+            },
+        },
+        active_run={
+            "policy": {
+                "priority_benchmark_families": ["integration", "project", "repository", "repo_chore", "repo_sandbox"]
+            }
+        },
+        active_child={
+            "sampled_families_from_progress": ["integration", "project", "repository", "repo_chore"],
+        },
+    )
+
+    assert projected["trust_breadth_summary"]["missing_required_families"] == ["repo_sandbox"]
+    assert projected["trust_breadth_summary"]["proof_required_families"] == [
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+    ]
+    assert projected["trust_breadth_summary"]["proof_required_families_with_reports"] == [
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+    ]
+    assert projected["trust_breadth_summary"]["proof_missing_required_families"] == []
+    assert projected["trust_breadth_summary"]["proof_distinct_family_gap"] == 0
+    assert projected["closure_gap_summary"]["trust_breadth"] == "closed"
+    assert projected["benchmark_dominance_summary"]["suite_kind"] == "minimum_fresh_proof_suite"
+    assert projected["benchmark_dominance_summary"]["required_families"] == [
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+    ]
+    assert projected["benchmark_dominance_summary"]["open_families"] == []
+    assert "repo_sandbox" not in projected["benchmark_dominance_summary"]["required_family_statuses"]
+
+
+def test_live_status_projection_prefers_live_child_breadth_summaries():
+    module = _load_script("run_unattended_campaign.py")
+
+    projected = module._live_status_projection(
+        payload={
+            "current_policy": {
+                "priority_benchmark_families": ["integration", "project", "repository"]
+            },
+            "unattended_evidence": {
+                "semantic_hub_summary": {
+                    "reports": 1,
+                    "distinct_benchmark_families": 1,
+                    "benchmark_families": ["integration"],
+                },
+                "external_summary": {
+                    "total": 0,
+                    "distinct_benchmark_families": 0,
+                    "benchmark_families": [],
+                },
+                "replay_derived_summary": {
+                    "reports": 0,
+                    "distinct_benchmark_families": 0,
+                    "benchmark_families": [],
+                },
+            },
+            "campaign_report": {
+                "trust_breadth_summary": {
+                    "required_families": ["integration", "project", "repository"],
+                    "required_families_with_reports": ["integration"],
+                    "missing_required_families": ["project", "repository"],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                    "distinct_family_gap": 2,
+                },
+            },
+        },
+        active_run={
+            "policy": {"priority_benchmark_families": ["integration", "project", "repository"]},
+        },
+        active_child={
+            "sampled_families_from_progress": ["integration", "project", "repository"],
+            "verification_outcome_summary": {
+                "verified_task_count": 2,
+                "failed_task_count": 0,
+                "successful_task_count": 2,
+                "verified_families": ["integration", "project"],
+                "failed_families": [],
+                "successful_families": ["integration", "project"],
+            },
+            "trust_breadth_summary": {
+                "required_families": ["integration", "project", "repository"],
+                "required_families_with_reports": ["integration", "project", "repository"],
+                "missing_required_families": [],
+                "external_report_count": 0,
+                "distinct_external_benchmark_families": 0,
+                "distinct_family_gap": 0,
+            },
+            "open_world_breadth_summary": {
+                "semantic_hub_report_count": 9,
+                "distinct_semantic_hub_benchmark_families": 3,
+                "semantic_hub_benchmark_families": ["integration", "project", "repository"],
+                "external_report_count": 0,
+                "distinct_external_benchmark_families": 0,
+                "external_benchmark_families": [],
+                "replay_derived_report_count": 0,
+                "distinct_replay_derived_benchmark_families": 0,
+                "replay_derived_benchmark_families": [],
+                "open_world_report_count": 9,
+                "distinct_open_world_benchmark_families": 3,
+                "benchmark_families": ["integration", "project", "repository"],
+                "open_world_benchmark_families": ["integration", "project", "repository"],
+                "retained_open_world_gain": False,
+                "open_world_task_yield_present": True,
+                "semantic_hub_summary": {
+                    "reports": 9,
+                    "distinct_benchmark_families": 3,
+                    "benchmark_families": ["integration", "project", "repository"],
+                },
+                "external_summary": {"total": 0, "distinct_benchmark_families": 0, "benchmark_families": []},
+                "replay_derived_summary": {
+                    "reports": 0,
+                    "distinct_benchmark_families": 0,
+                    "benchmark_families": [],
+                },
+            },
+        },
+    )
+
+    assert projected["verification_outcome_summary"]["successful_task_count"] == 2
+    assert projected["trust_breadth_summary"]["required_families_with_reports"] == [
+        "integration",
+        "project",
+        "repository",
+    ]
+    assert projected["trust_breadth_summary"]["missing_required_families"] == []
+    assert projected["open_world_breadth_summary"]["semantic_hub_report_count"] == 9
+    assert projected["open_world_breadth_summary"]["distinct_open_world_benchmark_families"] == 3
+
+
+def test_merge_mirrored_child_status_fields_keeps_live_open_world_and_verification_summaries():
+    module = _load_script("run_unattended_campaign.py")
+
+    merged = module._merge_mirrored_child_status_fields(
+        {
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "semantic_open_world_round_1_integration",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "semantic_progress_state": {
+                "phase": "primary",
+                "progress_class": "healthy",
+                "recorded_at": 10.0,
+            },
+        },
+        {
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "semantic_open_world_round_1_integration",
+                "family": "integration",
+                "phase": "primary",
+            },
+            "semantic_progress_state": {
+                "phase": "primary",
+                "progress_class": "healthy",
+                "recorded_at": 20.0,
+            },
+            "verification_outcome_summary": {
+                "verified_task_count": 2,
+                "failed_task_count": 1,
+                "successful_task_count": 1,
+                "verified_families": ["integration"],
+                "failed_families": ["integration"],
+                "successful_families": ["integration"],
+            },
+            "trust_breadth_summary": {
+                "required_families_with_reports": ["integration"],
+            },
+            "open_world_breadth_summary": {
+                "semantic_hub_report_count": 2,
+                "distinct_open_world_benchmark_families": 1,
+                "benchmark_families": ["integration"],
+            },
+        },
+    )
+
+    assert merged["verification_outcome_summary"]["verified_task_count"] == 2
+    assert merged["trust_breadth_summary"]["required_families_with_reports"] == ["integration"]
+    assert merged["open_world_breadth_summary"]["semantic_hub_report_count"] == 2
 
 
 def test_controller_observation_includes_strategy_memory_and_trust_features():
@@ -11401,7 +15615,7 @@ def test_persist_semantic_round_artifacts_writes_attempt_note_and_redirect(tmp_p
     assert agent["last_task_ids"][0].startswith("task:")
 
 
-def test_preferred_unattended_provider_prefers_tolbert_when_retained_surfaces_exist(tmp_path):
+def test_preferred_unattended_provider_defaults_to_seed_runtime_even_when_retained_surfaces_exist(tmp_path):
     module = _load_script("run_unattended_campaign.py")
     artifact_path = tmp_path / "trajectories" / "tolbert_model" / "tolbert_model_artifact.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11425,7 +15639,89 @@ def test_preferred_unattended_provider_prefers_tolbert_when_retained_surfaces_ex
 
     provider = module._preferred_unattended_provider(type("Args", (), {"provider": None})(), config=config)
 
-    assert provider == "hybrid"
+    assert provider == "vllm"
+
+
+def test_semantic_round_task_payloads_emit_shell_free_contract_commands(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+
+    tasks = module._semantic_round_task_payloads(
+        run_id="run-1",
+        round_payload={
+            "round_index": 2,
+            "semantic_redirection": {
+                "target_priority_families": ["integration"],
+            },
+        },
+        current_policy={"priority_benchmark_families": ["integration"]},
+    )
+
+    assert len(tasks) == 1
+    task = tasks[0]["payload"]["task"]
+    assert "python - <<'PY'" not in task["success_command"]
+    assert all("python - <<'PY'" not in command for command in task["suggested_commands"])
+    assert len(task["suggested_commands"]) == 1
+
+    sandbox = Sandbox(timeout_seconds=10)
+    for command in task["suggested_commands"]:
+        result = sandbox.run(command, tmp_path)
+        assert result.exit_code == 0, result.stderr
+
+    success = sandbox.run(task["success_command"], tmp_path)
+    assert success.exit_code == 0, success.stderr
+    contract_payload = json.loads((tmp_path / "semantic_open_world" / "integration_task.json").read_text(encoding="utf-8"))
+    assert contract_payload["metadata"]["benchmark_family"] == "integration"
+    assert contract_payload["metadata"]["open_world_candidate"] is True
+
+
+def test_task_bank_normalizes_legacy_semantic_hub_tasks_to_shell_free_contract_commands(tmp_path):
+    semantic_hub_root = tmp_path / "semantic_hub"
+    tasks_root = semantic_hub_root / "tasks"
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    legacy_task_path = tasks_root / "semantic_open_world_legacy_round_1_integration.json"
+    legacy_task_path.write_text(
+        json.dumps(
+            {
+                "task": {
+                    "task_id": "semantic_open_world_legacy_round_1_integration",
+                    "prompt": "Inspect this repository for a non-replay integration task surface.",
+                    "workspace_subdir": "semantic_hub/semantic_open_world_legacy_round_1_integration",
+                    "suggested_commands": [
+                        "mkdir -p semantic_open_world && printf '# integration open-world evidence\\n' > semantic_open_world/integration_evidence.md",
+                        "python - <<'PY'\nprint('legacy blocked command')\nPY",
+                    ],
+                    "success_command": "python - <<'PY'\nprint('legacy blocked success')\nPY",
+                    "expected_files": [
+                        "semantic_open_world/integration_task.json",
+                        "semantic_open_world/integration_evidence.md",
+                    ],
+                    "metadata": {
+                        "benchmark_family": "integration",
+                        "capability": "semantic_open_world",
+                        "open_world_candidate": True,
+                        "semantic_parent_attempt_id": "unattended_round:legacy:1",
+                    },
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(semantic_hub_root=semantic_hub_root)
+
+    task = TaskBank(config=config).get("semantic_open_world_legacy_round_1_integration")
+
+    assert "python - <<'PY'" not in task.success_command
+    assert all("python - <<'PY'" not in command for command in task.suggested_commands)
+    assert len(task.suggested_commands) == 1
+
+    sandbox = Sandbox(timeout_seconds=10)
+    for command in task.suggested_commands:
+        result = sandbox.run(command, tmp_path)
+        assert result.exit_code == 0, result.stderr
+
+    success = sandbox.run(task.success_command, tmp_path)
+    assert success.exit_code == 0, success.stderr
 
 
 def test_apply_semantic_policy_seed_uses_recent_redirects(tmp_path):
@@ -11485,11 +15781,82 @@ def test_apply_semantic_policy_seed_uses_recent_redirects(tmp_path):
     )
 
     assert seeded["adaptive_search"] is True
-    assert seeded["focus"] == "balanced"
+    assert seeded["focus"] == "discovered_task_adaptation"
     assert seeded["excluded_subsystems"] == ["tooling"]
     assert seeded["subsystem_cooldowns"] == {"tooling": 2}
     assert seeded["priority_benchmark_families"] == ["integration", "repository"]
     assert seeded["variant_width"] == 1
+
+
+def test_apply_semantic_policy_seed_preserves_bootstrap_minimum_fresh_proof_families():
+    module = _load_script("run_unattended_campaign.py")
+
+    seeded = module._apply_semantic_policy_seed(
+        {
+            "cycles": 3,
+            "campaign_width": 2,
+            "variant_width": 1,
+            "adaptive_search": True,
+            "task_limit": 128,
+            "task_step_floor": 50,
+            "priority_benchmark_families": ["integration", "project", "repository", "repo_chore"],
+            "tolbert_device": "cuda",
+            "focus": "balanced",
+            "liftoff": "auto",
+            "excluded_subsystems": [],
+            "subsystem_cooldowns": {},
+        },
+        semantic_seed={
+            "priority_benchmark_families": ["integration", "repository"],
+        },
+    )
+
+    assert seeded["priority_benchmark_families"] == ["integration", "repository", "project", "repo_chore"]
+
+
+def test_initial_round_policy_seeds_persistent_excluded_subsystems(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    args = SimpleNamespace(
+        cycles=3,
+        campaign_width=2,
+        variant_width=1,
+        adaptive_search=False,
+        task_limit=128,
+        task_step_floor=0,
+        priority_benchmark_family=[],
+        focus="balanced",
+        liftoff="never",
+        exclude_subsystem=["tolbert_model"],
+    )
+
+    policy = module._initial_round_policy(args, config)
+
+    assert policy["persistent_excluded_subsystems"] == ["tolbert_model"]
+    assert "tolbert_model" in policy["excluded_subsystems"]
+
+
+def test_advance_subsystem_cooldowns_preserves_persistent_excluded_subsystems():
+    module = _load_script("run_unattended_campaign.py")
+
+    next_policy = module._advance_subsystem_cooldowns(
+        {
+            "persistent_excluded_subsystems": ["tolbert_model"],
+            "excluded_subsystems": ["tolbert_model", "retrieval"],
+            "subsystem_cooldowns": {"retrieval": 2},
+        }
+    )
+
+    assert next_policy["persistent_excluded_subsystems"] == ["tolbert_model"]
+    assert next_policy["excluded_subsystems"] == ["tolbert_model", "retrieval"]
+    assert next_policy["subsystem_cooldowns"] == {"retrieval": 1}
+
 
 def test_parse_cognitive_progress_fields_extracts_stage_payload():
     module = _load_script("run_unattended_campaign.py")
@@ -11605,3 +15972,452 @@ def test_child_progress_callback_clears_failed_verification_on_new_task(tmp_path
     assert active_child["current_task_verification_passed"] is None
     assert active_child["current_cognitive_stage"]["cognitive_stage"] == "memory_retrieved"
     assert len(active_child["current_task_progress_timeline"]) == 1
+
+
+def test_child_progress_callback_clears_failed_verification_on_new_step_same_task(tmp_path):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    report = {}
+    round_payload = {}
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=None,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=primary task 3/128 semantic_open_world_task "
+            "family=integration cognitive_stage=verification_result step=1 verification_passed=0",
+            "pid": 123,
+            "timestamp": 1.0,
+        }
+    )
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=primary task 3/128 semantic_open_world_task "
+            "family=integration cognitive_stage=llm_request step=3",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert active_child["current_task"]["task_id"] == "semantic_open_world_task"
+    assert active_child["current_task"]["index"] == 3
+    assert active_child["current_task_verification_passed"] is None
+    assert active_child["current_cognitive_stage"]["cognitive_stage"] == "llm_request"
+    assert active_child["current_cognitive_stage"]["step_index"] == 3
+
+
+def test_child_progress_callback_preserves_live_task_over_ahead_of_pipe_future_task_snapshot(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    report = {}
+    round_payload = {}
+
+    monkeypatch.setattr(
+        module,
+        "_mirrored_child_status_from_parent_status",
+        lambda path: {
+            "report_kind": "repeated_improvement_status",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "healthy",
+                "decision_distance": "active",
+                "detail": "active task 3/4 is progressing",
+                "recorded_at": 3.0,
+            },
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 3,
+                    "total": 4,
+                    "task_id": "semantic_open_world_20260411T225301327576Z_round_1_project",
+                    "family": "project",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "transition_simulated",
+                    "phase": "primary",
+                    "step_index": 1,
+                },
+                "semantic_progress_state": {
+                    "phase": "primary",
+                    "phase_family": "active",
+                    "progress_class": "healthy",
+                    "decision_distance": "active",
+                    "detail": "active task 3/4 is progressing",
+                    "recorded_at": 3.0,
+                },
+            },
+        },
+    )
+
+    callback = module._make_child_progress_callback(
+        config=config,
+        report=report,
+        report_path=report_path,
+        status_path=status_path,
+        lock_path=None,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=primary task 1/4 semantic_open_world_20260411T225301327576Z_round_1_integration "
+            "family=integration task_origin=semantic_hub family=integration cognitive_stage=llm_request step=2",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert active_child["current_task"]["task_id"] == "semantic_open_world_20260411T225301327576Z_round_1_integration"
+    assert active_child["current_task"]["index"] == 1
+    assert active_child.get("current_cognitive_stage", {}).get("cognitive_stage") == "llm_request"
+
+
+def test_child_progress_callback_preserves_live_same_step_semantic_state_over_ahead_of_pipe_snapshot(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    report = {}
+    round_payload = {}
+
+    monkeypatch.setattr(
+        module,
+        "_mirrored_child_status_from_parent_status",
+        lambda path: {
+            "report_kind": "repeated_improvement_status",
+            "semantic_progress_state": {
+                "phase": "primary",
+                "phase_family": "active",
+                "progress_class": "degraded",
+                "decision_distance": "active",
+                "detail": "active task 1/128 failed verification and is awaiting recovery",
+                "recorded_at": 3.0,
+            },
+            "active_cycle_run": {
+                "last_progress_phase": "primary",
+                "current_task": {
+                    "index": 1,
+                    "total": 128,
+                    "task_id": "semantic_open_world_task",
+                    "family": "integration",
+                    "phase": "primary",
+                },
+                "current_cognitive_stage": {
+                    "cognitive_stage": "memory_update_written",
+                    "phase": "primary",
+                    "step_index": 2,
+                    "verification_passed": False,
+                },
+                "current_task_progress_timeline": [
+                    {
+                        "cognitive_stage": "memory_update_written",
+                        "phase": "primary",
+                        "step_index": 2,
+                        "verification_passed": False,
+                    }
+                ],
+                "current_task_verification_passed": False,
+            },
+        },
+    )
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=None,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=primary task 1/128 semantic_open_world_task "
+            "family=integration cognitive_stage=llm_response step=2",
+            "pid": 123,
+            "timestamp": 1.0,
+        }
+    )
+    callback(
+        {
+            "event": "adaptive_progress_state",
+            "phase": "primary",
+            "phase_family": "active",
+            "status": "active",
+            "progress_class": "healthy",
+            "decision_distance": "active",
+            "detail": "active task 1/128 is progressing",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert active_child["current_task"]["task_id"] == "semantic_open_world_task"
+    assert active_child["current_cognitive_stage"]["cognitive_stage"] == "llm_response"
+    assert active_child["current_cognitive_stage"]["step_index"] == 2
+    assert active_child["current_task_verification_passed"] is None
+    assert active_child["semantic_progress_state"]["progress_class"] == "healthy"
+    assert active_child["semantic_progress_state"]["detail"] == "active task 1/128 is progressing"
+    assert active_child["canonical_progress_state"]["progress_class"] == "healthy"
+    assert "controller_intervention" not in report
+
+
+def test_child_progress_callback_clears_stale_controller_intervention_after_progress_resumes(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    report = {
+        "active_child": {
+            "controller_intervention": {
+                "triggered": True,
+                "reason_code": "productive_partial_preview_without_decision",
+            }
+        },
+        "controller_intervention": {
+            "triggered": True,
+            "reason_code": "productive_partial_preview_without_decision",
+        },
+        "active_child_controller_intervention": {
+            "triggered": True,
+            "reason_code": "productive_partial_preview_without_decision",
+        },
+    }
+    round_payload = {
+        "controller_intervention": {
+            "triggered": True,
+            "reason_code": "productive_partial_preview_without_decision",
+        }
+    }
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_mirrored_child_status_from_parent_status", lambda path: {})
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=None,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=generated_failure task 1/1 semantic_open_world_task_recovery "
+            "family=integration source_task=semantic_open_world_task",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert "controller_intervention" not in active_child
+    assert "controller_intervention" not in report
+    assert "active_child_controller_intervention" not in report
+    assert "controller_intervention" not in round_payload
+
+
+def test_child_progress_callback_does_not_fire_observe_stall_intervention_when_task_progress_resumes(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    report = {"active_child": {}}
+    round_payload = {}
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "_mirrored_child_status_from_parent_status",
+        lambda path: {
+            "semantic_progress_state": {
+                "phase": "observe",
+                "phase_family": "observe",
+                "progress_class": "stuck",
+                "progress_silence_seconds": 361.0,
+                "recorded_at": 1.0,
+            },
+            "current_task": {
+                "index": 1,
+                "total": 128,
+                "task_id": "semantic_open_world_task",
+                "family": "integration",
+                "phase": "observe",
+            },
+        },
+    )
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=None,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[eval:campaign] phase=observe task 10/128 semantic_open_world_task family=integration task_origin=semantic_hub",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    active_child = report["active_child"]
+    assert active_child["current_task"]["index"] == 10
+    assert active_child["last_task_progress_at"] == 2.0
+    assert "controller_intervention" not in active_child
+    assert "controller_intervention" not in report
+    assert "active_child_controller_intervention" not in report
+    assert "controller_intervention" not in round_payload
+
+
+def test_child_progress_callback_does_not_clear_controller_intervention_on_still_running_heartbeat(
+    monkeypatch, tmp_path
+):
+    module = _load_script("run_unattended_campaign.py")
+    config = KernelConfig(
+        improvement_reports_dir=tmp_path / "reports",
+        candidate_artifacts_root=tmp_path / "candidates",
+        run_checkpoints_dir=tmp_path / "checkpoints",
+        unattended_workspace_snapshot_root=tmp_path / "snapshots",
+        tolbert_supervised_datasets_dir=tmp_path / "tolbert_datasets",
+    )
+    report_path = tmp_path / "report.json"
+    status_path = tmp_path / "status.json"
+    event_log_path = tmp_path / "events.jsonl"
+    intervention = {
+        "triggered": True,
+        "reason_code": "observe_progress_stall",
+    }
+    report = {
+        "active_child": {"controller_intervention": dict(intervention)},
+        "controller_intervention": dict(intervention),
+        "active_child_controller_intervention": dict(intervention),
+    }
+    round_payload = {"controller_intervention": dict(intervention)}
+
+    monkeypatch.setattr(module, "_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_persist_report_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_mirrored_child_status_from_parent_status", lambda path: {})
+
+    callback = module._make_child_progress_callback(
+        report_path=report_path,
+        report=report,
+        status_path=status_path,
+        lock_path=None,
+        config=config,
+        round_payload=round_payload,
+        round_index=1,
+        phase="campaign",
+        child_label="campaign_round_1",
+        event_log_path=event_log_path,
+        min_write_interval_seconds=0.0,
+    )
+
+    callback(
+        {
+            "event": "output",
+            "line": "[repeated] child=campaign_round_1 still_running silence=120s",
+            "pid": 123,
+            "timestamp": 2.0,
+        }
+    )
+
+    assert report["active_child"]["controller_intervention"]["reason_code"] == "observe_progress_stall"
+    assert report["controller_intervention"]["reason_code"] == "observe_progress_stall"
+    assert report["active_child_controller_intervention"]["reason_code"] == "observe_progress_stall"
+    assert round_payload["controller_intervention"]["reason_code"] == "observe_progress_stall"

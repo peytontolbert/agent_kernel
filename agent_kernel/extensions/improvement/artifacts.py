@@ -225,6 +225,7 @@ def stamp_artifact_generation_context(
     prior_active_artifact_path: Path | None = None,
     prior_retained_cycle_id: str | None = None,
     prior_retained_artifact_snapshot_path: Path | None = None,
+    extra_context: dict[str, object] | None = None,
     runtime_config: KernelConfig | None = None,
 ) -> None:
     if not artifact_path.exists():
@@ -243,6 +244,12 @@ def stamp_artifact_generation_context(
         context["prior_retained_cycle_id"] = prior_retained_cycle_id
     if prior_retained_artifact_snapshot_path is not None:
         context["prior_retained_artifact_snapshot_path"] = str(prior_retained_artifact_snapshot_path)
+    if isinstance(extra_context, dict):
+        for key, value in extra_context.items():
+            normalized = str(key).strip()
+            if not normalized:
+                continue
+            context[normalized] = value
     payload["generation_context"] = context
     _atomic_write_json_compat(artifact_path, payload, config=runtime_config)
 

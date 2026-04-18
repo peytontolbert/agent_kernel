@@ -70,6 +70,7 @@ class LLMDecisionPolicy(Policy):
         context_provider: ContextProvider | None = None,
         skill_library: SkillLibrary | None = None,
         config: KernelConfig | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.client = client
         self.context_provider = context_provider
@@ -78,11 +79,10 @@ class LLMDecisionPolicy(Policy):
         self.context_budgeter = ContextBudgeter(self.config)
         self.universe_model = UniverseModel(config=self.config) if self.config.use_universe_model else None
         self.world_model = WorldModel(config=self.config)
-        repo_root = Path(__file__).resolve().parents[1]
-        prompts_dir = repo_root / "prompts"
-        self.system_prompt = prompts_dir.joinpath("system.md").read_text(encoding="utf-8")
-        self.decision_prompt = prompts_dir.joinpath("decision.md").read_text(encoding="utf-8")
-        self.runtime_support = PolicyRuntimeSupport(config=self.config, repo_root=repo_root)
+        resolved_repo_root = repo_root if repo_root is not None else Path(__file__).resolve().parents[1]
+        self.runtime_support = PolicyRuntimeSupport(config=self.config, repo_root=resolved_repo_root)
+        self.system_prompt = self.runtime_support.prompt_template("system")
+        self.decision_prompt = self.runtime_support.prompt_template("decision")
         self.workflow_adapter = PolicyWorkflowAdapter(self)
         self._decision_progress_callback = None
 
@@ -113,6 +113,8 @@ class LLMDecisionPolicy(Policy):
         failure_origin: str = "",
         error_text: str = "",
     ) -> ActionDecision | None:
+        if self._require_live_llm_coding_control(state):
+            return None
         normalized_failure_origin = str(failure_origin).strip()
         allow_fallback = normalized_failure_origin == "inference_failure"
         allow_progressive_first_step = False
@@ -156,6 +158,10 @@ class LLMDecisionPolicy(Policy):
         )
         return self._apply_tolbert_shadow(fallback, tolbert_shadow, tolbert_route.mode, state=state)
 
+    def _require_live_llm_coding_control(self, state: AgentState) -> bool:
+        del state
+        return bool(self.config.asi_coding_require_live_llm)
+
     def _emit_decision_progress(self, stage: str, **payload: object) -> None:
         if self._decision_progress_callback is None:
             return
@@ -164,24 +170,29 @@ class LLMDecisionPolicy(Policy):
         self._decision_progress_callback(event)
 
     def decide(self, state: AgentState) -> ActionDecision:
-        pre_context_adjacent_success = self._pre_context_adjacent_success_direct_decision(state)
-        if pre_context_adjacent_success is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_adjacent_success)
-        pre_context_synthetic_edit = self._pre_context_synthetic_edit_plan_direct_decision(state)
-        if pre_context_synthetic_edit is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_synthetic_edit)
-        pre_context_shared_repo_integrator = self._pre_context_shared_repo_integrator_direct_decision(state)
-        if pre_context_shared_repo_integrator is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_shared_repo_integrator)
-        pre_context_git_repo_review = self._pre_context_git_repo_review_direct_decision(state)
-        if pre_context_git_repo_review is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_git_repo_review)
-        pre_context_plan_progress = self._pre_context_plan_progress_direct_decision(state)
-        if pre_context_plan_progress is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_plan_progress)
-        pre_context_trusted_retrieval_carryover = self._pre_context_trusted_retrieval_carryover_decision(state)
-        if pre_context_trusted_retrieval_carryover is not None:
-            return self._apply_pre_context_tolbert_route(state, pre_context_trusted_retrieval_carryover)
+        require_live_llm_coding_control = self._require_live_llm_coding_control(state)
+        state.retrieval_direct_candidates = []
+        context_compile_warning: dict[str, object] | None = None
+        if not require_live_llm_coding_control:
+            pre_context_adjacent_success = self._pre_context_adjacent_success_direct_decision(state)
+            if pre_context_adjacent_success is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_adjacent_success)
+            pre_context_synthetic_edit = self._pre_context_synthetic_edit_plan_direct_decision(state)
+            if pre_context_synthetic_edit is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_synthetic_edit)
+            pre_context_shared_repo_integrator = self._pre_context_shared_repo_integrator_direct_decision(state)
+            if pre_context_shared_repo_integrator is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_shared_repo_integrator)
+            pre_context_git_repo_review = self._pre_context_git_repo_review_direct_decision(state)
+            if pre_context_git_repo_review is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_git_repo_review)
+            pre_context_plan_progress = self._pre_context_plan_progress_direct_decision(state)
+            if pre_context_plan_progress is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_plan_progress)
+        if not require_live_llm_coding_control:
+            pre_context_trusted_retrieval_carryover = self._pre_context_trusted_retrieval_carryover_decision(state)
+            if pre_context_trusted_retrieval_carryover is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_trusted_retrieval_carryover)
         pre_context_recovery_exhaustion = self._pre_context_recovery_exhaustion_decision(state)
         if pre_context_recovery_exhaustion is not None:
             return self._apply_pre_context_tolbert_route(state, pre_context_recovery_exhaustion)
@@ -198,12 +209,34 @@ class LLMDecisionPolicy(Policy):
                 try:
                     state.context_packet = self.context_provider.compile(state)
                 except Exception as exc:
-                    raise ContextCompilationError(f"context packet compilation failed: {exc}") from exc
+                    error_text = str(exc)
+                    if (
+                        require_live_llm_coding_control
+                        and bool(self.config.use_tolbert_context)
+                        and self._is_retryable_tolbert_startup_failure(error_text)
+                    ):
+                        state.context_packet = None
+                        context_compile_warning = {
+                            "status": "degraded",
+                            "reason": "tolbert_startup_failure",
+                            "failure_origin": "retrieval_failure",
+                            "error_type": exc.__class__.__name__,
+                            "message": self._truncate_text(error_text, limit=240),
+                        }
+                        self._emit_decision_progress(
+                            "context_degraded",
+                            failure_origin="retrieval_failure",
+                            degrade_reason="tolbert_startup_failure",
+                            retryable=True,
+                        )
+                    else:
+                        raise ContextCompilationError(f"context packet compilation failed: {exc}") from exc
                 finally:
                     if callable(set_progress_callback):
                         set_progress_callback(None)
-                self._stamp_context_reuse_signature(state)
-                self._emit_decision_progress("context_ready")
+                if state.context_packet is not None:
+                    self._stamp_context_reuse_signature(state)
+                    self._emit_decision_progress("context_ready")
         if self.universe_model is not None and not state.universe_summary:
             self._emit_decision_progress("universe_summary")
             state.universe_summary = self.universe_model.summarize(
@@ -222,12 +255,13 @@ class LLMDecisionPolicy(Policy):
         if source_task_id and source_task_id not in preferred_task_ids:
             preferred_task_ids = [source_task_id, *preferred_task_ids]
         blocked_commands = self._blocked_commands(state)
-        synthetic_edit_priority = self._synthetic_edit_plan_direct_decision(
-            state,
-            blocked_commands=blocked_commands,
-        )
-        if synthetic_edit_priority is not None:
-            return synthetic_edit_priority
+        if not require_live_llm_coding_control:
+            synthetic_edit_priority = self._synthetic_edit_plan_direct_decision(
+                state,
+                blocked_commands=blocked_commands,
+            )
+            if synthetic_edit_priority is not None:
+                return synthetic_edit_priority
         recommended_commands = (
             retrieval_guidance.get("recommended_commands", [])
             if self._tolbert_skill_ranking_active(state)
@@ -254,7 +288,7 @@ class LLMDecisionPolicy(Policy):
             blocked_commands=blocked_commands,
             route_mode=tolbert_route.mode,
         )
-        if tolbert_route.mode == "primary" and not planner_recovery_rewrite_brief:
+        if not require_live_llm_coding_control and tolbert_route.mode == "primary" and not planner_recovery_rewrite_brief:
             primary_decision = self._tolbert_primary_decision(
                 state,
                 top_skill=top_skill,
@@ -265,29 +299,30 @@ class LLMDecisionPolicy(Policy):
                 return self._apply_tolbert_shadow(primary_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
         role = self._normalized_role(state)
-        deterministic_decision = self._deterministic_role_decision(
-            state,
-            role=role,
-            top_skill=top_skill,
-            retrieval_guidance=retrieval_guidance,
-            blocked_commands=blocked_commands,
-            tolbert_mode=tolbert_mode,
-            retrieval_has_signal=retrieval_has_signal,
-            tolbert_route_mode=tolbert_route.mode,
-        )
-        if deterministic_decision is not None:
-            return self._apply_tolbert_shadow(deterministic_decision, tolbert_shadow, tolbert_route.mode, state=state)
+        if not require_live_llm_coding_control:
+            deterministic_decision = self._deterministic_role_decision(
+                state,
+                role=role,
+                top_skill=top_skill,
+                retrieval_guidance=retrieval_guidance,
+                blocked_commands=blocked_commands,
+                tolbert_mode=tolbert_mode,
+                retrieval_has_signal=retrieval_has_signal,
+                tolbert_route_mode=tolbert_route.mode,
+            )
+            if deterministic_decision is not None:
+                return self._apply_tolbert_shadow(deterministic_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
-        followup_skill_decision = self._followup_skill_decision(
-            state,
-            role=role,
-            top_skill=top_skill,
-            retrieval_guidance=retrieval_guidance,
-            tolbert_mode=tolbert_mode,
-            retrieval_has_signal=retrieval_has_signal,
-        )
-        if followup_skill_decision is not None:
-            return self._apply_tolbert_shadow(followup_skill_decision, tolbert_shadow, tolbert_route.mode, state=state)
+            followup_skill_decision = self._followup_skill_decision(
+                state,
+                role=role,
+                top_skill=top_skill,
+                retrieval_guidance=retrieval_guidance,
+                tolbert_mode=tolbert_mode,
+                retrieval_has_signal=retrieval_has_signal,
+            )
+            if followup_skill_decision is not None:
+                return self._apply_tolbert_shadow(followup_skill_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
         self._emit_decision_progress("plan_candidates")
         transition_preview = self._transition_preview(state)
@@ -316,6 +351,8 @@ class LLMDecisionPolicy(Policy):
             plan=self._compact_plan(state.plan),
             active_subgoal=self._truncate_text(state.active_subgoal),
         )
+        if context_compile_warning is not None:
+            payload["context_compile_warning"] = dict(context_compile_warning)
         if planner_recovery_rewrite_brief:
             payload["planner_recovery_brief"] = planner_recovery_rewrite_brief
         software_work_phase_gate_brief = self._software_work_phase_gate_brief(state)
@@ -354,6 +391,15 @@ class LLMDecisionPolicy(Policy):
         )
         self._emit_decision_progress("llm_response")
         normalized = coerce_action_decision(raw)
+        raw_decision_source = str(raw.get("decision_source", "")).strip()
+        raw_proposal_metadata = raw.get("proposal_metadata", {})
+        if not isinstance(raw_proposal_metadata, dict):
+            raw_proposal_metadata = {}
+        if context_compile_warning is not None:
+            raw_proposal_metadata = {
+                **raw_proposal_metadata,
+                "context_compile_degraded": dict(context_compile_warning),
+            }
         action = normalized["action"]
         if action not in ALLOWED_ACTIONS:
             normalized = {
@@ -369,12 +415,14 @@ class LLMDecisionPolicy(Policy):
                 state.task.workspace_subdir,
             )
             if self._is_prohibited_null_command(state, content):
-                guarded_fallback = self._best_deterministic_fallback_decision(
-                    state,
-                    top_skill=top_skill,
-                    retrieval_guidance=retrieval_guidance,
-                    blocked_commands=blocked_commands,
-                )
+                guarded_fallback = None
+                if not require_live_llm_coding_control:
+                    guarded_fallback = self._best_deterministic_fallback_decision(
+                        state,
+                        top_skill=top_skill,
+                        retrieval_guidance=retrieval_guidance,
+                        blocked_commands=blocked_commands,
+                    )
                 if guarded_fallback is not None and not self._is_prohibited_null_command(
                     state,
                     guarded_fallback.content,
@@ -408,6 +456,8 @@ class LLMDecisionPolicy(Policy):
                 or (retrieval_has_signal and self._tolbert_influence_enabled())
             ),
             selected_retrieval_span_id=matched_span_id,
+            decision_source=raw_decision_source or "llm",
+            proposal_metadata=dict(raw_proposal_metadata),
         ), tolbert_shadow, tolbert_route.mode, state=state)
 
     def _deterministic_role_decision(
@@ -967,6 +1017,9 @@ class LLMDecisionPolicy(Policy):
 
     def _tolbert_hybrid_runtime(self) -> dict[str, object]:
         return self.runtime_support.tolbert_hybrid_runtime()
+
+    def _tolbert_active_decoder_runtime(self) -> dict[str, object]:
+        return self.runtime_support.tolbert_active_decoder_runtime()
 
     def _hybrid_scored_candidates(
         self,

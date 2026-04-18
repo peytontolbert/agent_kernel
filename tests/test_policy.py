@@ -153,6 +153,30 @@ class NonDeterministicContextProvider:
         )
 
 
+class PrimaryRoutingContextProvider:
+    def compile(self, state):
+        del state
+        return ContextPacket(
+            request_id="req-primary",
+            created_at="2026-04-14T00:00:00+00:00",
+            task={"goal": "g", "completion_criteria": "c"},
+            control={
+                "mode": "verify",
+                "path_confidence": 0.99,
+                "trust_retrieval": False,
+                "retrieval_guidance": {
+                    "recommended_commands": [],
+                    "recommended_command_spans": [],
+                    "avoidance_notes": [],
+                    "evidence": [],
+                },
+            },
+            tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+            retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+            verifier_contract={"success_command": "true"},
+        )
+
+
 def test_llm_policy_includes_tolbert_context_packet():
     client = CapturingClient()
     policy = LLMDecisionPolicy(client, context_provider=NonDeterministicContextProvider())
@@ -186,6 +210,160 @@ def test_llm_policy_emits_decision_progress_stages_for_llm_path():
         "llm_request",
         "llm_response",
     ]
+
+
+def test_tolbert_primary_route_uses_hybrid_decoder_generation_candidate(monkeypatch, tmp_path):
+    bundle_path = tmp_path / "tolbert" / "hybrid_bundle_manifest.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text("{}", encoding="utf-8")
+
+    class ShouldNotRunClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            raise AssertionError("primary Tolbert routing should resolve before external client fallback")
+
+    policy = LLMDecisionPolicy(ShouldNotRunClient(), context_provider=PrimaryRoutingContextProvider())
+    policy.runtime_support._tolbert_runtime_policy_cache = {
+        "primary_benchmark_families": ["workflow"],
+        "shadow_benchmark_families": [],
+        "min_path_confidence": 0.0,
+        "require_trusted_retrieval": False,
+        "allow_direct_command_primary": False,
+        "allow_skill_primary": False,
+        "primary_min_command_score": 0,
+    }
+    policy.runtime_support._tolbert_action_generation_policy_cache = {"enabled": False}
+    policy.runtime_support._tolbert_decoder_policy_cache = {
+        "allow_retrieval_guidance": False,
+        "allow_skill_commands": False,
+        "allow_task_suggestions": False,
+        "allow_stop_decision": False,
+        "min_stop_completion_ratio": 0.95,
+        "max_task_suggestions": 0,
+    }
+    policy.runtime_support._tolbert_rollout_policy_cache = {}
+    policy.runtime_support._tolbert_hybrid_runtime_cache = {
+        "primary_enabled": True,
+        "supports_decoder_surface": True,
+        "bundle_manifest_path": str(bundle_path),
+        "preferred_device": "cpu",
+        "scoring_policy": {},
+    }
+    monkeypatch.setattr(
+        "agent_kernel.extensions.policy_tolbert_support.generate_hybrid_decoder_text",
+        lambda **kwargs: {
+            "generated_text": "printf 'hybrid\\n' > hybrid.txt",
+            "model_family": "tolbert_ssm_v1",
+            "avg_logprob": -0.15,
+        },
+    )
+    monkeypatch.setattr(
+        policy,
+        "_hybrid_scored_candidates",
+        lambda state, candidates: [dict(candidates[0])] if candidates else [],
+    )
+
+    decision = policy.decide(
+        AgentState(
+            task=TaskSpec(
+                task_id="hybrid_primary_task",
+                prompt="Create hybrid.txt",
+                workspace_subdir="hybrid_primary_task",
+                metadata={"benchmark_family": "workflow"},
+            )
+        )
+    )
+
+    assert decision.action == "code_execute"
+    assert decision.content == "printf 'hybrid\\n' > hybrid.txt"
+    assert decision.proposal_source == "hybrid_decoder_generation"
+    assert decision.decision_source == "tolbert_hybrid_proposal_decoder"
+    assert decision.tolbert_route_mode == "primary"
+
+
+def test_tolbert_primary_route_prefers_materialized_universal_decoder_runtime(monkeypatch, tmp_path):
+    hybrid_bundle_path = tmp_path / "tolbert" / "hybrid_bundle_manifest.json"
+    universal_bundle_path = tmp_path / "tolbert" / "universal_bundle_manifest.json"
+    hybrid_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    hybrid_bundle_path.write_text("{}", encoding="utf-8")
+    universal_bundle_path.write_text("{}", encoding="utf-8")
+
+    class ShouldNotRunClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            raise AssertionError("primary Tolbert routing should resolve before external client fallback")
+
+    policy = LLMDecisionPolicy(ShouldNotRunClient(), context_provider=PrimaryRoutingContextProvider())
+    policy.runtime_support._tolbert_runtime_policy_cache = {
+        "primary_benchmark_families": ["workflow"],
+        "shadow_benchmark_families": [],
+        "min_path_confidence": 0.0,
+        "require_trusted_retrieval": False,
+        "allow_direct_command_primary": False,
+        "allow_skill_primary": False,
+        "primary_min_command_score": 0,
+    }
+    policy.runtime_support._tolbert_action_generation_policy_cache = {"enabled": False}
+    policy.runtime_support._tolbert_decoder_policy_cache = {
+        "allow_retrieval_guidance": False,
+        "allow_skill_commands": False,
+        "allow_task_suggestions": False,
+        "allow_stop_decision": False,
+        "min_stop_completion_ratio": 0.95,
+        "max_task_suggestions": 0,
+    }
+    policy.runtime_support._tolbert_rollout_policy_cache = {}
+    policy.runtime_support._tolbert_hybrid_runtime_cache = {
+        "primary_enabled": True,
+        "supports_decoder_surface": True,
+        "bundle_manifest_path": str(hybrid_bundle_path),
+        "preferred_device": "cpu",
+        "scoring_policy": {},
+    }
+    policy.runtime_support._tolbert_universal_decoder_runtime_cache = {
+        "materialized": True,
+        "supports_decoder_surface": True,
+        "bundle_manifest_path": str(universal_bundle_path),
+        "preferred_device": "cpu",
+        "training_objective": "universal_decoder_only",
+    }
+    seen: dict[str, object] = {}
+
+    def fake_generate_hybrid_decoder_text(**kwargs):
+        seen.update(kwargs)
+        return {
+            "generated_text": "printf 'universal\\n' > universal.txt",
+            "model_family": "tolbert_ssm_v1",
+            "avg_logprob": -0.05,
+        }
+
+    monkeypatch.setattr(
+        "agent_kernel.extensions.policy_tolbert_support.generate_hybrid_decoder_text",
+        fake_generate_hybrid_decoder_text,
+    )
+    monkeypatch.setattr(
+        policy,
+        "_hybrid_scored_candidates",
+        lambda state, candidates: [dict(candidates[0])] if candidates else [],
+    )
+
+    decision = policy.decide(
+        AgentState(
+            task=TaskSpec(
+                task_id="universal_primary_task",
+                prompt="Create universal.txt",
+                workspace_subdir="universal_primary_task",
+                metadata={"benchmark_family": "workflow"},
+            )
+        )
+    )
+
+    assert seen["bundle_manifest_path"] == universal_bundle_path
+    assert decision.action == "code_execute"
+    assert decision.content == "printf 'universal\\n' > universal.txt"
+    assert decision.proposal_source == "universal_decoder_generation"
+    assert decision.decision_source == "tolbert_retained_proposal_decoder"
+    assert decision.proposal_metadata["decoder_runtime_key"] == "universal_decoder_runtime"
 
 
 def test_llm_policy_reuses_context_packet_for_unchanged_long_horizon_continuation():
@@ -15643,6 +15821,114 @@ def test_llm_policy_world_model_blocks_bad_skill_short_circuit():
     assert decision.content == "printf 'hello agent kernel\\n' > hello.txt"
 
 
+def test_llm_policy_strict_live_llm_mode_skips_trusted_retrieval_carryover_direct():
+    class ContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            return ContextPacket(
+                request_id="req-1",
+                created_at="2026-03-16T00:00:00+00:00",
+                task={"goal": "g", "completion_criteria": "c"},
+                control={
+                    "mode": "verify",
+                    "path_confidence": 0.95,
+                    "trust_retrieval": True,
+                    "retrieval_guidance": {
+                        "recommended_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                        "recommended_command_spans": [
+                            {
+                                "span_id": "task:hello:suggested:1",
+                                "command": "printf 'hello agent kernel\\n' > hello.txt",
+                            }
+                        ],
+                        "avoidance_notes": [],
+                        "evidence": ["task:hello:suggested:1: template command"],
+                    },
+                },
+                tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+                retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+                verifier_contract={"success_command": "true"},
+            )
+
+    client = CapturingClient()
+    context_provider = ContextProvider()
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=context_provider,
+        config=KernelConfig(
+            provider="mock",
+            asi_coding_require_live_llm=True,
+        ),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="trusted_retrieval_sequence_task",
+            prompt="Finish the long-horizon status recovery.",
+            workspace_subdir="trusted_retrieval_sequence_task",
+            suggested_commands=[],
+            expected_files=["reports/status.txt"],
+            expected_file_contents={"reports/status.txt": "status ready\n"},
+            metadata={"difficulty": "long_horizon", "benchmark_family": "repository"},
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="replayed the trusted repair write",
+            action="code_execute",
+            content="printf 'status ready\\n' > reports/status.txt",
+            selected_skill_id=None,
+            command_result={
+                "command": "printf 'status ready\\n' > reports/status.txt",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["tests not run yet"]},
+        )
+    ]
+    state.active_subgoal = "materialize expected artifact reports/status.txt"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "path": "reports/status.txt",
+            "signals": ["missing_expected_file", "no_state_progress"],
+            "summary": "reports/status.txt needs write-plus-verify completion",
+            "source_role": "critic",
+        }
+    }
+    state.consecutive_failures = 1
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": ["reports/status.txt"],
+        "missing_expected_artifacts": ["reports/status.txt"],
+        "completion_ratio": 0.65,
+    }
+    state.graph_summary = {
+        "trusted_retrieval_procedures": [
+            {
+                "commands": [
+                    "printf 'status ready\\n' > reports/status.txt",
+                    "pytest -q tests/test_status.py",
+                ],
+                "count": 2,
+            }
+        ]
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "llm"
+    assert client.last_payload is not None
+    assert context_provider.compile_calls == 1
+
+
 def test_llm_policy_planner_role_prefers_subgoal_aligned_direct_command():
     class PlannerContextProvider:
         def compile(self, state):
@@ -15851,6 +16137,52 @@ def test_llm_policy_uses_synthetic_edit_plan_direct_command_before_llm():
     assert decision.proposal_metadata["edit_kind"] == "line_replace"
     assert decision.proposal_metadata["edit_source"] == "synthetic_edit_plan"
     assert client.last_payload is None
+
+
+def test_llm_policy_strict_live_llm_mode_skips_synthetic_edit_plan_direct_command():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            asi_coding_require_live_llm=True,
+        ),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="synthetic_edit_worker_task",
+            prompt="Update src/service_status.txt to ready.",
+            workspace_subdir="synthetic_edit_worker_task",
+            suggested_commands=[],
+            expected_files=["src/service_status.txt"],
+            expected_file_contents={"src/service_status.txt": "HEADER=stable\nrelease-ready active\nFOOTER=keep\n"},
+            metadata={
+                "benchmark_family": "repo_sandbox",
+                "synthetic_worker": True,
+                "synthetic_edit_plan": [
+                    {
+                        "path": "src/service_status.txt",
+                        "edit_kind": "line_replace",
+                        "replacements": [
+                            {
+                                "line_number": 2,
+                                "before_line": "SERVICE_STATE=broken",
+                                "after_line": "release-ready active",
+                            }
+                        ],
+                        "edit_score": 12,
+                    }
+                ],
+            },
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "llm"
+    assert client.last_payload is not None
 
 
 def test_llm_policy_synthetic_edit_plan_skips_context_compile_when_first_step_is_structurally_safe():
@@ -17747,6 +18079,67 @@ def test_llm_policy_inference_failure_fallback_preserves_tolbert_shadow_route(tm
     assert decision.decision_source == "deterministic_fallback"
     assert decision.tolbert_route_mode == "shadow"
     assert decision.content.startswith("mkdir -p deploy &&")
+
+
+def test_llm_policy_strict_live_llm_mode_disables_inference_failure_fallback():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(
+            provider="mock",
+            asi_coding_require_live_llm=True,
+        ),
+    )
+    state = AgentState(task=TaskBank().get("hello_task"))
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is None
+
+
+def test_llm_policy_strict_live_llm_mode_degrades_retryable_tolbert_compile_failure_to_live_llm():
+    class RetryableTolbertContextProvider:
+        def compile(self, state):
+            del state
+            raise RuntimeError(
+                "TOLBERT service exited before startup ready with code 1. "
+                "checkpoint mismatch"
+            )
+
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=RetryableTolbertContextProvider(),
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=True,
+            asi_coding_require_live_llm=True,
+        ),
+    )
+    state = AgentState(task=TaskBank().get("hello_task"))
+    state.retrieval_direct_candidates = [{"command": "stale"}]
+    observed: list[dict[str, object]] = []
+    policy.set_decision_progress_callback(lambda payload: observed.append(dict(payload)))
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "llm"
+    assert client.last_payload is not None
+    assert client.last_payload["context_packet"] is None
+    assert client.last_payload["context_compile_warning"]["reason"] == "tolbert_startup_failure"
+    assert decision.proposal_metadata["context_compile_degraded"]["failure_origin"] == "retrieval_failure"
+    assert state.retrieval_direct_candidates == []
+    assert [payload["step_stage"] for payload in observed] == [
+        "context_compile",
+        "context_degraded",
+        "universe_summary",
+        "memory_retrieved",
+        "plan_candidates",
+        "transition_simulated",
+        "payload_build",
+        "llm_request",
+        "llm_response",
+    ]
 
 
 def test_llm_policy_extracts_blocked_command_from_double_quoted_avoidance_note():

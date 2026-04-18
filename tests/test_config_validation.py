@@ -1,6 +1,57 @@
+import json
+
 from agent_kernel.config import KernelConfig
 from agent_kernel.loop import AgentKernel
 import pytest
+
+
+def _write_decoder_ready_tolbert_artifact(tmp_path):
+    bundle_path = tmp_path / "tolbert" / "hybrid_bundle_manifest.json"
+    artifact_path = tmp_path / "tolbert" / "tolbert_model_artifact.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text(json.dumps({"artifact_kind": "tolbert_hybrid_runtime_bundle"}), encoding="utf-8")
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "model_surfaces": {"decoder_surface": True},
+                "hybrid_runtime": {
+                    "primary_enabled": True,
+                    "supports_decoder_surface": True,
+                    "bundle_manifest_path": str(bundle_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return artifact_path
+
+
+def _write_universal_decoder_ready_tolbert_artifact(tmp_path):
+    bundle_path = tmp_path / "tolbert" / "universal_bundle_manifest.json"
+    artifact_path = tmp_path / "tolbert" / "tolbert_model_artifact.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text(json.dumps({"artifact_kind": "tolbert_hybrid_runtime_bundle"}), encoding="utf-8")
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_model_bundle",
+                "model_surfaces": {"decoder_surface": True},
+                "hybrid_runtime": {
+                    "primary_enabled": False,
+                    "supports_decoder_surface": True,
+                    "bundle_manifest_path": "",
+                },
+                "universal_decoder_runtime": {
+                    "materialized": True,
+                    "bundle_manifest_path": str(bundle_path),
+                    "training_objective": "universal_decoder_only",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return artifact_path
 
 
 def test_kernel_rejects_unknown_provider_at_startup(tmp_path):
@@ -62,6 +113,41 @@ def test_kernel_rejects_invalid_probability_thresholds_at_startup(tmp_path):
         AgentKernel(config=config)
 
 
+def test_claimed_runtime_shape_requires_native_decoder_ready(tmp_path):
+    artifact_path = _write_decoder_ready_tolbert_artifact(tmp_path)
+    hybrid_config = KernelConfig(
+        provider="hybrid",
+        tolbert_model_artifact_path=artifact_path,
+        workspace_root=tmp_path / "workspace_hybrid",
+        trajectories_root=tmp_path / "trajectories_hybrid",
+    )
+    external_config = KernelConfig(
+        provider="vllm",
+        tolbert_model_artifact_path=artifact_path,
+        workspace_root=tmp_path / "workspace_external",
+        trajectories_root=tmp_path / "trajectories_external",
+    )
+
+    assert hybrid_config.claimed_runtime_shape() == "bounded_autonomous"
+    assert external_config.claimed_runtime_shape() == "executable_floor"
+
+
+def test_claimed_runtime_shape_accepts_materialized_universal_decoder_runtime(tmp_path):
+    artifact_path = _write_universal_decoder_ready_tolbert_artifact(tmp_path)
+    config = KernelConfig(
+        provider="hybrid",
+        tolbert_model_artifact_path=artifact_path,
+        workspace_root=tmp_path / "workspace_hybrid",
+        trajectories_root=tmp_path / "trajectories_hybrid",
+    )
+
+    posture = config.decoder_runtime_posture()
+
+    assert config.claimed_runtime_shape() == "bounded_autonomous"
+    assert posture["runtime_key"] == "universal_decoder_runtime"
+    assert posture["training_objective"] == "universal_decoder_only"
+
+
 def test_kernel_config_validation_allows_json_storage_and_unlimited_budget_group_caps(tmp_path):
     config = KernelConfig(
         provider="mock",
@@ -87,8 +173,10 @@ def test_kernel_config_validation_allows_json_storage_and_unlimited_budget_group
     ],
 )
 def test_kernel_rejects_weakened_bounded_autonomous_runtime_minimum(tmp_path, override, message):
+    artifact_path = _write_decoder_ready_tolbert_artifact(tmp_path)
     config = KernelConfig(
-        provider="mock",
+        provider="hybrid",
+        tolbert_model_artifact_path=artifact_path,
         workspace_root=tmp_path / "workspace",
         trajectories_root=tmp_path / "trajectories",
         **override,

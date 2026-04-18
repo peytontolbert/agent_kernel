@@ -46,7 +46,7 @@ class Verifier:
         for needle in task.forbidden_output_substrings:
             _record(needle not in combined_output, f"forbidden output present: {needle}")
 
-        reasons.extend(self._semantic_verification_reasons(task, workspace))
+        reasons.extend(self._semantic_verification_reasons(task, workspace, result=result))
         semantic_failures = max(0, len(reasons) - failed_checks)
         total_checks += semantic_failures
         failed_checks += semantic_failures
@@ -85,7 +85,13 @@ class Verifier:
             ],
         )
 
-    def _semantic_verification_reasons(self, task: TaskSpec, workspace: Path) -> list[str]:
+    def _semantic_verification_reasons(
+        self,
+        task: TaskSpec,
+        workspace: Path,
+        *,
+        result: CommandResult | None = None,
+    ) -> list[str]:
         contract = task.metadata.get("semantic_verifier")
         if not isinstance(contract, dict):
             return []
@@ -98,6 +104,14 @@ class Verifier:
         reasons.extend(self._verify_behavior_checks(workspace, contract))
         reasons.extend(self._verify_differential_checks(workspace, contract))
         reasons.extend(self._verify_repo_invariants(workspace, contract))
+        reasons.extend(
+            self._verify_semantic_assertions(
+                workspace,
+                contract,
+                stdout=str(result.stdout if result is not None else ""),
+                stderr=str(result.stderr if result is not None else ""),
+            )
+        )
         return reasons
 
     def _verify_repo_chore_review(self, workspace: Path, contract: dict[str, object]) -> list[str]:
@@ -488,6 +502,88 @@ class Verifier:
                 reasons.append(f"semantic verifier contract malformed: unknown repo invariant kind {kind!r}")
         return reasons
 
+    def _verify_semantic_assertions(
+        self,
+        workspace: Path,
+        contract: dict[str, object],
+        *,
+        stdout: str,
+        stderr: str,
+    ) -> list[str]:
+        assertions = contract.get("semantic_assertions", [])
+        if assertions is None:
+            return []
+        if not isinstance(assertions, list):
+            return ["semantic verifier contract malformed: semantic_assertions must be a list"]
+        reasons: list[str] = []
+        for rule in assertions:
+            if not isinstance(rule, dict):
+                reasons.append("semantic verifier contract malformed: semantic assertion must be an object")
+                continue
+            label = str(rule.get("label", "semantic assertion")).strip() or "semantic assertion"
+            source = str(rule.get("source", "")).strip()
+            if source == "stdout_text":
+                reasons.extend(self._assert_text_semantics(stdout, rule, label=label))
+            elif source == "stderr_text":
+                reasons.extend(self._assert_text_semantics(stderr, rule, label=label))
+            elif source == "stdout_json":
+                reasons.extend(
+                    self._assert_json_fields_from_text(
+                        stdout,
+                        rule.get("json_fields", []),
+                        label=label,
+                    )
+                )
+            elif source == "stderr_json":
+                reasons.extend(
+                    self._assert_json_fields_from_text(
+                        stderr,
+                        rule.get("json_fields", []),
+                        label=label,
+                    )
+                )
+            elif source == "workspace_file_text":
+                path = str(rule.get("path", "")).strip()
+                if not path:
+                    reasons.append(f"semantic verifier contract malformed: {label} workspace_file_text missing path")
+                    continue
+                target = workspace / path
+                if not target.exists():
+                    reasons.append(f"{label} missing workspace file {path}")
+                    continue
+                reasons.extend(self._assert_text_semantics(target.read_text(encoding="utf-8"), rule, label=label))
+            elif source == "workspace_file_json":
+                path = str(rule.get("path", "")).strip()
+                if not path:
+                    reasons.append(f"semantic verifier contract malformed: {label} workspace_file_json missing path")
+                    continue
+                target = workspace / path
+                if not target.exists():
+                    reasons.append(f"{label} missing workspace file {path}")
+                    continue
+                reasons.extend(
+                    self._assert_json_fields_from_text(
+                        target.read_text(encoding="utf-8"),
+                        rule.get("json_fields", []),
+                        label=label,
+                    )
+                )
+            elif source == "git_diff":
+                text = self._git_output(workspace, "diff", "--")
+                if text is None:
+                    reasons.append(f"{label} git diff inspection failed")
+                    continue
+                reasons.extend(self._assert_text_semantics(text, rule, label=label))
+            elif source == "git_status":
+                text = self._git_output(workspace, "status", "--porcelain")
+                if text is None:
+                    reasons.append(f"{label} git status inspection failed")
+                    continue
+                reasons.extend(self._assert_text_semantics(text, rule, label=label))
+            else:
+                reasons.append(f"semantic verifier contract malformed: unknown semantic assertion source {source!r}")
+        return reasons
+
     def _verify_file_contains_invariant(self, workspace: Path, rule: dict[str, object]) -> list[str]:
         reasons: list[str] = []
         path = str(rule.get("path", "")).strip()
@@ -697,6 +793,73 @@ class Verifier:
                 label=f"{label} stderr",
             )
         )
+        return reasons
+
+    @staticmethod
+    def _assert_text_semantics(
+        text: str,
+        rule: dict[str, object],
+        *,
+        label: str,
+    ) -> list[str]:
+        reasons: list[str] = []
+        for needle in rule.get("contains", []):
+            normalized = str(needle).strip()
+            if normalized and normalized not in text:
+                reasons.append(f"{label} missing required text {normalized!r}")
+        for needle in rule.get("not_contains", []):
+            normalized = str(needle).strip()
+            if normalized and normalized in text:
+                reasons.append(f"{label} contains forbidden text {normalized!r}")
+        regex = str(rule.get("regex", "")).strip()
+        if regex and re.search(regex, text, flags=re.MULTILINE) is None:
+            reasons.append(f"{label} missing regex match {regex!r}")
+        not_regex = str(rule.get("not_regex", "")).strip()
+        if not_regex and re.search(not_regex, text, flags=re.MULTILINE) is not None:
+            reasons.append(f"{label} matched forbidden regex {not_regex!r}")
+        if "line_count_min" in rule:
+            try:
+                if len(text.splitlines()) < int(rule.get("line_count_min", 0) or 0):
+                    reasons.append(
+                        f"{label} line count {len(text.splitlines())} below minimum {int(rule.get('line_count_min', 0) or 0)}"
+                    )
+            except (TypeError, ValueError):
+                reasons.append(f"semantic verifier contract malformed: {label} line_count_min must be an integer")
+        if "line_count_max" in rule:
+            try:
+                if len(text.splitlines()) > int(rule.get("line_count_max", 0) or 0):
+                    reasons.append(
+                        f"{label} line count {len(text.splitlines())} above maximum {int(rule.get('line_count_max', 0) or 0)}"
+                    )
+            except (TypeError, ValueError):
+                reasons.append(f"semantic verifier contract malformed: {label} line_count_max must be an integer")
+        capture_regex = str(rule.get("capture_regex", "")).strip()
+        if capture_regex:
+            match = re.search(capture_regex, text, flags=re.MULTILINE)
+            if match is None:
+                reasons.append(f"{label} missing capture regex {capture_regex!r}")
+            else:
+                try:
+                    group_index = int(rule.get("capture_group", 1) or 1)
+                except (TypeError, ValueError):
+                    group_index = 1
+                try:
+                    captured = float(match.group(group_index))
+                except (IndexError, TypeError, ValueError):
+                    reasons.append(f"{label} capture regex {capture_regex!r} did not yield a numeric group")
+                else:
+                    if "min" in rule and captured < float(rule.get("min")):
+                        reasons.append(
+                            f"{label} captured value {captured!r} below minimum {float(rule.get('min'))!r}"
+                        )
+                    if "max" in rule and captured > float(rule.get("max")):
+                        reasons.append(
+                            f"{label} captured value {captured!r} above maximum {float(rule.get('max'))!r}"
+                        )
+                    if "equals" in rule and captured != float(rule.get("equals")):
+                        reasons.append(
+                            f"{label} captured value {captured!r} did not equal {float(rule.get('equals'))!r}"
+                        )
         return reasons
 
     @staticmethod

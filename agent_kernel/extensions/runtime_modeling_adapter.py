@@ -28,6 +28,20 @@ def retained_tolbert_hybrid_runtime(payload: dict[str, object]) -> dict[str, obj
     return _retained_tolbert_hybrid_runtime(payload)
 
 
+def retained_tolbert_universal_decoder_runtime(payload: dict[str, object]) -> dict[str, object]:
+    from ..modeling.artifacts import (
+        retained_tolbert_universal_decoder_runtime as _retained_tolbert_universal_decoder_runtime,
+    )
+
+    return _retained_tolbert_universal_decoder_runtime(payload)
+
+
+def retained_tolbert_active_decoder_runtime(payload: dict[str, object]) -> dict[str, object]:
+    from ..modeling.artifacts import retained_tolbert_active_decoder_runtime as _retained_tolbert_active_decoder_runtime
+
+    return _retained_tolbert_active_decoder_runtime(payload)
+
+
 def retained_tolbert_action_generation_policy(payload: dict[str, object]) -> dict[str, object]:
     from ..modeling.artifacts import (
         retained_tolbert_action_generation_policy as _retained_tolbert_action_generation_policy,
@@ -80,6 +94,17 @@ def score_hybrid_candidates(*, state, candidates: list[dict[str, object]], bundl
         bundle_manifest_path=bundle_manifest_path,
         device=device,
         scoring_policy=scoring_policy,
+    )
+
+
+def generate_hybrid_decoder_text(*, state, bundle_manifest_path: Path, device: str = "cpu", max_new_tokens: int | None = None) -> dict[str, object]:
+    from ..modeling.tolbert.runtime import generate_hybrid_decoder_text as _generate_hybrid_decoder_text
+
+    return _generate_hybrid_decoder_text(
+        state=state,
+        bundle_manifest_path=bundle_manifest_path,
+        device=device,
+        max_new_tokens=max_new_tokens,
     )
 
 
@@ -147,15 +172,18 @@ __all__ = [
     "choose_tolbert_route",
     "decode_action_generation_candidates",
     "decode_bounded_action_candidates",
+    "generate_hybrid_decoder_text",
     "infer_hybrid_world_signal",
     "latent_command_bias",
     "load_model_artifact",
     "render_structured_edit_command",
     "retained_tolbert_action_generation_policy",
+    "retained_tolbert_active_decoder_runtime",
     "retained_tolbert_decoder_policy",
     "retained_tolbert_hybrid_runtime",
     "retained_tolbert_model_surfaces",
     "retained_tolbert_rollout_policy",
     "retained_tolbert_runtime_policy",
+    "retained_tolbert_universal_decoder_runtime",
     "score_hybrid_candidates",
 ]

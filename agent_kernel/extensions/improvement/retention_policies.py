@@ -375,9 +375,13 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
         context.candidate_metrics,
     )
     trusted_retrieval_delta = int(context.evidence.get("trusted_retrieval_delta", 0) or 0)
+    retrieval_influenced_steps_delta = int(context.evidence.get("retrieval_influenced_steps_delta", 0) or 0)
+    retrieval_selected_steps_delta = int(context.evidence.get("retrieval_selected_steps_delta", 0) or 0)
     trusted_carryover_repair_rate_delta = float(context.evidence.get("trusted_carryover_repair_rate_delta", 0.0))
     retrieval_support_gain = (
         trusted_retrieval_delta > 0
+        or retrieval_influenced_steps_delta > 0
+        or retrieval_selected_steps_delta > 0
         or trusted_carryover_repair_rate_delta > 0.0
         or int(context.evidence.get("low_confidence_episode_delta", 0) or 0) < 0
         or float(context.evidence.get("family_discrimination_gain", 0.0)) > 0.0
@@ -455,6 +459,8 @@ def _evaluate_retrieval_retention(context: RetentionDecisionContext) -> tuple[st
         and context.average_step_delta == 0.0
         and int(context.evidence.get("proposal_selected_steps_delta", 0) or 0) == 0
         and int(context.evidence.get("trusted_retrieval_delta", 0) or 0) == 0
+        and retrieval_influenced_steps_delta == 0
+        and retrieval_selected_steps_delta == 0
         and trusted_carryover_repair_rate == baseline_trusted_carryover_repair_rate
         and trusted_carryover_verified_step_delta == 0
     )

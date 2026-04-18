@@ -43,7 +43,7 @@ def incomplete_cycle_summaries(
     summaries: list[dict[str, object]] = []
     for cycle_id, cycle_records in grouped.items():
         states = {str(record.get("state", "")).strip() for record in cycle_records}
-        if states & {"retain", "reject"}:
+        if states & {"retain", "reject", "incomplete"}:
             continue
         if not states & {"select", "generate", "evaluate"}:
             continue
@@ -137,11 +137,7 @@ def incomplete_cycle_summaries(
     return summaries
 
 
-def load_cycle_records(planner: Any, output_path: Path) -> list[dict[str, object]]:
-    if planner.runtime_config is not None and planner.runtime_config.uses_sqlite_storage():
-        records = planner.runtime_config.sqlite_store().load_cycle_records(output_path=output_path)
-        if records:
-            return records
+def _load_cycle_export_records(output_path: Path) -> list[dict[str, object]]:
     if not output_path.exists():
         return []
     records: list[dict[str, object]] = []
@@ -151,6 +147,34 @@ def load_cycle_records(planner: Any, output_path: Path) -> list[dict[str, object
             continue
         records.append(json.loads(line))
     return records
+
+
+def _cycle_record_fingerprint(record: dict[str, object]) -> str:
+    return json.dumps(record, sort_keys=True)
+
+
+def load_cycle_records(planner: Any, output_path: Path) -> list[dict[str, object]]:
+    export_records = _load_cycle_export_records(output_path)
+    if planner.runtime_config is not None and planner.runtime_config.uses_sqlite_storage():
+        records = planner.runtime_config.sqlite_store().load_cycle_records(output_path=output_path)
+        if records and export_records:
+            export_fingerprints = {_cycle_record_fingerprint(record) for record in export_records}
+            if len(export_records) >= len(records) and all(
+                _cycle_record_fingerprint(record) in export_fingerprints for record in records
+            ):
+                return export_records
+            merged = list(records)
+            seen = {_cycle_record_fingerprint(record) for record in merged}
+            for record in export_records:
+                fingerprint = _cycle_record_fingerprint(record)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                merged.append(record)
+            return merged
+        if records:
+            return records
+    return export_records
 
 
 def cycle_history(

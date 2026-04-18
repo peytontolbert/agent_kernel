@@ -562,6 +562,7 @@ def test_run_tolbert_liftoff_loop_resume_preserves_metrics_and_trust_payloads(tm
         candidate_trust_ledger,
         baseline_trust_ledger,
         takeover_drift_report,
+        universal_decoder_eval,
     ):
         assert artifact_payload["artifact_kind"] == "tolbert_model_bundle"
         assert baseline_metrics.long_horizon_persistence_summary["productive_long_horizon_step_rate"] == 0.25
@@ -571,6 +572,7 @@ def test_run_tolbert_liftoff_loop_resume_preserves_metrics_and_trust_payloads(tm
         assert baseline_trust_ledger["overall_summary"]["light_supervision_clean_success_count"] == 1
         assert candidate_trust_ledger["overall_summary"]["light_supervision_clean_success_count"] == 3
         assert takeover_drift_report == {"budget_reached": True}
+        assert universal_decoder_eval == {"available": False}
         captured["called"] = True
         return type(
             "Report",
