@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import agent_kernel.improvement as improvement_module
+from agent_kernel.extensions.improvement import experiment_ranking as experiment_ranking_module
 from agent_kernel.cycle_runner import prior_retained_guard_reason
 from agent_kernel.config import KernelConfig
 from agent_kernel.improvement import ImprovementCycleRecord, ImprovementExperiment, ImprovementPlanner, ImprovementVariant
@@ -32,7 +33,13 @@ from agent_kernel.extensions.improvement.prompt_improvement import (
     retained_role_directives,
 )
 from agent_kernel.extensions.improvement.recovery_improvement import build_recovery_proposal_artifact
-from agent_kernel.extensions.improvement.retrieval_improvement import build_retrieval_proposal_artifact, retained_retrieval_overrides
+from agent_kernel.extensions.improvement.retrieval_improvement import (
+    build_retrieval_proposal_artifact,
+    effective_retrieval_overrides,
+    effective_retrieval_runtime_policy,
+    retained_retrieval_overrides,
+    retained_retrieval_runtime_policy,
+)
 from agent_kernel.extensions.improvement.cycle_retention_reasoning import retention_reason_code_for_text
 from agent_kernel.extensions.improvement.state_estimation_improvement import build_state_estimation_proposal_artifact
 from agent_kernel.extensions.strategy.subsystems import (
@@ -2794,6 +2801,42 @@ def test_build_transition_model_proposal_artifact_emits_signatures(tmp_path: Pat
     assert artifact["signatures"][0]["command"] == "false"
 
 
+def test_build_transition_model_proposal_artifact_uses_proposed_runtime_snapshot(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+
+    artifact = build_transition_model_proposal_artifact(
+        episodes,
+        current_payload={
+            "spec_version": "asi_v1",
+            "artifact_kind": "transition_model_policy_set",
+            "lifecycle_state": "proposed",
+            "controls": {
+                "repeat_command_penalty": 7,
+                "regressed_path_command_penalty": 4,
+                "recovery_command_bonus": 3,
+                "progress_command_bonus": 4,
+                "long_horizon_repeat_command_penalty": 3,
+                "long_horizon_progress_command_bonus": 2,
+                "max_signatures": 3,
+            },
+            "signatures": [
+                {
+                    "signal": "no_state_progress",
+                    "command": "pytest -q tests/test_runtime_transition.py",
+                    "support": 2,
+                    "regressions": [],
+                }
+            ],
+        },
+    )
+
+    assert artifact["controls"]["repeat_command_penalty"] == 7
+    assert artifact["controls"]["max_signatures"] == 3
+    assert len(artifact["signatures"]) == 1
+    assert artifact["signatures"][0]["command"] == "pytest -q tests/test_runtime_transition.py"
+
+
 def test_build_transition_model_proposal_artifact_merges_same_pattern_signatures(tmp_path: Path):
     episodes = tmp_path / "episodes"
     episodes.mkdir()
@@ -3184,6 +3227,1240 @@ def test_improvement_planner_surfaces_trust_for_restricted_unattended_ledger(tmp
     assert trust.evidence["required_family_clean_task_root_counts"] == {"repository": 1}
     assert trust.evidence["clean_success_task_roots"] == ["repository_sync_a"]
     assert trust.evidence["failing_thresholds"] == ["unsafe_ambiguous_rate=0.250 above max_unsafe_ambiguous_rate=0.100"]
+
+
+def test_improvement_planner_skips_trust_when_current_metrics_close_coverage_only_gap(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 4,
+                "overall_summary": {"distinct_benchmark_families": 1},
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "clean_success_rate": 1.0,
+                    "distinct_clean_success_task_roots": 2,
+                },
+                "overall_assessment": {
+                    "status": "restricted",
+                    "passed": False,
+                    "failing_thresholds": ["distinct_benchmark_families=1 below min_distinct_families=3"],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 2,
+                    "missing_required_families": ["repo_chore", "repo_sandbox", "repository"],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 2,
+                        "repo_sandbox": 2,
+                        "project": 2,
+                        "repository": 2,
+                        "integration": 2,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    metrics = EvalMetrics(
+        total=10,
+        passed=10,
+        trusted_retrieval_steps=10,
+        total_by_memory_source={"verifier": 1, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 2,
+            "repo_sandbox": 2,
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert all(candidate.subsystem != "trust" for candidate in experiments)
+
+
+def test_improvement_planner_skips_trust_when_current_metrics_close_clean_task_root_breadth_gap(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 1,
+                "overall_summary": {"distinct_benchmark_families": 1},
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "clean_success_rate": 0.0,
+                    "distinct_clean_success_task_roots": 0,
+                },
+                "overall_assessment": {
+                    "status": "bootstrap",
+                    "passed": True,
+                    "failing_thresholds": [],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 0,
+                    "missing_required_families": [],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 0,
+                        "repo_sandbox": 0,
+                        "project": 0,
+                        "repository": 0,
+                        "integration": 0,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [
+                        "repo_chore",
+                        "repo_sandbox",
+                        "project",
+                        "repository",
+                        "integration",
+                    ],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    metrics = EvalMetrics(
+        total=10,
+        passed=10,
+        trusted_retrieval_steps=10,
+        total_by_memory_source={"verifier": 1, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 2,
+            "repo_sandbox": 2,
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 2,
+            "repo_sandbox": 2,
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+        },
+        task_outcomes={
+            "repo_chore_a": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_chore_b": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_sandbox_a": {"benchmark_family": "repo_sandbox", "clean_success": True},
+            "repo_sandbox_b": {"benchmark_family": "repo_sandbox", "clean_success": True},
+            "project_a": {"benchmark_family": "project", "clean_success": True},
+            "project_b": {"benchmark_family": "project", "clean_success": True},
+            "repository_a": {"benchmark_family": "repository", "clean_success": True},
+            "repository_b": {"benchmark_family": "repository", "clean_success": True},
+            "integration_a": {"benchmark_family": "integration", "clean_success": True},
+            "integration_b": {"benchmark_family": "integration", "clean_success": True},
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert all(candidate.subsystem != "trust" for candidate in experiments)
+
+
+def test_improvement_planner_keeps_trust_when_runtime_risk_remains_after_live_coverage(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 4,
+                "overall_summary": {"distinct_benchmark_families": 1},
+                "gated_summary": {
+                    "success_rate": 0.9,
+                    "unsafe_ambiguous_rate": 0.1,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "clean_success_rate": 0.9,
+                    "distinct_clean_success_task_roots": 2,
+                },
+                "overall_assessment": {
+                    "status": "restricted",
+                    "passed": False,
+                    "failing_thresholds": ["unsafe_ambiguous_rate=0.100 above max_unsafe_ambiguous_rate=0.050"],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 2,
+                    "missing_required_families": ["repo_chore", "repo_sandbox", "repository"],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 2,
+                        "repo_sandbox": 2,
+                        "project": 2,
+                        "repository": 2,
+                        "integration": 2,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    metrics = EvalMetrics(
+        total=10,
+        passed=10,
+        trusted_retrieval_steps=10,
+        total_by_memory_source={"verifier": 1, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 2,
+            "repo_sandbox": 2,
+            "project": 2,
+            "repository": 2,
+            "integration": 2,
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    trust = next(candidate for candidate in experiments if candidate.subsystem == "trust")
+    assert trust.evidence["overall_status"] == "restricted"
+    assert trust.evidence["coverage_override_applied"] is True
+    assert trust.evidence["current_missing_required_families"] == []
+
+
+def test_improvement_planner_prioritizes_curriculum_for_primary_only_broad_observe_with_external_only_trust_gap(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 20,
+                "overall_summary": {
+                    "distinct_benchmark_families": 5,
+                    "clean_success_task_roots": [
+                        "integration_sync_a",
+                        "project_sync_a",
+                        "repository_sync_a",
+                        "repo_chore_sync_a",
+                        "repo_sandbox_sync_a",
+                    ],
+                },
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "rollback_performed_rate": 0.0,
+                    "clean_success_rate": 1.0,
+                    "distinct_clean_success_task_roots": 5,
+                },
+                "overall_assessment": {
+                    "status": "bootstrap",
+                    "passed": False,
+                    "failing_thresholds": ["reports=0 threshold=5"],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 0,
+                    "missing_required_families": [],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 4,
+                        "repo_sandbox": 2,
+                        "project": 4,
+                        "repository": 6,
+                        "integration": 4,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"verifier": 1, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 2,
+            "project": 4,
+            "repository": 6,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 2,
+            "project": 4,
+            "repository": 6,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_chore_b": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_chore_c": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_chore_d": {"benchmark_family": "repo_chore", "clean_success": True},
+            "repo_sandbox_a": {"benchmark_family": "repo_sandbox", "clean_success": True},
+            "repo_sandbox_b": {"benchmark_family": "repo_sandbox", "clean_success": True},
+            "project_a": {"benchmark_family": "project", "clean_success": True},
+            "project_b": {"benchmark_family": "project", "clean_success": True},
+            "project_c": {"benchmark_family": "project", "clean_success": True},
+            "project_d": {"benchmark_family": "project", "clean_success": True},
+            "repository_a": {"benchmark_family": "repository", "clean_success": True},
+            "repository_b": {"benchmark_family": "repository", "clean_success": True},
+            "repository_c": {"benchmark_family": "repository", "clean_success": True},
+            "repository_d": {"benchmark_family": "repository", "clean_success": True},
+            "repository_e": {"benchmark_family": "repository", "clean_success": True},
+            "repository_f": {"benchmark_family": "repository", "clean_success": True},
+            "integration_a": {"benchmark_family": "integration", "clean_success": True},
+            "integration_b": {"benchmark_family": "integration", "clean_success": True},
+            "integration_c": {"benchmark_family": "integration", "clean_success": True},
+            "integration_d": {"benchmark_family": "integration", "clean_success": True},
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "curriculum"
+    assert all(candidate.subsystem != "trust" for candidate in experiments)
+    curriculum = experiments[0]
+    assert curriculum.evidence["retained_conversion_priority"] is True
+    assert curriculum.evidence["external_only_trust_bootstrap"] is True
+    assert curriculum.evidence["broad_observe_diversification"]["active"] is True
+    assert curriculum.evidence["broad_observe_diversification"]["primary_only_broad_observe"] is True
+
+
+def test_improvement_planner_prioritizes_curriculum_after_counted_external_breadth_when_retained_conversion_has_no_decisions(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 30,
+                "overall_summary": {
+                    "distinct_benchmark_families": 5,
+                    "clean_success_task_roots": [
+                        "integration_sync_a",
+                        "project_sync_a",
+                        "repository_sync_a",
+                        "repo_chore_sync_a",
+                        "repo_sandbox_sync_a",
+                    ],
+                },
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "rollback_performed_rate": 0.0,
+                    "clean_success_rate": 1.0,
+                    "distinct_clean_success_task_roots": 10,
+                },
+                "overall_assessment": {
+                    "status": "restricted",
+                    "passed": False,
+                    "failing_thresholds": ["external_report_count=4 below threshold=5"],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 0,
+                    "missing_required_families": [],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 4,
+                        "repo_sandbox": 4,
+                        "project": 4,
+                        "repository": 4,
+                        "integration": 4,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                    "required_families_with_reports": [],
+                    "external_unsafe_ambiguous_rate": 0.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "no_yield_cycles": 1,
+            "recent_incomplete_cycles": 0,
+        },
+        "transition_model": {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "no_yield_cycles": 2,
+            "recent_incomplete_cycles": 0,
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"verifier": 1, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_b": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_c": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_d": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_a": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_b": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_c": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_d": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_a": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_b": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_c": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_d": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_a": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_b": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_c": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_d": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_a": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_b": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_c": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_d": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "curriculum"
+    curriculum = experiments[0]
+    assert curriculum.evidence["retained_conversion_priority"] is True
+    assert curriculum.evidence["external_only_trust_bootstrap"] is False
+    assert curriculum.evidence["counted_external_breadth_aligned"] is True
+    assert curriculum.evidence["retained_conversion_gap"]["active"] is True
+    assert curriculum.evidence["retained_conversion_gap"]["total_decisions"] == 0
+
+
+def test_improvement_planner_prioritizes_curriculum_for_retained_conversion_gap_even_with_stale_trust_summary(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 1,
+                "overall_summary": {"distinct_benchmark_families": 1},
+                "gated_summary": {
+                    "success_rate": 0.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "rollback_performed_rate": 0.0,
+                    "clean_success_rate": 0.0,
+                    "distinct_clean_success_task_roots": 0,
+                },
+                "overall_assessment": {
+                    "status": "bootstrap",
+                    "passed": True,
+                    "failing_thresholds": [],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 1,
+                    "missing_required_families": [
+                        "integration",
+                        "project",
+                        "repo_chore",
+                        "repo_sandbox",
+                        "repository",
+                    ],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 0,
+                        "repo_sandbox": 0,
+                        "project": 0,
+                        "repository": 0,
+                        "integration": 0,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [
+                        "integration",
+                        "project",
+                        "repo_chore",
+                        "repo_sandbox",
+                        "repository",
+                    ],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "no_yield_cycles": 1,
+            "recent_incomplete_cycles": 0,
+        },
+        "transition_model": {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "no_yield_cycles": 2,
+            "recent_incomplete_cycles": 0,
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    planner.failure_counts = lambda: {
+        "missing_expected_file": 3,
+        "command_failure": 2,
+    }
+    planner.transition_failure_counts = lambda: {
+        "no_state_progress": 2,
+    }
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_a": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_a": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_a": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_a": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_b": {"benchmark_family": "repo_chore", "clean_success": True, "task_origin": "semantic_hub"},
+            "repo_sandbox_b": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "semantic_hub",
+            },
+            "project_b": {"benchmark_family": "project", "clean_success": True, "task_origin": "semantic_hub"},
+            "repository_b": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "semantic_hub",
+            },
+            "integration_b": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "semantic_hub",
+            },
+        },
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert campaign[0].subsystem == "curriculum"
+    curriculum = campaign[0]
+    assert curriculum.evidence["retained_conversion_priority"] is True
+    assert curriculum.evidence["retained_conversion_gap_active"] is True
+    assert curriculum.evidence["retained_conversion_gap"]["active"] is True
+    assert curriculum.evidence["external_only_trust_bootstrap"] is False
+
+
+def test_improvement_planner_keeps_retained_conversion_priority_after_reject_only_history(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 30,
+                "overall_summary": {
+                    "distinct_benchmark_families": 5,
+                    "clean_success_task_roots": [
+                        "integration_sync_a",
+                        "project_sync_a",
+                        "repository_sync_a",
+                        "repo_chore_sync_a",
+                        "repo_sandbox_sync_a",
+                    ],
+                },
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "rollback_performed_rate": 0.0,
+                    "clean_success_rate": 1.0,
+                    "distinct_clean_success_task_roots": 10,
+                },
+                "overall_assessment": {
+                    "status": "restricted",
+                    "passed": False,
+                    "failing_thresholds": ["external_report_count=4 below threshold=5"],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 0,
+                    "missing_required_families": [],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 4,
+                        "repo_sandbox": 4,
+                        "project": 4,
+                        "repository": 4,
+                        "integration": 4,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                    "external_report_count": 0,
+                    "distinct_external_benchmark_families": 0,
+                    "required_families_with_reports": [],
+                    "external_unsafe_ambiguous_rate": 0.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 1,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 0,
+        },
+        "transition_model": {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "total_decisions": 2,
+            "rejected_cycles": 2,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 0,
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"verifier": 0, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_b": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_c": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_d": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_a": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_b": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_c": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_d": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_a": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_b": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_c": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_d": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_a": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_b": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_c": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_d": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_a": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_b": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_c": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_d": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "curriculum"
+    curriculum = experiments[0]
+    assert curriculum.evidence["retained_conversion_priority"] is True
+    assert curriculum.evidence["counted_external_breadth_aligned"] is True
+    assert curriculum.evidence["retained_conversion_gap_active"] is True
+    assert curriculum.evidence["retained_conversion_gap"]["active"] is True
+    assert curriculum.evidence["retained_conversion_gap"]["rejected_cycles"] == 3
+
+
+def _write_aligned_trust_ledger(ledger_path: Path) -> None:
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "reports_considered": 40,
+                "overall_summary": {
+                    "distinct_benchmark_families": 5,
+                    "clean_success_task_roots": [
+                        "integration_sync_a",
+                        "project_sync_a",
+                        "repository_sync_a",
+                        "repo_chore_sync_a",
+                        "repo_sandbox_sync_a",
+                    ],
+                },
+                "gated_summary": {
+                    "success_rate": 1.0,
+                    "unsafe_ambiguous_rate": 0.0,
+                    "hidden_side_effect_risk_rate": 0.0,
+                    "success_hidden_side_effect_risk_rate": 0.0,
+                    "false_pass_risk_rate": 0.0,
+                    "unexpected_change_report_rate": 0.0,
+                    "rollback_performed_rate": 0.0,
+                    "clean_success_rate": 1.0,
+                    "distinct_clean_success_task_roots": 10,
+                },
+                "overall_assessment": {
+                    "status": "coverage_aligned",
+                    "passed": True,
+                    "failing_thresholds": [],
+                },
+                "coverage_summary": {
+                    "distinct_family_gap": 0,
+                    "missing_required_families": [],
+                    "restricted_required_families": [],
+                    "family_breadth_min_distinct_task_roots": 2,
+                    "required_family_clean_task_root_counts": {
+                        "repo_chore": 4,
+                        "repo_sandbox": 4,
+                        "project": 4,
+                        "repository": 4,
+                        "integration": 4,
+                    },
+                    "required_families_missing_clean_task_root_breadth": [],
+                    "external_report_count": 20,
+                    "distinct_external_benchmark_families": 5,
+                    "required_families_with_reports": [
+                        "integration",
+                        "project",
+                        "repo_chore",
+                        "repo_sandbox",
+                        "repository",
+                    ],
+                    "required_families_with_external_reports": [
+                        "integration",
+                        "project",
+                        "repo_chore",
+                        "repo_sandbox",
+                        "repository",
+                    ],
+                    "external_unsafe_ambiguous_rate": 0.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_closed_closure_progression_report(reports_dir: Path) -> None:
+    reports_dir.joinpath("campaign_report_closed_closure.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "improvement_campaign_report",
+                "runtime_managed_decisions": 2,
+                "retained_gain_runs": 2,
+                "yield_summary": {
+                    "retained_by_subsystem": {
+                        "curriculum": 1,
+                        "transition_model": 1,
+                    }
+                },
+                "closure_gap_summary": {
+                    "retained_conversion": "closed",
+                    "trust_breadth": "closed",
+                    "retrieval_carryover": "partial",
+                    "long_horizon_finalize_execution": "closed",
+                    "open_world_transfer": "closed",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _closure_progression_metrics(*, verifier_total: int) -> EvalMetrics:
+    return EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"verifier": verifier_total, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_b": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_c": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_d": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_a": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_b": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_c": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_d": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_a": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_b": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_c": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_d": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_a": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_b": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_c": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_d": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_a": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_b": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_c": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_d": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+        },
+    )
+
+
+def test_improvement_planner_prioritizes_retrieval_after_closure_progression_report(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    _write_closed_closure_progression_report(reports_dir)
+    config = KernelConfig(improvement_reports_dir=reports_dir)
+    planner = ImprovementPlanner(
+        memory_root=tmp_path / "episodes",
+        trust_ledger_path=ledger_path,
+        runtime_config=config,
+    )
+
+    experiments = planner.rank_experiments(_closure_progression_metrics(verifier_total=1))
+
+    assert experiments[0].subsystem == "retrieval"
+    retrieval = experiments[0]
+    assert retrieval.evidence["retrieval_carryover_priority"] is True
+    assert retrieval.evidence["closure_progression"]["retained_conversion"] == "closed"
+    assert retrieval.evidence["closure_progression"]["trust_breadth"] == "closed"
+    assert retrieval.evidence["closure_progression"]["retrieval_carryover"] == "partial"
+
+
+def test_improvement_planner_portfolio_prefers_retrieval_after_closure_progression_report(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    _write_closed_closure_progression_report(reports_dir)
+    config = KernelConfig(improvement_reports_dir=reports_dir)
+    planner = ImprovementPlanner(
+        memory_root=tmp_path / "episodes",
+        trust_ledger_path=ledger_path,
+        runtime_config=config,
+    )
+
+    campaign = planner.select_portfolio_campaign(_closure_progression_metrics(verifier_total=0), max_candidates=1)
+
+    assert campaign[0].subsystem == "retrieval"
+    assert campaign[0].evidence["retrieval_carryover_priority"] is True
+
+
+def test_closure_progression_summary_prefers_latest_decision_bearing_anchor(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.joinpath("campaign_report_newer_interrupted.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "improvement_campaign_report",
+                "campaign_label": "newer_interrupted",
+                "status": "interrupted",
+                "runtime_managed_decisions": 0,
+                "retained_gain_runs": 0,
+                "closure_gap_summary": {
+                    "retained_conversion": "open",
+                    "trust_breadth": "open",
+                    "retrieval_carryover": "open",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    reports_dir.joinpath("campaign_report_older_retained.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "improvement_campaign_report",
+                "campaign_label": "older_retained",
+                "runtime_managed_decisions": 2,
+                "retained_gain_runs": 2,
+                "closure_gap_summary": {
+                    "retained_conversion": "closed",
+                    "trust_breadth": "closed",
+                    "retrieval_carryover": "partial",
+                },
+                "yield_summary": {"retained_by_subsystem": {"curriculum": 1, "transition_model": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = ImprovementPlanner(
+        memory_root=tmp_path / "episodes",
+        runtime_config=KernelConfig(improvement_reports_dir=reports_dir),
+    )
+
+    summary = experiment_ranking_module._closure_progression_summary(planner)
+
+    assert summary["retained_conversion"] == "closed"
+    assert summary["trust_breadth"] == "closed"
+    assert summary["retrieval_carryover"] == "partial"
+    assert summary["retrieval_carryover_priority"] is True
+    assert summary["retained_gain_runs"] == 2
 
 
 def test_improvement_planner_penalizes_benchmark_when_evaluator_alignment_is_weak(tmp_path: Path):
@@ -3659,6 +4936,64 @@ def test_build_curriculum_proposal_artifact_uses_retained_runtime_snapshot():
     assert artifact["controls"]["frontier_priority_families"]
 
 
+def test_build_curriculum_proposal_artifact_ratchets_repeated_failure_recovery_focus():
+    artifact = build_curriculum_proposal_artifact(
+        EvalMetrics(total=10, passed=8, generated_total=0),
+        focus="failure_recovery",
+        current_payload={
+            "artifact_kind": "curriculum_proposal_set",
+            "lifecycle_state": "retained",
+            "generation_focus": "failure_recovery",
+            "controls": {
+                "success_reference_limit": 3,
+                "failure_reference_family_only": True,
+                "failure_recovery_anchor_min_matches": 2,
+                "failure_recovery_command_cap": 3,
+                "adjacent_reference_limit": 3,
+                "max_generated_adjacent_tasks": 2,
+                "max_generated_failure_recovery_tasks": 6,
+            },
+        },
+    )
+
+    assert artifact["generation_focus"] == "failure_recovery"
+    assert artifact["controls"]["success_reference_limit"] == 2
+    assert artifact["controls"]["failure_recovery_anchor_min_matches"] == 3
+    assert artifact["controls"]["failure_recovery_command_cap"] == 2
+    assert artifact["controls"]["adjacent_reference_limit"] == 2
+    assert artifact["controls"]["max_generated_adjacent_tasks"] == 1
+    assert artifact["controls"]["max_generated_failure_recovery_tasks"] == 8
+
+
+def test_build_curriculum_proposal_artifact_ratchets_repeated_failure_recovery_focus_from_proposed_runtime_snapshot():
+    artifact = build_curriculum_proposal_artifact(
+        EvalMetrics(total=10, passed=8, generated_total=0),
+        focus="failure_recovery",
+        current_payload={
+            "artifact_kind": "curriculum_proposal_set",
+            "lifecycle_state": "proposed",
+            "generation_focus": "failure_recovery",
+            "controls": {
+                "success_reference_limit": 3,
+                "failure_reference_family_only": True,
+                "failure_recovery_anchor_min_matches": 2,
+                "failure_recovery_command_cap": 3,
+                "adjacent_reference_limit": 3,
+                "max_generated_adjacent_tasks": 2,
+                "max_generated_failure_recovery_tasks": 6,
+            },
+        },
+    )
+
+    assert artifact["generation_focus"] == "failure_recovery"
+    assert artifact["controls"]["success_reference_limit"] == 2
+    assert artifact["controls"]["failure_recovery_anchor_min_matches"] == 3
+    assert artifact["controls"]["failure_recovery_command_cap"] == 2
+    assert artifact["controls"]["adjacent_reference_limit"] == 2
+    assert artifact["controls"]["max_generated_adjacent_tasks"] == 1
+    assert artifact["controls"]["max_generated_failure_recovery_tasks"] == 8
+
+
 def test_build_retrieval_proposal_artifact_uses_retained_runtime_snapshot():
     artifact = build_retrieval_proposal_artifact(
         EvalMetrics(total=10, passed=8, low_confidence_episodes=0, trusted_retrieval_steps=10),
@@ -3667,11 +5002,83 @@ def test_build_retrieval_proposal_artifact_uses_retained_runtime_snapshot():
             "lifecycle_state": "retained",
             "overrides": {"tolbert_context_char_budget": 3000},
             "asset_controls": {"max_episode_step_spans_per_task": 5},
+            "runtime_policy": {"primary_benchmark_families": ["integration", "project"]},
         },
     )
 
     assert artifact["overrides"]["tolbert_context_char_budget"] == 3000
     assert artifact["asset_controls"]["max_episode_step_spans_per_task"] == 5
+    assert artifact["runtime_policy"]["primary_benchmark_families"] == ["integration", "project"]
+
+
+def test_build_retrieval_proposal_artifact_bootstraps_runtime_policy_for_preview_families():
+    artifact = build_retrieval_proposal_artifact(
+        EvalMetrics(
+            total=8,
+            passed=8,
+            low_confidence_episodes=4,
+            total_by_benchmark_family={
+                "integration": 2,
+                "project": 2,
+                "repository": 2,
+                "repo_chore": 2,
+            },
+        ),
+        focus="confidence",
+    )
+
+    runtime_policy = artifact["runtime_policy"]
+
+    assert runtime_policy["primary_benchmark_families"] == [
+        "benchmark_candidate",
+        "integration",
+        "repository",
+        "project",
+    ]
+    assert runtime_policy["allow_trusted_primary_without_min_confidence"] is True
+    assert runtime_policy["trusted_primary_min_confidence"] == 0.0
+
+
+def test_retained_retrieval_runtime_policy_requires_retained_payload():
+    assert retained_retrieval_runtime_policy(
+        {
+            "artifact_kind": "retrieval_policy_set",
+            "lifecycle_state": "proposed",
+            "runtime_policy": {"primary_benchmark_families": ["integration"]},
+        }
+    ) == {}
+    assert retained_retrieval_runtime_policy(
+        {
+            "artifact_kind": "retrieval_policy_set",
+            "lifecycle_state": "retained",
+            "runtime_policy": {"primary_benchmark_families": ["integration"]},
+        }
+    ) == {"primary_benchmark_families": ["integration"]}
+
+
+def test_effective_retrieval_sections_allow_proposed_payloads():
+    payload = {
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_state": "proposed",
+        "runtime_policy": {"primary_benchmark_families": ["integration"]},
+        "overrides": {"tolbert_branch_results": 1},
+    }
+
+    assert effective_retrieval_runtime_policy(payload) == {"primary_benchmark_families": ["integration"]}
+    assert effective_retrieval_overrides(payload) == {"tolbert_branch_results": 1}
+
+
+def test_effective_retrieval_sections_ignore_rejected_payloads():
+    payload = {
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_state": "rejected",
+        "retention_decision": {"state": "reject"},
+        "runtime_policy": {"primary_benchmark_families": ["integration"]},
+        "overrides": {"tolbert_branch_results": 1},
+    }
+
+    assert effective_retrieval_runtime_policy(payload) == {}
+    assert effective_retrieval_overrides(payload) == {}
 
 
 def test_assess_artifact_compatibility_rejects_invalid_world_model_controls():
@@ -4404,6 +5811,56 @@ def test_select_portfolio_campaign_prefers_non_retrieval_after_strong_broad_obse
     assert strategy_candidate["strategy_id"] == "strategy:broad_observe_diversification"
     assert "broad_observe_ready" in strategy_candidate["generation_basis"]["repo_signals"]
     assert strategy_candidate["retention_inputs"]["selected_subsystem"] == "verifier"
+
+
+def test_select_portfolio_campaign_prefers_retained_conversion_after_primary_only_broad_observe(tmp_path: Path):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment("state_estimation", "s", 4, 0.02, 2, 0.069, {}),
+        ImprovementExperiment(
+            "curriculum",
+            "c",
+            5,
+            0.03,
+            3,
+            0.05,
+            {"retained_conversion_priority": True},
+        ),
+        ImprovementExperiment("trust", "t", 4, 0.02, 2, 0.04, {}),
+    ]
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: {}
+    planner.recent_campaign_surface_activity_summary = lambda subsystem, recent_cycle_window=6: {}
+    planner._portfolio_adjusted_experiment_score = (
+        lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    )
+    planner._strategy_portfolio_choice = lambda candidate, metrics, recent_activity, broad_observe_signal: {
+        "strategy_candidate": {
+            "strategy_candidate_id": f"strategy:{candidate.subsystem}",
+            "strategy_candidate_kind": "subsystem_direct",
+        },
+        "recent_activity": {},
+        "strategy_memory_summary": {},
+        "score_delta": 0.0,
+        "reasons": [],
+    }
+    planner._campaign_breadth_pressure = lambda summary: 0.0
+    planner._improvement_planner_controls = lambda: {}
+
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        low_confidence_episodes=0,
+        trusted_retrieval_steps=0,
+        total_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 4},
+        passed_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 4},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["curriculum"]
+    assert "retained_conversion_priority_preferred" in campaign[0].evidence["portfolio"]["reasons"]
 
 
 def test_select_portfolio_campaign_emits_discovered_strategy_for_primary_only_broad_observe(tmp_path: Path):
@@ -6898,6 +8355,128 @@ def test_evaluate_artifact_retention_rejects_zero_influence_trust_control_change
     assert "no measurable runtime influence" in reason
 
 
+def test_evaluate_artifact_retention_retains_transition_model_runtime_signal_from_proposed_active_artifact(
+    tmp_path: Path,
+):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    active_payload = build_transition_model_proposal_artifact(episodes)
+    active_payload["controls"] = {
+        "repeat_command_penalty": 5,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 2,
+        "progress_command_bonus": 3,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 2,
+        "max_signatures": 12,
+    }
+    active_payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_active_transition.py",
+            "support": 1,
+            "regressions": [],
+        }
+    ]
+    active_path = tmp_path / "transition_model" / "active.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+    payload = build_transition_model_proposal_artifact(episodes, focus="repeat_avoidance")
+    payload["retention_gate"] = {"require_transition_model_improvement": True}
+    payload["controls"] = {
+        "repeat_command_penalty": 6,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 2,
+        "progress_command_bonus": 3,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 2,
+        "max_signatures": 12,
+    }
+    payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_candidate_transition.py",
+            "support": 1,
+            "regressions": [],
+        }
+    ]
+    payload["generation_context"] = {"active_artifact_path": str(active_path)}
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+
+    evidence = improvement_module.retention_evidence("transition_model", baseline, candidate, payload=payload)
+    state, reason = evaluate_artifact_retention("transition_model", baseline, candidate, payload=payload)
+
+    assert evidence["transition_model_improvement_count"] == 2
+    assert evidence["transition_signature_count"] == 1
+    assert evidence["transition_signature_count_delta"] == 0
+    assert evidence["transition_signature_growth"] == 1
+    assert state == "retain"
+    assert "improved retained bad-transition guidance" in reason
+
+
+def test_evaluate_artifact_retention_counts_transition_signature_replacement_as_improvement(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    active_payload = build_transition_model_proposal_artifact(episodes)
+    active_payload["controls"] = {
+        "repeat_command_penalty": 5,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 2,
+        "progress_command_bonus": 3,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 2,
+        "max_signatures": 2,
+    }
+    active_payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_alpha_transition.py",
+            "support": 1,
+            "regressions": [],
+        },
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_beta_transition.py",
+            "support": 1,
+            "regressions": [],
+        },
+    ]
+    active_path = tmp_path / "transition_model" / "active.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+    payload = build_transition_model_proposal_artifact(episodes, focus="regression_guard")
+    payload["retention_gate"] = {"require_transition_model_improvement": True}
+    payload["controls"] = dict(active_payload["controls"])
+    payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_gamma_transition.py",
+            "support": 1,
+            "regressions": [],
+        },
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_delta_transition.py",
+            "support": 1,
+            "regressions": [],
+        },
+    ]
+    payload["generation_context"] = {"active_artifact_path": str(active_path)}
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+
+    evidence = improvement_module.retention_evidence("transition_model", baseline, candidate, payload=payload)
+    state, reason = evaluate_artifact_retention("transition_model", baseline, candidate, payload=payload)
+
+    assert evidence["transition_model_improvement_count"] == 1
+    assert evidence["transition_signature_count"] == 2
+    assert evidence["transition_signature_count_delta"] == 0
+    assert evidence["transition_signature_growth"] == 2
+    assert state == "retain"
+    assert "improved retained bad-transition guidance" in reason
+
+
 def test_evaluate_artifact_retention_retains_recovery_control_improvement_without_regression():
     baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
     candidate = EvalMetrics(total=10, passed=8, average_steps=1.4, generated_total=4, generated_passed=3)
@@ -7754,20 +9333,126 @@ def test_retrieval_artifact_emits_preview_controls_for_low_signal_carryover_pres
 
     artifact = build_retrieval_proposal_artifact(metrics, focus="confidence")
 
-    assert artifact["preview_controls"]["comparison_task_limit_floor"] == 8
+    assert artifact["preview_controls"]["comparison_task_limit_floor"] == 10
     assert artifact["preview_controls"]["priority_benchmark_families"] == [
-        "benchmark_candidate",
-        "integration",
-        "repository",
         "project",
+        "repository",
+        "integration",
+        "benchmark_candidate",
     ]
     assert artifact["preview_controls"]["priority_benchmark_family_weights"] == {
-        "benchmark_candidate": 4.0,
-        "integration": 3.0,
-        "repository": 2.0,
-        "project": 1.5,
+        "project": 4.0,
+        "repository": 3.0,
+        "integration": 2.0,
+        "benchmark_candidate": 1.0,
     }
-    assert artifact["preview_controls"]["prefer_family_discrimination_probe"] is True
+    assert artifact["preview_controls"]["prefer_family_discrimination_probe"] is False
+    assert artifact["preview_controls"]["prefer_long_horizon_tasks"] is True
+
+
+def test_retrieval_preview_controls_preserve_retained_carryover_priority():
+    metrics = EvalMetrics(
+        total=8,
+        passed=8,
+        trusted_retrieval_steps=0,
+        novel_valid_command_steps=0,
+        tolbert_primary_episodes=0,
+        total_by_benchmark_family={"integration": 3, "repository": 2, "project": 1},
+    )
+
+    artifact = build_retrieval_proposal_artifact(
+        metrics,
+        focus="confidence",
+        current_payload={
+            "artifact_kind": "retrieval_policy_set",
+            "lifecycle_state": "retained",
+            "asset_controls": {"prefer_successful_carryover_repairs": True},
+        },
+    )
+
+    assert artifact["preview_controls"]["comparison_task_limit_floor"] == 10
+    assert artifact["preview_controls"]["priority_benchmark_families"][:3] == [
+        "project",
+        "repository",
+        "integration",
+    ]
+    assert artifact["preview_controls"]["prefer_long_horizon_tasks"] is True
+    assert artifact["preview_controls"]["prefer_family_discrimination_probe"] is False
+
+
+def test_retrieval_artifact_preserves_retained_carryover_retention_gate():
+    metrics = EvalMetrics(
+        total=8,
+        passed=8,
+        trusted_retrieval_steps=0,
+        novel_valid_command_steps=0,
+        tolbert_primary_episodes=0,
+    )
+
+    artifact = build_retrieval_proposal_artifact(
+        metrics,
+        focus="confidence",
+        current_payload={
+            "artifact_kind": "retrieval_policy_set",
+            "lifecycle_state": "retained",
+            "asset_controls": {"prefer_successful_carryover_repairs": True},
+            "retention_gate": {
+                "require_trusted_carryover_repair_improvement": True,
+                "min_trusted_carryover_repair_rate": 0.5,
+                "min_trusted_carryover_verified_step_delta": 1,
+                "max_low_confidence_episode_regression": 0,
+            },
+        },
+    )
+
+    assert artifact["retention_gate"]["require_trusted_carryover_repair_improvement"] is True
+    assert artifact["retention_gate"]["min_trusted_carryover_repair_rate"] == 0.5
+    assert artifact["retention_gate"]["min_trusted_carryover_verified_step_delta"] == 1
+    assert artifact["retention_gate"]["max_low_confidence_episode_regression"] == 0
+
+
+def test_limit_tasks_for_compare_prefers_long_horizon_tasks_when_requested():
+    from types import SimpleNamespace
+
+    from evals.harness import _limit_tasks_for_compare
+
+    def _task(task_id: str, *, difficulty: str = "", benchmark_family: str = "project"):
+        metadata = {"benchmark_family": benchmark_family}
+        if difficulty:
+            metadata["difficulty"] = difficulty
+        return SimpleNamespace(
+            task_id=task_id,
+            metadata=metadata,
+            max_steps=4,
+            suggested_commands=[],
+            prompt=task_id,
+        )
+
+    tasks = [
+        _task("project_bounded_a"),
+        _task("project_long_horizon_a", difficulty="long_horizon"),
+        _task("project_bounded_b"),
+        _task("project_long_horizon_b", difficulty="long_horizon"),
+    ]
+
+    default_selected = _limit_tasks_for_compare(
+        list(tasks),
+        1,
+        priority_families=["project"],
+        priority_family_weights={"project": 1.0},
+        prefer_low_cost_tasks=True,
+    )
+    carryover_selected = _limit_tasks_for_compare(
+        list(tasks),
+        1,
+        priority_families=["project"],
+        priority_family_weights={"project": 1.0},
+        prefer_low_cost_tasks=True,
+        prefer_long_horizon_tasks=True,
+    )
+
+    assert default_selected[0].task_id == "project_bounded_a"
+    assert carryover_selected[0].task_id == "project_long_horizon_a"
 
 
 def test_retrieval_improvement_emits_broader_control_proposals():
@@ -8308,6 +9993,170 @@ def test_evaluate_artifact_retention_retains_curriculum_improvement():
     state, _ = evaluate_artifact_retention("curriculum", baseline, candidate)
 
     assert state == "retain"
+
+
+def test_evaluate_artifact_retention_retains_curriculum_clean_success_family_gain_without_pass_rate_delta():
+    baseline = EvalMetrics(
+        total=10,
+        passed=9,
+        average_steps=1.0,
+        generated_total=2,
+        generated_passed=2,
+        generated_by_kind={"adjacent_success": 2},
+        generated_passed_by_kind={"adjacent_success": 2},
+        generated_by_benchmark_family={"integration": 2},
+        generated_passed_by_benchmark_family={"integration": 2},
+        generated_task_summaries={
+            "integration_adjacent_1": {
+                "curriculum_kind": "adjacent_success",
+                "benchmark_family": "integration",
+                "success": True,
+                "clean_success": True,
+                "steps": 1,
+            },
+            "integration_adjacent_2": {
+                "curriculum_kind": "adjacent_success",
+                "benchmark_family": "integration",
+                "success": True,
+                "clean_success": True,
+                "steps": 1,
+            },
+        },
+    )
+    candidate = EvalMetrics(
+        total=10,
+        passed=9,
+        average_steps=1.0,
+        generated_total=2,
+        generated_passed=2,
+        generated_by_kind={"adjacent_success": 2},
+        generated_passed_by_kind={"adjacent_success": 2},
+        generated_by_benchmark_family={"integration": 1, "project": 1},
+        generated_passed_by_benchmark_family={"integration": 1, "project": 1},
+        generated_task_summaries={
+            "integration_adjacent_1": {
+                "curriculum_kind": "adjacent_success",
+                "benchmark_family": "integration",
+                "success": True,
+                "clean_success": True,
+                "steps": 1,
+            },
+            "project_adjacent_1": {
+                "curriculum_kind": "adjacent_success",
+                "benchmark_family": "project",
+                "success": True,
+                "clean_success": True,
+                "steps": 1,
+            },
+        },
+    )
+
+    state, reason = evaluate_artifact_retention("curriculum", baseline, candidate)
+
+    assert state == "retain"
+    assert "generated-task" in reason
+
+
+def test_evaluate_artifact_retention_retains_curriculum_contract_clean_recovery_gain_without_pass_rate_delta():
+    baseline = EvalMetrics(
+        total=10,
+        passed=9,
+        average_steps=1.0,
+        generated_total=2,
+        generated_passed=2,
+        generated_by_kind={"failure_recovery": 2},
+        generated_passed_by_kind={"failure_recovery": 2},
+        generated_by_benchmark_family={"repo_chore": 1, "repository": 1},
+        generated_passed_by_benchmark_family={"repo_chore": 1, "repository": 1},
+        generated_task_summaries={
+            "repo_chore_recovery": {
+                "curriculum_kind": "failure_recovery",
+                "benchmark_family": "repo_chore",
+                "success": True,
+                "clean_success": False,
+                "steps": 3,
+            },
+            "repository_recovery": {
+                "curriculum_kind": "failure_recovery",
+                "benchmark_family": "repository",
+                "success": True,
+                "clean_success": True,
+                "steps": 2,
+            },
+        },
+        contract_clean_failure_recovery_summary={
+            "task_count": 2,
+            "success_count": 2,
+            "clean_success_count": 1,
+            "average_steps": 2.5,
+        },
+        contract_clean_failure_recovery_by_origin_benchmark_family={
+            "repo_chore": {
+                "task_count": 1,
+                "success_count": 1,
+                "clean_success_count": 0,
+                "average_steps": 3.0,
+            },
+            "repository": {
+                "task_count": 1,
+                "success_count": 1,
+                "clean_success_count": 1,
+                "average_steps": 2.0,
+            },
+        },
+    )
+    candidate = EvalMetrics(
+        total=10,
+        passed=9,
+        average_steps=1.0,
+        generated_total=2,
+        generated_passed=2,
+        generated_by_kind={"failure_recovery": 2},
+        generated_passed_by_kind={"failure_recovery": 2},
+        generated_by_benchmark_family={"repo_chore": 1, "repository": 1},
+        generated_passed_by_benchmark_family={"repo_chore": 1, "repository": 1},
+        generated_task_summaries={
+            "repo_chore_recovery": {
+                "curriculum_kind": "failure_recovery",
+                "benchmark_family": "repo_chore",
+                "success": True,
+                "clean_success": True,
+                "steps": 2,
+            },
+            "repository_recovery": {
+                "curriculum_kind": "failure_recovery",
+                "benchmark_family": "repository",
+                "success": True,
+                "clean_success": True,
+                "steps": 2,
+            },
+        },
+        contract_clean_failure_recovery_summary={
+            "task_count": 2,
+            "success_count": 2,
+            "clean_success_count": 2,
+            "average_steps": 2.0,
+        },
+        contract_clean_failure_recovery_by_origin_benchmark_family={
+            "repo_chore": {
+                "task_count": 1,
+                "success_count": 1,
+                "clean_success_count": 1,
+                "average_steps": 2.0,
+            },
+            "repository": {
+                "task_count": 1,
+                "success_count": 1,
+                "clean_success_count": 1,
+                "average_steps": 2.0,
+            },
+        },
+    )
+
+    state, reason = evaluate_artifact_retention("curriculum", baseline, candidate)
+
+    assert state == "retain"
+    assert "failure-recovery" in reason
 
 
 def test_evaluate_artifact_retention_rejects_policy_regression_on_generated_lane():
@@ -11269,6 +13118,61 @@ def test_rank_variants_prefers_retrieval_confidence_gating_when_retrieval_never_
     assert breadth.controls["activation_bootstrap_bias"]["bias"] < 0.0
 
 
+def test_rank_variants_prefers_retrieval_confidence_gating_when_only_proposal_selection_exists(tmp_path: Path, monkeypatch):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=tmp_path / "improvement" / "cycles.jsonl")
+
+    monkeypatch.setattr(
+        planner,
+        "_variants_for_experiment",
+        lambda experiment, metrics, planner_controls=None: [
+            ImprovementVariant(
+                subsystem="retrieval",
+                variant_id="confidence_gating",
+                description="bootstrap retrieval activation",
+                expected_gain=0.03,
+                estimated_cost=2,
+                score=0.0,
+                controls={"focus": "confidence"},
+            ),
+            ImprovementVariant(
+                subsystem="retrieval",
+                variant_id="breadth_rebalance",
+                description="rebalance branch/global retrieval breadth",
+                expected_gain=0.025,
+                estimated_cost=3,
+                score=0.0,
+                controls={"focus": "breadth"},
+            ),
+        ],
+    )
+
+    ranked = planner.rank_variants(
+        ImprovementExperiment(
+            subsystem="retrieval",
+            reason="retrieval gap",
+            priority=5,
+            expected_gain=0.02,
+            estimated_cost=3,
+            score=0.1,
+            evidence={
+                "total": 8,
+                "low_confidence_episodes": 0,
+                "trusted_retrieval_steps": 0,
+                "retrieval_selected_steps": 0,
+                "retrieval_influenced_steps": 0,
+                "proposal_selected_steps": 1,
+            },
+        ),
+        EvalMetrics(total=8, passed=8),
+    )
+
+    assert ranked[0].variant_id == "confidence_gating"
+    assert ranked[0].controls["activation_bootstrap_bias"]["selection_without_influence"] is True
+    assert ranked[0].score > next(variant for variant in ranked if variant.variant_id == "breadth_rebalance").score
+    breadth = next(variant for variant in ranked if variant.variant_id == "breadth_rebalance")
+    assert breadth.controls["activation_bootstrap_bias"]["bias"] < 0.0
+
+
 def test_rank_variants_preserves_retrieval_confidence_gating_bootstrap_priority_when_history_clamps_scores(tmp_path: Path, monkeypatch):
     planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=tmp_path / "improvement" / "cycles.jsonl")
 
@@ -11355,6 +13259,197 @@ def test_rank_variants_preserves_retrieval_confidence_gating_bootstrap_priority_
     assert ranked[0].score == 0.01
     assert ranked[0].controls["activation_bootstrap_score_floor"]["floor"] == 0.01
     breadth = next(variant for variant in ranked if variant.variant_id == "breadth_rebalance")
+    assert breadth.score == 0.0
+
+
+def test_rank_variants_prefers_retrieval_confidence_gating_for_carryover_priority(tmp_path: Path, monkeypatch):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=tmp_path / "improvement" / "cycles.jsonl")
+
+    monkeypatch.setattr(
+        planner,
+        "_variants_for_experiment",
+        lambda experiment, metrics, planner_controls=None: [
+            ImprovementVariant(
+                subsystem="retrieval",
+                variant_id="confidence_gating",
+                description="tighten carryover verification routing",
+                expected_gain=0.022,
+                estimated_cost=2,
+                score=0.0,
+                controls={"focus": "confidence"},
+            ),
+            ImprovementVariant(
+                subsystem="retrieval",
+                variant_id="breadth_rebalance",
+                description="rebalance branch/global retrieval breadth",
+                expected_gain=0.025,
+                estimated_cost=2,
+                score=0.0,
+                controls={"focus": "breadth"},
+            ),
+        ],
+    )
+    subsystem_history = {
+        "total_decisions": 13,
+        "retained_cycles": 0,
+        "rejected_cycles": 13,
+        "retention_rate": 0.0,
+        "rejection_rate": 1.0,
+        "average_retained_pass_rate_delta": 0.0,
+        "average_rejected_pass_rate_delta": 0.0,
+        "average_rejected_step_delta": -0.19,
+        "decision_quality_score": -0.035,
+        "recent_decision_window": 3,
+        "recent_retained_cycles": 0,
+        "recent_rejected_cycles": 3,
+        "recent_retention_rate": 0.0,
+        "recent_rejection_rate": 1.0,
+        "last_decision_state": "reject",
+        "last_cycle_id": "cycle:retrieval:baseline",
+        "net_retained_cycle_advantage": -13,
+    }
+    variant_histories = {
+        "confidence_gating": {
+            "total_decisions": 3,
+            "retained_cycles": 0,
+            "rejected_cycles": 3,
+            "retention_rate": 0.0,
+            "rejection_rate": 1.0,
+            "average_retained_pass_rate_delta": 0.0,
+            "average_rejected_pass_rate_delta": 0.0,
+            "average_rejected_step_delta": 0.0,
+            "decision_quality_score": -0.035,
+            "recent_decision_window": 3,
+            "recent_retained_cycles": 0,
+            "recent_rejected_cycles": 3,
+            "recent_retention_rate": 0.0,
+            "recent_rejection_rate": 1.0,
+            "last_decision_state": "reject",
+            "last_cycle_id": "cycle:retrieval:confidence",
+            "net_retained_cycle_advantage": -3,
+        },
+        "breadth_rebalance": {
+            "total_decisions": 10,
+            "retained_cycles": 0,
+            "rejected_cycles": 10,
+            "retention_rate": 0.0,
+            "rejection_rate": 1.0,
+            "average_retained_pass_rate_delta": 0.0,
+            "average_rejected_pass_rate_delta": 0.0,
+            "average_rejected_step_delta": -0.25,
+            "decision_quality_score": -0.035,
+            "recent_decision_window": 3,
+            "recent_retained_cycles": 0,
+            "recent_rejected_cycles": 3,
+            "recent_retention_rate": 0.0,
+            "recent_rejection_rate": 1.0,
+            "last_decision_state": "reject",
+            "last_cycle_id": "cycle:retrieval:breadth",
+            "net_retained_cycle_advantage": -10,
+        },
+    }
+    recent_variant_histories = {
+        "confidence_gating": {
+            "recent_cycle_window": 6,
+            "selected_cycles": 3,
+            "retained_cycles": 0,
+            "rejected_cycles": 3,
+            "last_decision_state": "reject",
+            "last_cycle_id": "cycle:retrieval:confidence",
+            "average_retained_pass_rate_delta": 0.0,
+            "average_rejected_pass_rate_delta": 0.0,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 0,
+            "total_decisions": 3,
+            "retention_rate": 0.0,
+            "rejection_rate": 1.0,
+            "recent_retention_rate": 0.0,
+            "recent_rejection_rate": 1.0,
+            "recent_regression_cycles": 0,
+            "recent_phase_gate_failure_cycles": 0,
+            "last_phase_gate_failure_reason": "",
+            "repeated_phase_gate_reason_count": 0,
+            "recent_reconciled_failure_cycles": 0,
+            "recent_observation_timeout_cycles": 0,
+            "recent_budgeted_observation_timeout_cycles": 0,
+            "last_observation_timeout_budget_source": "",
+            "repeated_observation_timeout_budget_source_count": 0,
+            "net_retained_cycle_advantage": -3,
+            "decision_quality_score": -0.035,
+        },
+        "breadth_rebalance": {
+            "recent_cycle_window": 6,
+            "selected_cycles": 5,
+            "retained_cycles": 0,
+            "rejected_cycles": 3,
+            "last_decision_state": "reject",
+            "last_cycle_id": "cycle:retrieval:breadth",
+            "average_retained_pass_rate_delta": 0.0,
+            "average_rejected_pass_rate_delta": 0.0,
+            "no_yield_cycles": 2,
+            "recent_incomplete_cycles": 0,
+            "total_decisions": 3,
+            "retention_rate": 0.0,
+            "rejection_rate": 1.0,
+            "recent_retention_rate": 0.0,
+            "recent_rejection_rate": 0.6,
+            "recent_regression_cycles": 0,
+            "recent_phase_gate_failure_cycles": 0,
+            "last_phase_gate_failure_reason": "",
+            "repeated_phase_gate_reason_count": 0,
+            "recent_reconciled_failure_cycles": 0,
+            "recent_observation_timeout_cycles": 0,
+            "recent_budgeted_observation_timeout_cycles": 0,
+            "last_observation_timeout_budget_source": "",
+            "repeated_observation_timeout_budget_source_count": 0,
+            "net_retained_cycle_advantage": -3,
+            "decision_quality_score": -0.049,
+        },
+    }
+    monkeypatch.setattr(planner, "subsystem_history_summary", lambda subsystem, output_path=None: dict(subsystem_history))
+    monkeypatch.setattr(
+        planner,
+        "variant_history_summary",
+        lambda subsystem, variant_id, output_path=None: dict(variant_histories[variant_id]),
+    )
+    monkeypatch.setattr(
+        planner,
+        "recent_variant_activity_summary",
+        lambda subsystem, variant_id, output_path=None: dict(recent_variant_histories[variant_id]),
+    )
+
+    ranked = planner.rank_variants(
+        ImprovementExperiment(
+            subsystem="retrieval",
+            reason="retrieval carryover gap",
+            priority=7,
+            expected_gain=0.05,
+            estimated_cost=2,
+            score=0.175,
+            evidence={
+                "retrieval_carryover_priority": True,
+                "closure_progression": {
+                    "retained_conversion": "closed",
+                    "trust_breadth": "closed",
+                    "retrieval_carryover": "partial",
+                },
+                "total": 20,
+                "trusted_retrieval_steps": 20,
+                "retrieval_selected_steps": 20,
+                "retrieval_influenced_steps": 20,
+                "proposal_selected_steps": 0,
+            },
+        ),
+        EvalMetrics(total=20, passed=19, trusted_retrieval_steps=20),
+    )
+
+    assert ranked[0].variant_id == "confidence_gating"
+    assert ranked[0].controls["carryover_priority_bias"]["retrieval_carryover"] == "partial"
+    assert ranked[0].controls["carryover_priority_bias"]["bias"] > 0.0
+    assert ranked[0].controls["carryover_priority_score_floor"]["floor"] == 0.012
+    assert ranked[0].score == 0.012
+    breadth = next(variant for variant in ranked if variant.variant_id == "breadth_rebalance")
+    assert breadth.controls["carryover_priority_bias"]["bias"] < 0.0
     assert breadth.score == 0.0
 
 

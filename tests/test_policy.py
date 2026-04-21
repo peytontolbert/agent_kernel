@@ -18014,6 +18014,55 @@ def test_llm_policy_inference_failure_fallback_preserves_retrieval_guidance():
     )
 
 
+def test_llm_policy_inference_failure_fallback_prefers_trusted_carryover_over_task_suggestion():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(
+        task=TaskSpec(
+            task_id="trusted_retrieval_fallback_priority_task",
+            prompt="Recover the trusted release status.",
+            workspace_subdir="trusted_retrieval_fallback_priority_task",
+            suggested_commands=["printf 'fallback suggestion\\n' > status.txt"],
+            expected_files=["status.txt"],
+            expected_file_contents={"status.txt": "done\n"},
+            metadata={"difficulty": "long_horizon", "benchmark_family": "project"},
+        )
+    )
+    state.context_packet = ContextPacket(
+        request_id="req-1",
+        created_at="2026-04-02T00:00:00+00:00",
+        task={"goal": "g", "completion_criteria": "c"},
+        control={
+            "mode": "verify",
+            "path_confidence": 0.18,
+            "trust_retrieval": True,
+            "retrieval_guidance": {
+                "recommended_commands": [],
+                "recommended_command_spans": [],
+                "avoidance_notes": [],
+                "evidence": [],
+            },
+        },
+        tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+        retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+        verifier_contract={"success_command": "true"},
+    )
+    state.graph_summary = {
+        "trusted_retrieval_successes": 2,
+        "trusted_retrieval_command_counts": {
+            "printf 'done\\n' > status.txt": 2,
+        },
+    }
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is not None
+    assert decision.action == "code_execute"
+    assert decision.content == "printf 'done\\n' > status.txt"
+    assert decision.decision_source == "trusted_retrieval_carryover_direct"
+    assert decision.retrieval_influenced is True
+    assert str(decision.selected_retrieval_span_id).startswith("graph:trusted_retrieval:")
+
+
 def test_llm_policy_inference_failure_fallback_preserves_tolbert_shadow_route(tmp_path):
     artifact_path = tmp_path / "tolbert_model" / "artifact.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -18079,6 +18128,93 @@ def test_llm_policy_inference_failure_fallback_preserves_tolbert_shadow_route(tm
     assert decision.decision_source == "deterministic_fallback"
     assert decision.tolbert_route_mode == "shadow"
     assert decision.content.startswith("mkdir -p deploy &&")
+
+
+def test_llm_policy_disables_first_step_deterministic_fallback_for_contract_clean_failure_recovery():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(provider="mock"),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repo_contract_recovery",
+            prompt="Recover the repo workspace.",
+            workspace_subdir="repo_contract_recovery",
+            suggested_commands=["printf 'safe retry complete\\n' > retry.txt"],
+            expected_files=["retry.txt"],
+            expected_file_contents={"retry.txt": "safe retry complete\n"},
+            metadata={
+                "curriculum_kind": "failure_recovery",
+                "contract_clean_failure_recovery_origin": True,
+                "decision_yield_contract_candidate": True,
+                "benchmark_family": "repo_chore",
+            },
+        )
+    )
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is None
+
+
+def test_llm_policy_keeps_deterministic_fallback_for_non_contract_failure_recovery():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(provider="mock"),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repo_generic_recovery",
+            prompt="Recover the repo workspace.",
+            workspace_subdir="repo_generic_recovery",
+            suggested_commands=["printf 'safe retry complete\\n' > retry.txt"],
+            expected_files=["retry.txt"],
+            expected_file_contents={"retry.txt": "safe retry complete\n"},
+            metadata={
+                "curriculum_kind": "failure_recovery",
+                "contract_clean_failure_recovery_origin": False,
+                "decision_yield_contract_candidate": True,
+                "benchmark_family": "repo_chore",
+            },
+        )
+    )
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is not None
+    assert decision.decision_source == "deterministic_fallback"
+
+
+def test_llm_policy_allows_progressive_fallback_for_contract_clean_failure_recovery_after_retryable_tolbert_startup_failure():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(provider="mock"),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repo_contract_recovery_tolbert_retry",
+            prompt="Recover the repo workspace.",
+            workspace_subdir="repo_contract_recovery_tolbert_retry",
+            suggested_commands=["printf 'safe retry complete\\n' > retry.txt"],
+            expected_files=["retry.txt"],
+            expected_file_contents={"retry.txt": "safe retry complete\n"},
+            metadata={
+                "curriculum_kind": "failure_recovery",
+                "contract_clean_failure_recovery_origin": True,
+                "decision_yield_contract_candidate": True,
+                "benchmark_family": "repo_chore",
+            },
+        )
+    )
+
+    decision = policy.fallback_decision(
+        state,
+        failure_origin="retrieval_failure",
+        error_text="TOLBERT service exited before startup ready with code 1.",
+    )
+
+    assert decision is not None
+    assert decision.decision_source == "deterministic_fallback"
 
 
 def test_llm_policy_strict_live_llm_mode_disables_inference_failure_fallback():
@@ -18654,6 +18790,28 @@ def test_choose_tolbert_route_allows_high_confidence_primary_without_trusted_ret
     assert "direct or skill primary routing" in route.reason
 
 
+def test_choose_tolbert_route_allows_low_confidence_primary_without_trusted_retrieval_for_direct_primary():
+    from agent_kernel.modeling.policy.runtime import choose_tolbert_route
+
+    route = choose_tolbert_route(
+        runtime_policy={
+            "primary_benchmark_families": ["project"],
+            "shadow_benchmark_families": ["project"],
+            "min_path_confidence": 0.7,
+            "require_trusted_retrieval": True,
+            "allow_direct_command_primary": True,
+            "allow_skill_primary": False,
+            "use_latent_state": True,
+        },
+        benchmark_family="project",
+        path_confidence=0.2,
+        trust_retrieval=False,
+    )
+
+    assert route.mode == "primary"
+    assert "despite low path confidence" in route.reason
+
+
 def test_choose_tolbert_route_keeps_trusted_retrieval_requirement_when_direct_and_skill_primary_are_disabled():
     from agent_kernel.modeling.policy.runtime import choose_tolbert_route
 
@@ -19044,6 +19202,81 @@ def test_llm_policy_raises_primary_min_command_score_from_retrieval_overrides(tm
     assert policy._tolbert_runtime_policy()["require_trusted_retrieval"] is True
     assert policy._tolbert_runtime_policy()["fallback_to_vllm_on_low_confidence"] is False
     assert policy._tolbert_runtime_policy()["primary_min_command_score"] == 4
+
+
+def test_llm_policy_merges_retrieval_runtime_policy(tmp_path):
+    retrieval_path = tmp_path / "retrieval" / "retrieval_proposals.json"
+    retrieval_path.parent.mkdir(parents=True, exist_ok=True)
+    retrieval_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "retained",
+                "runtime_policy": {
+                    "primary_benchmark_families": ["integration", "repository"],
+                    "allow_trusted_primary_without_min_confidence": True,
+                    "trusted_primary_min_confidence": 0.0,
+                },
+                "overrides": {},
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        context_provider=FakeContextProvider(),
+        config=KernelConfig(
+            retrieval_proposals_path=retrieval_path,
+            use_retrieval_proposals=True,
+            use_tolbert_model_artifacts=False,
+        ),
+    )
+
+    runtime_policy = policy._tolbert_runtime_policy()
+
+    assert runtime_policy["primary_benchmark_families"] == ["integration", "repository"]
+    assert runtime_policy["allow_trusted_primary_without_min_confidence"] is True
+    assert runtime_policy["trusted_primary_min_confidence"] == 0.0
+
+
+def test_llm_policy_merges_proposed_retrieval_runtime_policy_and_overrides(tmp_path):
+    retrieval_path = tmp_path / "retrieval" / "retrieval_proposals.json"
+    retrieval_path.parent.mkdir(parents=True, exist_ok=True)
+    retrieval_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "proposed",
+                "runtime_policy": {
+                    "primary_benchmark_families": ["integration", "repository"],
+                    "allow_trusted_primary_without_min_confidence": True,
+                    "trusted_primary_min_confidence": 0.0,
+                },
+                "overrides": {
+                    "tolbert_direct_command_min_score": 4,
+                },
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        context_provider=FakeContextProvider(),
+        config=KernelConfig(
+            retrieval_proposals_path=retrieval_path,
+            use_retrieval_proposals=True,
+            use_tolbert_model_artifacts=False,
+        ),
+    )
+
+    runtime_policy = policy._tolbert_runtime_policy()
+
+    assert runtime_policy["primary_benchmark_families"] == ["integration", "repository"]
+    assert runtime_policy["allow_trusted_primary_without_min_confidence"] is True
+    assert runtime_policy["trusted_primary_min_confidence"] == 0.0
+    assert runtime_policy["primary_min_command_score"] == 4
 
 
 def test_llm_policy_screens_partial_first_step_retrieval_guidance_for_tolbert_candidates():

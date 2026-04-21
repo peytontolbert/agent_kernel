@@ -246,6 +246,7 @@ def preview_candidate_retention(
     subsystem: str,
     artifact_path: Path,
     cycle_id: str,
+    preview_scope_suffix: str | None = None,
     active_artifact_path: Path | None = None,
     include_discovered_tasks: bool = False,
     include_episode_memory: bool = False,
@@ -319,17 +320,22 @@ def preview_candidate_retention(
     managed_active_artifact_path = (
         active_artifact_path if active_artifact_path is not None else active_artifact_path_for_subsystem(config, subsystem)
     )
+    scope_suffix = ""
+    if preview_scope_suffix is not None:
+        normalized_scope_suffix = cycle_id_safe_fn(str(preview_scope_suffix).strip())
+        if normalized_scope_suffix:
+            scope_suffix = f"_{normalized_scope_suffix}"
     baseline_config = retention_eval_config_fn(
         base_config=config,
         subsystem=subsystem,
         artifact_path=managed_active_artifact_path,
-        scope=f"{cycle_id_safe_fn(cycle_id)}_{subsystem}_preview_baseline",
+        scope=f"{cycle_id_safe_fn(cycle_id)}_{subsystem}_preview_baseline{scope_suffix}",
     )
     candidate_config = retention_eval_config_fn(
         base_config=config,
         subsystem=subsystem,
         artifact_path=artifact_path,
-        scope=f"{cycle_id_safe_fn(cycle_id)}_{subsystem}_preview_candidate",
+        scope=f"{cycle_id_safe_fn(cycle_id)}_{subsystem}_preview_candidate{scope_suffix}",
     )
     baseline_flags, candidate_flags = baseline_candidate_flags(subsystem, config.capability_modules_path)
     baseline_flags.update(

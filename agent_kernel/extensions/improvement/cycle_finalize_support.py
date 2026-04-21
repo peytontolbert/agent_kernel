@@ -308,7 +308,7 @@ def run_holdout_phase(
             action="holdout_candidate_to_baseline",
             artifact_path=str(managed_active_artifact_path),
             artifact_kind="retention_holdout",
-            reason="validated capped preview on an uncapped holdout lane",
+            reason="validated capped preview on a bounded holdout lane",
             metrics_summary={
                 "baseline_pass_rate": holdout_baseline.pass_rate,
                 "candidate_pass_rate": holdout_candidate.pass_rate,

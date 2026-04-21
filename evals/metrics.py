@@ -72,6 +72,7 @@ class EvalMetrics:
     )
     transfer_alignment_summary: dict[str, object] = field(default_factory=dict)
     task_outcomes: dict[str, dict[str, object]] = field(default_factory=dict)
+    generated_task_summaries: dict[str, dict[str, object]] = field(default_factory=dict)
     task_trajectories: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property

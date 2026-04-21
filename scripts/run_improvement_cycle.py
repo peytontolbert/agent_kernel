@@ -2897,6 +2897,7 @@ def main() -> None:
                     config=config,
                     subsystem=target.subsystem,
                     cycle_id=cycle_id,
+                    preview_scope_suffix=variant.variant_id,
                     artifact_path=Path(artifact),
                     active_artifact_path=active_artifact_path_obj,
                     include_episode_memory=args.include_episode_memory,
@@ -2927,6 +2928,9 @@ def main() -> None:
                     f"candidate_pass_rate={candidate_preview.pass_rate:.4f} "
                     f"phase_gate_passed={bool(phase_gate_report.get('passed', False)) if isinstance(phase_gate_report, dict) else False}",
                 )
+                preview_evidence = preview.get("evidence", {})
+                if not isinstance(preview_evidence, dict):
+                    preview_evidence = {}
                 planner.append_cycle_record(
                     config.improvement_cycles_path,
                     ImprovementCycleRecord(
@@ -2968,6 +2972,24 @@ def main() -> None:
                                 ]
                                 if isinstance(phase_gate_report, dict)
                                 else []
+                            ),
+                            "preview_generated_pass_rate_delta": float(
+                                preview_evidence.get("generated_pass_rate_delta", 0.0) or 0.0
+                            ),
+                            "preview_failure_recovery_pass_rate_delta": float(
+                                preview_evidence.get("failure_recovery_pass_rate_delta", 0.0) or 0.0
+                            ),
+                            "preview_generated_clean_success_delta": int(
+                                preview_evidence.get("generated_clean_success_delta", 0) or 0
+                            ),
+                            "preview_generated_clean_success_family_gain_count": int(
+                                preview_evidence.get("generated_clean_success_family_gain_count", 0) or 0
+                            ),
+                            "preview_contract_clean_failure_recovery_clean_success_delta": int(
+                                preview_evidence.get("contract_clean_failure_recovery_clean_success_delta", 0) or 0
+                            ),
+                            "preview_contract_clean_failure_recovery_family_gain_count": int(
+                                preview_evidence.get("contract_clean_failure_recovery_family_gain_count", 0) or 0
                             ),
                         },
                         strategy_candidate_id=str(target_strategy.get("strategy_candidate_id", "")).strip(),

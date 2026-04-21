@@ -71,14 +71,32 @@ def select_portfolio_campaign(
         if bool(broad_observe_signal.get("active", False)) and not bool(
             broad_observe_signal.get("retrieval_emergency", False)
         ):
+            retrieval_carryover_available = [
+                candidate
+                for candidate in candidate_pool
+                if bool(candidate.evidence.get("retrieval_carryover_priority", False))
+            ]
+            retained_conversion_available = [
+                candidate
+                for candidate in candidate_pool
+                if bool(candidate.evidence.get("retained_conversion_priority", False))
+            ]
+            if bool(broad_observe_signal.get("primary_only_broad_observe", False)) and retrieval_carryover_available:
+                candidate_pool = retrieval_carryover_available
+            elif bool(broad_observe_signal.get("primary_only_broad_observe", False)) and retained_conversion_available:
+                candidate_pool = retained_conversion_available
             non_retrieval_available = [
                 candidate
                 for candidate in candidate_pool
                 if planner._base_subsystem(candidate.subsystem) not in {"retrieval", "tolbert_model", "qwen_adapter"}
             ]
-            if non_retrieval_available:
+            retrieval_carryover_priority_active = any(
+                bool(candidate.evidence.get("retrieval_carryover_priority", False))
+                for candidate in candidate_pool
+            )
+            if non_retrieval_available and not retrieval_carryover_priority_active:
                 candidate_pool = non_retrieval_available
-            elif not selected:
+            elif not selected and not retrieval_carryover_priority_active:
                 return []
         best_candidate: ImprovementExperiment | None = None
         best_sort_key: tuple[float, int, str] = (float("-inf"), -1, "")
@@ -126,11 +144,18 @@ def select_portfolio_campaign(
             if bool(broad_observe_signal.get("active", False)):
                 if bool(broad_observe_signal.get("retrieval_emergency", False)):
                     reasons.append("broad_observe_diversification_blocked_by_retrieval_emergency")
+                elif bool(candidate.evidence.get("retrieval_carryover_priority", False)):
+                    reasons.append("retrieval_carryover_priority_preferred")
+                elif bool(broad_observe_signal.get("primary_only_broad_observe", False)) and bool(
+                    candidate.evidence.get("retained_conversion_priority", False)
+                ):
+                    reasons.append("retained_conversion_priority_preferred")
                 elif planner._base_subsystem(candidate.subsystem) not in {"retrieval", "tolbert_model", "qwen_adapter"}:
                     reasons.append("broad_observe_diversification_preferred")
             if (
                 planner._campaign_surface_key(candidate.subsystem) == "retrieval_stack"
                 and bool(strategy_memory_summary.get("avoid_reselection", False))
+                and not bool(candidate.evidence.get("retrieval_carryover_priority", False))
                 and any(
                     planner._campaign_surface_key(other.subsystem)
                     != planner._campaign_surface_key(candidate.subsystem)

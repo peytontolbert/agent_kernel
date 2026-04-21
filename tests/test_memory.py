@@ -2003,6 +2003,63 @@ def test_skill_extractor_emits_structured_skill_records(tmp_path):
     assert payload["skills"][0]["task_contract"]["expected_files"] == ["hello.txt"]
 
 
+def test_skill_extractor_reads_retrieval_provenance_from_unattended_command_reports(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    (episodes_root / "hello_task.json").write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "task_id": "hello_task",
+                "prompt": "Create hello.txt containing hello agent kernel.",
+                "workspace": str(tmp_path / "workspace" / "hello_task"),
+                "success": True,
+                "termination_reason": "success",
+                "task_metadata": {"benchmark_family": "workflow", "capability": "file_write"},
+                "task_contract": {
+                    "prompt": "Create hello.txt containing hello agent kernel.",
+                    "workspace_subdir": "hello_task",
+                    "setup_commands": [],
+                    "success_command": "test -f hello.txt",
+                    "suggested_commands": ["printf 'hello agent kernel\\n' > hello.txt"],
+                    "expected_files": ["hello.txt"],
+                    "expected_output_substrings": [],
+                    "forbidden_files": [],
+                    "forbidden_output_substrings": [],
+                    "expected_file_contents": {"hello.txt": "hello agent kernel\n"},
+                    "max_steps": 5,
+                    "metadata": {"benchmark_family": "workflow", "capability": "file_write"},
+                },
+                "commands": [
+                    {
+                        "index": 1,
+                        "command": "printf 'hello agent kernel\\n' > hello.txt",
+                        "verification_passed": True,
+                        "verification_reasons": ["verification passed"],
+                        "decision_source": "trusted_retrieval_carryover_direct",
+                        "selected_retrieval_span_id": "learning:seed:hello",
+                        "retrieval_influenced": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "skills.json"
+    extract_successful_command_skills(episodes_root, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    skill = payload["skills"][0]
+    assert skill["procedure"]["commands"] == ["printf 'hello agent kernel\\n' > hello.txt"]
+    assert skill["retrieval_backed"] is True
+    assert skill["retrieval_selected_steps"] == 1
+    assert skill["retrieval_influenced_steps"] == 1
+    assert skill["trusted_retrieval_steps"] == 1
+    assert skill["selected_retrieval_span_ids"] == ["learning:seed:hello"]
+    assert skill["retrieval_backed_commands"] == ["printf 'hello agent kernel\\n' > hello.txt"]
+
+
 def test_skill_extractor_includes_postrun_learning_candidates(tmp_path):
     episodes_root = tmp_path / "episodes"
     episodes_root.mkdir()

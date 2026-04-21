@@ -359,6 +359,56 @@ def has_measurable_runtime_influence(context: RetentionDecisionContext) -> bool:
         return True
     if context.generated_pass_rate_delta > 0.0:
         return True
+    if context.generated_pass_rate_delta >= 0.0:
+        generated_positive_int_fields = (
+            "generated_clean_success_delta",
+            "generated_clean_success_family_gain_count",
+            "adjacent_success_clean_success_delta",
+            "adjacent_success_clean_success_family_gain_count",
+        )
+        for field in generated_positive_int_fields:
+            try:
+                value = int(context.evidence.get(field, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return True
+        generated_negative_float_fields = (
+            "generated_average_steps_delta",
+            "adjacent_success_average_steps_delta",
+        )
+        for field in generated_negative_float_fields:
+            try:
+                value = float(context.evidence.get(field, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value < 0.0:
+                return True
+    if float(context.evidence.get("failure_recovery_pass_rate_delta", 0.0) or 0.0) >= 0.0:
+        failure_recovery_positive_int_fields = (
+            "failure_recovery_clean_success_delta",
+            "failure_recovery_clean_success_family_gain_count",
+            "contract_clean_failure_recovery_clean_success_delta",
+            "contract_clean_failure_recovery_family_gain_count",
+        )
+        for field in failure_recovery_positive_int_fields:
+            try:
+                value = int(context.evidence.get(field, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return True
+        failure_recovery_negative_float_fields = (
+            "failure_recovery_average_steps_delta",
+            "contract_clean_failure_recovery_average_steps_delta",
+        )
+        for field in failure_recovery_negative_float_fields:
+            try:
+                value = float(context.evidence.get(field, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value < 0.0:
+                return True
     positive_float_fields = (
         "family_discrimination_gain",
         "discrimination_gain",
@@ -383,6 +433,7 @@ def has_measurable_runtime_influence(context: RetentionDecisionContext) -> bool:
         "retrieval_selected_steps_delta",
         "novel_command_steps_delta",
         "tolbert_primary_episodes_delta",
+        "transition_signature_growth",
         "trusted_carryover_verified_step_delta",
     )
     for field in positive_int_fields:

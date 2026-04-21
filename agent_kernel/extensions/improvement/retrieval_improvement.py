@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from evals.metrics import EvalMetrics
 from .improvement_common import (
+    artifact_payload_in_lifecycle_states,
     build_standard_proposal_artifact,
     normalized_generation_focus,
     retained_mapping_section,
@@ -20,6 +21,8 @@ def build_retrieval_proposal_artifact(
     generation_focus = normalized_generation_focus(focus)
     base_overrides = retained_retrieval_overrides(current_payload)
     baseline_asset_controls = retained_retrieval_asset_controls(current_payload)
+    baseline_retention_gate = retained_retrieval_retention_gate(current_payload)
+    baseline_runtime_policy = retained_retrieval_runtime_policy(current_payload)
     proposals = _adjust_noop_retrieval_proposals(
         _proposals(metrics, focus=generation_focus),
         focus=generation_focus,
@@ -32,30 +35,61 @@ def build_retrieval_proposal_artifact(
     )
     merged_overrides = deepcopy(base_overrides)
     merged_overrides.update(_merge_overrides(proposals))
+    preview_controls = _preview_controls(
+        metrics,
+        focus=generation_focus,
+        baseline_asset_controls=baseline_asset_controls,
+    )
     return build_standard_proposal_artifact(
         artifact_kind="retrieval_policy_set",
         generation_focus=generation_focus,
-        retention_gate=_retrieval_retention_gate(metrics),
+        retention_gate=_retrieval_retention_gate(
+            metrics,
+            baseline=baseline_retention_gate,
+        ),
         proposals=proposals,
         extra_sections={
             "asset_strategy": _asset_strategy(generation_focus),
             "overrides": merged_overrides,
             "asset_controls": asset_controls,
             "asset_rebuild_plan": _asset_rebuild_plan(generation_focus, asset_controls),
-            "preview_controls": _preview_controls(metrics, focus=generation_focus),
+            "preview_controls": preview_controls,
+            "runtime_policy": _runtime_policy(
+                metrics,
+                baseline=baseline_runtime_policy,
+                preview_controls=preview_controls,
+            ),
         },
     )
 
 
-def _retrieval_retention_gate(metrics: EvalMetrics) -> dict[str, object]:
+def _retrieval_retention_gate(
+    metrics: EvalMetrics,
+    *,
+    baseline: dict[str, object] | None = None,
+) -> dict[str, object]:
     gate = retention_gate_preset("retrieval")
+    baseline_gate = baseline if isinstance(baseline, dict) else {}
     carryover_repair_rate = _trusted_carryover_repair_rate(metrics)
-    if carryover_repair_rate < 0.1:
-        return gate
-    gate["require_trusted_carryover_repair_improvement"] = True
-    gate["min_trusted_carryover_repair_rate"] = round(carryover_repair_rate, 2)
-    gate["min_trusted_carryover_verified_step_delta"] = 1
-    gate["max_low_confidence_episode_regression"] = 0
+    if carryover_repair_rate >= 0.1:
+        gate["require_trusted_carryover_repair_improvement"] = True
+        gate["min_trusted_carryover_repair_rate"] = round(carryover_repair_rate, 2)
+        gate["min_trusted_carryover_verified_step_delta"] = 1
+        gate["max_low_confidence_episode_regression"] = 0
+    if bool(baseline_gate.get("require_trusted_carryover_repair_improvement", False)):
+        gate["require_trusted_carryover_repair_improvement"] = True
+        baseline_rate = _coerce_float(baseline_gate.get("min_trusted_carryover_repair_rate", 0.0))
+        current_rate = _coerce_float(gate.get("min_trusted_carryover_repair_rate", 0.0))
+        gate["min_trusted_carryover_repair_rate"] = round(max(current_rate, baseline_rate), 2)
+        baseline_step_delta = _coerce_int(baseline_gate.get("min_trusted_carryover_verified_step_delta", 1), default=1)
+        current_step_delta = _coerce_int(gate.get("min_trusted_carryover_verified_step_delta", 1), default=1)
+        gate["min_trusted_carryover_verified_step_delta"] = max(1, baseline_step_delta, current_step_delta)
+        baseline_low_conf_regression = baseline_gate.get("max_low_confidence_episode_regression", 0)
+        current_low_conf_regression = gate.get("max_low_confidence_episode_regression", 0)
+        gate["max_low_confidence_episode_regression"] = min(
+            _coerce_int(baseline_low_conf_regression, default=0),
+            _coerce_int(current_low_conf_regression, default=0),
+        )
     return gate
 
 
@@ -65,6 +99,52 @@ def retained_retrieval_overrides(payload: object) -> dict[str, object]:
 
 def retained_retrieval_asset_controls(payload: object) -> dict[str, object]:
     return retained_mapping_section(payload, artifact_kind="retrieval_policy_set", section="asset_controls")
+
+
+def retained_retrieval_retention_gate(payload: object) -> dict[str, object]:
+    return retained_mapping_section(payload, artifact_kind="retrieval_policy_set", section="retention_gate")
+
+
+def retained_retrieval_runtime_policy(payload: object) -> dict[str, object]:
+    return retained_mapping_section(payload, artifact_kind="retrieval_policy_set", section="runtime_policy")
+
+
+def _coerce_float(value: object, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: object, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def effective_retrieval_overrides(payload: object) -> dict[str, object]:
+    effective = artifact_payload_in_lifecycle_states(
+        payload,
+        artifact_kind="retrieval_policy_set",
+        allowed_states={"proposed", "retained"},
+    )
+    if effective is None:
+        return {}
+    value = effective.get("overrides", {})
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
+def effective_retrieval_runtime_policy(payload: object) -> dict[str, object]:
+    effective = artifact_payload_in_lifecycle_states(
+        payload,
+        artifact_kind="retrieval_policy_set",
+        allowed_states={"proposed", "retained"},
+    )
+    if effective is None:
+        return {}
+    value = effective.get("runtime_policy", {})
+    return deepcopy(value) if isinstance(value, dict) else {}
 
 
 def _proposals(metrics: EvalMetrics, *, focus: str) -> list[dict[str, object]]:
@@ -311,6 +391,38 @@ def _asset_strategy(focus: str) -> str:
     return "balanced_rebuild"
 
 
+def _runtime_policy(
+    metrics: EvalMetrics,
+    *,
+    baseline: dict[str, object] | None = None,
+    preview_controls: dict[str, object] | None = None,
+) -> dict[str, object]:
+    policy: dict[str, object] = deepcopy(baseline) if isinstance(baseline, dict) else {}
+    preview_controls = preview_controls if isinstance(preview_controls, dict) else {}
+    primary_families = [
+        str(family).strip()
+        for family in list(preview_controls.get("priority_benchmark_families", []) or [])
+        if str(family).strip()
+    ]
+    if not primary_families:
+        primary_families = [
+            family
+            for family in ("integration", "project", "repository", "repo_chore", "benchmark_candidate")
+            if int(metrics.total_by_benchmark_family.get(family, 0) or 0) > 0
+        ]
+    if primary_families and not list(policy.get("primary_benchmark_families", []) or []):
+        policy["primary_benchmark_families"] = primary_families
+    policy["shadow_benchmark_families"] = [
+        str(family).strip()
+        for family in list(policy.get("shadow_benchmark_families", []) or [])
+        if str(family).strip()
+    ]
+    if primary_families:
+        policy["allow_trusted_primary_without_min_confidence"] = True
+        policy["trusted_primary_min_confidence"] = 0.0
+    return policy
+
+
 def _asset_controls(
     metrics: EvalMetrics,
     *,
@@ -403,7 +515,12 @@ def _asset_rebuild_plan(focus: str, controls: dict[str, object]) -> dict[str, ob
     }
 
 
-def _preview_controls(metrics: EvalMetrics, *, focus: str) -> dict[str, object]:
+def _preview_controls(
+    metrics: EvalMetrics,
+    *,
+    focus: str,
+    baseline_asset_controls: dict[str, object] | None = None,
+) -> dict[str, object]:
     pass_rate = _pass_rate(metrics)
     low_signal_preview = (
         pass_rate >= 0.9
@@ -411,12 +528,18 @@ def _preview_controls(metrics: EvalMetrics, *, focus: str) -> dict[str, object]:
         and int(metrics.tolbert_primary_episodes or 0) <= 0
     )
     carryover_repair_rate = _trusted_carryover_repair_rate(metrics)
+    retained_carryover_priority = False
+    if isinstance(baseline_asset_controls, dict):
+        retained_carryover_priority = bool(
+            baseline_asset_controls.get("prefer_successful_carryover_repairs", False)
+        )
+    carryover_priority = carryover_repair_rate >= 0.1 or retained_carryover_priority
     if not low_signal_preview and carryover_repair_rate < 0.1:
         return {}
 
     comparison_task_limit_floor = 8 if low_signal_preview else 6
-    if carryover_repair_rate >= 0.1:
-        comparison_task_limit_floor = max(comparison_task_limit_floor, 8)
+    if carryover_priority:
+        comparison_task_limit_floor = max(comparison_task_limit_floor, 10)
     elif focus == "confidence":
         comparison_task_limit_floor = max(comparison_task_limit_floor, 8)
 
@@ -431,23 +554,40 @@ def _preview_controls(metrics: EvalMetrics, *, focus: str) -> dict[str, object]:
             priority_families.append(normalized)
         priority_weights[normalized] = max(weight, float(priority_weights.get(normalized, 0.0) or 0.0))
 
-    _push_family("benchmark_candidate", 4.0)
-    if metrics.total_by_benchmark_family.get("integration", 0) > 0:
-        _push_family("integration", 3.0)
-    if metrics.total_by_benchmark_family.get("repository", 0) > 0:
-        _push_family("repository", 2.0)
-    if metrics.total_by_benchmark_family.get("project", 0) > 0:
-        _push_family("project", 1.5)
-    if not priority_families:
-        _push_family("integration", 3.0)
-        _push_family("repository", 2.0)
-        _push_family("project", 1.5)
+    if carryover_priority:
+        if metrics.total_by_benchmark_family.get("project", 0) > 0:
+            _push_family("project", 4.0)
+        if metrics.total_by_benchmark_family.get("repository", 0) > 0:
+            _push_family("repository", 3.0)
+        if metrics.total_by_benchmark_family.get("integration", 0) > 0:
+            _push_family("integration", 2.0)
+        if metrics.total_by_benchmark_family.get("tooling", 0) > 0:
+            _push_family("tooling", 1.5)
+        _push_family("benchmark_candidate", 1.0)
+        if not priority_families:
+            _push_family("project", 4.0)
+            _push_family("repository", 3.0)
+            _push_family("integration", 2.0)
+            _push_family("benchmark_candidate", 1.0)
+    else:
+        _push_family("benchmark_candidate", 4.0)
+        if metrics.total_by_benchmark_family.get("integration", 0) > 0:
+            _push_family("integration", 3.0)
+        if metrics.total_by_benchmark_family.get("repository", 0) > 0:
+            _push_family("repository", 2.0)
+        if metrics.total_by_benchmark_family.get("project", 0) > 0:
+            _push_family("project", 1.5)
+        if not priority_families:
+            _push_family("integration", 3.0)
+            _push_family("repository", 2.0)
+            _push_family("project", 1.5)
 
     return {
         "comparison_task_limit_floor": comparison_task_limit_floor,
         "priority_benchmark_families": priority_families,
         "priority_benchmark_family_weights": priority_weights,
-        "prefer_family_discrimination_probe": low_signal_preview,
+        "prefer_family_discrimination_probe": low_signal_preview and not carryover_priority,
+        "prefer_long_horizon_tasks": carryover_priority,
         "bounded_comparison_required": True,
     }
 

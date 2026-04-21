@@ -1116,7 +1116,7 @@ def test_run_unattended_campaign_semantic_only_runtime_disables_tolbert_and_skip
             exclude_indexes = [index for index, token in enumerate(cmd) if token == "--exclude-subsystem"]
             assert exclude_indexes
             assert any(cmd[index + 1] == "tolbert_model" for index in exclude_indexes)
-            assert env["AGENT_KERNEL_USE_TOLBERT_CONTEXT"] == "0"
+            assert env["AGENT_KERNEL_USE_TOLBERT_CONTEXT"] == "1"
             assert env["AGENT_KERNEL_USE_TOLBERT_MODEL_ARTIFACTS"] == "0"
             return {"returncode": 0, "stdout": f"{campaign_report_path}\n"}
         raise AssertionError(joined)

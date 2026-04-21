@@ -661,9 +661,9 @@ def extract_successful_command_skills(
         ]
         if not commands:
             commands = [
-                _normalize_command_for_workspace(step["content"], workspace_name)
-                for step in data.get("steps", [])
-                if step.get("action") == "code_execute"
+                _normalize_command_for_workspace(str(step.get("content", "")).strip(), workspace_name)
+                for step in _record_step_entries(data)
+                if step.get("action") == "code_execute" and str(step.get("content", "")).strip()
             ]
         if commands:
             quality = score_skill_quality(data, commands)
@@ -738,8 +738,8 @@ def extract_tool_candidates(
         ]
         if not commands:
             commands = [
-                _normalize_command_for_workspace(step["content"], workspace_name)
-                for step in data.get("steps", [])
+                _normalize_command_for_workspace(str(step.get("content", "")).strip(), workspace_name)
+                for step in _record_step_entries(data)
                 if step.get("action") == "code_execute" and str(step.get("content", "")).strip()
             ]
         if not commands:
@@ -929,9 +929,9 @@ def _successful_commands(data: dict[str, object]) -> list[str]:
     if commands:
         return commands
     return [
-        _normalize_command_for_workspace(step["content"], workspace_name)
-        for step in data.get("steps", [])
-        if step.get("action") == "code_execute"
+        _normalize_command_for_workspace(str(step.get("content", "")).strip(), workspace_name)
+        for step in _record_step_entries(data)
+        if step.get("action") == "code_execute" and str(step.get("content", "")).strip()
     ]
 
 
@@ -1274,14 +1274,14 @@ def _retrieval_provenance_fields(record: dict[str, object], commands: list[str])
     retrieval_selected_steps = _safe_int(record.get("retrieval_selected_steps", 0))
     retrieval_influenced_steps = _safe_int(record.get("retrieval_influenced_steps", 0))
     trusted_retrieval_steps = _safe_int(record.get("trusted_retrieval_steps", 0))
-    for step in record.get("steps", []) if isinstance(record.get("steps", []), list) else []:
-        if not isinstance(step, dict):
-            continue
+    for step in _record_step_entries(record):
         command = str(step.get("content", "")).strip()
         selected_span_id = str(step.get("selected_retrieval_span_id", "")).strip()
         retrieval_influenced = bool(step.get("retrieval_influenced", False))
         trusted_retrieval = bool(step.get("trust_retrieval", False))
-        passed = bool(dict(step.get("verification", {})).get("passed", False))
+        passed = bool(dict(step.get("verification", {})).get("passed", False)) or bool(
+            step.get("verification_passed", False)
+        )
         if selected_span_id and selected_span_id not in selected_span_ids:
             selected_span_ids.append(selected_span_id)
             retrieval_selected_steps += 1
@@ -1303,6 +1303,52 @@ def _retrieval_provenance_fields(record: dict[str, object], commands: list[str])
         "selected_retrieval_span_ids": selected_span_ids,
         "retrieval_backed_commands": retrieval_backed_commands,
     }
+
+
+def _record_step_entries(record: dict[str, object]) -> list[dict[str, object]]:
+    raw_steps = record.get("steps", [])
+    if isinstance(raw_steps, list) and raw_steps:
+        return [step for step in raw_steps if isinstance(step, dict)]
+    raw_commands = record.get("commands", [])
+    if not isinstance(raw_commands, list):
+        return []
+    normalized: list[dict[str, object]] = []
+    for index, command_record in enumerate(raw_commands, start=1):
+        if not isinstance(command_record, dict):
+            continue
+        command = str(
+            command_record.get("content", command_record.get("command", ""))
+        ).strip()
+        decision_source = str(command_record.get("decision_source", "")).strip()
+        normalized.append(
+            {
+                "index": (
+                    _safe_int(command_record.get("index", index))
+                    if str(command_record.get("index", "")).strip()
+                    else index
+                ),
+                "action": "code_execute" if command else str(command_record.get("action", "")).strip(),
+                "content": command,
+                "command": str(command_record.get("command", command)).strip(),
+                "selected_retrieval_span_id": str(
+                    command_record.get("selected_retrieval_span_id", "")
+                ).strip(),
+                "retrieval_influenced": bool(command_record.get("retrieval_influenced", False)),
+                "trust_retrieval": bool(command_record.get("trust_retrieval", False))
+                or decision_source == "trusted_retrieval_carryover_direct",
+                "retrieval_ranked_skill": bool(command_record.get("retrieval_ranked_skill", False)),
+                "verification_passed": bool(command_record.get("verification_passed", False)),
+                "verification": {
+                    "passed": bool(command_record.get("verification_passed", False)),
+                    "reasons": [
+                        str(reason).strip()
+                        for reason in command_record.get("verification_reasons", [])
+                        if str(reason).strip()
+                    ],
+                },
+            }
+        )
+    return normalized
 
 
 def _retrieval_quality_bonus(record: dict[str, object]) -> float:

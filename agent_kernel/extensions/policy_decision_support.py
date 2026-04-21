@@ -272,6 +272,15 @@ def best_deterministic_fallback_decision(
     blocked_commands: list[str],
     allow_partial_first_step: bool = False,
 ) -> ActionDecision | None:
+    metadata = dict(state.task.metadata) if isinstance(getattr(state.task, "metadata", {}), dict) else {}
+    if (
+        not allow_partial_first_step
+        and not state.history
+        and str(metadata.get("curriculum_kind", "")).strip() == "failure_recovery"
+        and bool(metadata.get("contract_clean_failure_recovery_origin", False))
+        and bool(metadata.get("decision_yield_contract_candidate", False))
+    ):
+        return None
     candidates = policy._tolbert_ranked_candidates(
         state,
         top_skill=top_skill if policy._skill_is_safe_for_task(state, top_skill) else None,
@@ -289,6 +298,11 @@ def best_deterministic_fallback_decision(
             and not first_step_command_covers_required_artifacts(policy, state, command)
         ):
             continue
+        decision_source = (
+            "trusted_retrieval_carryover_direct"
+            if str(candidate.get("reason", "")).strip() == "trusted retrieval carryover"
+            else "deterministic_fallback"
+        )
         return ActionDecision(
             thought="Use deterministic fallback after inference failure.",
             action=CODE_EXECUTE,
@@ -297,7 +311,7 @@ def best_deterministic_fallback_decision(
             selected_retrieval_span_id=str(candidate.get("span_id", "")).strip() or None,
             retrieval_influenced=bool(candidate.get("retrieval_influenced", False)),
             retrieval_ranked_skill=bool(candidate.get("retrieval_ranked_skill", False)),
-            decision_source="deterministic_fallback",
+            decision_source=decision_source,
         )
     return None
 

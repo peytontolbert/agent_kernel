@@ -15,8 +15,8 @@ from .state_estimation_improvement import (
     retained_state_estimation_transition_controls,
 )
 from .transition_model_improvement import (
-    retained_transition_model_controls,
-    retained_transition_model_signatures,
+    runtime_transition_model_controls,
+    runtime_transition_model_signatures,
 )
 from .universe_improvement import (
     UNIVERSE_ACTION_RISK_CONTROL_KEYS,
@@ -806,11 +806,11 @@ def operator_policy_control_evidence(
 
 
 def transition_model_controls_from_payload(payload: dict[str, object] | None) -> dict[str, object]:
-    return retained_transition_model_controls(payload)
+    return runtime_transition_model_controls(payload)
 
 
 def transition_model_signatures_from_payload(payload: dict[str, object] | None) -> list[dict[str, object]]:
-    return retained_transition_model_signatures(payload)
+    return runtime_transition_model_signatures(payload)
 
 
 def transition_model_improvement_count(
@@ -839,7 +839,7 @@ def transition_model_improvement_count(
         (str(signature.get("signal", "")), str(signature.get("command", "")))
         for signature in candidate_signatures
     }
-    if candidate_signature_keys > baseline_signature_keys:
+    if candidate_signature_keys - baseline_signature_keys:
         improvements += 1
     if len(candidate_signatures) > len(baseline_signatures):
         improvements += 1

@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 
 from ..config import KernelConfig, current_external_task_manifests_paths
-from ..extensions.improvement.improvement_common import retained_artifact_payload
+from ..extensions.improvement.improvement_common import artifact_payload_in_lifecycle_states
 from ..memory import EpisodeMemory
 from ..schemas import EpisodeRecord, TaskSpec
 from ..extensions.strategy.semantic_hub import semantic_query_terms
@@ -3023,10 +3023,14 @@ class CurriculumEngine:
         if not path.exists():
             return task
         payload = json.loads(path.read_text(encoding="utf-8"))
-        retained = retained_artifact_payload(payload, artifact_kind="curriculum_proposal_set")
-        if retained is None:
+        effective = artifact_payload_in_lifecycle_states(
+            payload,
+            artifact_kind="curriculum_proposal_set",
+            allowed_states={"proposed", "retained"},
+        )
+        if effective is None:
             return task
-        proposals = retained.get("proposals", [])
+        proposals = effective.get("proposals", [])
         if not isinstance(proposals, list):
             return task
         family = str(task.metadata.get("benchmark_family", "bounded"))
@@ -3091,11 +3095,15 @@ class CurriculumEngine:
             self._curriculum_controls_cache = {}
             return self._curriculum_controls_cache
         payload = json.loads(path.read_text(encoding="utf-8"))
-        retained = retained_artifact_payload(payload, artifact_kind="curriculum_proposal_set")
-        if retained is None:
+        effective = artifact_payload_in_lifecycle_states(
+            payload,
+            artifact_kind="curriculum_proposal_set",
+            allowed_states={"proposed", "retained"},
+        )
+        if effective is None:
             self._curriculum_controls_cache = {}
             return self._curriculum_controls_cache
-        controls = retained.get("controls", {})
+        controls = effective.get("controls", {})
         self._curriculum_controls_cache = dict(controls) if isinstance(controls, dict) else {}
         return self._curriculum_controls_cache
 

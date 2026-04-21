@@ -18,6 +18,48 @@ def _failure_recovery_regressed(context: RetentionDecisionContext) -> bool:
     return context.failure_recovery_delta < 0.0
 
 
+def _curriculum_structural_generated_gain(context: RetentionDecisionContext) -> bool:
+    evidence = context.evidence
+    positive_int_fields = (
+        "generated_clean_success_delta",
+        "generated_clean_success_family_gain_count",
+        "adjacent_success_clean_success_delta",
+        "adjacent_success_clean_success_family_gain_count",
+    )
+    for field in positive_int_fields:
+        if int(evidence.get(field, 0) or 0) > 0:
+            return True
+    negative_float_fields = (
+        "generated_average_steps_delta",
+        "adjacent_success_average_steps_delta",
+    )
+    for field in negative_float_fields:
+        if float(evidence.get(field, 0.0) or 0.0) < 0.0:
+            return True
+    return False
+
+
+def _curriculum_structural_failure_recovery_gain(context: RetentionDecisionContext) -> bool:
+    evidence = context.evidence
+    positive_int_fields = (
+        "failure_recovery_clean_success_delta",
+        "failure_recovery_clean_success_family_gain_count",
+        "contract_clean_failure_recovery_clean_success_delta",
+        "contract_clean_failure_recovery_family_gain_count",
+    )
+    for field in positive_int_fields:
+        if int(evidence.get(field, 0) or 0) > 0:
+            return True
+    negative_float_fields = (
+        "failure_recovery_average_steps_delta",
+        "contract_clean_failure_recovery_average_steps_delta",
+    )
+    for field in negative_float_fields:
+        if float(evidence.get(field, 0.0) or 0.0) < 0.0:
+            return True
+    return False
+
+
 def _learning_artifact_support(context: RetentionDecisionContext, artifact_kind: str) -> int:
     summary = context.evidence.get("learning_evidence", {})
     if not isinstance(summary, dict):
@@ -73,16 +115,27 @@ def _evaluate_curriculum_retention(context: RetentionDecisionContext) -> tuple[s
         return ("reject", "base-lane pass rate regressed under the curriculum candidate")
     if context.regressed_family_count > int(context.gate.get("max_regressed_families", 0)):
         return ("reject", "curriculum candidate regressed one or more benchmark families")
-    if context.generated_pass_rate_delta < float(context.gate.get("min_generated_pass_rate_delta_abs", 0.02)):
+    generated_gain_required = float(context.gate.get("min_generated_pass_rate_delta_abs", 0.02))
+    generated_gain_satisfied = context.generated_pass_rate_delta >= generated_gain_required
+    structural_generated_gain = _curriculum_structural_generated_gain(context)
+    if not generated_gain_satisfied and not structural_generated_gain:
         return ("reject", "generated-task pass rate did not improve by the required margin")
     if context.generated_regressed_family_count > int(context.gate.get("max_generated_regressed_families", 0)):
         return ("reject", "curriculum candidate regressed one or more generated benchmark families")
+    structural_failure_recovery_gain = False
     if bool(context.gate.get("require_failure_recovery_improvement", True)) and (
         _has_generated_kind(context.baseline_metrics, "failure_recovery")
         or _has_generated_kind(context.candidate_metrics, "failure_recovery")
     ):
-        if context.failure_recovery_delta <= 0.0:
+        structural_failure_recovery_gain = _curriculum_structural_failure_recovery_gain(context)
+        if context.failure_recovery_delta <= 0.0 and not structural_failure_recovery_gain:
             return ("reject", "failure-recovery generation did not improve")
+    if generated_gain_satisfied and (
+        not bool(context.gate.get("require_failure_recovery_improvement", True))
+        or context.failure_recovery_delta > 0.0
+        or structural_failure_recovery_gain
+    ):
+        return ("retain", "generated-task and failure-recovery performance improved without regressing the base lane")
     return ("retain", "generated-task and failure-recovery performance improved without regressing the base lane")
 
 

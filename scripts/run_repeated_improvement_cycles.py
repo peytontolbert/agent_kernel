@@ -54,6 +54,94 @@ _SUPPORT_RETAINED_GAIN_REASON_SNIPPETS = _RETRIEVAL_RETAINED_GAIN_REASON_SNIPPET
     "strengthened complementary support without regressing the base lane",
     "preserved complementary support without regressing the base lane",
 )
+_REPEATED_PHASE_A_LANE_ORDER = (
+    "lane_runtime_authority",
+    "lane_decision_closure",
+    "lane_trust_and_carryover",
+    "lane_repo_generalization",
+    "lane_strategy_memory",
+)
+_DEFAULT_EXTERNAL_TASK_MANIFEST_BUNDLE = (
+    Path(__file__).resolve().parents[1]
+    / "datasets"
+    / "task_manifests"
+    / "default_external_breadth_tasks.json"
+)
+_REPEATED_LANE_PACKET_SPECS: dict[str, dict[str, object]] = {
+    "lane_runtime_authority": {
+        "owned_paths": [
+            "scripts/run_repeated_improvement_cycles.py",
+            "tests/test_finalize_cycle.py",
+        ],
+        "relevant_tests": ["tests/test_finalize_cycle.py"],
+        "done_when": "repeated improvement runs preserve authoritative status and report surfaces across interruptions",
+    },
+    "lane_decision_closure": {
+        "owned_paths": [
+            "agent_kernel/cycle_runner.py",
+            "scripts/run_repeated_improvement_cycles.py",
+            "tests/test_finalize_cycle.py",
+        ],
+        "relevant_tests": ["tests/test_finalize_cycle.py"],
+        "done_when": "runtime-managed child decisions convert into retained gains more often",
+    },
+    "lane_trust_and_carryover": {
+        "owned_paths": [
+            "agent_kernel/extensions/improvement/retrieval_improvement.py",
+            "scripts/run_repeated_improvement_cycles.py",
+            "tests/test_improvement.py",
+        ],
+        "relevant_tests": [
+            "tests/test_improvement.py",
+            "tests/test_finalize_cycle.py",
+        ],
+        "done_when": "required-family trust breadth and clean task-root breadth are both closed",
+    },
+    "lane_repo_generalization": {
+        "owned_paths": [
+            "scripts/run_repeated_improvement_cycles.py",
+            "scripts/run_autonomous_compounding_check.py",
+            "tests/test_autonomous_compounding.py",
+        ],
+        "relevant_tests": ["tests/test_autonomous_compounding.py"],
+        "done_when": "held-out or external open-world slices exist and remain non-regressing against the retained baseline",
+    },
+    "lane_strategy_memory": {
+        "owned_paths": [
+            "agent_kernel/extensions/improvement/planner_runtime_state.py",
+            "scripts/run_repeated_improvement_cycles.py",
+            "tests/test_improvement.py",
+        ],
+        "relevant_tests": ["tests/test_improvement.py"],
+        "done_when": "strategy memory and resource lineage expose retained mutation pressure instead of ad hoc local wins",
+    },
+}
+
+
+def _default_external_task_manifests_paths(*, repo_root: Path | None = None) -> tuple[str, ...]:
+    bundle_path = (
+        Path(repo_root) / "datasets" / "task_manifests" / "default_external_breadth_tasks.json"
+        if repo_root is not None
+        else _DEFAULT_EXTERNAL_TASK_MANIFEST_BUNDLE
+    )
+    if bundle_path.is_file():
+        return (str(bundle_path),)
+    return ()
+
+
+def _effective_external_task_manifests_paths(
+    config: KernelConfig,
+    *,
+    repo_root: Path | None = None,
+) -> tuple[str, ...]:
+    explicit = tuple(
+        str(path).strip()
+        for path in getattr(config, "external_task_manifests_paths", ())
+        if str(path).strip()
+    )
+    if explicit:
+        return explicit
+    return _default_external_task_manifests_paths(repo_root=repo_root)
 
 
 def _status_path(config: KernelConfig) -> Path:
@@ -910,6 +998,23 @@ def _verification_outcome_summary(active_cycle_run: dict[str, object] | None) ->
     }
 
 
+def _reset_active_cycle_run_verification_state(active_cycle_run: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(active_cycle_run, dict):
+        active_cycle_run = {}
+    cleaned = dict(active_cycle_run)
+    cleaned["verified_task_ids"] = []
+    cleaned["failed_verification_task_ids"] = []
+    cleaned["successful_verification_task_ids"] = []
+    cleaned["verified_families"] = []
+    cleaned["failed_verification_families"] = []
+    cleaned["successful_verification_families"] = []
+    cleaned["verification_outcomes_by_task"] = {}
+    cleaned["verification_task_families"] = {}
+    cleaned["verification_outcome_summary"] = _verification_outcome_summary({})
+    cleaned.pop("current_task_verification_passed", None)
+    return cleaned
+
+
 def _structured_child_decision_from_run(
     *,
     run: Mapping[str, object] | None,
@@ -1040,6 +1145,23 @@ def _active_cycle_semantic_progress_state(
     last_progress_at = float(
         active_cycle_run.get("last_progress_at", 0.0) or last_event_at or current_time
     )
+    if bool(active_cycle_run.get("child_exit_detected", False)):
+        runtime_elapsed_seconds = max(0.0, current_time - float(started_at or current_time))
+        progress_silence_seconds = max(0.0, current_time - last_progress_at)
+        prior_phase = _resolved_active_cycle_phase(active_cycle_run)
+        detail = "child exited; draining buffered output"
+        if prior_phase:
+            detail = f"child exited; draining buffered output from {prior_phase}"
+        return {
+            "phase": "buffer_drain_after_exit",
+            "phase_family": "finalize",
+            "status": "exited",
+            "progress_class": "buffer_drain",
+            "decision_distance": "closed",
+            "progress_silence_seconds": progress_silence_seconds,
+            "runtime_elapsed_seconds": runtime_elapsed_seconds,
+            "detail": detail,
+        }
     verification_value = (
         active_cycle_run.get("current_task_verification_passed")
         if "current_task_verification_passed" in active_cycle_run
@@ -1424,6 +1546,26 @@ def _run_and_stream(
     active_phase_progress: dict[str, object] = {}
     runtime_grace_keys: set[str] = set()
     runtime_deadline = started_at + max_runtime if max_runtime > 0.0 else 0.0
+    exit_detected = False
+
+    def _emit_exit_detected_if_needed() -> None:
+        nonlocal exit_detected
+        if exit_detected:
+            return
+        polled = process.poll()
+        if polled is None:
+            return
+        exit_detected = True
+        _emit_event(
+            {
+                "event": "exit_detected",
+                "pid": process_pid,
+                "progress_label": progress_label or "run_improvement_cycle",
+                "returncode": int(polled),
+                "timestamp": time.time(),
+            }
+        )
+
     try:
         while True:
             events = selector.select(timeout=1.0)
@@ -1433,6 +1575,7 @@ def _run_and_stream(
                     if line == "":
                         selector.unregister(key.fileobj)
                         break
+                    _emit_exit_detected_if_needed()
                     completed_output.append(line)
                     now = time.monotonic()
                     last_output_at = now
@@ -1466,6 +1609,7 @@ def _run_and_stream(
                             details={"intervention_reason": str(action.get("reason", "")).strip()},
                         )
             elif process.poll() is not None:
+                _emit_exit_detected_if_needed()
                 break
             now = time.monotonic()
             silence = now - last_output_at
@@ -1493,6 +1637,7 @@ def _run_and_stream(
                         details={"intervention_reason": str(action.get("reason", "")).strip()},
                     )
                 last_heartbeat_at = now
+            _emit_exit_detected_if_needed()
             if runtime_deadline > 0.0 and now >= runtime_deadline:
                 grace_key, extension_seconds = _child_runtime_extension_plan(
                     last_progress_phase=last_progress_phase,
@@ -2499,7 +2644,7 @@ def _cycle_audit_summary_from_report(report: dict[str, object]) -> dict[str, obj
     metrics_summary = decision_record.get("metrics_summary", {})
     if not isinstance(metrics_summary, dict):
         metrics_summary = {}
-    return {
+    audit = {
         "cycle_id": str(report.get("cycle_id", "")).strip(),
         "subsystem": str(report.get("subsystem", "")).strip(),
         "strategy_candidate_id": str(report.get("strategy_candidate_id", "")).strip(),
@@ -2528,6 +2673,13 @@ def _cycle_audit_summary_from_report(report: dict[str, object]) -> dict[str, obj
         "tolbert_runtime_summary": _normalize_tolbert_runtime_summary(report.get("tolbert_runtime_summary")),
         "decision_state": _decision_state_from_record(report),
     }
+    for field in _CONFIRMATION_STRONG_BASELINE_INT_FIELDS:
+        if field in metrics_summary:
+            audit[field] = int(metrics_summary.get(field, 0) or 0)
+    for field in _CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS:
+        if field in metrics_summary:
+            audit[field] = _report_float(metrics_summary.get(field, 0.0))
+    return audit
 
 
 def _report_records_for_campaign(
@@ -3348,6 +3500,934 @@ def _trust_and_open_world_breadth_summaries(config: KernelConfig) -> tuple[dict[
     return _trust_breadth_summary_from_ledger(ledger), _open_world_breadth_summary_from_ledger(ledger)
 
 
+def _normalize_benchmark_families(values: object) -> list[str]:
+    return _ordered_unique_strings(values)
+
+
+def _repeated_report_status(payload: Mapping[str, object] | None) -> str:
+    report = payload if isinstance(payload, Mapping) else {}
+    status = str(report.get("status", "")).strip()
+    return status or "finished"
+
+
+def _repeated_closure_gap_summary(report_payload: Mapping[str, object] | None) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    trust = report.get("trust_breadth_summary", {})
+    if not isinstance(trust, Mapping):
+        trust = {}
+    open_world = report.get("open_world_breadth_summary", {})
+    if not isinstance(open_world, Mapping):
+        open_world = {}
+    partial_progress = report.get("partial_progress_summary", {})
+    if not isinstance(partial_progress, Mapping):
+        partial_progress = {}
+    required_families = _normalize_benchmark_families(
+        trust.get("required_families", report.get("priority_benchmark_families", []))
+    )
+    missing_required_families = _normalize_benchmark_families(trust.get("missing_required_families", []))
+    missing_clean_task_root_breadth = _normalize_benchmark_families(
+        trust.get("missing_required_family_clean_task_root_breadth", [])
+    )
+    retained_conversion_closed = (
+        int(report.get("retained_gain_runs", 0) or 0) > 0
+        and int(report.get("runtime_managed_decisions", 0) or 0) > 0
+    )
+    trust_breadth_closed = (
+        not missing_required_families
+        and not missing_clean_task_root_breadth
+        and int(trust.get("distinct_family_gap", 0) or 0) <= 0
+    )
+    open_world_transfer_closed = (
+        int(open_world.get("open_world_report_count", 0) or 0) > 0
+        and int(open_world.get("distinct_open_world_benchmark_families", 0) or 0) > 0
+    )
+    long_horizon_started = int(partial_progress.get("generated_success_started_runs", 0) or 0) > 0
+    long_horizon_completed = int(partial_progress.get("generated_success_completed_runs", 0) or 0) > 0
+    long_horizon_state = "closed" if long_horizon_completed else "partial" if long_horizon_started else "open"
+    retrieval_carryover_state = (
+        "partial"
+        if int(report.get("runtime_managed_decisions", 0) or 0) > 0
+        or int(report.get("retained_gain_runs", 0) or 0) > 0
+        else "open"
+    )
+    return {
+        "retained_conversion": "closed" if retained_conversion_closed else "open",
+        "trust_breadth": "closed" if trust_breadth_closed else "open",
+        "retrieval_carryover": retrieval_carryover_state,
+        "long_horizon_finalize_execution": long_horizon_state,
+        "open_world_transfer": "closed" if open_world_transfer_closed else "open",
+        "required_families": required_families,
+        "missing_required_families": missing_required_families,
+        "missing_required_family_clean_task_root_breadth": missing_clean_task_root_breadth,
+    }
+
+
+def _repeated_benchmark_dominance_summary(
+    report_payload: Mapping[str, object] | None,
+    *,
+    closure_gap_summary: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    trust = report.get("trust_breadth_summary", {})
+    if not isinstance(trust, Mapping):
+        trust = {}
+    required_families = _normalize_benchmark_families(
+        trust.get("required_families", report.get("priority_benchmark_families", []))
+    )
+    required_families_with_reports = _normalize_benchmark_families(trust.get("required_families_with_reports", []))
+    missing_required_families = _normalize_benchmark_families(trust.get("missing_required_families", []))
+    missing_clean_task_root_breadth = _normalize_benchmark_families(
+        trust.get("missing_required_family_clean_task_root_breadth", [])
+    )
+    contract_state = (
+        "closed"
+        if (
+            str(closure.get("retained_conversion", "")).strip() == "closed"
+            and str(closure.get("trust_breadth", "")).strip() == "closed"
+        )
+        else "open"
+    )
+    return {
+        "required_families": required_families,
+        "required_families_with_reports": required_families_with_reports,
+        "missing_required_families": missing_required_families,
+        "missing_required_family_clean_task_root_breadth": missing_clean_task_root_breadth,
+        "contract_state": contract_state,
+    }
+
+
+def _repeated_asi_campaign_lane_recommendation(
+    report_payload: Mapping[str, object] | None,
+    *,
+    closure_gap_summary: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    status = _repeated_report_status(report)
+    trust = report.get("trust_breadth_summary", {})
+    if not isinstance(trust, Mapping):
+        trust = {}
+    blockers: list[str] = []
+    if int(report.get("runtime_managed_decisions", 0) or 0) <= 0:
+        blockers.append("no_runtime_managed_decisions")
+    if int(report.get("retained_gain_runs", 0) or 0) <= 0:
+        blockers.append("no_retained_gain_runs")
+    missing_required_families = _normalize_benchmark_families(trust.get("missing_required_families", []))
+    if missing_required_families:
+        blockers.extend(
+            f"missing_required_families:{family}" for family in missing_required_families
+        )
+    missing_clean_task_root_breadth = _normalize_benchmark_families(
+        trust.get("missing_required_family_clean_task_root_breadth", [])
+    )
+    if missing_clean_task_root_breadth:
+        blockers.extend(
+            f"missing_clean_task_root_breadth:{family}" for family in missing_clean_task_root_breadth
+        )
+    if str(closure.get("open_world_transfer", "")).strip() != "closed":
+        blockers.append("unfamiliar_environment_transfer_not_closed")
+    if status == "interrupted":
+        blockers.append("campaign_interrupted")
+
+    decision_gap = str(closure.get("retained_conversion", "")).strip() != "closed"
+    trust_gap = str(closure.get("trust_breadth", "")).strip() != "closed"
+    open_world_gap = str(closure.get("open_world_transfer", "")).strip() != "closed"
+    runtime_gap = status == "interrupted" or int(report.get("completed_runs", 0) or 0) <= 0
+
+    supporting_lanes: list[str] = []
+
+    def _add_support(lane_id: str) -> None:
+        if lane_id and lane_id not in supporting_lanes:
+            supporting_lanes.append(lane_id)
+
+    primary_lane = "lane_runtime_authority"
+    primary_batch_goal = "authoritative_runtime_state"
+    rationale = "repeated-cycle status still needs to stay authoritative before stronger claims can be trusted"
+    if decision_gap:
+        primary_lane = "lane_decision_closure"
+        primary_batch_goal = "retained_conversion"
+        rationale = "repeated cycles still lack retained runtime-managed conversion, so decision closure remains primary"
+        if trust_gap:
+            _add_support("lane_trust_and_carryover")
+        if open_world_gap:
+            _add_support("lane_repo_generalization")
+    elif trust_gap:
+        primary_lane = "lane_trust_and_carryover"
+        primary_batch_goal = "counted_trust_breadth"
+        rationale = "required-family breadth is still open, so trust and carryover becomes the primary lane"
+        if open_world_gap:
+            _add_support("lane_repo_generalization")
+    elif open_world_gap:
+        primary_lane = "lane_repo_generalization"
+        primary_batch_goal = "open_world_transfer"
+        rationale = "A8-oriented pressure still lacks open-world breadth, so repo generalization becomes primary"
+    elif runtime_gap:
+        primary_lane = "lane_runtime_authority"
+        primary_batch_goal = "resilient_campaign_completion"
+        rationale = "campaign completion is still fragile, so runtime authority remains the active lane"
+    else:
+        primary_lane = "lane_strategy_memory"
+        primary_batch_goal = "strategic_superiority_proof"
+        rationale = "closure is locally stable, so the next gains should target broader retained strategic pressure"
+
+    if runtime_gap and primary_lane != "lane_runtime_authority":
+        _add_support("lane_runtime_authority")
+    if trust_gap and primary_lane not in {"lane_trust_and_carryover", "lane_decision_closure"}:
+        _add_support("lane_trust_and_carryover")
+    if open_world_gap and primary_lane != "lane_repo_generalization":
+        _add_support("lane_repo_generalization")
+
+    supporting_lanes = [
+        lane_id
+        for lane_id in _REPEATED_PHASE_A_LANE_ORDER
+        if lane_id in supporting_lanes
+    ]
+    return {
+        "primary_lane": primary_lane,
+        "primary_batch_goal": primary_batch_goal,
+        "supporting_lanes": supporting_lanes,
+        "target_level": "A8",
+        "blockers": blockers,
+        "rationale": rationale,
+    }
+
+
+def _repeated_substantive_gaps(
+    report_payload: Mapping[str, object] | None,
+    *,
+    closure_gap_summary: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    closure = closure_gap_summary if isinstance(closure_gap_summary, Mapping) else {}
+    gaps: list[dict[str, object]] = []
+    if str(closure.get("retained_conversion", "")).strip() != "closed":
+        gaps.append(
+            {
+                "gap_id": "retained_conversion",
+                "rationale": "repeated cycles are not yet converting child-native runtime decisions into retained gains",
+                "recommended_lane": "lane_decision_closure",
+            }
+        )
+    if str(closure.get("trust_breadth", "")).strip() != "closed":
+        gaps.append(
+            {
+                "gap_id": "counted_trust_breadth",
+                "rationale": "required-family trust breadth and clean task-root breadth remain open",
+                "recommended_lane": "lane_trust_and_carryover",
+            }
+        )
+    if str(closure.get("open_world_transfer", "")).strip() != "closed":
+        gaps.append(
+            {
+                "gap_id": "open_world_transfer",
+                "rationale": "held-out or external open-world evidence is still too thin for A8-oriented pressure",
+                "recommended_lane": "lane_repo_generalization",
+            }
+        )
+    if _repeated_report_status(report) == "interrupted":
+        gaps.append(
+            {
+                "gap_id": "campaign_resilience",
+                "rationale": "the latest repeated-cycle campaign ended in an interrupted state before a clean closeout",
+                "recommended_lane": "lane_runtime_authority",
+            }
+        )
+    return gaps
+
+
+def _repeated_codex_input_packet_paths(
+    *,
+    report_path: Path,
+    status_path: Path,
+    report_payload: Mapping[str, object] | None,
+    lane_recommendation: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    lane = lane_recommendation if isinstance(lane_recommendation, Mapping) else {}
+    lane_ids = _ordered_unique_strings(
+        lane.get("primary_lane", ""),
+        lane.get("supporting_lanes", []),
+    )
+    lane_packet_paths = {
+        lane_id: str(report_path.parent / f"{report_path.stem}.{lane_id}.codex_lane_packet.json")
+        for lane_id in lane_ids
+    }
+    return {
+        "official_anchor": {
+            "report_path": str(report_path),
+            "status_path": str(status_path),
+            "repeated_status_path": str(status_path),
+            "child_report_path": str(report_path),
+            "anchor_date": str(report.get("created_at", "")).strip(),
+        },
+        "batch_packet_path": str(report_path.parent / f"{report_path.stem}.codex_batch_packet.json"),
+        "frontier_packet_path": str(report_path.parent / f"{report_path.stem}.codex_frontier_packet.json"),
+        "baseline_packet_path": str(report_path.parent / f"{report_path.stem}.codex_baseline_packet.json"),
+        "lane_packet_paths": lane_packet_paths,
+    }
+
+
+_CONFIRMATION_STRONG_BASELINE_INT_FIELDS = (
+    "confirmation_run_count",
+    "confirmation_regressed_task_count",
+    "confirmation_regressed_trace_task_count",
+    "confirmation_regressed_trajectory_task_count",
+    "confirmation_regressed_family_conservative_count",
+)
+_CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS = (
+    "confirmation_pass_rate_delta_lower_bound",
+    "confirmation_pass_rate_delta_conservative_lower_bound",
+    "confirmation_paired_task_non_regression_rate_lower_bound",
+    "confirmation_paired_trace_non_regression_rate_lower_bound",
+    "confirmation_paired_trajectory_non_regression_rate_lower_bound",
+    "confirmation_paired_trajectory_exact_match_rate_lower_bound",
+    "confirmation_worst_family_conservative_lower_bound",
+)
+
+
+def _confirmation_strong_baseline_evidence(payload: Mapping[str, object] | None) -> dict[str, object]:
+    evidence = payload if isinstance(payload, Mapping) else {}
+    confirmation_run_count = int(evidence.get("confirmation_run_count", 0) or 0)
+    comparison_fields_present = [
+        field
+        for field in (
+            *_CONFIRMATION_STRONG_BASELINE_INT_FIELDS[1:],
+            *_CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS,
+        )
+        if field in evidence
+    ]
+    summary: dict[str, object] = {
+        "confirmation_run_count": confirmation_run_count,
+        "comparison_fields_present": comparison_fields_present,
+        "ready": confirmation_run_count > 0 and bool(comparison_fields_present),
+    }
+    for field in _CONFIRMATION_STRONG_BASELINE_INT_FIELDS[1:]:
+        if field in evidence:
+            summary[field] = int(evidence.get(field, 0) or 0)
+    for field in _CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS:
+        if field in evidence:
+            summary[field] = _report_float(evidence.get(field, 0.0))
+    return summary
+
+
+def _repeated_strong_baseline_comparison_summary(report_payload: Mapping[str, object] | None) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    evidence_candidates: list[tuple[int, dict[str, object]]] = []
+    root_evidence = _confirmation_strong_baseline_evidence(report)
+    if bool(root_evidence.get("ready", False)):
+        evidence_candidates.append((0, root_evidence))
+    for run in report.get("runs", []) if isinstance(report.get("runs", []), list) else []:
+        if not isinstance(run, Mapping):
+            continue
+        run_evidence = _confirmation_strong_baseline_evidence(run)
+        if not bool(run_evidence.get("ready", False)):
+            continue
+        evidence_candidates.append((int(run.get("index", 0) or 0), run_evidence))
+    if not evidence_candidates:
+        return {
+            "ready": False,
+            "supporting_run_indices": [],
+            "comparison_fields_present": [],
+            "confirmation_run_count": 0,
+        }
+    strongest = max(
+        evidence_candidates,
+        key=lambda item: (
+            int(item[1].get("confirmation_run_count", 0) or 0),
+            len(item[1].get("comparison_fields_present", [])),
+            item[0],
+        ),
+    )[1]
+    return {
+        "ready": True,
+        "supporting_run_indices": [run_index for run_index, _ in evidence_candidates if run_index > 0],
+        "comparison_fields_present": sorted(
+            {
+                str(field).strip()
+                for _, evidence in evidence_candidates
+                for field in evidence.get("comparison_fields_present", [])
+                if str(field).strip()
+            }
+        ),
+        "confirmation_run_count": int(strongest.get("confirmation_run_count", 0) or 0),
+        **{
+            field: strongest[field]
+            for field in (
+                *_CONFIRMATION_STRONG_BASELINE_INT_FIELDS[1:],
+                *_CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS,
+            )
+            if field in strongest
+        },
+    }
+
+
+def _repeated_codex_input_packet_summary(report_payload: Mapping[str, object] | None) -> dict[str, object]:
+    report = report_payload if isinstance(report_payload, Mapping) else {}
+    codex_input_packets = report.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    closure = report.get("closure_gap_summary", {})
+    if not isinstance(closure, Mapping):
+        closure = {}
+    open_world = report.get("open_world_breadth_summary", {})
+    if not isinstance(open_world, Mapping):
+        open_world = {}
+    lane = report.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    official_anchor = codex_input_packets.get("official_anchor", {})
+    if not isinstance(official_anchor, Mapping):
+        official_anchor = {}
+    batch_packet_path = str(codex_input_packets.get("batch_packet_path", "")).strip()
+    frontier_packet_path = str(codex_input_packets.get("frontier_packet_path", "")).strip()
+    baseline_packet_path = str(codex_input_packets.get("baseline_packet_path", "")).strip()
+    raw_lane_packet_paths = codex_input_packets.get("lane_packet_paths", {})
+    lane_packet_paths = (
+        {
+            str(key).strip(): str(value).strip()
+            for key, value in raw_lane_packet_paths.items()
+            if str(key).strip() and str(value).strip()
+        }
+        if isinstance(raw_lane_packet_paths, Mapping)
+        else {}
+    )
+
+    batch_blockers: list[str] = []
+    if not str(official_anchor.get("report_path", "")).strip():
+        batch_blockers.append("missing_official_anchor_report_path")
+    if not str(official_anchor.get("status_path", "")).strip():
+        batch_blockers.append("missing_official_anchor_status_path")
+    if not str(official_anchor.get("child_report_path", "")).strip():
+        batch_blockers.append("missing_official_anchor_child_report_path")
+    if not batch_packet_path:
+        batch_blockers.append("missing_frozen_batch_packet_path")
+    if not lane:
+        batch_blockers.append("missing_lane_recommendation")
+    batch_packet = {
+        "ready": not batch_blockers,
+        "packet_path": batch_packet_path,
+        "blockers": batch_blockers,
+    }
+
+    external_summary = open_world.get("external_summary", {})
+    if not isinstance(external_summary, Mapping):
+        external_summary = {}
+    strong_baseline_summary = _repeated_strong_baseline_comparison_summary(report)
+    unfamiliar_domain_slice_ready = int(open_world.get("open_world_report_count", 0) or 0) > 0
+    strong_baseline_slice_ready = bool(strong_baseline_summary.get("ready", False))
+    long_horizon_transfer_slice_ready = str(closure.get("long_horizon_finalize_execution", "")).strip() in {
+        "partial",
+        "closed",
+    }
+    conservative_comparison_ready = bool(external_summary.get("success_rate_confidence_interval"))
+    frontier_blockers: list[str] = []
+    if not unfamiliar_domain_slice_ready:
+        frontier_blockers.append("missing_unfamiliar_domain_slice")
+    if not strong_baseline_slice_ready:
+        frontier_blockers.append("missing_strong_baseline_comparison_slice")
+    if not long_horizon_transfer_slice_ready:
+        frontier_blockers.append("missing_long_horizon_transfer_slice")
+    if not conservative_comparison_ready:
+        frontier_blockers.append("missing_conservative_comparison_report")
+    if not frontier_packet_path:
+        frontier_blockers.append("missing_frozen_frontier_packet_path")
+    frontier_packet = {
+        "ready": not frontier_blockers,
+        "packet_path": frontier_packet_path,
+        "unfamiliar_domain_slice_ready": unfamiliar_domain_slice_ready,
+        "strong_baseline_slice_ready": strong_baseline_slice_ready,
+        "strong_baseline_summary": strong_baseline_summary,
+        "long_horizon_transfer_slice_ready": long_horizon_transfer_slice_ready,
+        "conservative_comparison_ready": conservative_comparison_ready,
+        "blockers": frontier_blockers,
+    }
+
+    trust = report.get("trust_breadth_summary", {})
+    if not isinstance(trust, Mapping):
+        trust = {}
+    baseline_blockers: list[str] = []
+    if not str(official_anchor.get("report_path", "")).strip():
+        baseline_blockers.append("missing_baseline_artifact_anchor")
+    if not baseline_packet_path:
+        baseline_blockers.append("missing_frozen_baseline_packet_path")
+    if not trust:
+        baseline_blockers.append("missing_baseline_trust_summary")
+    baseline_packet = {
+        "ready": not baseline_blockers,
+        "packet_path": baseline_packet_path,
+        "blockers": baseline_blockers,
+    }
+
+    primary_lane = str(lane.get("primary_lane", "")).strip()
+    supporting_lanes = _normalize_benchmark_families(lane.get("supporting_lanes", []))
+    lane_ids = _ordered_unique_strings(primary_lane, supporting_lanes)
+    lane_blockers: list[str] = []
+    if not primary_lane:
+        lane_blockers.append("missing_primary_lane")
+    for lane_id in lane_ids:
+        if lane_id not in lane_packet_paths:
+            lane_blockers.append(f"missing_lane_packet_path:{lane_id}")
+    lane_packets = {
+        "ready": not lane_blockers,
+        "primary_lane": primary_lane,
+        "supporting_lanes": supporting_lanes,
+        "lane_packet_paths": lane_packet_paths,
+        "blockers": lane_blockers,
+    }
+
+    packet_set_blockers: list[str] = []
+    if not batch_packet["ready"]:
+        packet_set_blockers.append("CodexBatchPacket")
+    if not frontier_packet["ready"]:
+        packet_set_blockers.append("CodexFrontierPacket")
+    if not baseline_packet["ready"]:
+        packet_set_blockers.append("CodexBaselinePacket")
+    if not lane_packets["ready"]:
+        packet_set_blockers.append("CodexLanePacket")
+
+    suggested_actions: list[str] = []
+    if not batch_packet["ready"]:
+        suggested_actions.append("freeze_codex_batch_packet")
+    if not frontier_packet["ready"]:
+        if not unfamiliar_domain_slice_ready:
+            suggested_actions.append("add_held_out_unfamiliar_domain_slice")
+        if not strong_baseline_slice_ready:
+            suggested_actions.append("add_strong_baseline_comparison_slice")
+        if not long_horizon_transfer_slice_ready:
+            suggested_actions.append("add_long_horizon_transfer_slice")
+        if not conservative_comparison_ready:
+            suggested_actions.append("add_conservative_comparison_report")
+        suggested_actions.append("freeze_codex_frontier_packet")
+    if not baseline_packet["ready"]:
+        suggested_actions.append("freeze_codex_baseline_packet")
+    if not lane_packets["ready"]:
+        suggested_actions.append("freeze_codex_lane_packets")
+
+    return {
+        "packet_set_ready": not packet_set_blockers,
+        "packet_set_blockers": list(dict.fromkeys(packet_set_blockers)),
+        "batch_packet": batch_packet,
+        "frontier_packet": frontier_packet,
+        "baseline_packet": baseline_packet,
+        "lane_packets": lane_packets,
+        "suggested_actions": list(dict.fromkeys(suggested_actions)),
+        "a8_minimum_frontier_inputs_ready": frontier_packet["ready"],
+    }
+
+
+def _build_repeated_codex_batch_packet(
+    *,
+    report_path: Path,
+    status_path: Path,
+    payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = payload if isinstance(payload, Mapping) else {}
+    lane = report.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    closure = report.get("closure_gap_summary", {})
+    if not isinstance(closure, Mapping):
+        closure = {}
+    benchmark = report.get("benchmark_dominance_summary", {})
+    if not isinstance(benchmark, Mapping):
+        benchmark = {}
+    trust = report.get("trust_breadth_summary", {})
+    if not isinstance(trust, Mapping):
+        trust = {}
+    gaps = _repeated_substantive_gaps(report, closure_gap_summary=closure)
+    allowed_lanes = _ordered_unique_strings(
+        lane.get("primary_lane", ""),
+        lane.get("supporting_lanes", []),
+    )
+    non_upgrading_runs: list[dict[str, object]] = []
+    for run in report.get("runs", []) if isinstance(report.get("runs", []), list) else []:
+        if not isinstance(run, Mapping):
+            continue
+        if bool(run.get("retained_gain", False)):
+            continue
+        reason = "run produced no retained improvement"
+        if int(run.get("returncode", 0) or 0) != 0:
+            reason = "child run did not complete cleanly"
+        elif str(run.get("decision_conversion_state", "")).strip() == "partial_productive_without_decision":
+            reason = "run produced partial progress without a durable decision"
+        elif str(run.get("final_state", "")).strip() == "reject":
+            reason = "candidate was rejected and did not upgrade the retained baseline"
+        non_upgrading_runs.append(
+            {
+                "run_index": int(run.get("index", 0) or 0),
+                "decision_conversion_state": str(run.get("decision_conversion_state", "")).strip(),
+                "final_state": str(run.get("final_state", "")).strip(),
+                "why_not_anchor": reason,
+            }
+        )
+    return {
+        "packet_kind": "CodexBatchPacket",
+        "packet_id": f"CodexBatchPacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "batch_goal": str(lane.get("primary_batch_goal", "")).strip(),
+        "batch_scope": "repeated_improvement_campaign",
+        "official_anchor": {
+            "status_path": str(status_path),
+            "report_path": str(report_path),
+            "repeated_status_path": str(status_path),
+            "child_report_path": str(report_path),
+            "anchor_date": str(report.get("created_at", "")).strip(),
+        },
+        "non_upgrading_runs": non_upgrading_runs[:3],
+        "top_live_bottlenecks": [str(item.get("gap_id", "")).strip() for item in gaps[:3]],
+        "top_substantive_gaps": gaps[:4],
+        "closure_scoreboard": {
+            "retained_conversion": str(closure.get("retained_conversion", "")).strip(),
+            "trust_breadth": str(closure.get("trust_breadth", "")).strip(),
+            "retrieval_carryover": str(closure.get("retrieval_carryover", "")).strip(),
+            "long_horizon_finalize_execution": str(closure.get("long_horizon_finalize_execution", "")).strip(),
+            "required_families": _normalize_benchmark_families(benchmark.get("required_families", [])),
+            "contract_state": str(benchmark.get("contract_state", "")).strip(),
+        },
+        "frontier_scoreboard": {
+            "a8_coding_frontier_ready": bool(
+                isinstance(report.get("codex_input_packet_summary", {}), Mapping)
+                and report.get("codex_input_packet_summary", {}).get("a8_minimum_frontier_inputs_ready", False)
+            ),
+            "packet_set_ready": bool(
+                isinstance(report.get("codex_input_packet_summary", {}), Mapping)
+                and report.get("codex_input_packet_summary", {}).get("packet_set_ready", False)
+            ),
+            "frontier_packet_path": str(report.get("codex_input_packets", {}).get("frontier_packet_path", "")).strip()
+            if isinstance(report.get("codex_input_packets", {}), Mapping)
+            else "",
+            "baseline_packet_path": str(report.get("codex_input_packets", {}).get("baseline_packet_path", "")).strip()
+            if isinstance(report.get("codex_input_packets", {}), Mapping)
+            else "",
+        },
+        "reflection_records": [],
+        "selection_records": [],
+        "top_retained_reports": [],
+        "top_rejected_reports": [],
+        "trust_summary": dict(trust),
+        "strategy_memory_summary": {
+            "versioned_resource_lineage": False,
+        },
+        "frontier_packet_path": str(report.get("codex_input_packets", {}).get("frontier_packet_path", "")).strip()
+        if isinstance(report.get("codex_input_packets", {}), Mapping)
+        else "",
+        "baseline_packet_path": str(report.get("codex_input_packets", {}).get("baseline_packet_path", "")).strip()
+        if isinstance(report.get("codex_input_packets", {}), Mapping)
+        else "",
+        "allowed_lanes": allowed_lanes,
+        "merge_order": [lane_id for lane_id in _REPEATED_PHASE_A_LANE_ORDER if lane_id in allowed_lanes],
+        "compute_budget": {
+            "cycles": int(report.get("cycles_requested", 0) or 0),
+            "campaign_width": 0,
+            "variant_width": 0,
+            "task_limit": int(report.get("effective_task_limit", report.get("task_limit", 0)) or 0),
+            "task_step_floor": 0,
+        },
+        "rerun_budget": {
+            "rounds_requested": int(report.get("cycles_requested", 0) or 0),
+            "child_failure_recovery_budget": 0,
+        },
+    }
+
+
+def _build_repeated_codex_frontier_packet(
+    *,
+    report_path: Path,
+    payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = payload if isinstance(payload, Mapping) else {}
+    open_world = report.get("open_world_breadth_summary", {})
+    if not isinstance(open_world, Mapping):
+        open_world = {}
+    partial_progress = report.get("partial_progress_summary", {})
+    if not isinstance(partial_progress, Mapping):
+        partial_progress = {}
+    packet_summary = report.get("codex_input_packet_summary", {})
+    if not isinstance(packet_summary, Mapping):
+        packet_summary = {}
+    frontier_summary = packet_summary.get("frontier_packet", {})
+    if not isinstance(frontier_summary, Mapping):
+        frontier_summary = {}
+    strong_baseline_summary = _repeated_strong_baseline_comparison_summary(report)
+    external_summary = open_world.get("external_summary", {})
+    if not isinstance(external_summary, Mapping):
+        external_summary = {}
+    codex_input_packets = report.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    return {
+        "packet_kind": "CodexFrontierPacket",
+        "packet_id": f"CodexFrontierPacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "frontier_version": report_path.stem,
+        "held_out_task_manifest": {
+            "benchmark_families": _normalize_benchmark_families(open_world.get("benchmark_families", [])),
+            "external_benchmark_families": _normalize_benchmark_families(open_world.get("external_benchmark_families", [])),
+            "semantic_hub_report_count": int(open_world.get("semantic_hub_report_count", 0) or 0),
+            "external_report_count": int(open_world.get("external_report_count", 0) or 0),
+        },
+        "max_packet_age_seconds": 86400,
+        "slice_freeze_window": "freeze until next repeated-cycle campaign report is emitted",
+        "unfamiliar_domain_slices": {
+            "open_world_report_count": int(open_world.get("open_world_report_count", 0) or 0),
+            "benchmark_families": _normalize_benchmark_families(open_world.get("benchmark_families", [])),
+        },
+        "withheld_rotation_policy": "refresh only when the next repeated campaign report is written",
+        "train_exclusion_manifest": [],
+        "novelty_audit": {
+            "distinct_external_benchmark_families": int(open_world.get("distinct_external_benchmark_families", 0) or 0),
+            "distinct_open_world_benchmark_families": int(open_world.get("distinct_open_world_benchmark_families", 0) or 0),
+        },
+        "long_horizon_transfer_slices": {
+            "generated_success_started": bool(int(partial_progress.get("generated_success_started_runs", 0) or 0)),
+            "generated_success_completed": bool(int(partial_progress.get("generated_success_completed_runs", 0) or 0)),
+            "partial_productive_runs": int(report.get("partial_productive_runs", 0) or 0),
+        },
+        "baseline_bundle": {
+            "retained_kernel_baseline": str(codex_input_packets.get("baseline_packet_path", "")).strip(),
+            "current_codex_guided_baseline": str(report_path),
+            "artifact_anchor": str(report_path),
+        },
+        "comparison_commands": {
+            "retained_baseline_compare": ["python", "scripts/compare_retained_baseline.py"],
+            "frontier_eval": ["python", "scripts/run_autonomous_compounding_check.py"],
+        },
+        "family_conservative_bounds": {
+            "external_summary": dict(external_summary),
+            "strong_baseline_summary": dict(strong_baseline_summary),
+        },
+        "paired_task_trace_report": "",
+        "paired_trajectory_report": "",
+        "strong_baseline_comparison_summary": dict(strong_baseline_summary),
+        "transfer_alignment_evidence": {},
+        "long_horizon_evidence": dict(partial_progress),
+        "frontier_acceptance_policy": {
+            "minimum_non_regression_rate": 1.0,
+            "minimum_baseline_win_rate": 0.0,
+            "maximum_allowed_regressions": 0,
+        },
+        "blockers": [
+            str(item).strip()
+            for item in frontier_summary.get("blockers", [])
+            if str(item).strip()
+        ],
+    }
+
+
+def _build_repeated_codex_baseline_packet(
+    *,
+    report_path: Path,
+    payload: Mapping[str, object] | None,
+) -> dict[str, object]:
+    report = payload if isinstance(payload, Mapping) else {}
+    benchmark = report.get("benchmark_dominance_summary", {})
+    if not isinstance(benchmark, Mapping):
+        benchmark = {}
+    packet_summary = report.get("codex_input_packet_summary", {})
+    if not isinstance(packet_summary, Mapping):
+        packet_summary = {}
+    baseline_summary = packet_summary.get("baseline_packet", {})
+    if not isinstance(baseline_summary, Mapping):
+        baseline_summary = {}
+    codex_input_packets = report.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping):
+        codex_input_packets = {}
+    return {
+        "packet_kind": "CodexBaselinePacket",
+        "packet_id": f"CodexBaselinePacket:{report_path.stem}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "baseline_type": "codex_guided_kernel",
+        "artifact_paths": {
+            "report_path": str(report_path),
+            "child_report_path": str(report_path),
+            "active_resource_path": "",
+            "candidate_artifact_path": "",
+        },
+        "compare_commands": {
+            "retained_baseline_compare": ["python", "scripts/compare_retained_baseline.py"],
+            "frontier_eval": ["python", "scripts/run_autonomous_compounding_check.py"],
+        },
+        "baseline_metrics": {
+            "runtime_managed_decisions": int(report.get("runtime_managed_decisions", 0) or 0),
+            "retained_gain_runs": int(report.get("retained_gain_runs", 0) or 0),
+        },
+        "baseline_task_outcomes": dict(report.get("decision_conversion_summary", {}))
+        if isinstance(report.get("decision_conversion_summary", {}), Mapping)
+        else {},
+        "baseline_trajectory_signature_summary": {
+            "execution_source_summary": dict(report.get("execution_source_summary", {}))
+            if isinstance(report.get("execution_source_summary", {}), Mapping)
+            else {},
+            "partial_progress_summary": dict(report.get("partial_progress_summary", {}))
+            if isinstance(report.get("partial_progress_summary", {}), Mapping)
+            else {},
+        },
+        "baseline_trust_summary": dict(report.get("trust_breadth_summary", {}))
+        if isinstance(report.get("trust_breadth_summary", {}), Mapping)
+        else {},
+        "baseline_frontier_summary": dict(packet_summary.get("frontier_packet", {}))
+        if isinstance(packet_summary.get("frontier_packet", {}), Mapping)
+        else {},
+        "matched_budget_policy": {
+            "priority_benchmark_families": _normalize_benchmark_families(
+                report.get("effective_priority_benchmark_families", report.get("priority_benchmark_families", []))
+            ),
+        },
+        "baseline_freeze_window": "freeze until next repeated-cycle campaign report is emitted",
+        "tool_permission_profile": {
+            "claimed_runtime_shape": "repeated_improvement_campaign",
+            "decoder_runtime_posture": {},
+            "required_families": _normalize_benchmark_families(benchmark.get("required_families", [])),
+        },
+        "blockers": [
+            str(item).strip()
+            for item in baseline_summary.get("blockers", [])
+            if str(item).strip()
+        ],
+    }
+
+
+def _build_repeated_codex_lane_packets(
+    *,
+    report_path: Path,
+    payload: Mapping[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    report = payload if isinstance(payload, Mapping) else {}
+    lane = report.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(lane, Mapping):
+        lane = {}
+    lanes = _ordered_unique_strings(lane.get("primary_lane", ""), lane.get("supporting_lanes", []))
+    packets: dict[str, dict[str, object]] = {}
+    for lane_id in lanes:
+        spec = _REPEATED_LANE_PACKET_SPECS.get(lane_id, {})
+        packets[lane_id] = {
+            "packet_kind": "CodexLanePacket",
+            "packet_id": f"CodexLanePacket:{lane_id}:{report_path.stem}",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "lane_id": lane_id,
+            "question": str(lane.get("rationale", "")).strip(),
+            "owned_paths": list(spec.get("owned_paths", [])) if isinstance(spec.get("owned_paths", []), list) else [],
+            "explicitly_not_owned": [
+                other_lane
+                for other_lane in _REPEATED_PHASE_A_LANE_ORDER
+                if other_lane != lane_id and other_lane in lanes
+            ],
+            "relevant_tests": list(spec.get("relevant_tests", [])) if isinstance(spec.get("relevant_tests", []), list) else [],
+            "relevant_reports": [str(report_path)],
+            "relevant_reflection_records": [],
+            "relevant_selection_records": [],
+            "relevant_strategy_memory_nodes": [],
+            "failure_motifs": [
+                str(item).strip()
+                for item in lane.get("blockers", [])
+                if str(item).strip()
+            ],
+            "expected_signals": [
+                str(lane.get("primary_batch_goal", "")).strip(),
+                str(report.get("codex_input_packet_summary", {}).get("a8_minimum_frontier_inputs_ready", ""))
+                if isinstance(report.get("codex_input_packet_summary", {}), Mapping)
+                else "",
+            ],
+            "done_when": str(spec.get("done_when", "")).strip(),
+            "verification_plan": {
+                "tests": list(spec.get("relevant_tests", [])) if isinstance(spec.get("relevant_tests", []), list) else [],
+                "compare_commands": [
+                    ["python", "scripts/compare_retained_baseline.py"],
+                    ["python", "scripts/run_autonomous_compounding_check.py"],
+                ],
+            },
+            "restart_requirement": (
+                "resume from the latest repeated report and status packet because the last campaign ended interrupted"
+                if _repeated_report_status(report) == "interrupted"
+                else "continue from the latest repeated report and rerun the owned verification plan after edits"
+            ),
+        }
+    return packets
+
+
+def _attach_repeated_codex_packets(
+    *,
+    report_path: Path,
+    status_path: Path,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    report = dict(payload)
+    report["report_path"] = str(report_path)
+    report["status_path"] = str(status_path)
+    closure_gap_summary = _repeated_closure_gap_summary(report)
+    benchmark_dominance_summary = _repeated_benchmark_dominance_summary(
+        report,
+        closure_gap_summary=closure_gap_summary,
+    )
+    lane_recommendation = _repeated_asi_campaign_lane_recommendation(
+        report,
+        closure_gap_summary=closure_gap_summary,
+    )
+    codex_input_packets = _repeated_codex_input_packet_paths(
+        report_path=report_path,
+        status_path=status_path,
+        report_payload=report,
+        lane_recommendation=lane_recommendation,
+    )
+    report["closure_gap_summary"] = closure_gap_summary
+    report["benchmark_dominance_summary"] = benchmark_dominance_summary
+    report["asi_campaign_lane_recommendation"] = lane_recommendation
+    report["codex_input_packets"] = codex_input_packets
+    report["codex_input_packet_summary"] = _repeated_codex_input_packet_summary(report)
+    return report
+
+
+def _write_repeated_codex_input_packets(
+    *,
+    config: KernelConfig,
+    report_path: Path,
+    status_path: Path,
+    payload: Mapping[str, object] | None,
+) -> None:
+    report = payload if isinstance(payload, Mapping) else {}
+    codex_input_packets = report.get("codex_input_packets", {})
+    if not isinstance(codex_input_packets, Mapping) or not codex_input_packets:
+        return
+    batch_packet_path = str(codex_input_packets.get("batch_packet_path", "")).strip()
+    frontier_packet_path = str(codex_input_packets.get("frontier_packet_path", "")).strip()
+    baseline_packet_path = str(codex_input_packets.get("baseline_packet_path", "")).strip()
+    lane_packet_paths = codex_input_packets.get("lane_packet_paths", {})
+    if not isinstance(lane_packet_paths, Mapping):
+        lane_packet_paths = {}
+    if batch_packet_path:
+        atomic_write_json(
+            Path(batch_packet_path),
+            _build_repeated_codex_batch_packet(report_path=report_path, status_path=status_path, payload=report),
+            config=config,
+            govern_storage=False,
+        )
+    if frontier_packet_path:
+        atomic_write_json(
+            Path(frontier_packet_path),
+            _build_repeated_codex_frontier_packet(report_path=report_path, payload=report),
+            config=config,
+            govern_storage=False,
+        )
+    if baseline_packet_path:
+        atomic_write_json(
+            Path(baseline_packet_path),
+            _build_repeated_codex_baseline_packet(report_path=report_path, payload=report),
+            config=config,
+            govern_storage=False,
+        )
+    lane_packets = _build_repeated_codex_lane_packets(report_path=report_path, payload=report)
+    for lane_id, packet in lane_packets.items():
+        lane_path = str(lane_packet_paths.get(lane_id, "")).strip()
+        if lane_path:
+            atomic_write_json(
+                Path(lane_path),
+                packet,
+                config=config,
+                govern_storage=False,
+            )
+
+
 def _load_json_payload(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
@@ -3915,6 +4995,22 @@ def _write_campaign_status(
     )
     resolved_report_path = str(report_path) if report_path.exists() else ""
     pending_report_path = "" if resolved_report_path else str(report_path)
+    report_payload = _load_json_payload(report_path) if resolved_report_path else {}
+    report_codex_input_packets = report_payload.get("codex_input_packets", {})
+    if not isinstance(report_codex_input_packets, Mapping):
+        report_codex_input_packets = {}
+    report_codex_input_packet_summary = report_payload.get("codex_input_packet_summary", {})
+    if not isinstance(report_codex_input_packet_summary, Mapping):
+        report_codex_input_packet_summary = {}
+    report_lane_recommendation = report_payload.get("asi_campaign_lane_recommendation", {})
+    if not isinstance(report_lane_recommendation, Mapping):
+        report_lane_recommendation = {}
+    report_closure_gap_summary = report_payload.get("closure_gap_summary", {})
+    if not isinstance(report_closure_gap_summary, Mapping):
+        report_closure_gap_summary = {}
+    report_benchmark_dominance_summary = report_payload.get("benchmark_dominance_summary", {})
+    if not isinstance(report_benchmark_dominance_summary, Mapping):
+        report_benchmark_dominance_summary = {}
     payload = {
         "spec_version": "asi_v1",
         "report_kind": "repeated_improvement_status",
@@ -3953,6 +5049,11 @@ def _write_campaign_status(
         },
         "priority_benchmark_families": priority_benchmark_families,
         "priority_benchmark_family_weights": dict(priority_family_weights),
+        "external_task_manifests_paths": [
+            str(path).strip()
+            for path in getattr(config, "external_task_manifests_paths", ())
+            if str(path).strip()
+        ],
         "active_cycle_run": {
             **normalized_active_cycle_run,
             "verification_outcome_summary": active_verification_summary,
@@ -4012,6 +5113,23 @@ def _write_campaign_status(
         "priority_families_without_sampling": priority_families_without_sampling,
         "active_cycle_progress": progress_summary,
         "semantic_progress_state": terminal_campaign_projection.get("semantic_progress_state", semantic_state),
+        **({"codex_input_packets": dict(report_codex_input_packets)} if report_codex_input_packets else {}),
+        **(
+            {"codex_input_packet_summary": dict(report_codex_input_packet_summary)}
+            if report_codex_input_packet_summary
+            else {}
+        ),
+        **(
+            {"asi_campaign_lane_recommendation": dict(report_lane_recommendation)}
+            if report_lane_recommendation
+            else {}
+        ),
+        **({"closure_gap_summary": dict(report_closure_gap_summary)} if report_closure_gap_summary else {}),
+        **(
+            {"benchmark_dominance_summary": dict(report_benchmark_dominance_summary)}
+            if report_benchmark_dominance_summary
+            else {}
+        ),
     }
     status_path = _status_path(config)
     atomic_write_json(status_path, payload, config=config, govern_storage=False)
@@ -4072,7 +5190,8 @@ def main() -> None:
     if args.tolbert_device:
         config.tolbert_device = args.tolbert_device
     if args.semantic_only_runtime:
-        config.use_tolbert_context = False
+        # Semantic-only runtime still needs Tolbert retrieval/context at execution time;
+        # it only disables model-artifact mutation lanes such as Tolbert fine-tuning.
         config.use_tolbert_model_artifacts = False
     config.ensure_directories()
     campaign_label = str(args.campaign_label).strip()
@@ -4085,6 +5204,12 @@ def main() -> None:
     current_priority_family_weights = dict(requested_priority_family_weights)
 
     repo_root = Path(__file__).resolve().parents[1]
+    effective_external_task_manifests = _effective_external_task_manifests_paths(
+        config,
+        repo_root=repo_root,
+    )
+    if effective_external_task_manifests:
+        config.external_task_manifests_paths = effective_external_task_manifests
     script_path = repo_root / "scripts" / "run_improvement_cycle.py"
     runs: list[dict[str, object]] = []
     planner = ImprovementPlanner(
@@ -4240,9 +5365,29 @@ def main() -> None:
                     "progress_event_count": int(active_cycle_run.get("progress_event_count", 0) or 0) + 1,
                 }
                 if event_kind == "start":
+                    active_cycle_run = _reset_active_cycle_run_verification_state(active_cycle_run)
                     started_at = float(event.get("started_at", 0.0) or time.time())
                     active_cycle_run["started_at"] = started_at
                     active_cycle_run["last_progress_at"] = started_at
+                    active_cycle_run.pop("child_exit_detected", None)
+                    active_cycle_run.pop("child_exit_detected_at", None)
+                    active_cycle_run.pop("child_exit_confirmed_at", None)
+                    active_cycle_run.pop("output_buffer_draining_after_exit", None)
+                    active_cycle_run.pop("child_returncode", None)
+                if event_kind == "exit_detected":
+                    active_cycle_run["child_exit_detected"] = True
+                    active_cycle_run["child_exit_detected_at"] = event_timestamp
+                    active_cycle_run["output_buffer_draining_after_exit"] = True
+                    active_cycle_run["child_returncode"] = int(
+                        event.get("returncode", 0) or active_cycle_run.get("child_returncode", 0) or 0
+                    )
+                if event_kind == "exit":
+                    active_cycle_run["child_exit_detected"] = True
+                    active_cycle_run["child_exit_confirmed_at"] = event_timestamp
+                    active_cycle_run["output_buffer_draining_after_exit"] = False
+                    active_cycle_run["child_returncode"] = int(
+                        event.get("returncode", 0) or active_cycle_run.get("child_returncode", 0) or 0
+                    )
                 if event_kind == "heartbeat":
                     active_cycle_run["silence_seconds"] = int(event.get("silence_seconds", 0) or 0)
                 if line:
@@ -4585,6 +5730,8 @@ def main() -> None:
                     "baseline_average_steps",
                     "candidate_average_steps",
                     "tolbert_runtime_summary",
+                    *_CONFIRMATION_STRONG_BASELINE_INT_FIELDS,
+                    *_CONFIRMATION_STRONG_BASELINE_FLOAT_FIELDS,
                 ):
                     if field in best_cycle_audit:
                         runs[-1][field] = best_cycle_audit[field]
@@ -4882,6 +6029,7 @@ def main() -> None:
         )
         phase_gate_summary = _phase_gate_summary_for(production_decisions)
         trust_breadth_summary = _trust_breadth_summary(config)
+        open_world_breadth_summary = _open_world_breadth_summary(config)
         priority_family_yield_summary = _priority_family_yield_summary(
             production_decisions,
             requested_priority_benchmark_families,
@@ -4968,6 +6116,7 @@ def main() -> None:
             },
             "phase_gate_summary": phase_gate_summary,
             "trust_breadth_summary": trust_breadth_summary,
+            "open_world_breadth_summary": open_world_breadth_summary,
             "priority_family_yield_summary": priority_family_yield_summary,
             "priority_family_allocation_summary": priority_family_allocation_summary,
             "incomplete_cycle_summary": {
@@ -4999,7 +6148,18 @@ def main() -> None:
             **terminal_campaign_projection,
             "runs": runs,
         }
+        report = _attach_repeated_codex_packets(
+            report_path=report_path,
+            status_path=_status_path(config),
+            payload=report,
+        )
         atomic_write_json(report_path, report, config=config)
+        _write_repeated_codex_input_packets(
+            config=config,
+            report_path=report_path,
+            status_path=_status_path(config),
+            payload=report,
+        )
         status_snapshot_cache = _campaign_status_snapshot(
             config=config,
             planner=planner,
@@ -5095,6 +6255,7 @@ def main() -> None:
         run_evidence_summary = _run_status_evidence_summary(runs)
         decision_conversion_summary = _summarize_run_decision_conversion(runs)
         trust_breadth_summary = _trust_breadth_summary(config)
+        open_world_breadth_summary = _open_world_breadth_summary(config)
         structured_non_runtime_decisions = _structured_non_runtime_decisions(runs)
         interrupted_report = {
             "spec_version": "asi_v1",
@@ -5133,6 +6294,7 @@ def main() -> None:
             },
             "decision_conversion_summary": decision_conversion_summary,
             "trust_breadth_summary": trust_breadth_summary,
+            "open_world_breadth_summary": open_world_breadth_summary,
             "recent_non_runtime_decisions": [
                 {
                     **dict(record),
@@ -5151,7 +6313,18 @@ def main() -> None:
             "synthetic_interrupted_run_index": synthetic_run.get("index") if isinstance(synthetic_run, dict) else 0,
             "runs": runs,
         }
+        interrupted_report = _attach_repeated_codex_packets(
+            report_path=report_path,
+            status_path=_status_path(config),
+            payload=interrupted_report,
+        )
         atomic_write_json(report_path, interrupted_report, config=config)
+        _write_repeated_codex_input_packets(
+            config=config,
+            report_path=report_path,
+            status_path=_status_path(config),
+            payload=interrupted_report,
+        )
         _write_campaign_status(
             config=config,
             report_path=report_path,

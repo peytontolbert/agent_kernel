@@ -78,7 +78,7 @@ def build_transition_model_proposal_artifact(
     current_payload: object | None = None,
 ) -> dict[str, object]:
     generation_focus = normalized_generation_focus(focus)
-    baseline_controls = retained_transition_model_controls(current_payload)
+    baseline_controls = runtime_transition_model_controls(current_payload)
     summary = transition_model_summary(memory_root)
     controls = transition_model_controls(
         summary,
@@ -86,7 +86,7 @@ def build_transition_model_proposal_artifact(
         baseline=baseline_controls,
     )
     signatures = _merged_transition_signatures(
-        retained_transition_model_signatures(current_payload),
+        runtime_transition_model_signatures(current_payload),
         transition_failure_signatures(
             memory_root,
             max_signatures=int(controls.get("max_signatures", 12)),
@@ -109,6 +109,19 @@ def build_transition_model_proposal_artifact(
 
 def retained_transition_model_controls(payload: object) -> dict[str, object]:
     controls = retained_mapping_section(payload, artifact_kind="transition_model_policy_set", section="controls")
+    return _normalized_transition_model_controls(controls)
+
+
+def runtime_transition_model_controls(payload: object) -> dict[str, object]:
+    effective = _runtime_transition_model_payload(payload)
+    if effective is None:
+        return {}
+    return _normalized_transition_model_controls(effective.get("controls", {}))
+
+
+def _normalized_transition_model_controls(controls: object) -> dict[str, object]:
+    if not isinstance(controls, dict):
+        return {}
     normalized: dict[str, object] = {}
     for key in (
         "repeat_command_penalty",
@@ -132,6 +145,26 @@ def retained_transition_model_signatures(payload: object) -> list[dict[str, obje
     return _normalize_signatures(
         retained_sequence_section(payload, artifact_kind="transition_model_policy_set", section="signatures")
     )
+
+
+def runtime_transition_model_signatures(payload: object) -> list[dict[str, object]]:
+    effective = _runtime_transition_model_payload(payload)
+    if effective is None:
+        return []
+    return _normalize_signatures(effective.get("signatures", []))
+
+
+def _runtime_transition_model_payload(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("artifact_kind", "")).strip() != "transition_model_policy_set":
+        return None
+    retention_decision = payload.get("retention_decision", {})
+    if isinstance(retention_decision, dict) and str(retention_decision.get("state", "")).strip() == "reject":
+        return None
+    if str(payload.get("lifecycle_state", "")).strip() == "rejected":
+        return None
+    return payload
 
 
 def transition_model_summary(memory_root: Path) -> dict[str, object]:

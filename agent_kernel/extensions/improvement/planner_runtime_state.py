@@ -262,7 +262,14 @@ def active_artifact_payload_from_generation_context(payload: dict[str, object] |
             or "retention_decision" in candidate
         )
         if artifact_kind and has_contract_metadata:
-            return core.retained_artifact_payload(candidate, artifact_kind=artifact_kind)
+            retained = core.retained_artifact_payload(candidate, artifact_kind=artifact_kind)
+            if isinstance(retained, dict):
+                return retained
+            retention_decision = candidate.get("retention_decision", {})
+            if isinstance(retention_decision, dict) and str(retention_decision.get("state", "")).strip() == "reject":
+                return None
+            if str(candidate.get("lifecycle_state", "")).strip() == "rejected":
+                return None
         return candidate
 
     if not isinstance(payload, dict):

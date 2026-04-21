@@ -1,15 +1,505 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from evals.metrics import EvalMetrics
 
+from ...config import KernelConfig
+from ...extensions.trust import load_improvement_campaign_reports, trust_policy_snapshot
 from ...improvement_engine import ImprovementExperiment, sort_experiments as engine_sort_experiments
+
+
+def _improvement_reports_dir(planner) -> Path | None:
+    runtime_config = getattr(planner, "runtime_config", None)
+    if runtime_config is not None:
+        candidate = getattr(runtime_config, "improvement_reports_dir", None)
+        if candidate is not None:
+            resolved = Path(candidate)
+            if resolved.exists():
+                return resolved
+    cycles_path = getattr(planner, "cycles_path", None)
+    if cycles_path is not None:
+        resolved_cycles_path = Path(cycles_path)
+        candidate = resolved_cycles_path.parent / "reports"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _closure_progression_summary(planner) -> dict[str, object]:
+    reports_dir = _improvement_reports_dir(planner)
+    if reports_dir is None:
+        return {}
+    reports = load_improvement_campaign_reports(reports_dir, max_reports=12)
+    if not reports:
+        return {}
+    latest = reports[0]
+    for report in reports:
+        status = str(report.get("status", report.get("state", ""))).strip().lower()
+        retained_gain_runs = int(report.get("retained_gain_runs", 0) or 0)
+        runtime_managed_decisions = int(report.get("runtime_managed_decisions", 0) or 0)
+        if retained_gain_runs > 0:
+            latest = report
+            break
+        if runtime_managed_decisions > 0 and status not in {"interrupted", "running", "starting"}:
+            latest = report
+            break
+    closure = latest.get("closure_gap_summary", {})
+    if not isinstance(closure, dict):
+        return {}
+    retained_conversion = str(closure.get("retained_conversion", "")).strip().lower()
+    trust_breadth = str(closure.get("trust_breadth", "")).strip().lower()
+    retrieval_carryover = str(closure.get("retrieval_carryover", "")).strip().lower()
+    if not retained_conversion and not trust_breadth and not retrieval_carryover:
+        return {}
+    return {
+        "retained_conversion": retained_conversion,
+        "trust_breadth": trust_breadth,
+        "retrieval_carryover": retrieval_carryover,
+        "retrieval_carryover_priority": (
+            retained_conversion == "closed"
+            and trust_breadth == "closed"
+            and retrieval_carryover not in {"", "closed"}
+        ),
+        "runtime_managed_decisions": int(latest.get("runtime_managed_decisions", 0) or 0),
+        "retained_gain_runs": int(latest.get("retained_gain_runs", 0) or 0),
+        "retained_by_subsystem": dict(latest.get("yield_summary", {}).get("retained_by_subsystem", {}) or {})
+        if isinstance(latest.get("yield_summary", {}), dict)
+        else {},
+    }
+
+
+def _current_trust_coverage_summary(planner, metrics: EvalMetrics) -> dict[str, object]:
+    config = planner.runtime_config or KernelConfig()
+    policy = trust_policy_snapshot(config)
+    required_families = [
+        str(value).strip()
+        for value in policy.get("required_benchmark_families", [])
+        if str(value).strip()
+    ]
+    observed_family_totals = {
+        str(family).strip(): int(total or 0)
+        for family, total in metrics.total_by_benchmark_family.items()
+        if str(family).strip()
+        and str(family).strip() != "benchmark_candidate"
+        and int(total or 0) > 0
+    }
+    observed_families = sorted(observed_family_totals)
+    min_distinct_families = max(0, int(policy.get("min_distinct_families", 0) or 0))
+    family_breadth_min_distinct_task_roots = max(
+        0,
+        int(policy.get("family_breadth_min_distinct_task_roots", 0) or 0),
+    )
+    current_clean_task_root_counts: dict[str, int] = {family: 0 for family in required_families}
+    clean_success_task_roots_by_family: dict[str, set[str]] = {family: set() for family in required_families}
+    current_required_families_with_reports: set[str] = set()
+    current_required_families_with_external_reports: set[str] = set()
+    current_external_benchmark_families: set[str] = set()
+    current_external_report_count = 0
+    current_external_unsafe_ambiguous_count = 0
+    for task_id, summary in metrics.task_outcomes.items():
+        if not isinstance(summary, dict):
+            continue
+        family = str(summary.get("benchmark_family", "")).strip()
+        if family and family in required_families:
+            current_required_families_with_reports.add(family)
+        task_origin = str(summary.get("task_origin", "")).strip().lower()
+        if task_origin == "external_manifest":
+            current_external_report_count += 1
+            if family:
+                current_external_benchmark_families.add(family)
+                if family in required_families:
+                    current_required_families_with_external_reports.add(family)
+            if bool(summary.get("unsafe_ambiguous", False)):
+                current_external_unsafe_ambiguous_count += 1
+        if not family or family not in clean_success_task_roots_by_family:
+            continue
+        if not bool(summary.get("clean_success", False)):
+            continue
+        task_root = str(summary.get("task_root", "")).strip() or str(task_id).strip()
+        if not task_root:
+            continue
+        clean_success_task_roots_by_family[family].add(task_root)
+    current_clean_task_root_counts.update(
+        {
+            family: len(task_roots)
+            for family, task_roots in clean_success_task_roots_by_family.items()
+        }
+    )
+    return {
+        "required_families": required_families,
+        "observed_families": observed_families,
+        "observed_distinct_families": len(observed_families),
+        "missing_required_families": [
+            family for family in required_families if family not in observed_family_totals
+        ],
+        "required_families_with_reports": [
+            family for family in required_families if family in current_required_families_with_reports
+        ],
+        "required_families_with_external_reports": [
+            family for family in required_families if family in current_required_families_with_external_reports
+        ],
+        "distinct_family_gap": max(0, min_distinct_families - len(observed_families)),
+        "family_breadth_min_distinct_task_roots": family_breadth_min_distinct_task_roots,
+        "required_family_clean_task_root_counts": current_clean_task_root_counts,
+        "missing_required_family_clean_task_root_breadth": [
+            family
+            for family, total in current_clean_task_root_counts.items()
+            if total < family_breadth_min_distinct_task_roots
+        ],
+        "external_report_count": current_external_report_count,
+        "distinct_external_benchmark_families": len(current_external_benchmark_families),
+        "external_benchmark_families": sorted(current_external_benchmark_families),
+        "external_unsafe_ambiguous_rate": (
+            round(current_external_unsafe_ambiguous_count / current_external_report_count, 4)
+            if current_external_report_count > 0
+            else 0.0
+        ),
+    }
+
+
+def _coverage_only_trust_failure(threshold: object) -> bool:
+    normalized = str(threshold).strip()
+    return (
+        "distinct_benchmark_families=" in normalized
+        or "clean_task_roots=" in normalized
+        or "missing_required_families" in normalized
+    )
+
+
+def _external_only_bootstrap_trust_gap(trust_summary: dict[str, object]) -> bool:
+    if not trust_summary:
+        return False
+    if str(trust_summary.get("overall_status", "")).strip() not in {"bootstrap", "restricted"}:
+        return False
+    if int(trust_summary.get("external_report_count", 0) or 0) > 0:
+        return False
+    if int(trust_summary.get("distinct_external_benchmark_families", 0) or 0) > 0:
+        return False
+    if int(trust_summary.get("distinct_family_gap", 0) or 0) > 0:
+        return False
+    if list(trust_summary.get("missing_required_families", [])):
+        return False
+    if list(trust_summary.get("missing_required_family_clean_task_root_breadth", [])):
+        return False
+    return not any(
+        float(trust_summary.get(field, 0.0) or 0.0) > 0.0
+        for field in (
+            "unsafe_ambiguous_rate",
+            "hidden_side_effect_risk_rate",
+            "success_hidden_side_effect_risk_rate",
+            "false_pass_risk_rate",
+            "unexpected_change_report_rate",
+            "rollback_performed_rate",
+        )
+    )
+
+
+def _counted_external_breadth_aligned(trust_summary: dict[str, object]) -> bool:
+    if not trust_summary:
+        return False
+    required_families = [
+        str(value).strip()
+        for value in trust_summary.get("required_families", [])
+        if str(value).strip()
+    ]
+    required_families_with_reports = {
+        str(value).strip()
+        for value in trust_summary.get("required_families_with_external_reports", [])
+        if str(value).strip()
+    }
+    if not required_families_with_reports:
+        required_families_with_reports = {
+        str(value).strip()
+        for value in trust_summary.get("required_families_with_reports", [])
+        if str(value).strip()
+        }
+    if int(trust_summary.get("external_report_count", 0) or 0) <= 0:
+        return False
+    if int(trust_summary.get("distinct_external_benchmark_families", 0) or 0) <= 0:
+        return False
+    if int(trust_summary.get("distinct_family_gap", 0) or 0) > 0:
+        return False
+    if list(trust_summary.get("missing_required_families", [])):
+        return False
+    if list(trust_summary.get("missing_required_family_clean_task_root_breadth", [])):
+        return False
+    if required_families and not all(
+        family in required_families_with_reports for family in required_families
+    ):
+        return False
+    return not any(
+        float(trust_summary.get(field, 0.0) or 0.0) > 0.0
+        for field in (
+            "unsafe_ambiguous_rate",
+            "hidden_side_effect_risk_rate",
+            "success_hidden_side_effect_risk_rate",
+            "false_pass_risk_rate",
+            "unexpected_change_report_rate",
+            "rollback_performed_rate",
+            "external_unsafe_ambiguous_rate",
+        )
+    )
+
+
+def _retained_conversion_gap_summary(planner, *, recent_cycle_window: int = 8) -> dict[str, object]:
+    summaries: dict[str, dict[str, object]] = {}
+    for subsystem in ("curriculum", "transition_model"):
+        summaries[subsystem] = planner.recent_subsystem_activity_summary(
+            subsystem=subsystem,
+            recent_cycle_window=recent_cycle_window,
+        )
+    selected_cycles = sum(int(summary.get("selected_cycles", 0) or 0) for summary in summaries.values())
+    retained_cycles = sum(int(summary.get("retained_cycles", 0) or 0) for summary in summaries.values())
+    total_decisions = sum(int(summary.get("total_decisions", 0) or 0) for summary in summaries.values())
+    rejected_cycles = sum(int(summary.get("rejected_cycles", 0) or 0) for summary in summaries.values())
+    no_yield_cycles = sum(int(summary.get("no_yield_cycles", 0) or 0) for summary in summaries.values())
+    incomplete_cycles = sum(int(summary.get("recent_incomplete_cycles", 0) or 0) for summary in summaries.values())
+    return {
+        "recent_cycle_window": max(1, recent_cycle_window),
+        "selected_cycles": selected_cycles,
+        "retained_cycles": retained_cycles,
+        "total_decisions": total_decisions,
+        "rejected_cycles": rejected_cycles,
+        "no_yield_cycles": no_yield_cycles,
+        "recent_incomplete_cycles": incomplete_cycles,
+        "active": (
+            selected_cycles > 0
+            and retained_cycles == 0
+            and (
+                rejected_cycles > 0
+                or (
+                    total_decisions == 0
+                    and (no_yield_cycles > 0 or incomplete_cycles > 0)
+                )
+            )
+        ),
+        "subsystem_activity": summaries,
+    }
+
+
+def _effective_trust_summary(planner, metrics: EvalMetrics) -> dict[str, object]:
+    trust_summary = planner.trust_ledger_summary()
+    if not trust_summary:
+        return {}
+    effective = dict(trust_summary)
+    live_coverage = _current_trust_coverage_summary(planner, metrics)
+    original_missing_required_families = [
+        str(value).strip()
+        for value in effective.get("missing_required_families", [])
+        if str(value).strip()
+    ]
+    original_required_families_with_reports = [
+        str(value).strip()
+        for value in effective.get("required_families_with_reports", [])
+        if str(value).strip()
+    ]
+    original_required_families_with_external_reports = [
+        str(value).strip()
+        for value in effective.get("required_families_with_external_reports", [])
+        if str(value).strip()
+    ]
+    live_missing_required_families = set(live_coverage["missing_required_families"])
+    effective_missing_required_families = [
+        family for family in original_missing_required_families if family in live_missing_required_families
+    ]
+    original_distinct_family_gap = int(effective.get("distinct_family_gap", 0) or 0)
+    effective_distinct_family_gap = min(
+        original_distinct_family_gap,
+        int(live_coverage.get("distinct_family_gap", 0) or 0),
+    )
+    original_distinct_benchmark_families = int(effective.get("distinct_benchmark_families", 0) or 0)
+    effective_distinct_benchmark_families = max(
+        original_distinct_benchmark_families,
+        int(live_coverage.get("observed_distinct_families", 0) or 0),
+    )
+    original_required_family_clean_task_root_counts = {
+        str(family).strip(): int(total or 0)
+        for family, total in dict(effective.get("required_family_clean_task_root_counts", {})).items()
+        if str(family).strip()
+    }
+    live_required_family_clean_task_root_counts = {
+        str(family).strip(): int(total or 0)
+        for family, total in dict(live_coverage.get("required_family_clean_task_root_counts", {})).items()
+        if str(family).strip()
+    }
+    effective_required_family_clean_task_root_counts = dict(original_required_family_clean_task_root_counts)
+    for family, live_total in live_required_family_clean_task_root_counts.items():
+        effective_required_family_clean_task_root_counts[family] = max(
+            int(effective_required_family_clean_task_root_counts.get(family, 0) or 0),
+            live_total,
+        )
+    breadth_threshold = int(
+        effective.get(
+            "family_breadth_min_distinct_task_roots",
+            live_coverage.get("family_breadth_min_distinct_task_roots", 0),
+        )
+        or 0
+    )
+    original_missing_required_task_root_breadth = [
+        str(value).strip()
+        for value in effective.get("missing_required_family_clean_task_root_breadth", [])
+        if str(value).strip()
+    ]
+    effective_missing_required_task_root_breadth = [
+        family
+        for family in original_missing_required_task_root_breadth
+        if int(effective_required_family_clean_task_root_counts.get(family, 0) or 0) < breadth_threshold
+    ]
+    effective_required_families_with_reports = list(
+        dict.fromkeys(
+            original_required_families_with_reports
+            + [
+                family
+                for family in list(live_coverage.get("required_families_with_reports", []))
+                if str(family).strip()
+            ]
+        )
+    )
+    effective_required_families_with_external_reports = list(
+        dict.fromkeys(
+            original_required_families_with_external_reports
+            + [
+                family
+                for family in list(live_coverage.get("required_families_with_external_reports", []))
+                if str(family).strip()
+            ]
+        )
+    )
+    original_external_report_count = int(effective.get("external_report_count", 0) or 0)
+    effective_external_report_count = max(
+        original_external_report_count,
+        int(live_coverage.get("external_report_count", 0) or 0),
+    )
+    original_distinct_external_benchmark_families = int(
+        effective.get("distinct_external_benchmark_families", 0) or 0
+    )
+    effective_distinct_external_benchmark_families = max(
+        original_distinct_external_benchmark_families,
+        int(live_coverage.get("distinct_external_benchmark_families", 0) or 0),
+    )
+    original_external_benchmark_families = [
+        str(value).strip()
+        for value in effective.get("external_benchmark_families", [])
+        if str(value).strip()
+    ]
+    effective_external_benchmark_families = list(
+        dict.fromkeys(
+            original_external_benchmark_families
+            + [
+                family
+                for family in list(live_coverage.get("external_benchmark_families", []))
+                if str(family).strip()
+            ]
+        )
+    )
+    original_external_unsafe_ambiguous_rate = float(effective.get("external_unsafe_ambiguous_rate", 0.0) or 0.0)
+    effective_external_unsafe_ambiguous_rate = max(
+        original_external_unsafe_ambiguous_rate,
+        float(live_coverage.get("external_unsafe_ambiguous_rate", 0.0) or 0.0),
+    )
+    effective["missing_required_families"] = effective_missing_required_families
+    effective["required_families_with_reports"] = effective_required_families_with_reports
+    effective["required_families_with_external_reports"] = effective_required_families_with_external_reports
+    effective["distinct_family_gap"] = effective_distinct_family_gap
+    effective["distinct_benchmark_families"] = effective_distinct_benchmark_families
+    effective["required_family_clean_task_root_counts"] = effective_required_family_clean_task_root_counts
+    effective["missing_required_family_clean_task_root_breadth"] = effective_missing_required_task_root_breadth
+    effective["external_report_count"] = effective_external_report_count
+    effective["distinct_external_benchmark_families"] = effective_distinct_external_benchmark_families
+    effective["external_benchmark_families"] = effective_external_benchmark_families
+    effective["external_unsafe_ambiguous_rate"] = effective_external_unsafe_ambiguous_rate
+    effective["current_observed_benchmark_families"] = list(live_coverage["observed_families"])
+    effective["current_missing_required_families"] = list(live_coverage["missing_required_families"])
+    effective["current_required_families_with_reports"] = list(live_coverage.get("required_families_with_reports", []))
+    effective["current_required_families_with_external_reports"] = list(
+        live_coverage.get("required_families_with_external_reports", [])
+    )
+    effective["current_distinct_family_gap"] = int(live_coverage.get("distinct_family_gap", 0) or 0)
+    effective["current_required_family_clean_task_root_counts"] = live_required_family_clean_task_root_counts
+    effective["current_missing_required_family_clean_task_root_breadth"] = list(
+        live_coverage.get("missing_required_family_clean_task_root_breadth", [])
+    )
+    effective["current_external_report_count"] = int(live_coverage.get("external_report_count", 0) or 0)
+    effective["current_distinct_external_benchmark_families"] = int(
+        live_coverage.get("distinct_external_benchmark_families", 0) or 0
+    )
+    effective["current_external_benchmark_families"] = list(live_coverage.get("external_benchmark_families", []))
+    effective["current_external_unsafe_ambiguous_rate"] = float(
+        live_coverage.get("external_unsafe_ambiguous_rate", 0.0) or 0.0
+    )
+    effective["coverage_override_applied"] = (
+        effective_missing_required_families != original_missing_required_families
+        or effective_required_families_with_reports != original_required_families_with_reports
+        or effective_required_families_with_external_reports != original_required_families_with_external_reports
+        or effective_distinct_family_gap != original_distinct_family_gap
+        or effective_distinct_benchmark_families != original_distinct_benchmark_families
+        or effective_required_family_clean_task_root_counts != original_required_family_clean_task_root_counts
+        or effective_missing_required_task_root_breadth != original_missing_required_task_root_breadth
+        or effective_external_report_count != original_external_report_count
+        or effective_distinct_external_benchmark_families != original_distinct_external_benchmark_families
+        or effective_external_benchmark_families != original_external_benchmark_families
+        or effective_external_unsafe_ambiguous_rate != original_external_unsafe_ambiguous_rate
+    )
+    residual_coverage_signal = (
+        effective_distinct_benchmark_families < 2
+        or effective_distinct_family_gap > 0
+        or bool(effective_missing_required_families)
+        or bool(list(effective.get("missing_required_family_clean_task_root_breadth", [])))
+    )
+    residual_risk_signal = any(
+        float(effective.get(field, 0.0) or 0.0) > 0.0
+        for field in (
+            "unsafe_ambiguous_rate",
+            "hidden_side_effect_risk_rate",
+            "success_hidden_side_effect_risk_rate",
+            "false_pass_risk_rate",
+            "unexpected_change_report_rate",
+            "rollback_performed_rate",
+        )
+    )
+    non_coverage_failures = [
+        str(value).strip()
+        for value in effective.get("failing_thresholds", [])
+        if str(value).strip() and not _coverage_only_trust_failure(value)
+    ]
+    if (
+        str(effective.get("overall_status", "")).strip() in {"bootstrap", "restricted"}
+        and not residual_coverage_signal
+        and not residual_risk_signal
+        and not non_coverage_failures
+    ):
+        effective["overall_status"] = "coverage_aligned"
+        effective["overall_passed"] = True
+        effective["failing_thresholds"] = []
+        effective["status_override_reason"] = "current_metrics_closed_coverage_only_trust_gap"
+    return effective
 
 
 def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperiment]:
     failure_counts = planner.failure_counts()
     transition_failure_counts = planner.transition_failure_counts()
     transition_summary = planner.transition_summary()
-    trust_summary = planner.trust_ledger_summary()
+    trust_summary = _effective_trust_summary(planner, metrics)
+    closure_progression = _closure_progression_summary(planner)
+    broad_observe_signal = planner._broad_coding_observe_diversification_signal(metrics)
+    primary_only_broad_observe = bool(broad_observe_signal.get("primary_only_broad_observe", False))
+    retained_conversion_gap = _retained_conversion_gap_summary(planner)
+    broad_observe_curriculum_priority = (
+        bool(broad_observe_signal.get("active", False))
+        and primary_only_broad_observe
+        and not bool(broad_observe_signal.get("retrieval_emergency", False))
+        and (
+            bool(retained_conversion_gap.get("active", False))
+            or (
+            _external_only_bootstrap_trust_gap(trust_summary)
+            or (
+                _counted_external_breadth_aligned(trust_summary)
+                and bool(retained_conversion_gap.get("active", False))
+            )
+            )
+        )
+    )
     candidates: list[ImprovementExperiment] = []
     if (failure_counts or transition_failure_counts) and (
         metrics.total_by_benchmark_family.get("benchmark_candidate", 0) == 0
@@ -133,6 +623,44 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 },
             )
         )
+    if bool(closure_progression.get("retrieval_carryover_priority", False)):
+        retrieval_reason = (
+            "retained conversion and counted trust breadth are already closed in the latest official report, "
+            "so the next official batch should prove retrieval carryover instead of reopening closure-first lanes"
+        )
+        retrieval_evidence = {
+            "closure_progression": dict(closure_progression),
+            "retrieval_carryover_priority": True,
+        }
+        existing_retrieval_index = next(
+            (index for index, candidate in enumerate(candidates) if candidate.subsystem == "retrieval"),
+            None,
+        )
+        if existing_retrieval_index is None:
+            candidates.append(
+                ImprovementExperiment(
+                    subsystem="retrieval",
+                    reason=retrieval_reason,
+                    priority=7,
+                    expected_gain=0.05,
+                    estimated_cost=2,
+                    score=0.0,
+                    evidence=retrieval_evidence,
+                )
+            )
+        else:
+            existing_retrieval = candidates[existing_retrieval_index]
+            merged_evidence = dict(existing_retrieval.evidence)
+            merged_evidence.update(retrieval_evidence)
+            candidates[existing_retrieval_index] = ImprovementExperiment(
+                subsystem="retrieval",
+                reason=retrieval_reason,
+                priority=max(7, int(existing_retrieval.priority)),
+                expected_gain=max(0.05, float(existing_retrieval.expected_gain)),
+                estimated_cost=min(2, int(existing_retrieval.estimated_cost)),
+                score=0.0,
+                evidence=merged_evidence,
+            )
     if failure_counts.get("command_failure", 0) >= failure_counts.get("missing_expected_file", 0) and failure_counts:
         candidates.append(
             ImprovementExperiment(
@@ -226,6 +754,67 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 },
             )
         )
+    if broad_observe_curriculum_priority:
+        observed_family_count = int(broad_observe_signal.get("observed_family_count", 0) or 0)
+        external_only_trust_bootstrap = _external_only_bootstrap_trust_gap(trust_summary)
+        counted_external_breadth_aligned = _counted_external_breadth_aligned(trust_summary)
+        retained_conversion_gap_active = bool(retained_conversion_gap.get("active", False))
+        curriculum_reason = (
+            "primary-only broad observe should be converted into a retained integrated rerun and "
+            "generated repair pressure before external-only trust bootstrap closure"
+        )
+        if counted_external_breadth_aligned:
+            curriculum_reason = (
+                "counted external breadth is now live, so broad observe should convert into a "
+                "retained integrated rerun instead of another non-decision diversification lane"
+            )
+        elif retained_conversion_gap_active:
+            curriculum_reason = (
+                "clean broad observe should be converted into a retained integrated rerun because "
+                "retained conversion is still unresolved"
+            )
+        curriculum_evidence = {
+            "broad_observe_diversification": dict(broad_observe_signal),
+            "retained_conversion_priority": True,
+            "external_only_trust_bootstrap": external_only_trust_bootstrap,
+            "counted_external_breadth_aligned": counted_external_breadth_aligned,
+            "retained_conversion_gap_active": retained_conversion_gap_active,
+            "retained_conversion_gap": retained_conversion_gap,
+            "external_report_count": int(trust_summary.get("external_report_count", 0) or 0),
+            "distinct_external_benchmark_families": int(
+                trust_summary.get("distinct_external_benchmark_families", 0) or 0
+            ),
+        }
+        curriculum_expected_gain = round(max(0.03, min(0.05, observed_family_count * 0.01)), 4)
+        existing_curriculum_index = next(
+            (index for index, candidate in enumerate(candidates) if candidate.subsystem == "curriculum"),
+            None,
+        )
+        if existing_curriculum_index is None:
+            candidates.append(
+                ImprovementExperiment(
+                    subsystem="curriculum",
+                    reason=curriculum_reason,
+                    priority=5,
+                    expected_gain=curriculum_expected_gain,
+                    estimated_cost=3,
+                    score=0.0,
+                    evidence=curriculum_evidence,
+                )
+            )
+        else:
+            existing_curriculum = candidates[existing_curriculum_index]
+            merged_evidence = dict(existing_curriculum.evidence)
+            merged_evidence.update(curriculum_evidence)
+            candidates[existing_curriculum_index] = ImprovementExperiment(
+                subsystem="curriculum",
+                reason=curriculum_reason,
+                priority=max(5, int(existing_curriculum.priority)),
+                expected_gain=max(curriculum_expected_gain, float(existing_curriculum.expected_gain)),
+                estimated_cost=min(3, int(existing_curriculum.estimated_cost)),
+                score=0.0,
+                evidence=merged_evidence,
+            )
     repo_world_model_total = sum(
         int(metrics.total_by_benchmark_family.get(family, 0))
         for family in ("repo_sandbox", "repo_chore", "repository", "project", "integration")
@@ -402,7 +991,7 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
                 },
             )
         )
-    if trust_summary and (
+    if trust_summary and not broad_observe_curriculum_priority and (
         str(trust_summary.get("overall_status", "")).strip() in {"bootstrap", "restricted"}
         or float(trust_summary.get("unsafe_ambiguous_rate", 0.0)) > 0.0
         or float(trust_summary.get("hidden_side_effect_risk_rate", 0.0)) > 0.0

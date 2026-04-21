@@ -1377,6 +1377,11 @@ def _serialize_command_step(step: StepRecord) -> dict[str, Any]:
         "verification_reasons": list(step.verification.get("reasons", [])),
         "decision_source": str(step.decision_source).strip(),
         "tolbert_route_mode": str(step.tolbert_route_mode).strip(),
+        "selected_retrieval_span_id": str(step.selected_retrieval_span_id or "").strip() or None,
+        "retrieval_influenced": bool(step.retrieval_influenced),
+        "retrieval_ranked_skill": bool(step.retrieval_ranked_skill),
+        "trust_retrieval": bool(step.trust_retrieval),
+        "path_confidence": float(step.path_confidence or 0.0),
         "capabilities_used": [
             str(value).strip()
             for value in command_result.get("capabilities_used", [])

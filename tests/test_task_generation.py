@@ -333,6 +333,20 @@ def test_task_bank_loads_external_manifest_tasks_from_directory_and_glob(tmp_pat
     assert bank.get("glob_manifest_task").metadata["external_manifest_path"] == str(glob_manifest)
 
 
+def test_default_external_breadth_manifest_covers_required_families():
+    manifest_path = Path("datasets/task_manifests/default_external_breadth_tasks.json")
+    bank = TaskBank(config=KernelConfig(external_task_manifests_paths=(str(manifest_path),)))
+
+    families = {
+        task.metadata["benchmark_family"]
+        for task in bank.list()
+        if task.metadata.get("task_origin") == "external_manifest"
+        and str(task.metadata.get("external_manifest_path", "")).endswith("default_external_breadth_tasks.json")
+    }
+
+    assert {"integration", "project", "repository", "repo_chore", "repo_sandbox"} <= families
+
+
 def test_mock_eval_solves_expanded_task_bank(tmp_path):
     config = KernelConfig(
         provider="mock",

@@ -14,7 +14,12 @@ from ..extensions.improvement.policy_improvement import (
     retained_tolbert_rollout_policy_overrides,
     retained_tolbert_runtime_policy_overrides,
 )
-from ..extensions.improvement.retrieval_improvement import retained_retrieval_overrides
+from ..extensions.improvement.retrieval_improvement import (
+    effective_retrieval_overrides,
+    effective_retrieval_runtime_policy,
+    retained_retrieval_overrides,
+    retained_retrieval_runtime_policy,
+)
 from ..extensions.improvement.state_estimation_improvement import (
     retained_state_estimation_payload,
     retained_state_estimation_policy_controls,
@@ -196,6 +201,7 @@ class PolicyRuntimeSupport:
         self._tolbert_universal_decoder_runtime_cache: dict[str, object] | None = None
         self._tolbert_active_decoder_runtime_cache: dict[str, object] | None = None
         self._prompt_policy_payload_cache: dict[str, object] | None = None
+        self._retrieval_payload_cache: dict[str, object] | None = None
         self.last_hybrid_runtime_error: str = ""
 
     def prompt_template(self, name: str) -> str:
@@ -207,14 +213,22 @@ class PolicyRuntimeSupport:
             raise ValueError(f"unsupported prompt template: {name}")
         return self._resource_registry.load_text(resource_id)
 
-    def retrieval_overrides(self) -> dict[str, object]:
+    def retrieval_payload(self) -> dict[str, object]:
+        if self._retrieval_payload_cache is not None:
+            return self._retrieval_payload_cache
         if not self.config.use_retrieval_proposals:
-            return {}
+            self._retrieval_payload_cache = {}
+            return self._retrieval_payload_cache
         path = self.config.retrieval_proposals_path
         if not path.exists():
-            return {}
+            self._retrieval_payload_cache = {}
+            return self._retrieval_payload_cache
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return retained_retrieval_overrides(payload)
+        self._retrieval_payload_cache = payload if isinstance(payload, dict) else {}
+        return self._retrieval_payload_cache
+
+    def retrieval_overrides(self) -> dict[str, object]:
+        return effective_retrieval_overrides(self.retrieval_payload())
 
     def policy_controls(self) -> dict[str, object]:
         if self._policy_controls_cache is not None:
@@ -238,6 +252,16 @@ class PolicyRuntimeSupport:
         overrides = retained_tolbert_runtime_policy_overrides(self.prompt_policy_payload())
         if overrides:
             normalized.update(overrides)
+        retrieval_runtime_policy = effective_retrieval_runtime_policy(self.retrieval_payload())
+        if retrieval_runtime_policy:
+            normalized.update(
+                retained_tolbert_runtime_policy(
+                    {
+                        "artifact_kind": "tolbert_model_bundle",
+                        "runtime_policy": retrieval_runtime_policy,
+                    }
+                )
+            )
         retrieval_overrides = self.retrieval_overrides()
         if retrieval_overrides:
             try:

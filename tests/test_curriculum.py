@@ -1703,6 +1703,99 @@ def test_curriculum_controls_cap_failure_recovery_commands(tmp_path: Path):
     assert task.metadata["curriculum_behavior_controls"]["failure_recovery_command_cap"] == 2
 
 
+def test_curriculum_controls_apply_from_proposed_runtime_payload(tmp_path: Path):
+    curriculum_path = tmp_path / "curriculum" / "curriculum_proposals.json"
+    curriculum_path.parent.mkdir(parents=True, exist_ok=True)
+    curriculum_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "curriculum_proposal_set",
+                "lifecycle_state": "proposed",
+                "controls": {
+                    "failure_recovery_anchor_min_matches": 1,
+                    "failure_recovery_command_cap": 2,
+                },
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    episode = EpisodeRecord(
+        task_id="broken_task",
+        prompt="Create out.txt containing ok.",
+        workspace="workspace/broken_task",
+        success=False,
+        termination_reason="repeated_failed_action",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="run a broken command",
+                action="code_execute",
+                content="false",
+                selected_skill_id=None,
+                command_result=None,
+                verification={
+                    "passed": False,
+                    "reasons": ["exit code was 1", "missing expected file: out.txt"],
+                },
+            )
+        ],
+    )
+
+    task = CurriculumEngine(config=KernelConfig(curriculum_proposals_path=curriculum_path)).generate_followup_task(episode)
+
+    assert len(task.suggested_commands) == 2
+    assert task.metadata["curriculum_behavior_controls"]["failure_recovery_command_cap"] == 2
+
+
+def test_curriculum_hint_applies_from_proposed_runtime_payload(tmp_path: Path):
+    curriculum_path = tmp_path / "curriculum" / "curriculum_proposals.json"
+    curriculum_path.parent.mkdir(parents=True, exist_ok=True)
+    curriculum_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "curriculum_proposal_set",
+                "lifecycle_state": "proposed",
+                "controls": {},
+                "proposals": [
+                    {
+                        "area": "failure_recovery",
+                        "reason": "failure-recovery tasks need tighter local repairs",
+                        "suggestion": "Prefer the smallest verifier-preserving repair before broader retries.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    episode = EpisodeRecord(
+        task_id="broken_hint_task",
+        prompt="Create out.txt containing ok.",
+        workspace="workspace/broken_hint_task",
+        success=False,
+        termination_reason="repeated_failed_action",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="run a broken command",
+                action="code_execute",
+                content="false",
+                selected_skill_id=None,
+                command_result=None,
+                verification={
+                    "passed": False,
+                    "reasons": ["exit code was 1", "missing expected file: out.txt"],
+                },
+            )
+        ],
+    )
+
+    task = CurriculumEngine(config=KernelConfig(curriculum_proposals_path=curriculum_path)).generate_followup_task(episode)
+
+    assert "Curriculum guidance:" in task.prompt
+    assert "Prefer the smallest verifier-preserving repair" in task.prompt
+
+
 def test_curriculum_seed_scheduler_respects_limits_and_preferred_family(tmp_path: Path):
     curriculum_path = tmp_path / "curriculum" / "curriculum_proposals.json"
     curriculum_path.parent.mkdir(parents=True, exist_ok=True)

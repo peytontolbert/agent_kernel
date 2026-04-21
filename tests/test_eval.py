@@ -635,9 +635,17 @@ def test_run_eval_routes_generated_unattended_reports_to_parent_root(monkeypatch
             ]
 
     class FakeKernel:
+        init_rows: list[tuple[str, str]] = []
+
         def __init__(self, config=None, policy=None):
             self.config = config
             self.policy = policy
+            FakeKernel.init_rows.append(
+                (
+                    type(policy).__name__ if policy is not None else "",
+                    str(config.run_reports_dir),
+                )
+            )
 
         def run_task(self, task, progress_callback=None):
             del progress_callback
@@ -731,6 +739,10 @@ def test_run_eval_routes_generated_unattended_reports_to_parent_root(monkeypatch
         ),
         ("repository_guardrail_sync_task_repository_recovery", str(config.run_reports_dir)),
     ]
+    assert any(
+        policy_name == "_ForcedFailurePolicy" and reports_dir == str(config.run_reports_dir)
+        for policy_name, reports_dir in FakeKernel.init_rows
+    )
 
 
 def test_run_eval_reports_world_feedback_calibration(monkeypatch, tmp_path):
@@ -2966,6 +2978,27 @@ def test_scoped_eval_config_skips_nested_scoped_snapshot_dirs(tmp_path):
     assert not (copied_run_root / "generated_failure_seed").exists()
     assert (copied_nested_run_root / "kept.txt").read_text(encoding="utf-8") == "nested"
     assert not (copied_nested_run_root / "generated_success").exists()
+
+
+def test_scoped_eval_config_copies_mutable_cycle_exports_instead_of_hardlinking(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        improvement_cycles_path=tmp_path / "trajectories" / "improvement" / "cycles.jsonl",
+    )
+    config.improvement_cycles_path.parent.mkdir(parents=True, exist_ok=True)
+    config.improvement_cycles_path.write_text('{"cycle":"base"}\n', encoding="utf-8")
+
+    scoped = scoped_eval_config(config, "preview_scope")
+
+    assert scoped.improvement_cycles_path.exists()
+    assert not os.path.samefile(config.improvement_cycles_path, scoped.improvement_cycles_path)
+    assert scoped.improvement_cycles_path.read_text(encoding="utf-8") == ""
+
+    scoped.improvement_cycles_path.write_text('{"cycle":"scoped"}\n', encoding="utf-8")
+
+    assert config.improvement_cycles_path.read_text(encoding="utf-8") == '{"cycle":"base"}\n'
 
 
 def test_compare_skill_modes_cleans_scoped_checkpoints_and_snapshots(tmp_path, monkeypatch):

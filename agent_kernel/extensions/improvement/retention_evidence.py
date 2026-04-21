@@ -11,6 +11,107 @@ from . import planner_runtime_state as planner_runtime_state_ext
 from . import transition_model_improvement as transition_model_improvement_ext
 
 
+def _generated_task_summary(
+    metrics: EvalMetrics,
+    *,
+    curriculum_kind: str | None = None,
+) -> dict[str, object]:
+    summaries = getattr(metrics, "generated_task_summaries", {})
+    normalized_kind = "" if curriculum_kind is None else str(curriculum_kind).strip()
+    if not isinstance(summaries, dict) or not summaries:
+        if normalized_kind:
+            task_count = int(metrics.generated_by_kind.get(normalized_kind, 0) or 0)
+            success_count = int(metrics.generated_passed_by_kind.get(normalized_kind, 0) or 0)
+        else:
+            task_count = int(metrics.generated_total or 0)
+            success_count = int(metrics.generated_passed or 0)
+        return {
+            "task_count": task_count,
+            "success_count": success_count,
+            "clean_success_count": 0,
+            "pass_rate": round(0.0 if task_count <= 0 else success_count / task_count, 4),
+            "clean_success_rate": 0.0,
+            "average_steps": 0.0,
+            "clean_success_benchmark_families": [],
+            "distinct_clean_success_benchmark_families": 0,
+        }
+    task_count = 0
+    success_count = 0
+    clean_success_count = 0
+    total_steps = 0
+    clean_success_families: set[str] = set()
+    for summary in summaries.values():
+        if not isinstance(summary, dict):
+            continue
+        summary_kind = str(summary.get("curriculum_kind", "")).strip()
+        if normalized_kind and summary_kind != normalized_kind:
+            continue
+        task_count += 1
+        success = bool(summary.get("success", False))
+        clean_success = bool(summary.get("clean_success", False))
+        success_count += int(success)
+        clean_success_count += int(clean_success)
+        try:
+            total_steps += max(0, int(summary.get("steps", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        if clean_success:
+            family = str(summary.get("benchmark_family", "bounded")).strip() or "bounded"
+            clean_success_families.add(family)
+    return {
+        "task_count": task_count,
+        "success_count": success_count,
+        "clean_success_count": clean_success_count,
+        "pass_rate": round(0.0 if task_count <= 0 else success_count / task_count, 4),
+        "clean_success_rate": round(0.0 if task_count <= 0 else clean_success_count / task_count, 4),
+        "average_steps": round(0.0 if task_count <= 0 else total_steps / task_count, 4),
+        "clean_success_benchmark_families": sorted(clean_success_families),
+        "distinct_clean_success_benchmark_families": len(clean_success_families),
+    }
+
+
+def _clean_success_family_gain_count(
+    baseline_summary: dict[str, object],
+    candidate_summary: dict[str, object],
+) -> int:
+    baseline_families = {
+        str(value).strip()
+        for value in baseline_summary.get("clean_success_benchmark_families", [])
+        if str(value).strip()
+    }
+    candidate_families = {
+        str(value).strip()
+        for value in candidate_summary.get("clean_success_benchmark_families", [])
+        if str(value).strip()
+    }
+    return len(candidate_families - baseline_families)
+
+
+def _contract_clean_failure_recovery_family_gain_count(
+    baseline_metrics: EvalMetrics,
+    candidate_metrics: EvalMetrics,
+) -> int:
+    baseline_summary = getattr(baseline_metrics, "contract_clean_failure_recovery_by_origin_benchmark_family", {})
+    candidate_summary = getattr(candidate_metrics, "contract_clean_failure_recovery_by_origin_benchmark_family", {})
+    if not isinstance(baseline_summary, dict):
+        baseline_summary = {}
+    if not isinstance(candidate_summary, dict):
+        candidate_summary = {}
+    gained = 0
+    for family in sorted(set(baseline_summary) | set(candidate_summary)):
+        baseline_row = baseline_summary.get(family, {})
+        candidate_row = candidate_summary.get(family, {})
+        if not isinstance(baseline_row, dict):
+            baseline_row = {}
+        if not isinstance(candidate_row, dict):
+            candidate_row = {}
+        baseline_clean_successes = int(baseline_row.get("clean_success_count", 0) or 0)
+        candidate_clean_successes = int(candidate_row.get("clean_success_count", 0) or 0)
+        if candidate_clean_successes > baseline_clean_successes:
+            gained += 1
+    return gained
+
+
 def retention_evidence(
     subsystem: str,
     baseline_metrics: EvalMetrics,
@@ -53,6 +154,46 @@ def retention_evidence(
         base_subsystem_fn=DEFAULT_IMPROVEMENT_PLUGIN_LAYER.base_subsystem,
         learning_evidence_adapter=core.DEFAULT_LEARNING_EVIDENCE_ADAPTER,
     )
+    baseline_generated_summary = _generated_task_summary(baseline_metrics)
+    candidate_generated_summary = _generated_task_summary(candidate_metrics)
+    evidence["generated_task_count_delta"] = (
+        int(candidate_generated_summary.get("task_count", 0) or 0)
+        - int(baseline_generated_summary.get("task_count", 0) or 0)
+    )
+    evidence["generated_clean_success_delta"] = (
+        int(candidate_generated_summary.get("clean_success_count", 0) or 0)
+        - int(baseline_generated_summary.get("clean_success_count", 0) or 0)
+    )
+    evidence["generated_average_steps_delta"] = round(
+        float(candidate_generated_summary.get("average_steps", 0.0) or 0.0)
+        - float(baseline_generated_summary.get("average_steps", 0.0) or 0.0),
+        4,
+    )
+    evidence["generated_clean_success_family_gain_count"] = _clean_success_family_gain_count(
+        baseline_generated_summary,
+        candidate_generated_summary,
+    )
+    baseline_adjacent_success_summary = _generated_task_summary(
+        baseline_metrics,
+        curriculum_kind="adjacent_success",
+    )
+    candidate_adjacent_success_summary = _generated_task_summary(
+        candidate_metrics,
+        curriculum_kind="adjacent_success",
+    )
+    evidence["adjacent_success_clean_success_delta"] = (
+        int(candidate_adjacent_success_summary.get("clean_success_count", 0) or 0)
+        - int(baseline_adjacent_success_summary.get("clean_success_count", 0) or 0)
+    )
+    evidence["adjacent_success_average_steps_delta"] = round(
+        float(candidate_adjacent_success_summary.get("average_steps", 0.0) or 0.0)
+        - float(baseline_adjacent_success_summary.get("average_steps", 0.0) or 0.0),
+        4,
+    )
+    evidence["adjacent_success_clean_success_family_gain_count"] = _clean_success_family_gain_count(
+        baseline_adjacent_success_summary,
+        candidate_adjacent_success_summary,
+    )
     family_pass_rate_delta = core._family_pass_rate_delta_map(baseline_metrics, candidate_metrics)
     if family_pass_rate_delta:
         evidence["family_pass_rate_delta"] = family_pass_rate_delta
@@ -79,6 +220,56 @@ def retention_evidence(
             candidate_metrics,
             "failure_recovery",
         ) - core._generated_kind_pass_rate(baseline_metrics, "failure_recovery")
+        baseline_failure_recovery_summary = _generated_task_summary(
+            baseline_metrics,
+            curriculum_kind="failure_recovery",
+        )
+        candidate_failure_recovery_summary = _generated_task_summary(
+            candidate_metrics,
+            curriculum_kind="failure_recovery",
+        )
+        evidence["failure_recovery_clean_success_delta"] = (
+            int(candidate_failure_recovery_summary.get("clean_success_count", 0) or 0)
+            - int(baseline_failure_recovery_summary.get("clean_success_count", 0) or 0)
+        )
+        evidence["failure_recovery_average_steps_delta"] = round(
+            float(candidate_failure_recovery_summary.get("average_steps", 0.0) or 0.0)
+            - float(baseline_failure_recovery_summary.get("average_steps", 0.0) or 0.0),
+            4,
+        )
+        evidence["failure_recovery_clean_success_family_gain_count"] = _clean_success_family_gain_count(
+            baseline_failure_recovery_summary,
+            candidate_failure_recovery_summary,
+        )
+    baseline_contract_clean_failure_recovery_summary = getattr(
+        baseline_metrics,
+        "contract_clean_failure_recovery_summary",
+        {},
+    )
+    candidate_contract_clean_failure_recovery_summary = getattr(
+        candidate_metrics,
+        "contract_clean_failure_recovery_summary",
+        {},
+    )
+    if not isinstance(baseline_contract_clean_failure_recovery_summary, dict):
+        baseline_contract_clean_failure_recovery_summary = {}
+    if not isinstance(candidate_contract_clean_failure_recovery_summary, dict):
+        candidate_contract_clean_failure_recovery_summary = {}
+    evidence["contract_clean_failure_recovery_clean_success_delta"] = (
+        int(candidate_contract_clean_failure_recovery_summary.get("clean_success_count", 0) or 0)
+        - int(baseline_contract_clean_failure_recovery_summary.get("clean_success_count", 0) or 0)
+    )
+    evidence["contract_clean_failure_recovery_average_steps_delta"] = round(
+        float(candidate_contract_clean_failure_recovery_summary.get("average_steps", 0.0) or 0.0)
+        - float(baseline_contract_clean_failure_recovery_summary.get("average_steps", 0.0) or 0.0),
+        4,
+    )
+    evidence["contract_clean_failure_recovery_family_gain_count"] = (
+        _contract_clean_failure_recovery_family_gain_count(
+            baseline_metrics,
+            candidate_metrics,
+        )
+    )
     validation_family_summary = core._benchmark_family_summary(
         baseline_metrics,
         candidate_metrics,
@@ -306,13 +497,10 @@ def retention_evidence(
         candidate_controls = core._operator_policy_controls_from_payload(payload)
         evidence.update(core._operator_policy_control_evidence(baseline_controls, candidate_controls))
     if subsystem == "transition_model":
-        baseline_controls = transition_model_improvement_ext.retained_transition_model_controls(
-            planner_runtime_state_ext.active_artifact_payload_from_generation_context(payload)
-        )
-        candidate_controls = transition_model_improvement_ext.retained_transition_model_controls(payload)
-        baseline_signatures = core._transition_model_signatures_from_payload(
-            planner_runtime_state_ext.active_artifact_payload_from_generation_context(payload)
-        )
+        baseline_payload = planner_runtime_state_ext.active_artifact_payload_from_generation_context(payload)
+        baseline_controls = control_evidence.transition_model_controls_from_payload(baseline_payload)
+        candidate_controls = control_evidence.transition_model_controls_from_payload(payload)
+        baseline_signatures = core._transition_model_signatures_from_payload(baseline_payload)
         candidate_signatures = core._transition_model_signatures_from_payload(payload)
         evidence.update(
             core._transition_model_evidence(

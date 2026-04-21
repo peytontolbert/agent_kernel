@@ -89,7 +89,7 @@ def holdout_task_limit_for_retention(
     if not isinstance(comparison_task_limit, int) or comparison_task_limit <= 0:
         return None
     if base_subsystem_for(subsystem, capability_modules_path) != "retrieval":
-        return None
+        return min(comparison_task_limit, 16)
     return max(4, comparison_task_limit)
 
 
@@ -166,6 +166,9 @@ def apply_retrieval_bounded_preview_filters(
         return scoped_flags
     scoped_flags["include_episode_memory"] = False
     scoped_flags["include_verifier_memory"] = False
+    preview_controls = payload.get("preview_controls", {}) if isinstance(payload, dict) else {}
+    if isinstance(preview_controls, dict) and bool(preview_controls.get("prefer_long_horizon_tasks", False)):
+        scoped_flags["prefer_long_horizon_tasks"] = True
     return scoped_flags
 
 

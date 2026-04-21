@@ -56,7 +56,12 @@ def choose_tolbert_route(
             and allow_trusted_primary_without_min_confidence
             and path_confidence >= trusted_confidence_floor
         )
-        if path_confidence < min_confidence and not trusted_confidence_override:
+        low_confidence_direct_override = not trust_retrieval and direct_or_skill_primary_allowed
+        if (
+            path_confidence < min_confidence
+            and not trusted_confidence_override
+            and not low_confidence_direct_override
+        ):
             return TolbertRoutingDecision(
                 mode="disabled",
                 benchmark_family=family,
@@ -70,6 +75,15 @@ def choose_tolbert_route(
                 mode="primary",
                 benchmark_family=family,
                 reason="trusted retrieval satisfied the retained Tolbert primary route override",
+                min_confidence=min_confidence,
+                require_trusted_retrieval=require_trusted,
+                use_latent_state=use_latent_state,
+            )
+        if low_confidence_direct_override:
+            return TolbertRoutingDecision(
+                mode="primary",
+                benchmark_family=family,
+                reason="benchmark family is approved for retained Tolbert primary control via direct or skill primary routing despite low path confidence",
                 min_confidence=min_confidence,
                 require_trusted_retrieval=require_trusted,
                 use_latent_state=use_latent_state,

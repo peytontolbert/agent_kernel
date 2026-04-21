@@ -88,6 +88,14 @@ _RESIDUE_STYLE_RECOVERY_STRATEGY_FAMILIES = {
     "mutation_residue_scan",
     "unexpected_change_audit",
 }
+_SCOPED_MUTABLE_SEED_PREFIXES = (
+    "cycles",
+    "delegated_job_queue",
+    "delegated_job_runtime_state",
+    "unattended_trust_ledger",
+    "tolbert_liftoff_report",
+)
+_SCOPED_MUTABLE_SEED_SUFFIXES = {".json", ".jsonl"}
 
 
 def _lineage_phase_bucket_from_depth(depth: int) -> str:
@@ -1985,6 +1993,7 @@ def _write_success_seed_bundle(
 
 def _task_outcome_summary(task, result, *, low_confidence_threshold: float) -> dict[str, object]:
     benchmark_family = str(task.metadata.get("benchmark_family", "bounded"))
+    task_origin = str(task.metadata.get("task_origin", "")).strip()
     memory_source = str(task.metadata.get("memory_source", "none"))
     difficulty = str(task.metadata.get("difficulty", "unknown"))
     curriculum_kind = str(task.metadata.get("curriculum_kind", "")).strip()
@@ -2027,6 +2036,7 @@ def _task_outcome_summary(task, result, *, low_confidence_threshold: float) -> d
         "success": bool(result.success),
         "clean_success": clean_success,
         "benchmark_family": benchmark_family,
+        "task_origin": task_origin,
         "difficulty": difficulty,
         "curriculum_kind": curriculum_kind,
         "memory_source": memory_source,
@@ -2997,6 +3007,12 @@ def _seed_file_copy(src, dst):
         pass
     if dst_path.exists() or dst_path.is_symlink():
         dst_path.unlink(missing_ok=True)
+    prefer_copy = src_path.suffix in _SCOPED_MUTABLE_SEED_SUFFIXES and src_path.name.startswith(
+        _SCOPED_MUTABLE_SEED_PREFIXES
+    )
+    if prefer_copy:
+        shutil.copy2(src_path, dst_path)
+        return
     try:
         os.link(src_path, dst_path)
     except OSError:
@@ -3072,7 +3088,6 @@ def _scoped_config(base_config: KernelConfig, scope: str, **overrides) -> Kernel
         (base_config.operator_policy_proposals_path, config.operator_policy_proposals_path),
         (base_config.transition_model_proposals_path, config.transition_model_proposals_path),
         (base_config.curriculum_proposals_path, config.curriculum_proposals_path),
-        (base_config.improvement_cycles_path, config.improvement_cycles_path),
         (base_config.capability_modules_path, config.capability_modules_path),
         (base_config.delegated_job_queue_path, config.delegated_job_queue_path),
         (base_config.delegated_job_runtime_state_path, config.delegated_job_runtime_state_path),
@@ -3114,6 +3129,9 @@ def _scoped_config(base_config: KernelConfig, scope: str, **overrides) -> Kernel
         config.unattended_workspace_snapshot_root,
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    config.improvement_cycles_path.parent.mkdir(parents=True, exist_ok=True)
+    if not config.improvement_cycles_path.exists():
+        config.improvement_cycles_path.write_text("", encoding="utf-8")
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
@@ -3217,6 +3235,7 @@ def run_eval(
     priority_benchmark_families: Sequence[str] | None = None,
     priority_benchmark_family_weights: dict[str, object] | None = None,
     prefer_low_cost_tasks: bool = False,
+    prefer_long_horizon_tasks: bool = False,
     restrict_to_priority_benchmark_families: bool = False,
     progress_label: str | None = None,
     progress_snapshot_path: Path | None = None,
@@ -3320,6 +3339,7 @@ def run_eval(
                     priority_families=effective_priority_families,
                     priority_family_weights=priority_benchmark_family_weights,
                     prefer_low_cost_tasks=prefer_low_cost_tasks,
+                    prefer_long_horizon_tasks=prefer_long_horizon_tasks,
                     required_executable_families=active_config.unattended_trust_required_benchmark_families,
                 )
         completed_primary_tasks: list = []
@@ -3633,7 +3653,16 @@ def run_eval(
                 )
             if include_failure_generated:
                 _emit_eval_progress(progress_label, f"phase=generated_failure_seed total={len(tasks)}")
-                failure_seed_config = _scoped_config(active_config, "generated_failure_seed")
+                failure_seed_report_config = _scoped_config(active_config, "generated_failure_seed")
+                failure_seed_config = (
+                    _scoped_config(
+                        active_config,
+                        "generated_failure_seed",
+                        run_reports_dir=shared_generated_reports_dir,
+                    )
+                    if shared_generated_reports_dir is not None
+                    else failure_seed_report_config
+                )
                 failing_kernel = AgentKernel(config=failure_seed_config, policy=_ForcedFailurePolicy())
                 failure_generated_config = (
                     _scoped_config(
@@ -3650,7 +3679,7 @@ def run_eval(
                         failing_kernel,
                         progress_label=progress_label,
                         phase="generated_failure_seed",
-                        report_config=failure_seed_config if write_unattended_reports else None,
+                        report_config=failure_seed_report_config if write_unattended_reports else None,
                     )
                 finally:
                     failing_kernel.close()
@@ -4145,6 +4174,7 @@ def run_eval(
         ),
         transfer_alignment_summary=transfer_alignment_summary,
         task_outcomes=task_outcomes,
+        generated_task_summaries=generated_task_summaries,
         task_trajectories=task_trajectories,
     )
     _emit_eval_progress(progress_label, "phase=metrics_finalize complete")
@@ -4684,6 +4714,26 @@ def _low_cost_task_key(task) -> tuple[int, int, int, int, int, int, int, int, st
     )
 
 
+def _long_horizon_priority_key(task) -> tuple[int, int, str]:
+    metadata = getattr(task, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    difficulty = str(metadata.get("difficulty", "") or getattr(task, "difficulty", "")).strip()
+    if str(metadata.get("horizon", "")).strip() == "long_horizon":
+        difficulty = "long_horizon"
+    surface = str(metadata.get("long_horizon_coding_surface", "")).strip()
+    if surface == "shared_repo_synthetic_worker":
+        surface_rank = 0
+    elif surface == "shared_repo_integrator":
+        surface_rank = 1
+    elif difficulty == "long_horizon":
+        surface_rank = 2
+    else:
+        surface_rank = 3
+    requires_retrieval_rank = 0 if bool(metadata.get("requires_retrieval", False)) else 1
+    return (surface_rank, requires_retrieval_rank, str(getattr(task, "task_id", "")))
+
+
 def _repo_sandbox_low_cost_rank(task) -> int:
     metadata = getattr(task, "metadata", {}) or {}
     if str(metadata.get("benchmark_family", "")).strip() != "repo_sandbox":
@@ -4963,6 +5013,7 @@ def _limit_tasks_for_compare(
     priority_families: Sequence[str] | None = None,
     priority_family_weights: dict[str, object] | None = None,
     prefer_low_cost_tasks: bool = False,
+    prefer_long_horizon_tasks: bool = False,
     required_executable_families: Sequence[str] | None = None,
 ) -> list:
     grouped: dict[str, list] = {}
@@ -4984,16 +5035,41 @@ def _limit_tasks_for_compare(
     if prefer_low_cost_tasks:
         for family, family_tasks in grouped.items():
             if family in required_executable_family_set:
-                family_tasks.sort(key=_required_executable_family_sort_key)
+                if prefer_long_horizon_tasks:
+                    family_tasks.sort(
+                        key=lambda task: (
+                            _long_horizon_priority_key(task),
+                            _required_executable_family_sort_key(task),
+                        )
+                    )
+                else:
+                    family_tasks.sort(key=_required_executable_family_sort_key)
                 continue
-            family_tasks.sort(key=_low_cost_task_key)
+            if prefer_long_horizon_tasks:
+                family_tasks.sort(
+                    key=lambda task: (
+                        _long_horizon_priority_key(task),
+                        _low_cost_task_key(task),
+                    )
+                )
+            else:
+                family_tasks.sort(key=_low_cost_task_key)
     else:
         for family_tasks in grouped.values():
-            family_tasks.sort(
-                key=lambda task: (
-                    int(not bool(getattr(task, "metadata", {}).get("light_supervision_candidate", False))),
+            if prefer_long_horizon_tasks:
+                family_tasks.sort(
+                    key=lambda task: (
+                        _long_horizon_priority_key(task),
+                        int(not bool(getattr(task, "metadata", {}).get("light_supervision_candidate", False))),
+                        str(getattr(task, "task_id", "")),
+                    )
                 )
-            )
+            else:
+                family_tasks.sort(
+                    key=lambda task: (
+                        int(not bool(getattr(task, "metadata", {}).get("light_supervision_candidate", False))),
+                    )
+                )
 
     selected = []
 

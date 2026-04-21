@@ -735,4 +735,20 @@ def tolbert_ranked_candidates(
             policy._command_control_score(state, command)
             + policy._trusted_retrieval_carryover_match_bonus(state, command)
         )
-    return sorted(candidates, key=lambda item: (-int(item["score"]), str(item["command"])))
+        reason = str(candidate.get("reason", "")).strip()
+        if reason == "trusted retrieval carryover":
+            candidate["priority_rank"] = 0
+        elif bool(candidate.get("retrieval_influenced", False)):
+            candidate["priority_rank"] = 1
+        elif bool(candidate.get("retrieval_ranked_skill", False)) or str(candidate.get("span_id", "")).strip():
+            candidate["priority_rank"] = 2
+        else:
+            candidate["priority_rank"] = 3
+    return sorted(
+        candidates,
+        key=lambda item: (
+            int(item.get("priority_rank", 99)),
+            -int(item["score"]),
+            str(item["command"]),
+        ),
+    )

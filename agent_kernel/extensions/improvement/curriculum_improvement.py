@@ -6,6 +6,7 @@ from pathlib import Path
 
 from evals.metrics import EvalMetrics
 from .improvement_common import (
+    artifact_payload_in_lifecycle_states,
     build_standard_proposal_artifact,
     filter_proposals_by_area,
     merged_string_lists,
@@ -341,12 +342,24 @@ def _recent_curriculum_retention_feedback(cycles_path: Path | None) -> dict[str,
     }
 
 
+def _effective_curriculum_generation_focus(payload: object) -> str:
+    effective = artifact_payload_in_lifecycle_states(
+        payload,
+        artifact_kind="curriculum_proposal_set",
+        allowed_states={"proposed", "retained"},
+    )
+    if effective is None:
+        return ""
+    return str(effective.get("generation_focus", "")).strip()
+
+
 def curriculum_behavior_controls(
     metrics: EvalMetrics,
     *,
     focus: str | None = None,
     family: str | None = None,
     baseline: dict[str, object] | None = None,
+    baseline_generation_focus: str | None = None,
     cycles_path: Path | None = None,
 ) -> dict[str, object]:
     controls: dict[str, object] = {
@@ -419,6 +432,20 @@ def curriculum_behavior_controls(
         controls["failure_recovery_command_cap"] = min(int(controls["failure_recovery_command_cap"]), 3)
         controls["max_generated_adjacent_tasks"] = min(int(controls["max_generated_adjacent_tasks"]), 2)
         controls["max_generated_failure_recovery_tasks"] = max(int(controls["max_generated_failure_recovery_tasks"]), 6)
+        if str(baseline_generation_focus or "").strip() == "failure_recovery":
+            # Ratchet the active failure-recovery lane so repeated retries produce a materially distinct schedule.
+            controls["success_reference_limit"] = min(int(controls["success_reference_limit"]), 2)
+            controls["adjacent_reference_limit"] = min(int(controls["adjacent_reference_limit"]), 2)
+            controls["failure_recovery_anchor_min_matches"] = max(
+                int(controls["failure_recovery_anchor_min_matches"]),
+                3,
+            )
+            controls["failure_recovery_command_cap"] = min(int(controls["failure_recovery_command_cap"]), 2)
+            controls["max_generated_adjacent_tasks"] = min(int(controls["max_generated_adjacent_tasks"]), 1)
+            controls["max_generated_failure_recovery_tasks"] = max(
+                int(controls["max_generated_failure_recovery_tasks"]),
+                8,
+            )
     if focus == "benchmark_family" and family:
         controls["preferred_benchmark_family"] = family
         controls["frontier_priority_families"] = [family, *[value for value in priority_families if value != family]]
@@ -436,6 +463,7 @@ def build_curriculum_proposal_artifact(
     current_payload: object | None = None,
     cycles_path: Path | None = None,
 ) -> dict[str, object]:
+    baseline_generation_focus = _effective_curriculum_generation_focus(current_payload)
     proposals: list[dict[str, object]] = []
     if focus == "failure_recovery":
         proposals.append(
@@ -595,6 +623,7 @@ def build_curriculum_proposal_artifact(
             focus=focus,
             family=family,
             baseline=retained_curriculum_controls(current_payload),
+            baseline_generation_focus=baseline_generation_focus,
             cycles_path=cycles_path,
         ),
         proposals=proposals,

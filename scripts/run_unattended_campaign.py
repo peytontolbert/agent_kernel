@@ -14148,7 +14148,8 @@ def main() -> None:
     if args.tolbert_device:
         config.tolbert_device = args.tolbert_device
     if args.semantic_only_runtime:
-        config.use_tolbert_context = False
+        # Semantic-only runtime still needs Tolbert retrieval/context at execution time;
+        # it only disables model-artifact mutation lanes such as Tolbert fine-tuning.
         config.use_tolbert_model_artifacts = False
     config.asi_coding_require_live_llm = True
     config.ensure_directories()

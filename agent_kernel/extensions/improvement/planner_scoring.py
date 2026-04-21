@@ -467,25 +467,68 @@ def _retrieval_activation_variant_bias(
         and trusted_steps <= 0
         and retrieval_selected_steps <= 0
         and retrieval_influenced_steps <= 0
-        and proposal_selected_steps <= 0
     )
-    if not activation_absent:
+    selection_without_influence = (
+        total > 0
+        and trusted_steps <= 0
+        and retrieval_influenced_steps <= 0
+        and proposal_selected_steps > 0
+    )
+    if not activation_absent and not selection_without_influence:
         return 0.0, {}
     bias = 0.0
     if str(variant.variant_id).strip() == "confidence_gating":
-        bias = 0.03
+        bias = 0.04 if selection_without_influence else 0.03
     elif str(variant.variant_id).strip() == "breadth_rebalance":
-        bias = -0.03 if low_confidence <= 0 else -0.015
+        if selection_without_influence:
+            bias = -0.04
+        else:
+            bias = -0.03 if low_confidence <= 0 else -0.015
     if bias == 0.0:
         return 0.0, {}
     return round(bias, 4), {
-        "activation_absent": True,
+        "activation_absent": activation_absent,
+        "selection_without_influence": selection_without_influence,
         "low_confidence_episodes": low_confidence,
         "trusted_retrieval_steps": trusted_steps,
         "retrieval_selected_steps": retrieval_selected_steps,
         "retrieval_influenced_steps": retrieval_influenced_steps,
         "proposal_selected_steps": proposal_selected_steps,
         "bias": round(bias, 4),
+    }
+
+
+def _retrieval_carryover_variant_bias(
+    experiment: ImprovementExperiment,
+    variant: ImprovementVariant,
+) -> tuple[float, dict[str, object]]:
+    if str(experiment.subsystem).strip() != "retrieval":
+        return 0.0, {}
+    evidence = experiment.evidence if isinstance(experiment.evidence, dict) else {}
+    if not bool(evidence.get("retrieval_carryover_priority", False)):
+        return 0.0, {}
+    closure_progression = evidence.get("closure_progression", {})
+    retrieval_carryover_state = (
+        str(closure_progression.get("retrieval_carryover", "")).strip().lower()
+        if isinstance(closure_progression, dict)
+        else ""
+    )
+    if retrieval_carryover_state in {"", "closed"}:
+        return 0.0, {}
+    bias = 0.0
+    variant_id = str(variant.variant_id).strip()
+    if variant_id == "confidence_gating":
+        bias = 0.03
+    elif variant_id == "breadth_rebalance":
+        bias = -0.02
+    if bias == 0.0:
+        return 0.0, {}
+    return round(bias, 4), {
+        "retrieval_carryover_priority": True,
+        "retrieval_carryover": retrieval_carryover_state,
+        "variant_id": variant_id,
+        "bias": round(bias, 4),
+        "reason": "prefer retrieval variants that directly target carryover verification once closure-first gaps are already closed",
     }
 
 
@@ -532,6 +575,7 @@ def score_variant(
         variant,
     )
     activation_bias, activation_evidence = _retrieval_activation_variant_bias(experiment, variant)
+    carryover_bias, carryover_evidence = _retrieval_carryover_variant_bias(experiment, variant)
     score = round(
         max(
             0.0,
@@ -542,23 +586,39 @@ def score_variant(
             + exploration_bonus
             + strategy_memory_adjustment
             + activation_bias
+            + carryover_bias
             + score_bias,
         ),
         4,
     )
     activation_score_floor_evidence: dict[str, object] = {}
-    if activation_evidence.get("activation_absent") and str(experiment.subsystem).strip() == "retrieval":
+    carryover_score_floor_evidence: dict[str, object] = {}
+    if (activation_evidence.get("activation_absent") or activation_evidence.get("selection_without_influence")) and str(experiment.subsystem).strip() == "retrieval":
         low_confidence = int(activation_evidence.get("low_confidence_episodes", 0) or 0)
         if str(variant.variant_id).strip() == "confidence_gating":
-            activation_score_floor = 0.01 if low_confidence <= 0 else 0.008
+            activation_score_floor = 0.012 if activation_evidence.get("selection_without_influence") else (0.01 if low_confidence <= 0 else 0.008)
             if score < activation_score_floor:
                 score = round(activation_score_floor, 4)
                 activation_score_floor_evidence = {
-                    "activation_absent": True,
+                    "activation_absent": bool(activation_evidence.get("activation_absent")),
+                    "selection_without_influence": bool(activation_evidence.get("selection_without_influence")),
                     "low_confidence_episodes": low_confidence,
                     "floor": round(activation_score_floor, 4),
-                    "reason": "preserve confidence-gating bootstrap priority when reject-heavy history collapses retrieval variant scores",
+                    "reason": "preserve confidence-gating bootstrap priority when retrieval selection still fails to produce runtime influence",
                 }
+    if (
+        str(experiment.subsystem).strip() == "retrieval"
+        and str(variant.variant_id).strip() == "confidence_gating"
+        and bool(carryover_evidence.get("retrieval_carryover_priority", False))
+    ):
+        carryover_score_floor = 0.012
+        if score < carryover_score_floor:
+            score = round(carryover_score_floor, 4)
+            carryover_score_floor_evidence = {
+                "retrieval_carryover": str(carryover_evidence.get("retrieval_carryover", "")).strip(),
+                "floor": round(carryover_score_floor, 4),
+                "reason": "preserve carryover-oriented retrieval routing when closure-first gaps are already closed",
+            }
     controls = dict(variant.controls)
     controls["base_subsystem"] = effective_subsystem
     controls["history"] = {
@@ -574,8 +634,12 @@ def score_variant(
         controls["strategy_memory_variant_lineage"] = strategy_memory_evidence
     if activation_evidence:
         controls["activation_bootstrap_bias"] = activation_evidence
+    if carryover_evidence:
+        controls["carryover_priority_bias"] = carryover_evidence
     if activation_score_floor_evidence:
         controls["activation_bootstrap_score_floor"] = activation_score_floor_evidence
+    if carryover_score_floor_evidence:
+        controls["carryover_priority_score_floor"] = carryover_score_floor_evidence
     return ImprovementVariant(
         subsystem=variant.subsystem,
         variant_id=variant.variant_id,
