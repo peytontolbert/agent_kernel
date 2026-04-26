@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -274,6 +278,186 @@ class VLLMClient:
         if parsed is not None:
             return parsed
         return _extract_json_object(str(message.get("reasoning", "")))
+
+
+class ModelStackClient:
+    """Client for the local model-stack token generation server."""
+
+    _DECISION_MAX_TOKENS = (32, 64, 96, 128, 192, 256)
+    _DEFAULT_PROMPT_TOKEN_BUDGET = 1536
+
+    def __init__(
+        self,
+        host: str,
+        model_name: str,
+        timeout_seconds: int,
+        retry_attempts: int = 2,
+        retry_backoff_seconds: float = 0.5,
+        *,
+        model_dir: str = "",
+        tokenizer_path: str = "",
+        repo_path: str = "",
+        api_key: str = "",
+    ) -> None:
+        self.host = host.rstrip("/")
+        self.model_name = model_name
+        self.timeout_seconds = timeout_seconds
+        self.retry_attempts = max(1, retry_attempts)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self.model_dir = str(model_dir or "").strip()
+        self.tokenizer_path = str(tokenizer_path or "").strip()
+        self.repo_path = str(repo_path or "").strip()
+        self.api_key = api_key.strip()
+        self._tokenizer: Any | None = None
+
+    def create_decision(
+        self,
+        *,
+        system_prompt: str,
+        decision_prompt: str,
+        state_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        attempts = [
+            _render_prompt(
+                decision_prompt=f"System prompt:\n{system_prompt}\n\n{decision_prompt}",
+                state_payload=_compact_state_payload(state_payload),
+            ),
+            _render_prompt(
+                decision_prompt=f"System prompt:\n{system_prompt}\n\n{decision_prompt}",
+                state_payload=_minimal_state_payload(state_payload),
+            ),
+            _render_prompt(
+                decision_prompt=f"System prompt:\n{system_prompt}\n\n{decision_prompt}",
+                state_payload=_lean_state_payload(state_payload),
+            ),
+        ]
+        last_data: dict[str, Any] | None = None
+        last_text = ""
+        last_error: Exception | None = None
+        for prompt in attempts:
+            for max_tokens in self._decision_max_tokens():
+                try:
+                    data = self._generate_text(prompt=prompt, max_new_tokens=max_tokens)
+                except RuntimeError as exc:
+                    last_error = exc
+                    continue
+                last_data = data
+                last_text = str(data.get("generated_text", ""))
+                parsed = _extract_json_object(last_text)
+                if parsed is not None:
+                    decision = coerce_action_decision(parsed)
+                    decision["decision_source"] = "model_stack"
+                    return decision
+        error_detail = f" last_error={last_error}" if last_error is not None else ""
+        raise ValueError(
+            "Model Stack did not return a parseable JSON decision: "
+            f"text={last_text!r} response={last_data}{error_detail}"
+        )
+
+    def _generate_text(self, *, prompt: str, max_new_tokens: int) -> dict[str, Any]:
+        tokenizer = self._load_tokenizer()
+        input_ids = list(tokenizer.encode(prompt))
+        if not input_ids:
+            raise ValueError("Model Stack tokenizer produced no input tokens")
+        raw_input_token_count = len(input_ids)
+        input_ids = self._budget_prompt_tokens(input_ids)
+        data = _post_json(
+            url=f"{self.host}/v1/generate",
+            payload={
+                "input_ids": [input_ids],
+                "max_new_tokens": max(1, int(max_new_tokens)),
+                "do_sample": False,
+                "temperature": 0.0,
+            },
+            timeout_seconds=self.timeout_seconds,
+            retry_attempts=self.retry_attempts,
+            retry_backoff_seconds=self.retry_backoff_seconds,
+            headers=_authorization_headers(self.api_key),
+            error_label="Model Stack request",
+        )
+        output_ids = data.get("output_ids")
+        if not isinstance(output_ids, list) or not output_ids or not isinstance(output_ids[0], list):
+            raise ValueError(f"Model Stack response missing output_ids: {data}")
+        generated_ids = [int(token_id) for token_id in output_ids[0][len(input_ids) :]]
+        generated_text = str(tokenizer.decode(generated_ids)) if generated_ids else ""
+        return {
+            "generated_text": generated_text,
+            "input_token_count": len(input_ids),
+            "raw_input_token_count": raw_input_token_count,
+            "prompt_truncated": raw_input_token_count != len(input_ids),
+            "generated_token_count": len(generated_ids),
+            "raw_response": data,
+        }
+
+    def _budget_prompt_tokens(self, input_ids: list[int]) -> list[int]:
+        raw_budget = os.getenv("AGENT_KERNEL_MODEL_STACK_PROMPT_TOKEN_BUDGET", "").strip()
+        try:
+            budget = int(raw_budget) if raw_budget else self._DEFAULT_PROMPT_TOKEN_BUDGET
+        except ValueError:
+            budget = self._DEFAULT_PROMPT_TOKEN_BUDGET
+        if budget <= 0 or len(input_ids) <= budget:
+            return input_ids
+        prefix_count = max(1, min(256, budget // 4))
+        suffix_count = max(1, budget - prefix_count)
+        return [*input_ids[:prefix_count], *input_ids[-suffix_count:]]
+
+    def _decision_max_tokens(self) -> tuple[int, ...]:
+        raw = os.getenv("AGENT_KERNEL_MODEL_STACK_DECISION_MAX_TOKENS", "").strip()
+        if not raw:
+            return self._DECISION_MAX_TOKENS
+        budgets: list[int] = []
+        for token in raw.split(","):
+            try:
+                value = int(token.strip())
+            except ValueError:
+                continue
+            if value > 0:
+                budgets.append(value)
+        return tuple(budgets) if budgets else self._DECISION_MAX_TOKENS
+
+    def _load_tokenizer(self) -> Any:
+        if self._tokenizer is not None:
+            return self._tokenizer
+        tokenizer_root = self._tokenizer_root()
+        repo_path = Path(self.repo_path) if self.repo_path else Path()
+        if not repo_path.is_absolute() and self.repo_path:
+            repo_path = Path.cwd() / repo_path
+        if not repo_path.exists():
+            raise RuntimeError(f"Model Stack repo path does not exist: {repo_path}")
+        repo_path_text = str(repo_path)
+        inserted = False
+        if repo_path_text not in sys.path:
+            sys.path.insert(0, repo_path_text)
+            inserted = True
+        try:
+            from data.tokenizer import get_tokenizer  # type: ignore
+
+            self._tokenizer = get_tokenizer(str(tokenizer_root))
+            return self._tokenizer
+        finally:
+            if inserted:
+                try:
+                    sys.path.remove(repo_path_text)
+                except ValueError:
+                    pass
+
+    def _tokenizer_root(self) -> Path:
+        raw = self.tokenizer_path or self.model_dir
+        if not raw:
+            model_name_path = Path(self.model_name)
+            if model_name_path.exists():
+                raw = str(model_name_path)
+        if not raw:
+            raise RuntimeError(
+                "provider='model_stack' requires AGENT_KERNEL_MODEL_STACK_TOKENIZER_PATH "
+                "or AGENT_KERNEL_MODEL_STACK_MODEL_DIR for text/token conversion"
+            )
+        path = Path(raw)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            raise RuntimeError(f"Model Stack tokenizer path does not exist: {path}")
+        return path
 
 
 class MockLLMClient:
@@ -840,8 +1024,9 @@ def _post_json(
     last_error: Exception | None = None
     for attempt in range(retry_attempts):
         try:
-            with request.urlopen(req, timeout=timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
+            with _request_wall_timeout(timeout_seconds, error_label):
+                with request.urlopen(req, timeout=timeout_seconds) as response:
+                    return json.loads(response.read().decode("utf-8"))
         except (TimeoutError, error.URLError, OSError, json.JSONDecodeError) as exc:
             if isinstance(exc, error.HTTPError):
                 try:
@@ -856,3 +1041,40 @@ def _post_json(
             if retry_backoff_seconds > 0:
                 time.sleep(retry_backoff_seconds * (attempt + 1))
     raise RuntimeError(f"{error_label} failed after {retry_attempts} attempts: {last_error}")
+
+
+class _request_wall_timeout:
+    def __init__(self, timeout_seconds: int, error_label: str) -> None:
+        self.timeout_seconds = max(0, int(timeout_seconds))
+        self.error_label = str(error_label).strip() or "request"
+        self._active = False
+        self._previous_handler: Any = None
+        self._previous_timer: tuple[float, float] = (0.0, 0.0)
+
+    def __enter__(self) -> "_request_wall_timeout":
+        if (
+            self.timeout_seconds <= 0
+            or threading.current_thread() is not threading.main_thread()
+            or not hasattr(signal, "SIGALRM")
+        ):
+            return self
+        self._active = True
+        self._previous_handler = signal.getsignal(signal.SIGALRM)
+        self._previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, self._raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, float(self.timeout_seconds))
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        if not self._active:
+            return False
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        delay, interval = self._previous_timer
+        if delay > 0:
+            signal.setitimer(signal.ITIMER_REAL, delay, interval)
+        return False
+
+    def _raise_timeout(self, signum: int, frame: object) -> None:
+        del signum, frame
+        raise TimeoutError(f"{self.error_label} exceeded wall timeout {self.timeout_seconds}s")

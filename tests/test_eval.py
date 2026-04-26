@@ -232,6 +232,125 @@ def test_eval_reports_capability_breakdown(tmp_path):
     assert metrics.generated_total == 0
 
 
+def test_run_eval_prewarms_tolbert_for_narrow_transition_pressure_compare(monkeypatch, tmp_path):
+    ensure_attempts: list[int] = []
+    query_attempts: list[dict[str, object]] = []
+    run_task_calls: list[str] = []
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return [
+                TaskSpec(
+                    task_id="integration_failover_drill_retrieval_task",
+                    prompt="Recover the integration failover drill outputs.",
+                    workspace_subdir="integration_failover_drill_retrieval_task",
+                    metadata={"benchmark_family": "integration", "memory_source": "episode"},
+                )
+            ]
+
+    class FakeTolbertClient:
+        service_startup_timeout_seconds = 1.0
+        service_startup_grace_seconds = 0.0
+
+        def _ensure_process(self):
+            ensure_attempts.append(len(ensure_attempts) + 1)
+            return object()
+
+        def query(self, **kwargs):
+            query_attempts.append(dict(kwargs))
+            if len(query_attempts) == 1:
+                raise RuntimeError("TOLBERT service exited before startup ready with code 1.")
+            return {"retrieval": {"branch_scoped": [], "fallback_scoped": [], "global": []}}
+
+    class FakeContextProvider:
+        def __init__(self):
+            self.client = FakeTolbertClient()
+
+        def _retrieval_config(self):
+            return {
+                "tolbert_branch_results": 3,
+                "tolbert_global_results": 2,
+                "tolbert_confidence_threshold": 0.0,
+                "tolbert_branch_confidence_margin": 0.12,
+                "tolbert_low_confidence_widen_threshold": 0.6,
+                "tolbert_ancestor_branch_levels": 1,
+                "tolbert_low_confidence_branch_multiplier": 2.0,
+                "tolbert_low_confidence_global_multiplier": 2.0,
+            }
+
+        def close(self):
+            return None
+
+    class FakePolicy:
+        def __init__(self):
+            self.context_provider = FakeContextProvider()
+
+        def close(self):
+            self.context_provider.close()
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+            self.policy = FakePolicy()
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            run_task_calls.append(task.task_id)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(tmp_path / "workspace" / task.workspace_subdir),
+                success=True,
+                steps=[],
+                task_metadata=dict(task.metadata),
+                task_contract=task.to_dict(),
+                termination_reason="success",
+            )
+
+        def close(self):
+            self.policy.close()
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+    monkeypatch.setattr(harness_module, "load_discovered_tasks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(harness_module, "load_transition_pressure_tasks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(harness_module.time, "sleep", lambda _seconds: None)
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=True,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    metrics = run_eval(
+        config=config,
+        include_discovered_tasks=True,
+        task_limit=24,
+        priority_benchmark_families=[
+            "integration",
+            "project",
+            "repository",
+            "repo_chore",
+            "repo_sandbox",
+            "transition_pressure",
+        ],
+        restrict_to_priority_benchmark_families=True,
+        prefer_retrieval_tasks=True,
+    )
+
+    assert ensure_attempts == []
+    assert len(query_attempts) == 2
+    assert query_attempts[0]["query_text"] == "agentkernel tolbert warmup"
+    assert query_attempts[1]["top_branches"] == 1
+    assert run_task_calls == ["integration_failover_drill_retrieval_task"]
+    assert metrics.total == 1
+    assert metrics.passed == 1
+
+
 def test_run_eval_ignores_zero_step_tasks_in_first_step_confidence_metrics(monkeypatch, tmp_path):
     class FakeTaskBank:
         def __init__(self, config=None):
@@ -1215,6 +1334,289 @@ def test_limit_tasks_for_compare_prefers_executable_project_tasks_over_retrieval
         "project_release_cutover_task",
     }
     assert all(not bool(task.metadata.get("requires_retrieval", False)) for task in selected)
+
+
+def test_limit_tasks_for_compare_can_prefer_exact_retrieval_replay_tasks_when_requested():
+    tasks = [
+        TaskSpec(
+            task_id="deployment_manifest_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="deployment_manifest_retrieval_task",
+            max_steps=12,
+            metadata={
+                "benchmark_family": "project",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "deployment_manifest_task",
+            },
+        ),
+        TaskSpec(
+            task_id="deployment_manifest_task",
+            prompt="deployment manifest",
+            workspace_subdir="deployment_manifest_task",
+            max_steps=12,
+            metadata={"benchmark_family": "project", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="repository_migration_wave_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="repository_migration_wave_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "repository",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "repository_migration_wave_task",
+            },
+        ),
+        TaskSpec(
+            task_id="repository_migration_wave_task",
+            prompt="repository migration wave",
+            workspace_subdir="repository_migration_wave_task",
+            max_steps=18,
+            metadata={"benchmark_family": "repository", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="integration_failover_drill_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="integration_failover_drill_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "integration",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "integration_failover_drill_task",
+            },
+        ),
+        TaskSpec(
+            task_id="integration_failover_drill_task",
+            prompt="integration failover drill",
+            workspace_subdir="integration_failover_drill_task",
+            max_steps=18,
+            metadata={"benchmark_family": "integration", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="tooling_release_contract_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="tooling_release_contract_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "tooling",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "tooling_release_contract_task",
+            },
+        ),
+        TaskSpec(
+            task_id="tooling_release_contract_task",
+            prompt="tooling release contract",
+            workspace_subdir="tooling_release_contract_task",
+            max_steps=18,
+            metadata={"benchmark_family": "tooling", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="report_rollup_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="report_rollup_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "workflow",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "report_rollup_task",
+            },
+        ),
+        TaskSpec(
+            task_id="report_rollup_task",
+            prompt="report rollup",
+            workspace_subdir="report_rollup_task",
+            max_steps=18,
+            metadata={"benchmark_family": "workflow", "difficulty": "long_horizon"},
+        ),
+    ]
+
+    selected = _limit_tasks_for_compare(
+        tasks,
+        5,
+        priority_families=["integration", "repository", "project", "tooling", "workflow"],
+        prefer_retrieval_tasks=True,
+        prefer_long_horizon_tasks=True,
+    )
+
+    assert [task.task_id for task in selected] == [
+        "integration_failover_drill_retrieval_task",
+        "repository_migration_wave_retrieval_task",
+        "deployment_manifest_retrieval_task",
+        "tooling_release_contract_retrieval_task",
+        "report_rollup_retrieval_task",
+    ]
+
+
+def test_run_eval_restrict_priority_keeps_retrieval_companions_when_requested(monkeypatch, tmp_path):
+    task_specs = [
+        TaskSpec(
+            task_id="integration_failover_drill_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="integration_failover_drill_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "integration",
+                "difficulty": "multi_system",
+                "requires_retrieval": True,
+                "source_task": "integration_failover_drill_task",
+            },
+        ),
+        TaskSpec(
+            task_id="integration_failover_drill_task",
+            prompt="integration source",
+            workspace_subdir="integration_failover_drill_task",
+            max_steps=18,
+            metadata={"benchmark_family": "integration", "difficulty": "multi_system"},
+        ),
+        TaskSpec(
+            task_id="repository_migration_wave_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="repository_migration_wave_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "repository",
+                "difficulty": "cross_component",
+                "requires_retrieval": True,
+                "source_task": "repository_migration_wave_task",
+            },
+        ),
+        TaskSpec(
+            task_id="repository_migration_wave_task",
+            prompt="repository source",
+            workspace_subdir="repository_migration_wave_task",
+            max_steps=18,
+            metadata={"benchmark_family": "repository", "difficulty": "cross_component"},
+        ),
+        TaskSpec(
+            task_id="deployment_manifest_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="deployment_manifest_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "project",
+                "difficulty": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "deployment_manifest_task",
+            },
+        ),
+        TaskSpec(
+            task_id="deployment_manifest_task",
+            prompt="project source",
+            workspace_subdir="deployment_manifest_task",
+            max_steps=18,
+            metadata={"benchmark_family": "project", "difficulty": "long_horizon"},
+        ),
+        TaskSpec(
+            task_id="tooling_release_contract_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="tooling_release_contract_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "tooling",
+                "difficulty": "cross_tool",
+                "requires_retrieval": True,
+                "source_task": "tooling_release_contract_task",
+            },
+        ),
+        TaskSpec(
+            task_id="tooling_release_contract_task",
+            prompt="tooling source",
+            workspace_subdir="tooling_release_contract_task",
+            max_steps=18,
+            metadata={"benchmark_family": "tooling", "difficulty": "cross_tool"},
+        ),
+        TaskSpec(
+            task_id="config_sync_retrieval_task",
+            prompt="retrieval companion",
+            workspace_subdir="config_sync_retrieval_task",
+            max_steps=18,
+            metadata={
+                "benchmark_family": "workflow",
+                "difficulty": "retrieval",
+                "requires_retrieval": True,
+                "source_task": "config_sync_task",
+            },
+        ),
+        TaskSpec(
+            task_id="config_sync_task",
+            prompt="workflow source",
+            workspace_subdir="config_sync_task",
+            max_steps=18,
+            metadata={"benchmark_family": "workflow", "difficulty": "retrieval"},
+        ),
+    ]
+
+    class FakeTaskBank:
+        def __init__(self, config=None):
+            del config
+
+        def list(self):
+            return list(task_specs)
+
+    executed: list[str] = []
+
+    class FakeKernel:
+        def __init__(self, config=None, policy=None):
+            del config, policy
+
+        def run_task(self, task, progress_callback=None):
+            del progress_callback
+            executed.append(task.task_id)
+            workspace = tmp_path / "workspace" / task.workspace_subdir
+            workspace.mkdir(parents=True, exist_ok=True)
+            return EpisodeRecord(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                workspace=str(workspace),
+                success=True,
+                steps=[
+                    StepRecord(
+                        index=1,
+                        thought="done",
+                        action="code_execute",
+                        content="true",
+                        selected_skill_id=None,
+                        command_result=None,
+                        verification={"passed": True},
+                    )
+                ],
+                termination_reason="success",
+                task_metadata=dict(task.metadata),
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(harness_module, "TaskBank", FakeTaskBank)
+    monkeypatch.setattr(harness_module, "AgentKernel", FakeKernel)
+
+    metrics = run_eval(
+        config=KernelConfig(
+            provider="vllm",
+            use_tolbert_context=True,
+            workspace_root=tmp_path / "workspace",
+            run_reports_dir=tmp_path / "reports",
+        ),
+        task_limit=5,
+        priority_benchmark_families=["integration", "repository", "project", "tooling", "workflow"],
+        prefer_retrieval_tasks=True,
+        prefer_long_horizon_tasks=True,
+        restrict_to_priority_benchmark_families=True,
+    )
+
+    assert metrics.total == 5
+    assert executed == [
+        "integration_failover_drill_retrieval_task",
+        "repository_migration_wave_retrieval_task",
+        "deployment_manifest_retrieval_task",
+        "tooling_release_contract_retrieval_task",
+        "config_sync_retrieval_task",
+    ]
 
 
 def test_limit_tasks_for_compare_prefers_executable_required_integration_tasks_over_retrieval_companions():

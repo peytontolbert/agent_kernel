@@ -1,4 +1,5 @@
 import io
+import time
 from urllib import error
 from pathlib import Path
 
@@ -9,9 +10,11 @@ import json
 from agent_kernel.config import KernelConfig
 from agent_kernel.llm import (
     HybridDecoderClient,
+    ModelStackClient,
     VLLMClient,
     OllamaClient,
     _extract_json_object,
+    _post_json,
     coerce_action_decision,
 )
 
@@ -258,6 +261,213 @@ def test_vllm_client_reduces_completion_budget_after_context_limit_error(monkeyp
 
     assert decision["action"] == "respond"
     assert calls["max_tokens"][:3] == [384, 384, 256]
+
+
+def test_model_stack_client_uses_token_generation_endpoint(monkeypatch):
+    seen = {}
+
+    class FakeTokenizer:
+        def encode(self, text):
+            seen["prompt"] = text
+            return [1, 2, 3]
+
+        def decode(self, ids):
+            seen["decoded_ids"] = list(ids)
+            return '{"thought":"ok","action":"respond","content":"done","done":true}'
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_ids": [[1, 2, 3, 100, 101]]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        seen["timeout"] = timeout
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["payload"] = json.loads(req.data.decode("utf-8"))
+        return _Response()
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(ModelStackClient, "_load_tokenizer", lambda self: FakeTokenizer())
+    client = ModelStackClient(
+        host="http://127.0.0.1:8001",
+        model_name="model-stack-test",
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        model_dir="/tmp/model-stack-model",
+        repo_path="/tmp/model-stack",
+        api_key="secret",
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert decision["action"] == "respond"
+    assert decision["decision_source"] == "model_stack"
+    assert seen["url"] == "http://127.0.0.1:8001/v1/generate"
+    assert seen["timeout"] == 3
+    assert seen["headers"]["Authorization"] == "Bearer secret"
+    assert seen["payload"]["input_ids"] == [[1, 2, 3]]
+    assert seen["payload"]["do_sample"] is False
+    assert seen["payload"]["temperature"] == 0.0
+    assert seen["payload"]["max_new_tokens"] == 32
+    assert seen["decoded_ids"] == [100, 101]
+
+
+def test_model_stack_client_recovers_from_transient_generation_failure(monkeypatch):
+    calls = {"count": 0}
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [1, 2, 3]
+
+        def decode(self, ids):
+            return '{"thought":"ok","action":"respond","content":"done","done":true}'
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_ids": [[1, 2, 3, 100, 101]]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del req, timeout
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise TimeoutError("slow local model")
+        return _Response()
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(ModelStackClient, "_load_tokenizer", lambda self: FakeTokenizer())
+    client = ModelStackClient(
+        host="http://127.0.0.1:8001",
+        model_name="model-stack-test",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        model_dir="/tmp/model-stack-model",
+        repo_path="/tmp/model-stack",
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert decision["decision_source"] == "model_stack"
+    assert calls["count"] == 2
+
+
+def test_model_stack_client_accepts_decision_token_budget_override(monkeypatch):
+    seen = {"max_new_tokens": []}
+
+    class FakeTokenizer:
+        def encode(self, text):
+            del text
+            return [1, 2, 3]
+
+        def decode(self, ids):
+            del ids
+            return '{"thought":"ok","action":"respond","content":"done","done":true}'
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_ids": [[1, 2, 3, 100]]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        payload = json.loads(req.data.decode("utf-8"))
+        seen["max_new_tokens"].append(int(payload["max_new_tokens"]))
+        return _Response()
+
+    monkeypatch.setenv("AGENT_KERNEL_MODEL_STACK_DECISION_MAX_TOKENS", "8,16")
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(ModelStackClient, "_load_tokenizer", lambda self: FakeTokenizer())
+    client = ModelStackClient(
+        host="http://127.0.0.1:8001",
+        model_name="model-stack-test",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        model_dir="/tmp/model-stack-model",
+        repo_path="/tmp/model-stack",
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert decision["decision_source"] == "model_stack"
+    assert seen["max_new_tokens"] == [8]
+
+
+def test_post_json_enforces_wall_timeout(monkeypatch):
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            time.sleep(2)
+            return b'{"ok":true}'
+
+    def fake_urlopen(req, timeout):
+        del req, timeout
+        return _Response()
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="wall timeout"):
+        _post_json(
+            url="http://127.0.0.1:8001/v1/generate",
+            payload={"input_ids": [[1]], "max_new_tokens": 1},
+            timeout_seconds=1,
+            retry_attempts=1,
+            retry_backoff_seconds=0.0,
+            headers={"Content-Type": "application/json"},
+            error_label="Model Stack request",
+        )
+
+    assert time.monotonic() - started < 1.8
+
+
+def test_model_stack_client_requires_tokenizer_root():
+    client = ModelStackClient(
+        host="http://127.0.0.1:8001",
+        model_name="not-a-path",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        repo_path="/tmp/model-stack",
+    )
+
+    with pytest.raises(RuntimeError, match="requires AGENT_KERNEL_MODEL_STACK_TOKENIZER_PATH"):
+        client._tokenizer_root()
 
 
 def test_vllm_client_compacts_large_prompt_payload(monkeypatch):

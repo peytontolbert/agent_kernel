@@ -1060,6 +1060,14 @@ def load_transition_pressure_tasks(episodes_root: Path, *, limit: int | None = N
             prompt=pressure_task.prompt,
             failure_modes=", ".join(transition_failures),
         )
+        underlying_source_task_id = str(contract.metadata.get("source_task", "")).strip()
+        if not pressure_task.suggested_commands and underlying_source_task_id:
+            try:
+                underlying_source_task = bank.get(underlying_source_task_id)
+            except KeyError:
+                underlying_source_task = None
+            if underlying_source_task is not None:
+                pressure_task.suggested_commands = list(underlying_source_task.suggested_commands)
         pressure_task.workspace_subdir = (
             f"{contract.workspace_subdir}{_memory_task_rule_text('transition_pressure', 'workspace_suffix', fallback='_transition_pressure')}"
         )

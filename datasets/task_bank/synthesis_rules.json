@@ -1,0 +1,158 @@
+{
+  "worker_prompt_template": "On branch {branch}, update only these worker-owned paths: {owned}. Keep unrelated paths unchanged, run any assigned tests, and commit the branch.",
+  "worker_report": {
+    "path_template": "reports/{worker_name}_report.txt",
+    "base_must_mention": [
+      "updated"
+    ]
+  },
+  "branch_intent": {
+    "preferred_states": {
+      "ready": "ready",
+      "done": "done",
+      "fixed": "ready",
+      "complete": "complete",
+      "final": "final",
+      "enabled": "enabled"
+    },
+    "direct_replacements": [
+      "pending",
+      "broken",
+      "stale",
+      "wip"
+    ],
+    "todo_replacement": "done",
+    "draft_replacement": "final"
+  },
+  "edit_kind_order": [
+    "token_replace",
+    "line_replace",
+    "line_delete",
+    "line_insert",
+    "block_replace",
+    "rewrite"
+  ],
+  "edit_scores": {
+    "token_replace": {
+      "base": 10,
+      "per_replacement": 5,
+      "char_weight": 1
+    },
+    "line_replace": {
+      "base": 30,
+      "per_replacement": 12,
+      "char_weight": 1
+    },
+    "line_insert": {
+      "base": 38,
+      "per_line": 12,
+      "char_weight": 1
+    },
+    "line_delete": {
+      "base": 34,
+      "per_line": 10,
+      "char_weight": 1
+    },
+    "block_replace": {
+      "base": 60,
+      "per_line": 20,
+      "char_weight": 1
+    },
+    "rewrite": {
+      "base": 120,
+      "char_weight": 1
+    }
+  },
+  "memory_task_rules": {
+    "episode_replay": {
+      "task_id_suffix": "_episode_replay",
+      "workspace_suffix": "_episode_replay",
+      "prompt_template": "Reproduce a previously successful task from episodic memory. {prompt}",
+      "metadata": {
+        "benchmark_family": "episode_memory",
+        "memory_source": "episode",
+        "requires_retrieval": true
+      }
+    },
+    "discovered_task": {
+      "task_id_suffix": "_discovered",
+      "workspace_suffix": "_discovered",
+      "prompt_template": "Solve a discovered robustness task derived from prior failures or bad state transitions. {prompt}",
+      "metadata": {
+        "benchmark_family": "discovered_task",
+        "memory_source": "discovered_task"
+      }
+    },
+    "transition_pressure": {
+      "task_id_suffix": "_transition_pressure",
+      "workspace_suffix": "_transition_pressure",
+      "prompt_template": "Solve a transition-pressure task derived from prior bad state transitions. Avoid repeating these failure modes: {failure_modes}. {prompt}",
+      "metadata": {
+        "benchmark_family": "transition_pressure",
+        "memory_source": "transition_pressure"
+      }
+    },
+    "skill_replay": {
+      "task_id_suffix": "_skill_replay",
+      "workspace_suffix": "_skill_replay",
+      "prompt_template": "Use the promoted reusable procedure from prior successful work to solve an equivalent task. {prompt}",
+      "metadata": {
+        "benchmark_family": "skill_memory",
+        "memory_source": "skill",
+        "requires_skill_memory": true
+      }
+    },
+    "verifier_replay": {
+      "task_id_suffix": "_verifier_replay",
+      "workspace_suffix": "_verifier_replay",
+      "metadata": {
+        "benchmark_family": "verifier_memory",
+        "memory_source": "verifier"
+      }
+    },
+    "skill_transfer": {
+      "task_id_suffix": "_skill_transfer",
+      "workspace_suffix": "_skill_transfer",
+      "prompt_template": "Attempt cross-task transfer with the raw remembered procedure from a different task. {prompt}",
+      "metadata": {
+        "benchmark_family": "skill_transfer",
+        "memory_source": "skill_transfer"
+      }
+    },
+    "operator_replay": {
+      "task_id_suffix": "_operator_replay",
+      "workspace_suffix": "_operator_replay",
+      "prompt_template": "Use the induced operator class distilled from multiple successful procedures to solve a related task. {prompt}",
+      "metadata": {
+        "benchmark_family": "operator_memory",
+        "memory_source": "operator"
+      }
+    },
+    "benchmark_candidate": {
+      "task_id_suffix": "_benchmark_candidate",
+      "workspace_suffix": "_benchmark_candidate",
+      "metadata": {
+        "benchmark_family": "benchmark_candidate",
+        "memory_source": "benchmark_candidate"
+      }
+    },
+    "verifier_candidate": {
+      "task_id_suffix": "_verifier_candidate",
+      "workspace_suffix": "_verifier_candidate",
+      "metadata": {
+        "benchmark_family": "verifier_candidate",
+        "memory_source": "verifier_candidate"
+      }
+    },
+    "tool_replay": {
+      "task_id_suffix": "_tool_replay",
+      "workspace_suffix": "_tool_replay",
+      "prompt_template": "Use the promoted local shell procedure from prior successful work to solve an equivalent task. {prompt}",
+      "metadata": {
+        "benchmark_family": "tool_memory",
+        "memory_source": "tool",
+        "requires_tool_memory": true
+      }
+    }
+  }
+}

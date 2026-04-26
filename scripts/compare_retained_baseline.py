@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
+from dataclasses import asdict
 import json
 
 from agent_kernel.config import KernelConfig
@@ -14,7 +16,7 @@ from agent_kernel.improvement import ImprovementPlanner
 from agent_kernel.extensions.improvement.artifacts import payload_with_active_artifact_context, retention_gate_for_payload
 from agent_kernel.improvement_retention import proposal_gate_failure_reasons_by_benchmark_family, retention_evidence
 from agent_kernel.extensions.strategy.subsystems import active_artifact_path_for_subsystem, base_subsystem_for, comparison_config_for_subsystem_artifact
-from evals.harness import compare_abstraction_transfer_modes, run_eval
+from evals.harness import _cleanup_scoped_runtime_state, _scoped_config, compare_abstraction_transfer_modes, run_eval
 
 
 def _artifact_path_for_subsystem(config: KernelConfig, subsystem: str) -> Path:
@@ -25,12 +27,42 @@ def _comparison_flags(subsystem: str, *, config: KernelConfig | None = None) -> 
     return comparison_flags(subsystem, config=config)
 
 
+def _run_eval_kwargs(
+    flags: dict[str, bool],
+    *,
+    task_limit: int | None,
+    priority_benchmark_families: list[str],
+    restrict_to_priority_benchmark_families: bool,
+    prefer_retrieval_tasks: bool,
+    include_discovered_tasks: bool,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(flags)
+    kwargs["task_limit"] = task_limit
+    kwargs["priority_benchmark_families"] = list(priority_benchmark_families)
+    kwargs["restrict_to_priority_benchmark_families"] = bool(restrict_to_priority_benchmark_families)
+    kwargs["prefer_retrieval_tasks"] = bool(prefer_retrieval_tasks)
+    kwargs["include_discovered_tasks"] = bool(include_discovered_tasks)
+    return kwargs
+
+
+def _compare_scope_name(subsystem: str, lane: str) -> str:
+    normalized_subsystem = str(subsystem).strip() or "unknown"
+    normalized_lane = str(lane).strip() or "lane"
+    return f"compare_retained_baseline_{normalized_subsystem}_{normalized_lane}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--subsystem", required=True)
     parser.add_argument("--artifact-path", default=None)
     parser.add_argument("--cycles-path", default=None)
     parser.add_argument("--before-cycle-id", default=None)
+    parser.add_argument("--task-limit", type=int, default=None)
+    parser.add_argument("--priority-benchmark-family", action="append", default=[])
+    parser.add_argument("--restrict-to-priority-benchmark-families", action="store_true")
+    parser.add_argument("--prefer-retrieval-tasks", action="store_true")
+    parser.add_argument("--include-discovered-tasks", action="store_true")
+    parser.add_argument("--output-json", default=None)
     args = parser.parse_args()
 
     config = KernelConfig()
@@ -55,31 +87,51 @@ def main() -> None:
     if not snapshot_path.exists():
         raise SystemExit(f"retained artifact snapshot does not exist: {snapshot_path}")
 
-    baseline_config = comparison_config_for_subsystem_artifact(config, args.subsystem, snapshot_path)
-    current_config = comparison_config_for_subsystem_artifact(config, args.subsystem, artifact_path)
+    baseline_config = comparison_config_for_subsystem_artifact(
+        _scoped_config(config, _compare_scope_name(args.subsystem, "baseline")),
+        args.subsystem,
+        snapshot_path,
+    )
+    current_config = comparison_config_for_subsystem_artifact(
+        _scoped_config(config, _compare_scope_name(args.subsystem, "current")),
+        args.subsystem,
+        artifact_path,
+    )
     flags = autonomous_runtime_eval_flags(config, _comparison_flags(args.subsystem, config=config))
-    if base_subsystem_for(args.subsystem, config.capability_modules_path) == "operators":
-        baseline_metrics = compare_abstraction_transfer_modes(
-            config=baseline_config,
-            include_episode_memory=flags["include_episode_memory"],
-            include_verifier_memory=flags["include_verifier_memory"],
-            include_benchmark_candidates=flags["include_benchmark_candidates"],
-            include_verifier_candidates=flags["include_verifier_candidates"],
-            include_generated=flags["include_generated"],
-            include_failure_generated=flags["include_failure_generated"],
-        ).operator_metrics
-        current_metrics = compare_abstraction_transfer_modes(
-            config=current_config,
-            include_episode_memory=flags["include_episode_memory"],
-            include_verifier_memory=flags["include_verifier_memory"],
-            include_benchmark_candidates=flags["include_benchmark_candidates"],
-            include_verifier_candidates=flags["include_verifier_candidates"],
-            include_generated=flags["include_generated"],
-            include_failure_generated=flags["include_failure_generated"],
-        ).operator_metrics
-    else:
-        baseline_metrics = run_eval(config=baseline_config, **flags)
-        current_metrics = run_eval(config=current_config, **flags)
+    run_eval_kwargs = _run_eval_kwargs(
+        flags,
+        task_limit=args.task_limit,
+        priority_benchmark_families=[str(value).strip() for value in args.priority_benchmark_family if str(value).strip()],
+        restrict_to_priority_benchmark_families=args.restrict_to_priority_benchmark_families,
+        prefer_retrieval_tasks=args.prefer_retrieval_tasks,
+        include_discovered_tasks=args.include_discovered_tasks,
+    )
+    try:
+        if base_subsystem_for(args.subsystem, config.capability_modules_path) == "operators":
+            baseline_metrics = compare_abstraction_transfer_modes(
+                config=baseline_config,
+                include_episode_memory=flags["include_episode_memory"],
+                include_verifier_memory=flags["include_verifier_memory"],
+                include_benchmark_candidates=flags["include_benchmark_candidates"],
+                include_verifier_candidates=flags["include_verifier_candidates"],
+                include_generated=flags["include_generated"],
+                include_failure_generated=flags["include_failure_generated"],
+            ).operator_metrics
+            current_metrics = compare_abstraction_transfer_modes(
+                config=current_config,
+                include_episode_memory=flags["include_episode_memory"],
+                include_verifier_memory=flags["include_verifier_memory"],
+                include_benchmark_candidates=flags["include_benchmark_candidates"],
+                include_verifier_candidates=flags["include_verifier_candidates"],
+                include_generated=flags["include_generated"],
+                include_failure_generated=flags["include_failure_generated"],
+            ).operator_metrics
+        else:
+            baseline_metrics = run_eval(config=baseline_config, **run_eval_kwargs)
+            current_metrics = run_eval(config=current_config, **run_eval_kwargs)
+    finally:
+        _cleanup_scoped_runtime_state(baseline_config)
+        _cleanup_scoped_runtime_state(current_config)
     current_payload: dict[str, object] | None = None
     baseline_payload: dict[str, object] | None = None
     try:
@@ -116,6 +168,26 @@ def main() -> None:
         evidence,
         subject="current artifact",
     )
+    report_payload = {
+        "subsystem": args.subsystem,
+        "current_artifact_path": str(artifact_path),
+        "baseline_snapshot_path": str(snapshot_path),
+        "baseline_cycle_id": str(prior_record.get("cycle_id", "")),
+        "task_limit": args.task_limit,
+        "priority_benchmark_families": run_eval_kwargs["priority_benchmark_families"],
+        "restrict_to_priority_benchmark_families": run_eval_kwargs["restrict_to_priority_benchmark_families"],
+        "prefer_retrieval_tasks": run_eval_kwargs["prefer_retrieval_tasks"],
+        "include_discovered_tasks": run_eval_kwargs["include_discovered_tasks"],
+        "baseline_metrics": asdict(baseline_metrics),
+        "current_metrics": asdict(current_metrics),
+        "evidence": evidence,
+        "retention_gate": retention_gate,
+        "proposal_gate_failures": proposal_gate_failures,
+    }
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report_payload, indent=2, sort_keys=True), encoding="utf-8")
 
     print(
         f"subsystem={args.subsystem} "
@@ -249,6 +321,8 @@ def main() -> None:
             f"family_proposal_gate_failure benchmark_family={family} "
             f"reason={proposal_gate_failures[family]}"
         )
+    if args.output_json:
+        print(f"output_json={args.output_json}")
 
 
 if __name__ == "__main__":

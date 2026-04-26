@@ -2708,6 +2708,50 @@ def test_discovered_and_transition_pressure_skip_synthetic_lineage_sources(tmp_p
     assert load_transition_pressure_tasks(episodes_root) == []
 
 
+def test_transition_pressure_tasks_inherit_underlying_source_task_suggestions(tmp_path):
+    episodes_root = tmp_path / "episodes"
+    episodes_root.mkdir()
+    bank = TaskBank()
+    retrieval_task = bank.get("integration_failover_drill_retrieval_task")
+    assert retrieval_task.suggested_commands == []
+    source_task = bank.get("integration_failover_drill_task")
+    assert source_task.suggested_commands
+
+    (episodes_root / "integration_failover_drill_retrieval_task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "integration_failover_drill_retrieval_task",
+                "prompt": retrieval_task.prompt,
+                "workspace": str(tmp_path / "workspace" / "integration_failover_drill_retrieval_task"),
+                "success": False,
+                "task_metadata": dict(retrieval_task.metadata),
+                "task_contract": {
+                    "prompt": retrieval_task.prompt,
+                    "workspace_subdir": retrieval_task.workspace_subdir,
+                    "setup_commands": list(retrieval_task.setup_commands),
+                    "success_command": retrieval_task.success_command,
+                    "suggested_commands": list(retrieval_task.suggested_commands),
+                    "expected_files": list(retrieval_task.expected_files),
+                    "expected_output_substrings": list(retrieval_task.expected_output_substrings),
+                    "forbidden_files": list(retrieval_task.forbidden_files),
+                    "forbidden_output_substrings": list(retrieval_task.forbidden_output_substrings),
+                    "expected_file_contents": dict(retrieval_task.expected_file_contents),
+                    "max_steps": retrieval_task.max_steps,
+                    "metadata": dict(retrieval_task.metadata),
+                },
+                "summary": {"transition_failures": ["no_state_progress"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = load_transition_pressure_tasks(episodes_root)
+
+    assert len(tasks) == 1
+    assert tasks[0].task_id == "integration_failover_drill_retrieval_task_transition_pressure"
+    assert tasks[0].suggested_commands == source_task.suggested_commands
+
+
 def test_skill_replay_tasks_load_from_skill_contract(tmp_path):
     skills_path = tmp_path / "skills.json"
     skills_path.write_text(

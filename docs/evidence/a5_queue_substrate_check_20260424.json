@@ -1,0 +1,70 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_delegated_queue",
+    "status": "supported",
+    "summary": "Persistent delegated queue can enqueue, select, execute, checkpoint, report, and close a bounded job in an isolated mock runtime."
+  },
+  "created_at": "2026-04-24T22:54:41Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py -k \"completes_mock_job or resumes_interrupted_job_without_active_lease or skips_live_leased_in_progress_job or writes_progress_sidecar\"",
+      "result": "4 passed, 65 deselected",
+      "covered_surfaces": [
+        "completed mock delegated job",
+        "checkpoint persistence",
+        "stale in-progress resume without active lease",
+        "live leased job skip",
+        "progress sidecar"
+      ]
+    },
+    "isolated_cli_run": {
+      "queue_root": "/tmp/agentkernel_a5_queue",
+      "provider": "mock",
+      "enqueue_result": {
+        "job_id": "job:hello_task:20260424T225326732810Z:ce4810f3",
+        "state": "queued",
+        "task_id": "hello_task",
+        "priority": 3,
+        "budget_group": "family_bounded"
+      },
+      "run_next_result": {
+        "job_id": "job:hello_task:20260424T225326732810Z:ce4810f3",
+        "state": "completed",
+        "task_id": "hello_task",
+        "outcome": "success"
+      },
+      "status_summary": {
+        "total_jobs": 1,
+        "state_counts": {
+          "completed": 1
+        },
+        "decision_counts": {
+          "selected:runnable_job": 1
+        },
+        "active_leases": 0,
+        "blocked_jobs": 0,
+        "scheduler_selected_total": 1,
+        "scheduler_blocked_total": 0
+      },
+      "checkpoint": {
+        "exists": true,
+        "status": "completed",
+        "success": true,
+        "termination_reason": "success"
+      },
+      "report": {
+        "exists": true,
+        "task_id": "hello_task",
+        "success": true
+      }
+    }
+  },
+  "open_limits": [
+    "This is A5 substrate evidence, not an A5 claim.",
+    "It uses provider=mock and a bounded built-in task, so live vLLM/non-mock long-horizon queue operation remains open.",
+    "The isolated /tmp queue artifacts are ephemeral; this packet records the durable summary."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

@@ -8,6 +8,74 @@ from ...improvement_engine import ImprovementExperiment
 from .improvement_common import normalized_control_mapping
 
 
+def _a4_runtime_conversion_transition_model_available(
+    planner: Any,
+    candidate_pool: list[ImprovementExperiment],
+    recent_activity: dict[str, dict[str, object]],
+) -> bool:
+    transition_model_candidates = [
+        candidate
+        for candidate in candidate_pool
+        if planner._base_subsystem(candidate.subsystem) == "transition_model"
+    ]
+    curriculum_candidates = [
+        candidate
+        for candidate in candidate_pool
+        if planner._base_subsystem(candidate.subsystem) == "curriculum"
+    ]
+    if not transition_model_candidates or not curriculum_candidates:
+        return False
+    transition_model_summary = next(
+        (
+            dict(recent_activity.get(candidate.subsystem, {}))
+            for candidate in transition_model_candidates
+            if isinstance(recent_activity.get(candidate.subsystem, {}), dict)
+        ),
+        {},
+    )
+    if (
+        int(transition_model_summary.get("total_decisions", 0) or 0) <= 0
+        and (
+            int(transition_model_summary.get("selected_cycles", 0) or 0) > 0
+            or int(transition_model_summary.get("no_yield_cycles", 0) or 0) > 0
+        )
+    ):
+        extended_transition_model_summary = planner.recent_subsystem_activity_summary(
+            subsystem="transition_model",
+            recent_cycle_window=12,
+        )
+        if isinstance(extended_transition_model_summary, dict):
+            transition_model_summary = dict(extended_transition_model_summary)
+    curriculum_summary = next(
+        (
+            dict(recent_activity.get(candidate.subsystem, {}))
+            for candidate in curriculum_candidates
+            if isinstance(recent_activity.get(candidate.subsystem, {}), dict)
+        ),
+        {},
+    )
+    transition_model_has_decision_reject = (
+        int(transition_model_summary.get("total_decisions", 0) or 0) > 0
+        and int(transition_model_summary.get("rejected_cycles", 0) or 0) > 0
+        and str(transition_model_summary.get("last_decision_state", "")).strip() == "reject"
+    )
+    curriculum_is_still_unresolved = (
+        int(curriculum_summary.get("total_decisions", 0) or 0) == 0
+        and (
+            int(curriculum_summary.get("no_yield_cycles", 0) or 0) > 0
+            or int(curriculum_summary.get("recent_incomplete_cycles", 0) or 0) > 0
+        )
+    )
+    curriculum_already_retained = (
+        int(curriculum_summary.get("retained_cycles", 0) or 0) > 0
+        and int(curriculum_summary.get("total_decisions", 0) or 0) > 0
+        and str(curriculum_summary.get("last_decision_state", "")).strip() == "retain"
+    )
+    return transition_model_has_decision_reject and (
+        curriculum_is_still_unresolved or curriculum_already_retained
+    )
+
+
 def select_portfolio_campaign(
     planner: Any,
     metrics: EvalMetrics,
@@ -71,6 +139,16 @@ def select_portfolio_campaign(
         if bool(broad_observe_signal.get("active", False)) and not bool(
             broad_observe_signal.get("retrieval_emergency", False)
         ):
+            a4_runtime_conversion_history_override = _a4_runtime_conversion_transition_model_available(
+                planner,
+                candidate_pool,
+                recent_activity,
+            )
+            a4_runtime_conversion_available = [
+                candidate
+                for candidate in candidate_pool
+                if bool(candidate.evidence.get("a4_runtime_conversion_priority", False))
+            ]
             retrieval_carryover_available = [
                 candidate
                 for candidate in candidate_pool
@@ -81,7 +159,18 @@ def select_portfolio_campaign(
                 for candidate in candidate_pool
                 if bool(candidate.evidence.get("retained_conversion_priority", False))
             ]
-            if bool(broad_observe_signal.get("primary_only_broad_observe", False)) and retrieval_carryover_available:
+            if bool(broad_observe_signal.get("primary_only_broad_observe", False)) and (
+                a4_runtime_conversion_available or a4_runtime_conversion_history_override
+            ):
+                if a4_runtime_conversion_available:
+                    candidate_pool = a4_runtime_conversion_available
+                else:
+                    candidate_pool = [
+                        candidate
+                        for candidate in candidate_pool
+                        if planner._base_subsystem(candidate.subsystem) == "transition_model"
+                    ]
+            elif bool(broad_observe_signal.get("primary_only_broad_observe", False)) and retrieval_carryover_available:
                 candidate_pool = retrieval_carryover_available
             elif bool(broad_observe_signal.get("primary_only_broad_observe", False)) and retained_conversion_available:
                 candidate_pool = retained_conversion_available
@@ -144,6 +233,12 @@ def select_portfolio_campaign(
             if bool(broad_observe_signal.get("active", False)):
                 if bool(broad_observe_signal.get("retrieval_emergency", False)):
                     reasons.append("broad_observe_diversification_blocked_by_retrieval_emergency")
+                elif bool(candidate.evidence.get("a4_runtime_conversion_priority", False)) or (
+                    bool(broad_observe_signal.get("primary_only_broad_observe", False))
+                    and planner._base_subsystem(candidate.subsystem) == "transition_model"
+                    and a4_runtime_conversion_history_override
+                ):
+                    reasons.append("a4_runtime_conversion_priority_preferred")
                 elif bool(candidate.evidence.get("retrieval_carryover_priority", False)):
                     reasons.append("retrieval_carryover_priority_preferred")
                 elif bool(broad_observe_signal.get("primary_only_broad_observe", False)) and bool(

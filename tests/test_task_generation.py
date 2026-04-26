@@ -284,6 +284,22 @@ def test_priority_long_horizon_tasks_first_suggestion_satisfies_contract(tmp_pat
         subprocess.run(task.success_command, shell=True, cwd=workspace, check=True)
 
 
+def test_tooling_release_contract_suggested_sequence_satisfies_contract(tmp_path):
+    task = TaskBank().get("tooling_release_contract_task")
+    workspace = tmp_path / task.task_id
+    workspace.mkdir()
+    for command in task.setup_commands:
+        subprocess.run(command, shell=True, cwd=workspace, check=True)
+
+    for command in task.suggested_commands[:8]:
+        subprocess.run(command, shell=True, cwd=workspace, check=True)
+
+    assert (workspace / "scripts" / "replay.sh").read_text(encoding="utf-8") == (
+        "#!/bin/sh\nprintf 'replay ready\\n'\n"
+    )
+    subprocess.run(task.success_command, shell=True, cwd=workspace, check=True)
+
+
 def test_task_bank_loads_external_manifest_tasks_from_directory_and_glob(tmp_path):
     manifests_dir = tmp_path / "task_manifests"
     manifests_dir.mkdir()

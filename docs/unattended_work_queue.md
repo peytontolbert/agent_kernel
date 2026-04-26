@@ -39,17 +39,24 @@ What improved:
 - top-level reports now preserve authoritative decision state
 - the run recorded `runtime_managed_decisions=1`
 - the sampled families now include `integration`, `project`, and `repository`
+- the April 11, 2026 reevaluation closed two runtime wiring bugs that had been overstating the live
+  unattended gap surface:
+  - retention/finalization no longer inherits bounded-observation curriculum suppression, so
+    autonomous phase gates are not falsely failed by missing generated lanes during priority-family
+    campaigns
+  - repeated-child supervision now clears stale decision state when a new `observe` cycle starts, so
+    a prior-cycle reject no longer contaminates later generated-failure work in the same child
 
 What is still not solved:
 
 - the credited retain was controller-closed over an incomplete child cycle rather than a clean
   child-native decision stream
-- the final child snapshot still carries conflicting progress interpretations
-- there is still no retained `discovered_strategy` path in live unattended artifacts
+- a live retained `discovered_strategy` path is now wired but still needs an integrated retained rerun artifact
 - runtime ontology expansion is not yet present in the catalogs
 - discovered structural work classes are not yet first-class in reports or routing
-- strategy memory exists, but it is still priors-heavy rather than lesson-driven and parent-linked
+- strategy memory now carries parent-linked lessons and reuse surfaces, but it still needs integrated retained evidence proving those priors improve unattended outcomes
 - counted trust breadth and retrieval carryover are not yet broadly proven
+- transparent unattended attach or supersede semantics are still not complete
 
 ## Active Steward Claim
 
@@ -145,8 +152,8 @@ Authoritative shape for unattended round closeout:
 
 Required conventions:
 
-- `decision_owner` must distinguish `child_native` from `controller_runtime_manager`
-- `closeout_mode` must distinguish `natural`, `accepted_partial_timeout`, and `forced_reject`
+- `decision_owner` must distinguish `child_native`, `controller_runtime_manager`, and `none`
+- `closeout_mode` must distinguish `natural`, `child_native_before_partial_timeout`, `partial_timeout_evidence_only`, and `forced_reject`
 - reports must expose both raw child state and authoritative round state without conflating them
 
 Owned by:
@@ -391,6 +398,11 @@ Each lane below is claimable by one Codex terminal. The write scopes are intenti
 - completion_update:
   - fallback campaign selection now enriches raw ranked-experiment fallbacks with canonical strategy candidates before record/finalize
   - excluded-subsystem fallback paths no longer produce anonymous strategy-memory nodes with empty `strategy_candidate_id`/`strategy_candidate_kind`
+  - primary-only broad-observe lanes can now emit `origin=discovered_strategy` instead of requiring generated-task coverage before strategy discovery is credited
+  - strategy memory nodes and snapshots now preserve `strategy_origin`, so retained discovered strategies can be reloaded and counted by later selectors
+  - canonical cycle records now promote `strategy_origin` at the top level and in `metrics_summary`, matching `strategy_candidate_id`/`strategy_candidate_kind` on observe, select, generate, sibling preview/evaluation, final closeout, retention-outcome, and final report records
+  - live detached validation `/data/agentkernel/var/unattended_run_20260410T182000Z_asi_lineage_surface_validation` proved sibling preview/evaluation rows now carry `strategy_origin=discovered_strategy`; it also exposed the remaining closeout-row lineage gap on `finalize_cycle` and `persist_retention_outcome`
+  - closeout-row lineage is patched and covered by `tests/test_finalize_cycle.py::test_finalize_cycle_promotes_strategy_lineage_to_closeout_records`; live validation is running under `/data/agentkernel/var/unattended_run_20260410T191100Z_asi_closeout_lineage_validation`
   - verified with fallback attribution, discovered-strategy planner, and strategy-memory tests
 
 ### `lane_ontology_expansion`

@@ -67,6 +67,12 @@ def planner_direct_decision(
     tolbert_route_mode: str,
 ) -> ActionDecision | None:
     del tolbert_mode, retrieval_has_signal
+    worker_direct_decision = policy._shared_repo_worker_direct_decision(
+        state,
+        blocked_commands=blocked_commands,
+    )
+    if worker_direct_decision is not None:
+        return worker_direct_decision
     integrator_segment_decision = policy._shared_repo_integrator_segment_direct_decision(
         state,
         blocked_commands=blocked_commands,
@@ -122,6 +128,12 @@ def critic_direct_decision(
     tolbert_route_mode: str,
 ) -> ActionDecision | None:
     del top_skill, retrieval_guidance, tolbert_mode, retrieval_has_signal, tolbert_route_mode
+    worker_direct_decision = policy._shared_repo_worker_direct_decision(
+        state,
+        blocked_commands=blocked_commands,
+    )
+    if worker_direct_decision is not None:
+        return worker_direct_decision
     integrator_segment_decision = policy._shared_repo_integrator_segment_direct_decision(
         state,
         blocked_commands=blocked_commands,
@@ -176,6 +188,12 @@ def executor_direct_decision(
     tolbert_route_mode: str,
 ) -> ActionDecision | None:
     del tolbert_mode, retrieval_has_signal
+    worker_direct_decision = policy._shared_repo_worker_direct_decision(
+        state,
+        blocked_commands=blocked_commands,
+    )
+    if worker_direct_decision is not None:
+        return worker_direct_decision
     integrator_segment_decision = policy._shared_repo_integrator_segment_direct_decision(
         state,
         blocked_commands=blocked_commands,
@@ -272,6 +290,8 @@ def best_deterministic_fallback_decision(
     blocked_commands: list[str],
     allow_partial_first_step: bool = False,
 ) -> ActionDecision | None:
+    if policy.workflow_adapter.deterministic_fallback_disabled(state):
+        return None
     metadata = dict(state.task.metadata) if isinstance(getattr(state.task, "metadata", {}), dict) else {}
     if (
         not allow_partial_first_step

@@ -1,22 +1,26 @@
-# TOLBERT Universal Family and Liftoff Architecture
+# TOLBERT Seed and Hybrid Liftoff Architecture
 
 ## Goal
 
-The long-term goal is to establish TOLBERT as the full encoder-latent-decoder universal family for the kernel.
+The long-term goal is to keep seeded TOLBERT as the encoder/retrieval compiler
+entry point while training a retained hybrid runtime that can eventually take
+over approved task families.
 
 Before liftoff:
 
 - `vllm` remains the authoritative free-form decoder and policy runtime
 - the live TOLBERT service supplies the encoder/retrieval compiler slice
-- retained hybrid TOLBERT-family checkpoints learn latent dynamics, transition/value/risk surfaces, and decoder control in shadow mode
-- new TOLBERT-family checkpoints are trained and evaluated under the existing retain/reject loop
+- retained hybrid checkpoints learn latent dynamics, transition/value/risk surfaces, and decoder control in shadow mode
+- new hybrid checkpoints are trained and evaluated under the existing retain/reject loop
 
 After liftoff:
 
-- a retained TOLBERT-family checkpoint becomes the default runtime for approved task families
+- a retained hybrid checkpoint becomes the default runtime for approved task families
 - `vllm` moves to fallback, arbitration, distillation, and exploration roles
 
-Liftoff is not a naming change. It is the point where retained TOLBERT-family checkpoints measurably outperform the `vllm` baseline without weakening verifier, trust, or side-effect posture.
+Liftoff is not a naming change. It is the point where retained hybrid checkpoints
+measurably outperform the `vllm` baseline without weakening verifier, trust, or
+side-effect posture.
 
 ## Architectural rule
 
@@ -24,8 +28,8 @@ The kernel should not split into separate "agent code" and "model project" repos
 
 Planned package boundary:
 
-- [`agent_kernel/modeling/`](/data/agentkernel/agent_kernel/modeling): model code, checkpoint interfaces, training/eval utilities, and TOLBERT-family components
-- [`agent_kernel/modeling/ssm/`](/data/agentkernel/agent_kernel/modeling/ssm): selective-scan and state-space modeling primitives for improved TOLBERT work
+- [`agent_kernel/modeling/`](/data/agentkernel/agent_kernel/modeling): model code, checkpoint interfaces, training/eval utilities, and retained hybrid-runtime components
+- [`agent_kernel/modeling/ssm/`](/data/agentkernel/agent_kernel/modeling/ssm): selective-scan and state-space modeling primitives for improved hybrid-runtime work
 - [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py): task execution loop
 - [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py): runtime routing between model capabilities and fallbacks
 - [`agent_kernel/preflight.py`](/data/agentkernel/agent_kernel/preflight.py): trust and safety gates
@@ -63,9 +67,9 @@ Current live role:
 Authority:
 
 - `vllm` remains the sole authoritative free-form decoder
-- the TOLBERT family is broader than the live service, but only its compiler slice is authoritative today
+- seeded `tolbert` refers to the live compiler slice; the retained modeled runtime is the separate `hybrid` lane
 
-### Stage 1: TOLBERT Policy Heads
+### Stage 1: Hybrid Policy Heads
 
 Add learned heads for:
 
@@ -74,7 +78,9 @@ Add learned heads for:
 - verifier-pass likelihood
 - action risk scoring
 
-At this stage, TOLBERT acts in shadow mode first, then in limited-authority lanes for narrow families where verifier outcomes are strong and action formats are constrained.
+At this stage, the retained hybrid runtime acts in shadow mode first, then in
+limited-authority lanes for narrow families where verifier outcomes are strong
+and action formats are constrained.
 
 The repo now has the bounded runtime handoff substrate for this:
 
@@ -82,7 +88,7 @@ The repo now has the bounded runtime handoff substrate for this:
 - shadow and primary family routing in [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py)
 - liftoff-gate reporting in [`agent_kernel/modeling/evaluation/liftoff.py`](/data/agentkernel/agent_kernel/modeling/evaluation/liftoff.py) and [`scripts/evaluate_tolbert_liftoff.py`](/data/agentkernel/scripts/evaluate_tolbert_liftoff.py)
 
-### Stage 2: TOLBERT Latent Dynamics, Transition, and World Modeling
+### Stage 2: Hybrid Latent Dynamics, Transition, and World Modeling
 
 Add learned heads for:
 
@@ -92,25 +98,26 @@ Add learned heads for:
 - retrieval reranking by expected future utility
 - learned latent state updates using state-space dynamics
 
-This is also the point where improved TOLBERT variants can start using
+This is also the point where improved hybrid variants can start using
 selective-scan and broader state-space modeling machinery as first-class model
 primitives rather than keeping them as external research dependencies.
 
 This does not replace the current symbolic world model in [`agent_kernel/world_model.py`](/data/agentkernel/agent_kernel/world_model.py). The symbolic model remains the explicit state/accounting layer. Learned world modeling augments it with generalization and forecasting.
 
-### Stage 3: TOLBERT Decoder Runtime
+### Stage 3: Hybrid Decoder Runtime
 
-When retained checkpoints are non-regressive, the policy layer can route approved task families to TOLBERT-first decoding.
+When retained checkpoints are non-regressive, the policy layer can route approved task families to hybrid-first decoding.
 
 At this point:
 
-- TOLBERT-family decoder control becomes primary for approved benchmark families
+- hybrid decoder control becomes primary for approved benchmark families
 - `vllm` remains available for fallback, arbitration, and teacher generation
 - trust and preflight gates still govern whether unattended execution is allowed
 
 ### Stage 4: Liftoff
 
-Liftoff occurs only when the kernel can retain a TOLBERT-family runtime bundle that is stronger than the `vllm` baseline across repeated evals and unattended runs.
+Liftoff occurs only when the kernel can retain a hybrid runtime bundle that is
+stronger than the `vllm` baseline across repeated evals and unattended runs.
 
 Liftoff criteria should include:
 
@@ -118,6 +125,7 @@ Liftoff criteria should include:
 - no safety regression
 - no hidden side-effect regression
 - no degradation in long-horizon or failure-recovery lanes
+- no regression in universal decoder exact-match, token-F1, or hybrid-vs-baseline decoder win rate
 - stable retained gains across multiple cycles
 
 ## Runtime roles before and after liftoff

@@ -14,6 +14,7 @@ from agent_kernel.modeling.policy.decoder import (
 )
 from agent_kernel.modeling.world.latent_state import build_latent_state_summary
 from agent_kernel.modeling.world.rollout import rollout_action_value
+from agent_kernel.extensions.policy_workflow_adapter import PolicyWorkflowAdapter
 from agent_kernel.policy import LLMDecisionPolicy, SkillLibrary
 from agent_kernel.schemas import ActionDecision, ContextPacket, StepRecord, TaskSpec
 from agent_kernel.state import AgentState
@@ -719,6 +720,141 @@ def test_llm_policy_shared_repo_integrator_skips_context_compile_for_first_merge
     assert decision.action == "code_execute"
     assert decision.decision_source == "shared_repo_integrator_segment_direct"
     assert decision.content == "git merge --no-ff worker/api-status -m 'merge worker/api-status'"
+    assert context_provider.compile_calls == 0
+    assert client.last_payload is None
+
+
+def test_llm_policy_shared_repo_worker_uses_contract_command_before_context_compile():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("shared-repo worker direct path should skip context compilation")
+
+    command = (
+        "sed -i '1s#routes pending#routes ready#' gateway/routes.txt && "
+        "tests/test_gateway.sh && mkdir -p reports && "
+        "printf 'updated worker/gateway-routes gateway/routes.txt gateway suite\\n' "
+        "> reports/worker_gateway-routes_report.txt && "
+        "git add gateway/routes.txt reports/worker_gateway-routes_report.txt && "
+        "git commit -m 'worker gateway routes ready'"
+    )
+    task = TaskSpec(
+        task_id="integration_parallel_failover_task__worker__worker_gateway-routes",
+        prompt="On branch worker/gateway-routes, update gateway/routes.txt and the worker report.",
+        workspace_subdir="integration_parallel_failover_task__worker__worker_gateway-routes",
+        suggested_commands=[command],
+        expected_files=["gateway/routes.txt", "reports/worker_gateway-routes_report.txt"],
+        metadata={
+            "benchmark_family": "integration",
+            "synthetic_worker": True,
+            "workflow_guard": {
+                "worker_branch": "worker/gateway-routes",
+                "target_branch": "main",
+                "shared_repo_id": "integration_parallel_failover",
+            },
+        },
+    )
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+
+    decision = policy.decide(AgentState(task=task))
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "shared_repo_worker_direct"
+    assert "worker_gateway-routes_report.txt" in decision.content
+    assert context_provider.compile_calls == 0
+    assert client.last_payload is None
+
+
+def test_llm_policy_explicit_shared_repo_worker_uses_contract_command_before_context_compile():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("explicit shared-repo worker direct path should skip context compilation")
+
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+
+    decision = policy.decide(AgentState(task=TaskBank().get("git_parallel_worker_api_task")))
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "shared_repo_worker_direct"
+    assert decision.content.startswith("printf 'API_STATUS=ready")
+    assert context_provider.compile_calls == 0
+    assert client.last_payload is None
+
+
+def test_llm_policy_workspace_contract_uses_exact_contract_before_context_compile():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("workspace contract direct path should skip context compilation")
+
+    task = TaskBank().get("api_contract_task")
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+
+    decision = policy.decide(AgentState(task=task))
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "workspace_contract_direct"
+    assert decision.content == task.suggested_commands[0]
+    assert context_provider.compile_calls == 0
+    assert client.last_payload is None
+
+
+def test_llm_policy_workspace_contract_stages_exact_long_horizon_sequence_before_context_compile():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("workspace contract staged path should skip context compilation")
+
+    task = TaskBank().get("tooling_release_contract_task")
+    first_command = task.suggested_commands[0]
+    state = AgentState(
+        task=task,
+        history=[
+            StepRecord(
+                index=1,
+                thought="prepared artifact directories",
+                action="code_execute",
+                content=first_command,
+                selected_skill_id=None,
+                command_result={"command": first_command, "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+                verification={"passed": False, "reasons": ["scratch/old_payload.json still present"]},
+                decision_source="workspace_contract_direct",
+            )
+        ],
+        world_model_summary={"horizon": "long_horizon"},
+    )
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "workspace_contract_direct"
+    assert decision.content == task.suggested_commands[1]
     assert context_provider.compile_calls == 0
     assert client.last_payload is None
 
@@ -15653,6 +15789,150 @@ def test_llm_policy_synthesizes_trusted_retrieval_write_for_unsatisfied_artifact
     assert context_provider.compile_calls == 0
 
 
+def test_llm_policy_synthesizes_trusted_retrieval_write_without_explicit_materialize_subgoal():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("trusted retrieval fallback materialize should skip context compilation")
+
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="trusted_retrieval_materialize_fallback_task",
+            prompt="Recover the missing release status artifact.",
+            workspace_subdir="trusted_retrieval_materialize_fallback_task",
+            suggested_commands=[],
+            expected_files=["reports/status.txt", "audit/verification.txt"],
+            expected_file_contents={
+                "reports/status.txt": "status ready\n",
+                "audit/verification.txt": "verification ready\n",
+            },
+            metadata={
+                "difficulty": "long_horizon",
+                "benchmark_family": "repository",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior verifier run showed the report is still missing",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/status.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "recover the release packet"
+    state.consecutive_failures = 1
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": ["reports/status.txt", "audit/verification.txt"],
+        "missing_expected_artifacts": ["reports/status.txt"],
+        "unsatisfied_expected_contents": ["reports/status.txt"],
+        "completion_ratio": 0.6,
+    }
+    state.graph_summary = {
+        "trusted_retrieval_successes": 2,
+        "trusted_retrieval_command_counts": {
+            "mkdir -p app && printf 'release ready\\n' > app/release.txt": 2,
+        },
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "trusted_retrieval_carryover_direct"
+    assert decision.retrieval_influenced is True
+    assert decision.selected_retrieval_span_id.startswith("graph:trusted_retrieval:materialize:")
+    assert decision.content == policy._trusted_retrieval_materialize_write_command(
+        "reports/status.txt",
+        "status ready\n",
+    )
+    assert context_provider.compile_calls == 0
+
+
+def test_llm_policy_executor_allows_trusted_retrieval_materialize_before_context_compile():
+    class UnexpectedContextProvider:
+        def __init__(self) -> None:
+            self.compile_calls = 0
+
+        def compile(self, state):
+            del state
+            self.compile_calls += 1
+            raise AssertionError("executor trusted retrieval carryover should skip context compilation")
+
+    client = CapturingClient()
+    context_provider = UnexpectedContextProvider()
+    policy = LLMDecisionPolicy(client, context_provider=context_provider)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="executor_trusted_retrieval_materialize_task",
+            prompt="Recover the repository migration wave outputs.",
+            workspace_subdir="executor_trusted_retrieval_materialize_task",
+            suggested_commands=[],
+            expected_files=["reports/migration.txt", "audit/verification.txt"],
+            expected_file_contents={
+                "reports/migration.txt": "repository migration recorded\n",
+                "audit/verification.txt": "repo verification complete\n",
+            },
+            metadata={
+                "difficulty": "cross_component",
+                "horizon": "long_horizon",
+                "benchmark_family": "repository",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.current_role = "executor"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior verifier run showed the migration outputs are still incomplete",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/migration.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "materialize expected artifact docs/overview.md"
+    state.world_model_summary = {
+        "horizon": "bounded",
+        "expected_artifacts": ["reports/migration.txt", "audit/verification.txt"],
+        "missing_expected_artifacts": ["reports/migration.txt", "audit/verification.txt"],
+        "unsatisfied_expected_contents": ["reports/migration.txt", "audit/verification.txt"],
+        "completion_ratio": 0.4,
+    }
+    state.graph_summary = {
+        "trusted_retrieval_command_counts": {
+            "mkdir -p requests api responses && printf 'GET /template\\n' > requests/template.http && printf '{\"route\": \"/health\", \"method\": \"GET\"}\\n' > api/request.json && printf '{\"status\": \"ok\"}\\n' > responses/expected.json": 2,
+        },
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "trusted_retrieval_carryover_direct"
+    assert decision.retrieval_influenced is True
+    assert decision.selected_retrieval_span_id.startswith("graph:trusted_retrieval:materialize:")
+    assert (
+        "reports/migration.txt" in decision.content
+        or "audit/verification.txt" in decision.content
+    )
+    assert "requests/template.http" not in decision.content
+    assert context_provider.compile_calls == 0
+
+
 def test_llm_policy_does_not_synthesize_trusted_retrieval_rewrite_when_preview_exists():
     policy = LLMDecisionPolicy(MockLLMClient())
     state = AgentState(
@@ -15710,6 +15990,544 @@ def test_llm_policy_does_not_synthesize_trusted_retrieval_rewrite_when_preview_e
     )
 
     assert candidates == []
+
+
+def test_trusted_retrieval_carryover_candidates_skip_off_surface_direct_command_for_retrieval_task():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repository_migration_wave_retrieval_task",
+            prompt="Recover the repository migration wave outputs.",
+            workspace_subdir="repository_migration_wave_retrieval_task",
+            suggested_commands=[],
+            expected_files=[
+                "reports/migration.txt",
+                "audit/verification.txt",
+                "config/deploy.env",
+            ],
+            expected_file_contents={
+                "reports/migration.txt": "repository migration recorded\n",
+                "audit/verification.txt": "repo verification complete\n",
+                "config/deploy.env": "DEPLOY_MODE=wave2\nFEATURE_GATE=enabled\n",
+            },
+            forbidden_files=["tmp/legacy_patch.txt"],
+            metadata={
+                "difficulty": "cross_component",
+                "horizon": "long_horizon",
+                "benchmark_family": "repository",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior verifier run showed the migration contract is still incomplete",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/migration.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "repair api request response bundle"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": ["reports/migration.txt", "audit/verification.txt", "config/deploy.env"],
+        "missing_expected_artifacts": ["reports/migration.txt", "audit/verification.txt"],
+    }
+    state.graph_summary = {
+        "trusted_retrieval_command_counts": {
+            "mkdir -p requests api responses && printf 'GET /template\\n' > requests/template.http && printf '{\"route\": \"/health\", \"method\": \"GET\"}\\n' > api/request.json && printf '{\"status\": \"ok\"}\\n' > responses/expected.json": 2,
+        },
+    }
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert all("requests/template.http" not in str(candidate.get("command", "")) for candidate in candidates)
+    assert any(
+        str(candidate.get("command", "")).startswith("mkdir -p ")
+        and (
+            "reports/migration.txt" in str(candidate.get("command", ""))
+            or "audit/verification.txt" in str(candidate.get("command", ""))
+        )
+        for candidate in candidates
+    )
+
+
+def test_trusted_retrieval_carryover_candidates_skip_off_surface_direct_command_for_project_retrieval_task():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(
+        task=TaskSpec(
+            task_id="project_release_cutover_retrieval_task",
+            prompt="Recover the project cutover outputs.",
+            workspace_subdir="project_release_cutover_retrieval_task",
+            suggested_commands=[],
+            expected_files=[
+                "notes/brief.txt",
+                "docs/charter.md",
+                "plan/timeline.txt",
+                "plan/checklist.txt",
+                "reports/packet.txt",
+                "reports/signoff.txt",
+                "audit/summary.txt",
+            ],
+            expected_file_contents={
+                "notes/brief.txt": "project brief\n",
+                "docs/charter.md": "project charter\n",
+                "plan/timeline.txt": "freeze locked\nowner handoff\nvalidation queued\n",
+                "plan/checklist.txt": "smoke checklist complete\nrollback checklist complete\n",
+                "reports/packet.txt": "cutover packet assembled\n",
+                "reports/signoff.txt": "signoff captured\n",
+                "audit/summary.txt": "project cutover recorded\n",
+            },
+            forbidden_files=["drafts/obsolete.txt"],
+            metadata={
+                "difficulty": "long_horizon",
+                "horizon": "long_horizon",
+                "benchmark_family": "project",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior verifier run showed the project cutover contract is still incomplete",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/signoff.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "repair api request response bundle"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": [
+            "notes/brief.txt",
+            "docs/charter.md",
+            "plan/timeline.txt",
+            "plan/checklist.txt",
+            "reports/packet.txt",
+            "reports/signoff.txt",
+            "audit/summary.txt",
+        ],
+        "missing_expected_artifacts": ["reports/signoff.txt", "audit/summary.txt"],
+        "unsatisfied_expected_contents": ["reports/signoff.txt", "audit/summary.txt"],
+    }
+    state.graph_summary = {
+        "trusted_retrieval_command_counts": {
+            "mkdir -p requests api responses && printf 'GET /template\\n' > requests/template.http && printf '{\"route\": \"/health\", \"method\": \"GET\"}\\n' > api/request.json && printf '{\"status\": \"ok\"}\\n' > responses/expected.json": 2,
+        },
+    }
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert all("requests/template.http" not in str(candidate.get("command", "")) for candidate in candidates)
+    assert any(
+        str(candidate.get("command", "")).startswith("mkdir -p ")
+        and (
+            "reports/signoff.txt" in str(candidate.get("command", ""))
+            or "audit/summary.txt" in str(candidate.get("command", ""))
+        )
+        for candidate in candidates
+    )
+
+
+def test_trusted_retrieval_carryover_candidates_keep_current_task_path_command_for_retrieval_task():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repository_migration_wave_retrieval_task",
+            prompt="Recover the repository migration wave outputs.",
+            workspace_subdir="repository_migration_wave_retrieval_task",
+            suggested_commands=[],
+            expected_files=[
+                "reports/migration.txt",
+                "audit/verification.txt",
+                "config/deploy.env",
+            ],
+            expected_file_contents={
+                "reports/migration.txt": "repository migration recorded\n",
+                "audit/verification.txt": "repo verification complete\n",
+                "config/deploy.env": "DEPLOY_MODE=wave2\nFEATURE_GATE=enabled\n",
+            },
+            forbidden_files=["tmp/legacy_patch.txt"],
+            metadata={
+                "difficulty": "cross_component",
+                "horizon": "long_horizon",
+                "benchmark_family": "repository",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior verifier run showed the migration contract is still incomplete",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/migration.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "repair api request response bundle"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": ["reports/migration.txt", "audit/verification.txt", "config/deploy.env"],
+        "missing_expected_artifacts": ["reports/migration.txt", "audit/verification.txt"],
+    }
+    state.graph_summary = {
+        "trusted_retrieval_command_counts": {
+            "mkdir -p reports && printf %s 'repository migration recorded\\n' > reports/migration.txt": 2,
+        },
+    }
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["command"] == "mkdir -p reports && printf %s 'repository migration recorded\\n' > reports/migration.txt"
+
+
+def test_trusted_retrieval_carryover_candidates_prefer_source_task_bundle_for_multi_artifact_retrieval_task():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    bank = TaskBank()
+    state = AgentState(task=bank.get("integration_failover_drill_retrieval_task"))
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="prior retrieval companion run stalled after partial materialization",
+            action="code_execute",
+            content="mkdir -p reports && printf %s 'integration green\\n' > reports/health.txt",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["gateway/routes.txt content mismatch"]},
+        )
+    ]
+    state.active_subgoal = "repair integration failover drill"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": list(state.task.expected_files),
+        "missing_expected_artifacts": ["reports/health.txt", "audit/drill.txt"],
+        "unsatisfied_expected_contents": [
+            "gateway/routes.txt",
+            "services/api.env",
+            "queues/failover.plan",
+            "workers/state.txt",
+            "reports/health.txt",
+            "audit/drill.txt",
+        ],
+    }
+    state.graph_summary = {
+        "trusted_retrieval_command_counts": {
+            "mkdir -p reports && printf %s 'integration green\\n' > reports/health.txt": 2,
+            "mkdir -p audit && printf %s 'failover drill recorded\\n' > audit/drill.txt": 2,
+        }
+    }
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert candidates
+    assert candidates[0].get("source_task_bundle") is True
+    assert candidates[0]["span_id"].startswith("graph:trusted_retrieval:source_task:")
+    assert candidates[0]["command"] == bank.get("integration_failover_drill_task").suggested_commands[0]
+
+
+def test_trusted_retrieval_carryover_candidates_use_successful_source_task_report_cleanup(tmp_path):
+    report_path = tmp_path / "task_report_tooling_release_contract_task_20260421T200319591464Z.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "task_id": "tooling_release_contract_task",
+                "success": True,
+                "commands": [
+                    {
+                        "command": "rm -f scratch/old_payload.json",
+                        "decision_source": "plan_progress_direct",
+                        "verification_passed": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(run_reports_dir=tmp_path))
+    bank = TaskBank(config=policy.config)
+    state = AgentState(task=bank.get("tooling_release_contract_retrieval_task"))
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="all expected artifacts are now in place; only stale payload cleanup remains",
+            action="code_execute",
+            content="printf 'tooling contract validated\\n' > reports/validation.txt",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["forbidden file present: scratch/old_payload.json"]},
+        )
+    ]
+    state.active_subgoal = "remove stale payload"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": list(state.task.expected_files),
+        "missing_expected_artifacts": [],
+        "unsatisfied_expected_contents": [],
+    }
+    state.graph_summary = {"trusted_retrieval_command_counts": {}}
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert candidates
+    assert candidates[0]["command"] == "rm -f scratch/old_payload.json"
+    assert candidates[0].get("source_task_bundle") is True
+    assert candidates[0].get("source_task_runtime") is True
+    assert candidates[0]["span_id"].startswith("graph:trusted_retrieval:source_task:")
+
+
+def test_trusted_retrieval_carryover_candidates_fallback_to_canonical_reports_for_scoped_reports(tmp_path):
+    canonical_reports = tmp_path / "reports"
+    canonical_reports.mkdir(parents=True, exist_ok=True)
+    scoped_reports = tmp_path / "scoped_reports"
+    scoped_reports.mkdir(parents=True, exist_ok=True)
+    report_path = canonical_reports / "task_report_integration_failover_drill_retrieval_task_20260424T001456487119Z.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "task_id": "integration_failover_drill_retrieval_task",
+                "success": True,
+                "commands": [
+                    {
+                        "command": (
+                            "mkdir -p reports audit && rm -f incidents/stale.txt && "
+                            "printf 'routes synced\\nfailover armed\\n' > gateway/routes.txt && "
+                            "printf 'API_VERSION=v3\\nQUEUE_ENABLED=yes\\nFAILOVER_MODE=armed\\n' > services/api.env && "
+                            "printf 'primary drained\\nsecondary promoted\\n' > queues/failover.plan && "
+                            "printf 'workers warmed\\nreplay ready\\n' > workers/state.txt && "
+                            "printf 'integration green\\n' > reports/health.txt && "
+                            "printf 'failover drill recorded\\n' > audit/drill.txt"
+                        ),
+                        "decision_source": "trusted_retrieval_carryover_direct",
+                        "verification_passed": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = KernelConfig(run_reports_dir=scoped_reports, trajectories_root=tmp_path)
+    policy = LLMDecisionPolicy(MockLLMClient(), config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="integration_failover_drill_retrieval_task",
+            prompt="Recover the integration failover drill.",
+            workspace_subdir="integration_failover_drill_retrieval_task",
+            suggested_commands=[],
+            expected_files=[
+                "docs/topology.md",
+                "docs/runbook.md",
+                "gateway/routes.txt",
+                "services/api.env",
+                "queues/failover.plan",
+                "workers/state.txt",
+                "reports/health.txt",
+                "audit/drill.txt",
+            ],
+            forbidden_files=["incidents/stale.txt"],
+            expected_file_contents={
+                "gateway/routes.txt": "routes synced\nfailover armed\n",
+                "services/api.env": "API_VERSION=v3\nQUEUE_ENABLED=yes\nFAILOVER_MODE=armed\n",
+                "queues/failover.plan": "primary drained\nsecondary promoted\n",
+                "workers/state.txt": "workers warmed\nreplay ready\n",
+                "reports/health.txt": "integration green\n",
+                "audit/drill.txt": "failover drill recorded\n",
+            },
+            metadata={
+                "benchmark_family": "integration",
+                "difficulty": "long_horizon",
+                "horizon": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "integration_failover_drill_retrieval_task",
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="first repair attempt stalled",
+            action="code_execute",
+            content="printf 'routes synced\nfailover armed\n' > gateway/routes.txt",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/health.txt missing", "audit/drill.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "repair integration failover drill"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": list(state.task.expected_files),
+        "missing_expected_artifacts": ["reports/health.txt", "audit/drill.txt"],
+        "unsatisfied_expected_contents": [
+            "gateway/routes.txt",
+            "services/api.env",
+            "queues/failover.plan",
+            "workers/state.txt",
+            "reports/health.txt",
+            "audit/drill.txt",
+        ],
+    }
+    state.graph_summary = {"trusted_retrieval_command_counts": {}}
+
+    candidates = policy._trusted_retrieval_carryover_candidates(
+        state,
+        blocked_commands=set(),
+    )
+
+    assert candidates
+    assert candidates[0].get("source_task_bundle") is True
+    assert candidates[0].get("source_task_runtime") is True
+    assert candidates[0]["command"].startswith("mkdir -p reports audit && rm -f incidents/stale.txt")
+
+
+def test_transition_pressure_tasks_disable_trusted_retrieval_carryover(tmp_path):
+    canonical_reports = tmp_path / "reports"
+    canonical_reports.mkdir(parents=True, exist_ok=True)
+    report_path = canonical_reports / "task_report_integration_failover_drill_retrieval_task_20260424T001456487119Z.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "task_id": "integration_failover_drill_retrieval_task",
+                "success": True,
+                "commands": [
+                    {
+                        "command": (
+                            "mkdir -p reports audit && rm -f incidents/stale.txt && "
+                            "printf 'routes synced\\nfailover armed\\n' > gateway/routes.txt && "
+                            "printf 'API_VERSION=v3\\nQUEUE_ENABLED=yes\\nFAILOVER_MODE=armed\\n' > services/api.env && "
+                            "printf 'primary drained\\nsecondary promoted\\n' > queues/failover.plan && "
+                            "printf 'workers warmed\\nreplay ready\\n' > workers/state.txt && "
+                            "printf 'integration green\\n' > reports/health.txt && "
+                            "printf 'failover drill recorded\\n' > audit/drill.txt"
+                        ),
+                        "decision_source": "trusted_retrieval_carryover_direct",
+                        "verification_passed": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = KernelConfig(run_reports_dir=canonical_reports)
+    policy = LLMDecisionPolicy(MockLLMClient(), config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="integration_failover_drill_retrieval_task_transition_pressure",
+            prompt="Recover from transition pressure on the integration failover drill.",
+            workspace_subdir="integration_failover_drill_retrieval_task_transition_pressure",
+            suggested_commands=[],
+            expected_files=[
+                "docs/topology.md",
+                "docs/runbook.md",
+                "gateway/routes.txt",
+                "services/api.env",
+                "queues/failover.plan",
+                "workers/state.txt",
+                "reports/health.txt",
+                "audit/drill.txt",
+            ],
+            forbidden_files=["incidents/stale.txt"],
+            expected_file_contents={
+                "gateway/routes.txt": "routes synced\nfailover armed\n",
+                "services/api.env": "API_VERSION=v3\nQUEUE_ENABLED=yes\nFAILOVER_MODE=armed\n",
+                "queues/failover.plan": "primary drained\nsecondary promoted\n",
+                "workers/state.txt": "workers warmed\nreplay ready\n",
+                "reports/health.txt": "integration green\n",
+                "audit/drill.txt": "failover drill recorded\n",
+            },
+            metadata={
+                "benchmark_family": "transition_pressure",
+                "difficulty": "long_horizon",
+                "horizon": "long_horizon",
+                "requires_retrieval": True,
+                "source_task": "integration_failover_drill_retrieval_task",
+                "memory_source": "transition_pressure",
+            },
+        )
+    )
+    state.current_role = "planner"
+    state.history = [
+        StepRecord(
+            index=1,
+            thought="first repair attempt stalled",
+            action="code_execute",
+            content="printf 'routes synced\nfailover armed\n' > gateway/routes.txt",
+            selected_skill_id=None,
+            command_result={"command": "true", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            verification={"passed": False, "reasons": ["reports/health.txt missing", "audit/drill.txt missing"]},
+        )
+    ]
+    state.active_subgoal = "repair integration failover drill"
+    state.world_model_summary = {
+        "horizon": "long_horizon",
+        "expected_artifacts": list(state.task.expected_files),
+        "missing_expected_artifacts": ["reports/health.txt", "audit/drill.txt"],
+        "unsatisfied_expected_contents": [
+            "gateway/routes.txt",
+            "services/api.env",
+            "queues/failover.plan",
+            "workers/state.txt",
+            "reports/health.txt",
+            "audit/drill.txt",
+        ],
+    }
+    state.graph_summary = {"trusted_retrieval_command_counts": {}}
+
+    assert policy._trusted_retrieval_carryover_candidates(state, blocked_commands=set()) == []
+    assert policy._pre_context_trusted_retrieval_carryover_decision(state) is None
+
+
+def test_trusted_retrieval_source_task_report_roots_include_parent_reports_dir_for_scoped_compare(tmp_path):
+    trajectories_root = tmp_path / "episodes"
+    trajectories_root.mkdir(parents=True, exist_ok=True)
+    canonical_reports = tmp_path / "reports"
+    canonical_reports.mkdir(parents=True, exist_ok=True)
+    scoped_reports = canonical_reports / "compare_retained_baseline_transition_model_baseline"
+    scoped_reports.mkdir(parents=True, exist_ok=True)
+
+    config = KernelConfig(run_reports_dir=scoped_reports, trajectories_root=trajectories_root)
+
+    roots = PolicyWorkflowAdapter.trusted_retrieval_source_task_report_roots(config)
+
+    assert scoped_reports in roots
+    assert canonical_reports in roots
+    assert trajectories_root / "reports" not in roots
 
 
 def test_llm_policy_continues_trusted_retrieval_procedure_before_context_compile():
@@ -18063,6 +18881,74 @@ def test_llm_policy_inference_failure_fallback_prefers_trusted_carryover_over_ta
     assert str(decision.selected_retrieval_span_id).startswith("graph:trusted_retrieval:")
 
 
+def test_tolbert_ranked_candidates_skip_off_surface_trusted_carryover_even_if_candidate_leaks():
+    policy = LLMDecisionPolicy(MockLLMClient())
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repository_migration_wave_retrieval_task",
+            prompt="Recover the repository migration wave outputs.",
+            workspace_subdir="repository_migration_wave_retrieval_task",
+            suggested_commands=["mkdir -p reports && printf 'repository migration recorded\\n' > reports/migration.txt"],
+            expected_files=[
+                "reports/migration.txt",
+                "audit/verification.txt",
+            ],
+            expected_file_contents={
+                "reports/migration.txt": "repository migration recorded\n",
+                "audit/verification.txt": "repo verification complete\n",
+            },
+            forbidden_files=["tmp/legacy_patch.txt"],
+            metadata={
+                "difficulty": "cross_component",
+                "horizon": "long_horizon",
+                "benchmark_family": "repository",
+                "requires_retrieval": True,
+            },
+        )
+    )
+    state.context_packet = ContextPacket(
+        request_id="req-1",
+        created_at="2026-04-02T00:00:00+00:00",
+        task={"goal": "g", "completion_criteria": "c"},
+        control={
+            "mode": "verify",
+            "path_confidence": 0.18,
+            "trust_retrieval": True,
+            "retrieval_guidance": {
+                "recommended_commands": [],
+                "recommended_command_spans": [],
+                "avoidance_notes": [],
+                "evidence": [],
+            },
+        },
+        tolbert={"path_prediction": {"tree_version": "tol_v1"}},
+        retrieval={"branch_scoped": [], "fallback_scoped": [], "global": []},
+        verifier_contract={"success_command": "true"},
+    )
+    leaked_command = (
+        "mkdir -p requests api responses && printf 'GET /template\\n' > requests/template.http "
+        "&& printf '{\"route\": \"/health\", \"method\": \"GET\"}\\n' > api/request.json "
+        "&& printf '{\"status\": \"ok\"}\\n' > responses/expected.json"
+    )
+    policy._trusted_retrieval_carryover_candidates = lambda *_args, **_kwargs: [
+        {
+            "command": leaked_command,
+            "span_id": "graph:trusted_retrieval:leaked",
+            "generated": False,
+        }
+    ]
+
+    ranked = policy._tolbert_ranked_candidates(
+        state,
+        top_skill=None,
+        retrieval_guidance=state.context_packet.control["retrieval_guidance"],
+        blocked_commands=[],
+    )
+
+    assert all(candidate["command"] != leaked_command for candidate in ranked)
+    assert any(candidate["reason"] == "task suggestion" for candidate in ranked)
+
+
 def test_llm_policy_inference_failure_fallback_preserves_tolbert_shadow_route(tmp_path):
     artifact_path = tmp_path / "tolbert_model" / "artifact.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -18185,6 +19071,33 @@ def test_llm_policy_keeps_deterministic_fallback_for_non_contract_failure_recove
     assert decision.decision_source == "deterministic_fallback"
 
 
+def test_llm_policy_disables_deterministic_fallback_for_transition_pressure():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(provider="mock"),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="deployment_manifest_retrieval_task_transition_pressure",
+            prompt="Stress the deployment manifest transition surface.",
+            workspace_subdir="deployment_manifest_retrieval_task_transition_pressure",
+            suggested_commands=[
+                "mkdir -p deploy && printf 'deployment manifest ready\\n' > deploy/manifest.txt"
+            ],
+            expected_files=["deploy/manifest.txt"],
+            expected_file_contents={"deploy/manifest.txt": "deployment manifest ready\n"},
+            metadata={
+                "benchmark_family": "transition_pressure",
+                "memory_source": "transition_pressure",
+            },
+        )
+    )
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is None
+
+
 def test_llm_policy_allows_progressive_fallback_for_contract_clean_failure_recovery_after_retryable_tolbert_startup_failure():
     policy = LLMDecisionPolicy(
         MockLLMClient(),
@@ -18275,6 +19188,55 @@ def test_llm_policy_strict_live_llm_mode_degrades_retryable_tolbert_compile_fail
         "payload_build",
         "llm_request",
         "llm_response",
+    ]
+
+
+def test_llm_policy_retryable_tolbert_compile_failure_uses_fallback_in_autonomous_mode():
+    class RetryableTolbertContextProvider:
+        def compile(self, state):
+            del state
+            raise RuntimeError(
+                "TOLBERT service exited before startup ready with code 1. "
+                "checkpoint mismatch"
+            )
+
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=RetryableTolbertContextProvider(),
+        config=KernelConfig(
+            provider="mock",
+            use_tolbert_context=True,
+        ),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="retryable_tolbert_autonomous_fallback_task",
+            prompt="Recover the fallback status artifact.",
+            workspace_subdir="retryable_tolbert_autonomous_fallback_task",
+            suggested_commands=["printf 'done\\n' > status.txt"],
+            expected_files=["status.txt"],
+            expected_file_contents={"status.txt": "done\n"},
+            metadata={
+                "benchmark_family": "project",
+            },
+        )
+    )
+    state.current_role = "executor"
+    state.world_model_summary = {"horizon": "bounded"}
+    observed: list[dict[str, object]] = []
+    policy.set_decision_progress_callback(lambda payload: observed.append(dict(payload)))
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.decision_source == "deterministic_fallback"
+    assert decision.content == "printf 'done\\n' > status.txt"
+    assert decision.proposal_metadata["context_compile_degraded"]["reason"] == "tolbert_startup_failure"
+    assert client.last_payload is None
+    assert [payload["step_stage"] for payload in observed] == [
+        "context_compile",
+        "context_degraded",
     ]
 
 

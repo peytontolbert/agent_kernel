@@ -19,6 +19,7 @@ def build_default_policy(
     context_provider_factory: Callable[..., object | None],
     ollama_client_cls,
     vllm_client_cls,
+    model_stack_client_cls,
     mock_client_factory: Callable[[], object],
     hybrid_client_factory: Callable[..., object],
 ):
@@ -52,6 +53,29 @@ def build_default_policy(
             retry_attempts=config.llm_retry_attempts,
             retry_backoff_seconds=config.llm_retry_backoff_seconds,
             api_key=config.vllm_api_key,
+        )
+    elif provider == "model_stack":
+        model_stack_repo_path = Path(config.model_stack_repo_path)
+        if not model_stack_repo_path.is_absolute():
+            model_stack_repo_path = repo_root / model_stack_repo_path
+        model_stack_model_dir = Path(config.model_stack_model_dir) if config.model_stack_model_dir else Path()
+        if config.model_stack_model_dir and not model_stack_model_dir.is_absolute():
+            model_stack_model_dir = repo_root / model_stack_model_dir
+        model_stack_tokenizer_path = (
+            Path(config.model_stack_tokenizer_path) if config.model_stack_tokenizer_path else Path()
+        )
+        if config.model_stack_tokenizer_path and not model_stack_tokenizer_path.is_absolute():
+            model_stack_tokenizer_path = repo_root / model_stack_tokenizer_path
+        client = model_stack_client_cls(
+            host=config.model_stack_host,
+            model_name=config.model_name,
+            timeout_seconds=config.llm_timeout_seconds,
+            retry_attempts=config.llm_retry_attempts,
+            retry_backoff_seconds=config.llm_retry_backoff_seconds,
+            model_dir=str(model_stack_model_dir) if config.model_stack_model_dir else "",
+            tokenizer_path=str(model_stack_tokenizer_path) if config.model_stack_tokenizer_path else "",
+            repo_path=str(model_stack_repo_path),
+            api_key=config.model_stack_api_key,
         )
     elif provider == "mock":
         client = mock_client_factory()

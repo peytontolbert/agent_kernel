@@ -1562,6 +1562,9 @@ def test_build_unattended_task_report_uses_preflight_failure_without_episode(tmp
 
     assert payload["outcome"] == "safe_stop"
     assert payload["termination_reason"] == "preflight_failed"
+    assert payload["failure_origin"] == "provider_health"
+    assert payload["failure_reason"] == "probe failed"
+    assert payload["last_decision_source"] is None
     assert payload["commands"] == []
 
 
@@ -1737,6 +1740,57 @@ def test_summarize_workspace_side_effects_keeps_non_git_unexpected_changes_for_g
     assert side_effects["hidden_side_effect_risk"] is True
 
 
+def test_summarize_workspace_side_effects_accounts_for_required_worker_branch_outputs():
+    task = TaskSpec(
+        task_id="integration_parent",
+        prompt="merge worker branches",
+        workspace_subdir="repo",
+        expected_files=["reports/merge_report.txt"],
+        metadata={
+            "requires_git": True,
+            "workflow_guard": {
+                "shared_repo_id": "repo-a",
+                "target_branch": "main",
+            },
+            "semantic_verifier": {
+                "required_merged_branches": ["worker/api"],
+            },
+            "parallel_workers": [
+                {
+                    "worker_branch": "worker/api",
+                    "expected_changed_paths": [
+                        "src/api.txt",
+                        "reports/worker_api_report.txt",
+                    ],
+                }
+            ],
+        },
+    )
+    side_effects = summarize_workspace_side_effects(
+        before_snapshot={},
+        after_snapshot={
+            ".git/HEAD": WorkspaceFileSnapshot(relative_path=".git/HEAD", size_bytes=20, sha256="git-head"),
+            "reports/merge_report.txt": WorkspaceFileSnapshot(
+                relative_path="reports/merge_report.txt",
+                size_bytes=6,
+                sha256="merge",
+            ),
+            "reports/worker_api_report.txt": WorkspaceFileSnapshot(
+                relative_path="reports/worker_api_report.txt",
+                size_bytes=6,
+                sha256="worker",
+            ),
+            "src/api.txt": WorkspaceFileSnapshot(relative_path="src/api.txt", size_bytes=6, sha256="api"),
+        },
+        clean_workspace=True,
+        task=task,
+    )
+
+    assert side_effects["unexpected_change_files"] == []
+    assert side_effects["hidden_side_effect_risk"] is False
+    assert "reports/worker_api_report.txt" in side_effects["contract_managed_paths"]
+
+
 def test_build_unattended_task_report_records_side_effect_deletions_and_uncertainty(tmp_path):
     workspace = tmp_path / "workspace" / "ambiguous"
     workspace.mkdir(parents=True)
@@ -1858,6 +1912,81 @@ def test_build_unattended_task_report_serializes_command_route_metadata(tmp_path
         "deterministic_or_other": 1,
         "total_executed_commands": 1,
     }
+
+
+def test_build_unattended_task_report_preserves_policy_termination_trace_without_commands(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    workspace = config.workspace_root / "retrieval_termination_task"
+    workspace.mkdir(parents=True, exist_ok=True)
+    task = TaskSpec(
+        task_id="retrieval_termination_task",
+        prompt="attempt retrieval-backed release task",
+        workspace_subdir="retrieval_termination_task",
+        expected_files=["reports/ok.txt"],
+        metadata={"benchmark_family": "project"},
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(workspace),
+        success=False,
+        termination_reason="policy_terminated",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="no safe retrieval command remains",
+                action="respond",
+                content="No safe deterministic command remains.",
+                selected_skill_id=None,
+                command_result=None,
+                verification={
+                    "passed": False,
+                    "reasons": ["policy terminated", "policy failure origin: retrieval_failure"],
+                    "outcome_label": "policy_terminated",
+                },
+                decision_source="trusted_retrieval_carryover_direct",
+                selected_retrieval_span_id="graph:trusted_retrieval:materialize:test-span",
+                retrieval_influenced=True,
+                trust_retrieval=True,
+                failure_origin="retrieval_failure",
+            )
+        ],
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    assert payload["termination_reason"] == "policy_terminated"
+    assert payload["failure_origin"] == "retrieval_failure"
+    assert payload["failure_reason"] == "policy terminated"
+    assert payload["last_decision_source"] == "trusted_retrieval_carryover_direct"
+    assert payload["trusted_retrieval_steps"] == 1
+    assert payload["retrieval_influenced_steps"] == 1
+    assert payload["selected_retrieval_span_ids"] == ["graph:trusted_retrieval:materialize:test-span"]
+    assert payload["commands"] == []
+    assert payload["policy_trace"] == [
+        {
+            "index": 1,
+            "action": "respond",
+            "decision_source": "trusted_retrieval_carryover_direct",
+            "verification_passed": False,
+            "verification_reasons": ["policy terminated", "policy failure origin: retrieval_failure"],
+            "failure_origin": "retrieval_failure",
+            "selected_retrieval_span_id": "graph:trusted_retrieval:materialize:test-span",
+            "retrieval_influenced": True,
+            "trust_retrieval": True,
+        }
+    ]
 
 
 def test_build_unattended_task_report_marks_nonacting_retrieval_companion_as_coverage_only(tmp_path):

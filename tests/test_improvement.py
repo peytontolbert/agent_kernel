@@ -10,6 +10,7 @@ from agent_kernel.extensions.improvement.artifacts import (
     apply_artifact_retention_decision,
     assess_artifact_compatibility,
     effective_artifact_payload_for_retention,
+    materialize_replay_candidate_payload,
     materialize_replay_verified_tool_payload,
     persist_replay_verified_tool_artifact,
     snapshot_artifact_state,
@@ -2837,6 +2838,45 @@ def test_build_transition_model_proposal_artifact_uses_proposed_runtime_snapshot
     assert artifact["signatures"][0]["command"] == "pytest -q tests/test_runtime_transition.py"
 
 
+def test_build_transition_model_proposal_artifact_ratchets_repeated_recovery_bias_focus_from_runtime_snapshot(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+
+    artifact = build_transition_model_proposal_artifact(
+        episodes,
+        focus="recovery_bias",
+        current_payload={
+            "spec_version": "asi_v1",
+            "artifact_kind": "transition_model_policy_set",
+            "lifecycle_state": "retained",
+            "generation_focus": "recovery_bias",
+            "controls": {
+                "repeat_command_penalty": 5,
+                "regressed_path_command_penalty": 3,
+                "recovery_command_bonus": 4,
+                "progress_command_bonus": 4,
+                "long_horizon_repeat_command_penalty": 3,
+                "long_horizon_progress_command_bonus": 2,
+                "max_signatures": 12,
+            },
+            "signatures": [
+                {
+                    "signal": "no_state_progress",
+                    "command": "pytest -q tests/test_runtime_transition.py",
+                    "support": 2,
+                    "regressions": [],
+                }
+            ],
+        },
+    )
+
+    assert artifact["generation_focus"] == "recovery_bias"
+    assert artifact["controls"]["recovery_command_bonus"] == 5
+    assert artifact["controls"]["progress_command_bonus"] == 5
+    assert artifact["controls"]["long_horizon_progress_command_bonus"] == 3
+    assert artifact["controls"]["max_signatures"] == 13
+
+
 def test_build_transition_model_proposal_artifact_merges_same_pattern_signatures(tmp_path: Path):
     episodes = tmp_path / "episodes"
     episodes.mkdir()
@@ -2983,6 +3023,82 @@ def test_build_transition_model_proposal_artifact_carries_long_horizon_difficult
     assert artifact["controls"]["long_horizon_progress_command_bonus"] >= 2
     assert artifact["signatures"][0]["difficulty"] == "long_horizon"
     assert any(proposal["area"] == "long_horizon_alignment" for proposal in artifact["proposals"])
+
+
+def test_build_transition_model_proposal_artifact_prioritizes_long_horizon_required_family_signatures(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    for index in range(3):
+        episodes.joinpath(f"generated_repository_{index}.json").write_text(
+            json.dumps(
+                {
+                    "task_id": f"generated_repository_{index}",
+                    "task_metadata": {"benchmark_family": "repository", "difficulty": "generated"},
+                    "success": False,
+                    "summary": {"transition_failures": ["no_state_progress"]},
+                    "fragments": [
+                        {
+                            "kind": "command",
+                            "step_index": 1,
+                            "command": "mkdir -p semantic_open_world && cat > semantic_open_world/repository_task.json << 'EOF'",
+                            "passed": False,
+                        },
+                        {
+                            "kind": "failure",
+                            "step_index": 1,
+                            "failure_signals": ["no_state_progress"],
+                        },
+                        {
+                            "kind": "state_transition",
+                            "step_index": 1,
+                            "progress_delta": 0.0,
+                            "regressions": [],
+                            "cleared_forbidden_artifacts": [],
+                            "newly_materialized_expected_artifacts": [],
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    episodes.joinpath("integration_long_horizon.json").write_text(
+        json.dumps(
+            {
+                "task_id": "integration_long_horizon",
+                "task_metadata": {"benchmark_family": "integration", "difficulty": "long_horizon"},
+                "success": False,
+                "summary": {"transition_failures": ["no_state_progress"]},
+                "fragments": [
+                    {
+                        "kind": "command",
+                        "step_index": 1,
+                        "command": "printf 'routes synced failover armed ' > gateway/routes.txt",
+                        "passed": False,
+                    },
+                    {
+                        "kind": "failure",
+                        "step_index": 1,
+                        "failure_signals": ["no_state_progress"],
+                    },
+                    {
+                        "kind": "state_transition",
+                        "step_index": 1,
+                        "progress_delta": 0.0,
+                        "regressions": [],
+                        "cleared_forbidden_artifacts": [],
+                        "newly_materialized_expected_artifacts": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifact = build_transition_model_proposal_artifact(episodes, focus="recovery_bias")
+
+    assert artifact["signatures"][0]["benchmark_family"] == "integration"
+    assert artifact["signatures"][0]["difficulty"] == "long_horizon"
+    assert artifact["signatures"][0]["command"] == "printf 'routes synced failover armed ' > gateway/routes.txt"
 
 
 def test_assess_artifact_compatibility_accepts_valid_transition_model_artifact(tmp_path: Path):
@@ -3636,6 +3752,12 @@ def test_improvement_planner_prioritizes_curriculum_after_counted_external_bread
     planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
         retained_conversion_recent_activity.get(subsystem, {})
     )
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
     metrics = EvalMetrics(
         total=20,
         passed=20,
@@ -4013,6 +4135,12 @@ def test_improvement_planner_keeps_retained_conversion_priority_after_reject_onl
     planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
         retained_conversion_recent_activity.get(subsystem, {})
     )
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
     metrics = EvalMetrics(
         total=20,
         passed=20,
@@ -4147,6 +4275,431 @@ def test_improvement_planner_keeps_retained_conversion_priority_after_reject_onl
     assert curriculum.evidence["retained_conversion_gap_active"] is True
     assert curriculum.evidence["retained_conversion_gap"]["active"] is True
     assert curriculum.evidence["retained_conversion_gap"]["rejected_cycles"] == 3
+
+
+def test_improvement_planner_prefers_transition_model_for_a4_runtime_conversion_gap(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "rejected_cycles": 0,
+            "no_yield_cycles": 1,
+            "recent_incomplete_cycles": 1,
+            "last_decision_state": "",
+        },
+        "transition_model": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 1,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "reject",
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"verifier": 0, "skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            "repo_chore_a": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_b": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_c": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_chore_d": {
+                "benchmark_family": "repo_chore",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_a": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_b": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_c": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repo_sandbox_d": {
+                "benchmark_family": "repo_sandbox",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_a": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_b": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_c": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "project_d": {
+                "benchmark_family": "project",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_a": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_b": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_c": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "repository_d": {
+                "benchmark_family": "repository",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_a": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_b": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_c": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+            "integration_d": {
+                "benchmark_family": "integration",
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            },
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "transition_model"
+    transition_model = experiments[0]
+    assert transition_model.evidence["retained_conversion_priority"] is True
+    assert transition_model.evidence["a4_runtime_conversion_priority"] is True
+    assert transition_model.evidence["counted_external_breadth_aligned"] is True
+    assert transition_model.evidence["retained_conversion_gap"]["active"] is True
+
+
+def test_improvement_planner_prefers_transition_model_when_curriculum_already_retained_for_a4_gap(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 5,
+            "retained_cycles": 1,
+            "total_decisions": 1,
+            "rejected_cycles": 0,
+            "no_yield_cycles": 2,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "retain",
+        },
+        "transition_model": {
+            "selected_cycles": 1,
+            "retained_cycles": 0,
+            "total_decisions": 1,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 1,
+            "last_decision_state": "reject",
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            f"task_{family}_{i}": {
+                "benchmark_family": family,
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            }
+            for family in ("repo_chore", "repo_sandbox", "project", "repository", "integration")
+            for i in range(4)
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "transition_model"
+    transition_model = experiments[0]
+    assert transition_model.evidence["retained_conversion_priority"] is True
+    assert transition_model.evidence["a4_runtime_conversion_priority"] is True
+    assert transition_model.evidence["counted_external_breadth_aligned"] is True
+    assert transition_model.evidence["retained_conversion_gap"]["active"] is False
+    assert (
+        transition_model.evidence["retained_conversion_gap"]["subsystem_activity"]["curriculum"][
+            "last_decision_state"
+        ]
+        == "retain"
+    )
+
+
+def test_improvement_planner_prefers_transition_model_for_a4_gap_even_with_later_no_yield_cycle(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+    retained_conversion_recent_activity = {
+        "curriculum": {
+            "selected_cycles": 4,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "rejected_cycles": 0,
+            "no_yield_cycles": 4,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "",
+        },
+        "transition_model": {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "total_decisions": 1,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 1,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "reject",
+        },
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        retained_conversion_recent_activity.get(subsystem, {})
+    )
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            f"task_{family}_{i}": {
+                "benchmark_family": family,
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            }
+            for family in ("repo_chore", "repo_sandbox", "project", "repository", "integration")
+            for i in range(4)
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "transition_model"
+    assert experiments[0].evidence["a4_runtime_conversion_priority"] is True
+
+
+def test_improvement_planner_prefers_transition_model_for_a4_gap_with_extended_history_window(
+    tmp_path: Path,
+):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = reports_dir / "unattended_trust_ledger.json"
+    _write_aligned_trust_ledger(ledger_path)
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", trust_ledger_path=ledger_path)
+
+    def _recent_activity(subsystem, recent_cycle_window=8):
+        if subsystem == "curriculum":
+            return {
+                "selected_cycles": 6,
+                "retained_cycles": 0,
+                "total_decisions": 0,
+                "rejected_cycles": 0,
+                "no_yield_cycles": 6,
+                "recent_incomplete_cycles": 1,
+                "last_decision_state": "",
+            }
+        if subsystem == "transition_model":
+            if recent_cycle_window < 12:
+                return {
+                    "selected_cycles": 1,
+                    "retained_cycles": 0,
+                    "total_decisions": 0,
+                    "rejected_cycles": 0,
+                    "no_yield_cycles": 1,
+                    "recent_incomplete_cycles": 0,
+                    "last_decision_state": "",
+                }
+            return {
+                "selected_cycles": 2,
+                "retained_cycles": 0,
+                "total_decisions": 1,
+                "rejected_cycles": 1,
+                "no_yield_cycles": 1,
+                "recent_incomplete_cycles": 0,
+                "last_decision_state": "reject",
+            }
+        return {}
+
+    planner.recent_subsystem_activity_summary = _recent_activity
+    planner._broad_coding_observe_diversification_signal = lambda metrics: {
+        "active": True,
+        "primary_only_broad_observe": True,
+        "retrieval_emergency": False,
+        "observed_family_count": 5,
+    }
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        trusted_retrieval_steps=20,
+        total_by_memory_source={"skill_transfer": 1},
+        total_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        passed_by_benchmark_family={
+            "repo_chore": 4,
+            "repo_sandbox": 4,
+            "project": 4,
+            "repository": 4,
+            "integration": 4,
+        },
+        task_outcomes={
+            f"task_{family}_{i}": {
+                "benchmark_family": family,
+                "clean_success": True,
+                "task_origin": "external_manifest",
+            }
+            for family in ("repo_chore", "repo_sandbox", "project", "repository", "integration")
+            for i in range(4)
+        },
+    )
+
+    experiments = planner.rank_experiments(metrics)
+
+    assert experiments[0].subsystem == "transition_model"
+    assert experiments[0].evidence["a4_runtime_conversion_priority"] is True
+    assert (
+        experiments[0].evidence["retained_conversion_gap"]["subsystem_activity"]["transition_model"][
+            "last_decision_state"
+        ]
+        == "reject"
+    )
 
 
 def _write_aligned_trust_ledger(ledger_path: Path) -> None:
@@ -5861,6 +6414,248 @@ def test_select_portfolio_campaign_prefers_retained_conversion_after_primary_onl
 
     assert [candidate.subsystem for candidate in campaign] == ["curriculum"]
     assert "retained_conversion_priority_preferred" in campaign[0].evidence["portfolio"]["reasons"]
+
+
+def test_select_portfolio_campaign_prefers_a4_runtime_conversion_priority_after_primary_only_broad_observe(
+    tmp_path: Path,
+):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment(
+            "curriculum",
+            "c",
+            5,
+            0.03,
+            3,
+            0.08,
+            {"retained_conversion_priority": True},
+        ),
+        ImprovementExperiment(
+            "transition_model",
+            "t",
+            6,
+            0.05,
+            2,
+            0.05,
+            {
+                "retained_conversion_priority": True,
+                "a4_runtime_conversion_priority": True,
+            },
+        ),
+        ImprovementExperiment("verifier", "v", 5, 0.03, 3, 0.07, {}),
+    ]
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: {}
+    planner.recent_campaign_surface_activity_summary = lambda subsystem, recent_cycle_window=6: {}
+    planner._portfolio_adjusted_experiment_score = (
+        lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    )
+    planner._strategy_portfolio_choice = lambda candidate, metrics, recent_activity, broad_observe_signal: {
+        "strategy_candidate": {
+            "strategy_candidate_id": f"strategy:{candidate.subsystem}",
+            "strategy_candidate_kind": "subsystem_direct",
+        },
+        "recent_activity": {},
+        "strategy_memory_summary": {},
+        "score_delta": 0.0,
+        "reasons": [],
+    }
+    planner._campaign_breadth_pressure = lambda summary: 0.0
+    planner._improvement_planner_controls = lambda: {}
+
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        low_confidence_episodes=0,
+        trusted_retrieval_steps=0,
+        total_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+        passed_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["transition_model"]
+    assert "a4_runtime_conversion_priority_preferred" in campaign[0].evidence["portfolio"]["reasons"]
+
+
+def test_select_portfolio_campaign_prefers_transition_model_from_a4_history_override(
+    tmp_path: Path,
+):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment(
+            "curriculum",
+            "c",
+            5,
+            0.03,
+            3,
+            0.08,
+            {"retained_conversion_priority": True},
+        ),
+        ImprovementExperiment(
+            "transition_model",
+            "t",
+            5,
+            0.05,
+            2,
+            0.05,
+            {"retained_conversion_priority": False},
+        ),
+        ImprovementExperiment("verifier", "v", 5, 0.03, 3, 0.07, {}),
+    ]
+    recent_activity = {
+        "curriculum": {
+            "selected_cycles": 4,
+            "retained_cycles": 0,
+            "total_decisions": 0,
+            "rejected_cycles": 0,
+            "no_yield_cycles": 4,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "",
+        },
+        "transition_model": {
+            "selected_cycles": 2,
+            "retained_cycles": 0,
+            "total_decisions": 1,
+            "rejected_cycles": 1,
+            "no_yield_cycles": 0,
+            "recent_incomplete_cycles": 0,
+            "last_decision_state": "reject",
+        },
+        "verifier": {},
+    }
+    planner.recent_subsystem_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        recent_activity.get(subsystem, {})
+    )
+    planner.recent_campaign_surface_activity_summary = lambda subsystem, recent_cycle_window=6: dict(
+        recent_activity.get(subsystem, {})
+    )
+    planner._portfolio_adjusted_experiment_score = (
+        lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    )
+    planner._strategy_portfolio_choice = lambda candidate, metrics, recent_activity, broad_observe_signal: {
+        "strategy_candidate": {
+            "strategy_candidate_id": f"strategy:{candidate.subsystem}",
+            "strategy_candidate_kind": "subsystem_direct",
+        },
+        "recent_activity": {},
+        "strategy_memory_summary": {},
+        "score_delta": 0.0,
+        "reasons": [],
+    }
+    planner._campaign_breadth_pressure = lambda summary: 0.0
+    planner._improvement_planner_controls = lambda: {}
+
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        low_confidence_episodes=0,
+        trusted_retrieval_steps=0,
+        total_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+        passed_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["transition_model"]
+    assert "a4_runtime_conversion_priority_preferred" in campaign[0].evidence["portfolio"]["reasons"]
+
+
+def test_select_portfolio_campaign_prefers_transition_model_from_extended_a4_history_override(
+    tmp_path: Path,
+):
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.rank_experiments = lambda current_metrics: [
+        ImprovementExperiment(
+            "curriculum",
+            "c",
+            5,
+            0.03,
+            3,
+            0.08,
+            {"retained_conversion_priority": True},
+        ),
+        ImprovementExperiment(
+            "transition_model",
+            "t",
+            5,
+            0.05,
+            2,
+            0.05,
+            {"retained_conversion_priority": False},
+        ),
+        ImprovementExperiment("verifier", "v", 5, 0.03, 3, 0.07, {}),
+    ]
+
+    def _recent_activity(subsystem, recent_cycle_window=6):
+        if subsystem == "curriculum":
+            return {
+                "selected_cycles": 6,
+                "retained_cycles": 0,
+                "total_decisions": 0,
+                "rejected_cycles": 0,
+                "no_yield_cycles": 6,
+                "recent_incomplete_cycles": 1,
+                "last_decision_state": "",
+            }
+        if subsystem == "transition_model":
+            if recent_cycle_window < 12:
+                return {
+                    "selected_cycles": 1,
+                    "retained_cycles": 0,
+                    "total_decisions": 0,
+                    "rejected_cycles": 0,
+                    "no_yield_cycles": 1,
+                    "recent_incomplete_cycles": 0,
+                    "last_decision_state": "",
+                }
+            return {
+                "selected_cycles": 2,
+                "retained_cycles": 0,
+                "total_decisions": 1,
+                "rejected_cycles": 1,
+                "no_yield_cycles": 1,
+                "recent_incomplete_cycles": 0,
+                "last_decision_state": "reject",
+            }
+        return {}
+
+    planner.recent_subsystem_activity_summary = _recent_activity
+    planner.recent_campaign_surface_activity_summary = _recent_activity
+    planner._portfolio_adjusted_experiment_score = (
+        lambda candidate, recent_activity, planner_controls: (candidate.score, [])
+    )
+    planner._strategy_portfolio_choice = lambda candidate, metrics, recent_activity, broad_observe_signal: {
+        "strategy_candidate": {
+            "strategy_candidate_id": f"strategy:{candidate.subsystem}",
+            "strategy_candidate_kind": "subsystem_direct",
+        },
+        "recent_activity": {},
+        "strategy_memory_summary": {},
+        "score_delta": 0.0,
+        "reasons": [],
+    }
+    planner._campaign_breadth_pressure = lambda summary: 0.0
+    planner._improvement_planner_controls = lambda: {}
+
+    metrics = EvalMetrics(
+        total=20,
+        passed=20,
+        generated_total=0,
+        generated_passed=0,
+        low_confidence_episodes=0,
+        trusted_retrieval_steps=0,
+        total_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+        passed_by_benchmark_family={"repository": 8, "project": 4, "integration": 4, "repo_chore": 2, "repo_sandbox": 2},
+    )
+
+    campaign = planner.select_portfolio_campaign(metrics, max_candidates=1)
+
+    assert [candidate.subsystem for candidate in campaign] == ["transition_model"]
+    assert "a4_runtime_conversion_priority_preferred" in campaign[0].evidence["portfolio"]["reasons"]
 
 
 def test_select_portfolio_campaign_emits_discovered_strategy_for_primary_only_broad_observe(tmp_path: Path):
@@ -8413,6 +9208,99 @@ def test_evaluate_artifact_retention_retains_transition_model_runtime_signal_fro
     assert evidence["transition_signature_growth"] == 1
     assert state == "retain"
     assert "improved retained bad-transition guidance" in reason
+
+
+def test_evaluate_artifact_retention_counts_transition_model_scoring_control_delta_as_runtime_influence(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    active_payload = build_transition_model_proposal_artifact(episodes)
+    active_payload["controls"] = {
+        "repeat_command_penalty": 5,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 5,
+        "progress_command_bonus": 5,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 3,
+        "max_signatures": 13,
+    }
+    active_payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_transition_runtime.py",
+            "support": 1,
+            "regressions": [],
+        }
+    ]
+    active_path = tmp_path / "transition_model" / "active.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+    payload = build_transition_model_proposal_artifact(episodes, focus="recovery_bias")
+    payload["retention_gate"] = {"require_transition_model_improvement": True}
+    payload["controls"] = {
+        "repeat_command_penalty": 5,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 6,
+        "progress_command_bonus": 6,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 4,
+        "max_signatures": 14,
+    }
+    payload["signatures"] = list(active_payload["signatures"])
+    payload["generation_context"] = {"active_artifact_path": str(active_path)}
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+
+    evidence = improvement_module.retention_evidence("transition_model", baseline, candidate, payload=payload)
+    state, reason = evaluate_artifact_retention("transition_model", baseline, candidate, payload=payload)
+
+    assert evidence["transition_model_improvement_count"] == 3
+    assert evidence["transition_model_scoring_control_delta_count"] == 3
+    assert evidence["transition_signature_growth"] == 0
+    assert state == "retain"
+    assert "improved retained bad-transition guidance" in reason
+
+
+def test_evaluate_artifact_retention_rejects_transition_model_capacity_only_without_runtime_signal(tmp_path: Path):
+    episodes = tmp_path / "episodes"
+    episodes.mkdir()
+    active_payload = build_transition_model_proposal_artifact(episodes)
+    active_payload["controls"] = {
+        "repeat_command_penalty": 5,
+        "regressed_path_command_penalty": 3,
+        "recovery_command_bonus": 5,
+        "progress_command_bonus": 5,
+        "long_horizon_repeat_command_penalty": 3,
+        "long_horizon_progress_command_bonus": 3,
+        "max_signatures": 13,
+    }
+    active_payload["signatures"] = [
+        {
+            "signal": "no_state_progress",
+            "command": "pytest -q tests/test_transition_runtime.py",
+            "support": 1,
+            "regressions": [],
+        }
+    ]
+    active_path = tmp_path / "transition_model" / "active.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+    payload = build_transition_model_proposal_artifact(episodes, focus="recovery_bias")
+    payload["retention_gate"] = {"require_transition_model_improvement": True}
+    payload["controls"] = dict(active_payload["controls"])
+    payload["controls"]["max_signatures"] = 14
+    payload["signatures"] = list(active_payload["signatures"])
+    payload["generation_context"] = {"active_artifact_path": str(active_path)}
+    baseline = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+    candidate = EvalMetrics(total=10, passed=8, average_steps=1.5, generated_total=4, generated_passed=3)
+
+    evidence = improvement_module.retention_evidence("transition_model", baseline, candidate, payload=payload)
+    state, reason = evaluate_artifact_retention("transition_model", baseline, candidate, payload=payload)
+
+    assert evidence["transition_model_improvement_count"] == 1
+    assert evidence["transition_model_scoring_control_delta_count"] == 0
+    assert evidence["transition_signature_growth"] == 0
+    assert state == "reject"
+    assert "no measurable runtime influence" in reason
 
 
 def test_evaluate_artifact_retention_counts_transition_signature_replacement_as_improvement(tmp_path: Path):
@@ -11132,6 +12020,25 @@ def test_materialize_replay_verified_tool_payload_marks_candidates_replay_verifi
 
     assert replay_verified["candidates"][0]["promotion_stage"] == "replay_verified"
     assert replay_verified["candidates"][0]["lifecycle_state"] == "replay_verified"
+
+
+def test_materialize_replay_candidate_payload_clears_reject_state():
+    payload = {
+        "artifact_kind": "transition_model_policy_set",
+        "lifecycle_state": "rejected",
+        "retention_decision": {"state": "reject", "reason": "old reject"},
+        "controls": {"recovery_command_bonus": 5},
+        "signatures": [{"signature_id": "sig-1"}],
+    }
+
+    replay_payload = materialize_replay_candidate_payload(payload)
+
+    assert replay_payload["lifecycle_state"] == "proposed"
+    assert "retention_decision" not in replay_payload
+    assert replay_payload["controls"] == {"recovery_command_bonus": 5}
+    assert replay_payload["signatures"] == [{"signature_id": "sig-1"}]
+    assert replay_payload["replay_context"]["replay_materialized"] is True
+    assert replay_payload["replay_context"]["previous_lifecycle_state"] == "rejected"
 
 
 def test_effective_artifact_payload_for_retention_marks_tool_candidates_replay_verified():

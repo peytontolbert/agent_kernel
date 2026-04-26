@@ -157,6 +157,12 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
             if token == "--priority-benchmark-family"
         ]
         assert forwarded_families == ["workflow", "project", "repository", "tooling", "integration"]
+        forwarded_exclusions = [
+            cmd[index + 1]
+            for index, token in enumerate(cmd[:-1])
+            if token == "--exclude-subsystem"
+        ]
+        assert forwarded_exclusions == ["retrieval", "tolbert_model"]
         assert Path(env["AGENT_KERNEL_RETRIEVAL_ASSET_BUNDLE_PATH"]).exists()
         assert env["AGENT_KERNEL_USE_PROMPT_PROPOSALS"] == "0"
         assert env["AGENT_KERNEL_USE_CURRICULUM_PROPOSALS"] == "0"
@@ -410,7 +416,23 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
             use_retrieval_proposals=False,
         ),
     )
-    monkeypatch.setattr(sys, "argv", ["run_autonomous_compounding_check.py", "--runs", "2", "--cycles", "2"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_autonomous_compounding_check.py",
+            "--runs",
+            "2",
+            "--cycles",
+            "2",
+            "--exclude-subsystem",
+            "retrieval",
+            "--exclude-subsystem",
+            "tolbert_model",
+            "--exclude-subsystem",
+            "retrieval",
+        ],
+    )
     stream = StringIO()
     monkeypatch.setattr(sys, "stdout", stream)
 
@@ -457,6 +479,10 @@ def test_run_autonomous_compounding_check_writes_report(tmp_path, monkeypatch):
     assert payload["summary"]["retained_cycle_spread"] == 1.0
     assert payload["summary"]["claim_gate_summary"]["starting_state_consistent"] is True
     assert payload["summary"]["claim_gate_summary"]["retention_criteria_stable"] is True
+    assert payload["runs"][0]["retention_criteria_manifest"]["run_parameters"]["excluded_subsystems"] == [
+        "retrieval",
+        "tolbert_model",
+    ]
     assert payload["runs"][0]["seed_fingerprint"] == payload["runs"][1]["seed_fingerprint"]
     assert payload["runs"][0]["retention_criteria_fingerprint"] == payload["runs"][1]["retention_criteria_fingerprint"]
     assert payload["summary"]["claim_gate_summary"]["autonomous_compounding_claim_ready"] is True
@@ -4078,3 +4104,26 @@ def test_claim_gate_blocks_when_transfer_is_persistent_but_too_expensive():
     investment_ranking = claim_gate["family_transfer_investment_ranking"]
     assert investment_ranking["ranked_families_by_transfer_investment"][:2] == ["workflow", "project"]
     assert investment_ranking["family_rankings"][0]["category"] == "costly_persistent"
+
+
+def test_claim_gate_accepts_costed_support_gain_when_pass_rate_is_saturated():
+    module = _load_script("run_autonomous_compounding_check.py")
+    results = [_claim_gate_result(run_index=1), _claim_gate_result(run_index=2)]
+    for result in results:
+        result["production_yield_summary"]["average_retained_pass_rate_delta"] = 0.0
+        family_summaries = result["report_payload"]["priority_family_yield_summary"]["family_summaries"]
+        for family in ("workflow", "project"):
+            family_summaries[family]["retained_positive_pass_rate_delta_sum"] = 0.0
+            family_summaries[family]["retained_support_gain_decisions"] = 1
+            family_summaries[family]["retained_support_gain_score"] = 0.05
+
+    claim_gate = module._claim_gate_summary(results)
+
+    assert claim_gate["autonomous_compounding_claim_ready"] is True
+    assert "non_replay_transfer_return_on_cost_too_low" not in claim_gate["blockers"]
+    timeline = claim_gate["family_transfer_timeline"]
+    assert timeline["families_with_cost_acceptable_non_declining_repeated_retained_gain"] == [
+        "workflow",
+        "project",
+    ]
+    assert timeline["family_timelines"]["workflow"][-1]["retained_transfer_gain_score"] == 0.05

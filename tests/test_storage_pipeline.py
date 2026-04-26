@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 import agent_kernel.ops.export_governance as export_governance
 from agent_kernel.config import KernelConfig
@@ -87,6 +88,32 @@ def test_episode_and_learning_candidates_persist_to_sqlite_without_exports(tmp_p
 
     candidates = load_learning_candidates(config.learning_artifacts_path, config=config)
     assert any(candidate["artifact_kind"] == "success_skill_candidate" for candidate in candidates)
+
+
+def test_sqlite_store_recreates_schema_after_cached_database_file_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _storage_config(tmp_path, monkeypatch)
+    store = config.sqlite_store()
+
+    assert store.load_episode_attempt_documents("missing_task") == []
+
+    runtime_db = config.runtime_database_path
+    for candidate in (
+        runtime_db,
+        runtime_db.with_name(f"{runtime_db.name}-wal"),
+        runtime_db.with_name(f"{runtime_db.name}-shm"),
+    ):
+        candidate.unlink(missing_ok=True)
+
+    assert store.load_episode_attempt_documents("missing_task") == []
+
+    with sqlite3.connect(runtime_db) as conn:
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert {"episodes", "cycle_records"}.issubset(tables)
 
 
 def test_universal_dataset_reads_trajectories_from_sqlite_store(tmp_path: Path, monkeypatch) -> None:

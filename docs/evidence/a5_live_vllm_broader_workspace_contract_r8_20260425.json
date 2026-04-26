@@ -1,0 +1,68 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T15:46:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_broader_workspace_contract_control",
+    "status": "supported",
+    "summary": "Live-vLLM delegated queue completed a broader ordinary workspace task-bank sweep after adding exact workspace-contract direct routing and fixing a bad bundled tooling command."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python -m py_compile agent_kernel/extensions/policy_workflow_adapter.py agent_kernel/policy.py tests/test_policy.py tests/test_task_generation.py && /home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_policy.py::test_llm_policy_workspace_contract_uses_exact_contract_before_context_compile tests/test_policy.py::test_llm_policy_workspace_contract_stages_exact_long_horizon_sequence_before_context_compile tests/test_policy.py::test_llm_policy_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_explicit_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_shared_repo_integrator_skips_context_compile_for_first_merge_segment && /home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_task_generation.py::test_tooling_release_contract_suggested_sequence_satisfies_contract tests/test_policy.py::test_llm_policy_workspace_contract_stages_exact_long_horizon_sequence_before_context_compile",
+      "result": "passed: py_compile clean; 5 focused policy tests passed in 80.64s; 2 tooling/task-bank focused tests passed in 15.53s"
+    },
+    "code_changes": [
+      "Added workspace_contract_direct pre-context routing for ordinary non-retrieval, non-shared-repo workspace tasks with exact suggested commands.",
+      "Added staged exact-command handling for long-horizon workspace contracts such as tooling_release_contract_task.",
+      "Fixed the bundled tooling_release_contract_task replay.sh suggested command and success-command shell quoting."
+    ],
+    "isolated_cli_r8": {
+      "root": "/tmp/agentkernel_a5_live_vllm_broader_persistent_role_r8_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "drain_invocations": 11,
+      "terminal_jobs": 11,
+      "completed_jobs": 10,
+      "successful_jobs": 10,
+      "safe_stop_jobs": 1,
+      "final_active_leases": 0,
+      "hidden_side_effect_risk_count": 0,
+      "unexpected_change_file_reports": 0,
+      "trust_status": "trusted",
+      "queue_state_counts": {
+        "completed": 10,
+        "safe_stop": 1
+      },
+      "passing_required_families_in_packet": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repository"
+      ],
+      "successful_task_ids": [
+        "api_contract_task",
+        "deployment_manifest_task",
+        "integration_failover_drill_task",
+        "project_release_cutover_task",
+        "repo_cleanup_review_task",
+        "repository_audit_packet_task",
+        "schema_alignment_task",
+        "service_mesh_task",
+        "service_release_task",
+        "tooling_release_contract_task"
+      ],
+      "superseded_negative_evidence": {
+        "task_id": "tooling_release_contract_task",
+        "outcome": "safe_stop",
+        "reason": "The bundled suggested command for scripts/replay.sh was shell-quoted incorrectly before the task-bank fix; the controller executed the exact staged contract sequence, but the command did not produce verifier-expected content."
+      }
+    }
+  },
+  "open_limits": [
+    "This packet broadens ordinary workspace task coverage, but it is still task-bank bounded evidence, not full production-duty A5.",
+    "The packet does not replace the r5+r6 required-family shared-repo repeated-control packet; it complements it by addressing the r7 ordinary workspace failure mode.",
+    "A stronger full A5 claim still needs longer-duration persistent role operation, repeated interruption/resume, and broader non-fixture production workloads."
+  ]
+}

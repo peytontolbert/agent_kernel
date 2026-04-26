@@ -161,6 +161,15 @@ def test_sandbox_blocks_unknown_host_executable(tmp_path):
     assert "blocked unsupported executable: awk" in result.stderr
 
 
+def test_sandbox_allows_bounded_sleep_and_times_out(tmp_path):
+    quick = Sandbox(timeout_seconds=1).run("sleep 0", tmp_path)
+    slow = Sandbox(timeout_seconds=1).run("sleep 2", tmp_path)
+
+    assert quick.exit_code == 0
+    assert slow.exit_code == 124
+    assert slow.timed_out is True
+
+
 def test_sandbox_wraps_local_commands_with_bubblewrap_when_available(monkeypatch, tmp_path):
     config = KernelConfig(
         provider="mock",

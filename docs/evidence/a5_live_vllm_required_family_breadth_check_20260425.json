@@ -1,0 +1,146 @@
+{
+  "packet_kind": "a5_live_provider_required_family_breadth_check",
+  "generated_at": "2026-04-25T04:34:00Z",
+  "claim_state": "substrate_evidence_not_full_a5",
+  "provider": "vllm",
+  "model_name": "Qwen/Qwen3.5-9B",
+  "provider_endpoint": "http://127.0.0.1:8000",
+  "provider_health": {
+    "checked": true,
+    "models_endpoint": "/v1/models",
+    "model_visible": true
+  },
+  "runtime_posture": {
+    "vllm_autostart": false,
+    "used_existing_provider_process": true,
+    "use_tolbert_context": false,
+    "use_skills": false,
+    "use_graph_memory": false,
+    "use_world_model": false,
+    "use_universe_model": false,
+    "use_planner": false,
+    "use_role_specialization": false,
+    "proposal_layers_disabled": true,
+    "sandbox_command_containment_mode": "disabled"
+  },
+  "required_family_results": [
+    {
+      "family": "integration",
+      "task_id": "incident_matrix_task",
+      "queue_root": "/tmp/agentkernel_a5_vllm_required_family_20260425",
+      "job_id": "job:incident_matrix_task:20260425T042805819242Z:12896649",
+      "outcome": "success",
+      "command_steps": 1,
+      "decision_source": "llm",
+      "llm_generated_commands": 1,
+      "verification_passed": true,
+      "hidden_side_effect_risk": false,
+      "active_lease_count_after": 0,
+      "clean_first_shot": true
+    },
+    {
+      "family": "project",
+      "task_id": "report_rollup_task",
+      "queue_root": "/tmp/agentkernel_a5_vllm_required_family_more_20260425",
+      "job_id": "job:report_rollup_task:20260425T042946301492Z:75b6ed48",
+      "outcome": "success",
+      "command_steps": 1,
+      "decision_source": "llm",
+      "llm_generated_commands": 1,
+      "verification_passed": true,
+      "hidden_side_effect_risk": false,
+      "active_lease_count_after": 0,
+      "clean_first_shot": true
+    },
+    {
+      "family": "repository",
+      "task_id": "repository_audit_packet_task",
+      "queue_root": "/tmp/agentkernel_a5_vllm_required_family_more_20260425",
+      "job_id": "job:repository_audit_packet_task:20260425T043004936539Z:8cd656b7",
+      "outcome": "success",
+      "command_steps": 1,
+      "decision_source": "llm",
+      "llm_generated_commands": 1,
+      "verification_passed": true,
+      "hidden_side_effect_risk": false,
+      "active_lease_count_after": 0,
+      "clean_first_shot": true
+    },
+    {
+      "family": "repo_chore",
+      "task_id": "repo_notice_review_task",
+      "queue_root": "/tmp/agentkernel_a5_vllm_required_family_more_20260425",
+      "job_id": "job:repo_notice_review_task:20260425T043023436272Z:618b9a34",
+      "outcome": "success",
+      "command_steps": 2,
+      "decision_source": "llm_then_plan_progress_direct",
+      "llm_generated_commands": 1,
+      "verification_passed": true,
+      "hidden_side_effect_risk": false,
+      "active_lease_count_after": 0,
+      "clean_first_shot": false,
+      "notes": "The first vLLM command used spaces instead of expected newlines; the direct plan-progress repair completed verification on step 2."
+    },
+    {
+      "family": "repo_sandbox",
+      "task_id": "git_repo_status_review_task",
+      "queue_root": "/tmp/agentkernel_a5_vllm_reposandbox_20260425",
+      "job_id": "job:git_repo_status_review_task:20260425T043228259536Z:cdf48122",
+      "outcome": "success",
+      "command_steps": 1,
+      "decision_source": "git_repo_review_direct",
+      "llm_generated_commands": 0,
+      "verification_passed": true,
+      "hidden_side_effect_risk": false,
+      "active_lease_count_after": 0,
+      "clean_first_shot": true,
+      "git_allowed_for_task": true,
+      "notes": "This proves live-provider queue posture and repo-sandbox verifier flow, but not LLM-generated repo-sandbox command selection."
+    }
+  ],
+  "summary": {
+    "required_families_attempted": [
+      "integration",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox"
+    ],
+    "required_families_successful": [
+      "integration",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox"
+    ],
+    "required_families_with_clean_first_shot_llm_success": [
+      "integration",
+      "project",
+      "repository"
+    ],
+    "required_families_with_recovery_assisted_success": [
+      "repo_chore"
+    ],
+    "required_families_with_direct_non_llm_success": [
+      "repo_sandbox"
+    ],
+    "all_terminal_success": true,
+    "all_zero_active_leases_after": true,
+    "all_hidden_side_effect_risk_false": true
+  },
+  "a5_interpretation": {
+    "closes_gap": "live provider delegated queue execution reached all required A4-to-A5 families at least once",
+    "does_not_close": [
+      "live provider hard interruption/recovery",
+      "multi-job live provider breadth",
+      "model_stack live server/model-dir proof",
+      "full A5 persistent role claim",
+      "LLM-generated repo_sandbox command breadth"
+    ],
+    "next_shortest_steps": [
+      "Repeat the stale-lease recovery proof with provider=vllm.",
+      "Start model-stack with a concrete MODEL_DIR/tokenizer path and repeat the bounded queue proof.",
+      "Run one live provider multi-job decomposition after recovery is proven."
+    ]
+  }
+}

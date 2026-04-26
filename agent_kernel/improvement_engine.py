@@ -443,6 +443,15 @@ def has_measurable_runtime_influence(context: RetentionDecisionContext) -> bool:
             value = 0
         if value > 0:
             return True
+    if context.subsystem == "transition_model":
+        try:
+            transition_model_scoring_control_delta_count = int(
+                context.evidence.get("transition_model_scoring_control_delta_count", 0) or 0
+            )
+        except (TypeError, ValueError):
+            transition_model_scoring_control_delta_count = 0
+        if transition_model_scoring_control_delta_count > 0:
+            return True
     negative_improvement_fields = (
         "low_confidence_episode_delta",
         "no_state_progress_termination_delta",

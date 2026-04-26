@@ -1,0 +1,126 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T19:06:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_longer_mixed_persistent_role_with_selected_intake_and_two_real_restarts",
+    "status": "supported",
+    "summary": "A longer live delegated queue window selected ordinary built-in task-bank work by family, ran git-backed repo_sandbox work, and recovered two real SIGINT interruptions, completing all 15 jobs with trusted clean evidence and no active lease residue."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python /tmp/agentkernel_a5_live_vllm_longer_mixed_role_r15_20260425/run_longer_mixed_role.py",
+      "result": "passed: longer_mixed_role_jobs=15 all_completed=true restart_resumed=2 elapsed_seconds=183.62"
+    },
+    "code_changes": [
+      "No production code change was required for r15.",
+      "r15 adds a temporary isolated external manifest and proof driver under /tmp to exercise deterministic task-bank selection, git-backed work, and two real restart/resume events in one longer queue window."
+    ],
+    "isolated_cli_r15": {
+      "root": "/tmp/agentkernel_a5_live_vllm_longer_mixed_role_r15_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "budget_group": "r15-longer-mixed-role",
+      "external_manifest_path": "/tmp/agentkernel_a5_live_vllm_longer_mixed_role_r15_20260425/manifests/restart_tasks.json",
+      "preflight_mode": "drain --enforce-preflight 0 because host bubblewrap preflight is unavailable in this environment",
+      "elapsed_seconds": 183.615,
+      "selection": {
+        "ordinary_selector": "deterministic filter over built-in task-bank tasks: required non-git families, suggested_commands present, acceptance contract present, no git command fragments; first two sorted candidates per family",
+        "selected_ordinary_tasks": [
+          "bridge_handoff_task",
+          "incident_matrix_task",
+          "deployment_manifest_task",
+          "project_release_cutover_task",
+          "repo_cleanup_review_task",
+          "repo_guardrail_review_task",
+          "repo_sync_matrix_task",
+          "repository_audit_packet_task"
+        ],
+        "git_backed_tasks": [
+          "git_repo_status_review_task",
+          "git_repo_test_repair_task",
+          "git_parallel_worker_api_task",
+          "git_parallel_worker_docs_task",
+          "git_parallel_merge_acceptance_task"
+        ],
+        "external_restart_tasks": [
+          "external_r15_project_restart_task",
+          "external_r15_git_restart_repo_sandbox_task"
+        ]
+      },
+      "execution": {
+        "jobs": 15,
+        "fresh_successful_drains_without_interrupt": 13,
+        "interrupted_drain_invocations": 2,
+        "fresh_resume_invocations_after_interrupt": 2,
+        "final_states": {
+          "completed": 15
+        },
+        "final_outcomes": {
+          "success": 15
+        },
+        "final_active_leases": 0,
+        "restart_results": [
+          {
+            "task_id": "external_r15_project_restart_task",
+            "allow_git": false,
+            "post_interrupt_state": "in_progress",
+            "post_interrupt_attempt_count": 1,
+            "post_interrupt_last_error": "runner interrupted",
+            "post_interrupt_active_leases": 0,
+            "final_state": "completed",
+            "final_outcome": "success",
+            "final_attempt_count": 2,
+            "final_active_leases": 0
+          },
+          {
+            "task_id": "external_r15_git_restart_repo_sandbox_task",
+            "allow_git": true,
+            "post_interrupt_state": "in_progress",
+            "post_interrupt_attempt_count": 1,
+            "post_interrupt_last_error": "runner interrupted",
+            "post_interrupt_active_leases": 0,
+            "final_state": "completed",
+            "final_outcome": "success",
+            "final_attempt_count": 2,
+            "final_active_leases": 0
+          }
+        ]
+      },
+      "trust_summary": {
+        "reports_considered": 15,
+        "trust_status": "trusted",
+        "success_count": 15,
+        "clean_success_count": 15,
+        "light_supervision_clean_success_count": 15,
+        "hidden_side_effect_risk_count": 0,
+        "unexpected_change_report_count": 0,
+        "task_origins": {
+          "built_in": 13,
+          "external_manifest": 2
+        },
+        "benchmark_families": [
+          "integration",
+          "project",
+          "repo_chore",
+          "repo_sandbox",
+          "repository"
+        ],
+        "required_family_counted_gated_report_counts": {
+          "integration": 2,
+          "project": 3,
+          "repo_chore": 2,
+          "repo_sandbox": 6,
+          "repository": 2
+        }
+      }
+    }
+  },
+  "open_limits": [
+    "This is a 184-second bounded role proof, not a multi-hour or multi-day production-duty role.",
+    "The ordinary intake is selected by deterministic task-bank criteria rather than hand-picked task IDs, but the workload is still limited to known task-bank families plus two external restart probes.",
+    "The host environment lacks working bubblewrap preflight, so this packet uses the same explicit --enforce-preflight 0 live-drain path as r10 through r14.",
+    "A stronger full A5 claim still needs longer wall-clock continuity, less curated external restart scaffolding, and a natural role closeout loop without operator steering."
+  ]
+}

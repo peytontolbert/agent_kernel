@@ -114,6 +114,46 @@ def materialize_replay_verified_tool_payload(payload: Any) -> dict[str, object]:
     return clone
 
 
+def materialize_replay_candidate_payload(
+    payload: Any,
+    *,
+    source_artifact_path: Path | None = None,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("candidate artifact payload must be a JSON object")
+    clone = deepcopy(payload)
+    previous_lifecycle_state = str(clone.get("lifecycle_state", "")).strip()
+    clone.pop("retention_decision", None)
+    clone["lifecycle_state"] = "proposed"
+    replay_context = clone.get("replay_context", {})
+    if not isinstance(replay_context, dict):
+        replay_context = {}
+    replay_context = deepcopy(replay_context)
+    replay_context["replay_materialized"] = True
+    if previous_lifecycle_state:
+        replay_context["previous_lifecycle_state"] = previous_lifecycle_state
+    if source_artifact_path is not None:
+        replay_context["source_artifact_path"] = str(source_artifact_path)
+    clone["replay_context"] = replay_context
+    return clone
+
+
+def materialize_replay_candidate_artifact(
+    artifact_path: Path,
+    *,
+    cycle_id: str = "manual",
+    runtime_config: KernelConfig | None = None,
+) -> Path:
+    payload = _load_json_payload(artifact_path)
+    replay_payload = materialize_replay_candidate_payload(payload, source_artifact_path=artifact_path)
+    replay_root = artifact_path.parent / ".replay_candidates"
+    replay_root.mkdir(parents=True, exist_ok=True)
+    safe_cycle_id = re.sub(r"[^A-Za-z0-9._-]+", "_", cycle_id).strip("._") or "cycle"
+    replay_path = replay_root / f"{artifact_path.stem}.{safe_cycle_id}{artifact_path.suffix or '.json'}"
+    _atomic_write_json_compat(replay_path, replay_payload, config=runtime_config)
+    return replay_path
+
+
 def persist_replay_verified_tool_artifact(
     artifact_path: Path,
     *,
@@ -305,6 +345,8 @@ __all__ = [
     "artifact_sha256",
     "assess_artifact_compatibility",
     "effective_artifact_payload_for_retention",
+    "materialize_replay_candidate_artifact",
+    "materialize_replay_candidate_payload",
     "materialize_replay_verified_tool_payload",
     "payload_with_active_artifact_context",
     "persist_replay_verified_tool_artifact",

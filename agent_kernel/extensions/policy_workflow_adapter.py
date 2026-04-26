@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import shlex
 from typing import Protocol
@@ -14,6 +15,7 @@ from ..extensions.runtime_modeling_adapter import render_structured_edit_command
 from ..extensions.syntax_motor import summarize_python_edit_step
 from ..schemas import ActionDecision
 from ..state import AgentState
+from ..tasking.task_bank import TaskBank
 
 
 class WorkflowPolicyHost(Protocol):
@@ -282,6 +284,172 @@ class PolicyWorkflowAdapter:
             decision_source="shared_repo_integrator_segment_direct",
             retrieval_influenced=False,
         )
+
+    def shared_repo_worker_direct_decision(
+        self,
+        state: AgentState,
+        *,
+        blocked_commands: list[str],
+    ) -> ActionDecision | None:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        workflow_guard = metadata.get("workflow_guard", {})
+        workflow_guard = dict(workflow_guard) if isinstance(workflow_guard, dict) else {}
+        if not str(workflow_guard.get("worker_branch", "")).strip():
+            return None
+        if not str(workflow_guard.get("shared_repo_id", "")).strip():
+            return None
+        if not state.task.suggested_commands:
+            return None
+        blocked = {_canonicalize_command(command) for command in blocked_commands}
+        exhausted = state.all_successful_command_signatures() | state.all_failed_command_signatures()
+        for command in state.task.suggested_commands[:2]:
+            normalized = _normalize_command_for_workspace(
+                str(command).strip(),
+                state.task.workspace_subdir,
+            )
+            canonical = _canonicalize_command(normalized)
+            if not canonical or canonical in blocked or canonical in exhausted:
+                continue
+            if self._host._command_control_score(state, normalized) < 0:
+                continue
+            return ActionDecision(
+                thought="Use the shared-repo worker task-contract command.",
+                action=CODE_EXECUTE,
+                content=normalized,
+                done=False,
+                decision_source="shared_repo_worker_direct",
+                retrieval_influenced=False,
+            )
+        return None
+
+    def workspace_contract_direct_decision(
+        self,
+        state: AgentState,
+        *,
+        blocked_commands: list[str],
+    ) -> ActionDecision | None:
+        if not self.workspace_contract_direct_active(state):
+            return None
+        if not state.task.suggested_commands:
+            return None
+        blocked = {_canonicalize_command(command) for command in blocked_commands}
+        exhausted = state.all_successful_command_signatures() | state.all_failed_command_signatures()
+        for command in state.task.suggested_commands[:8]:
+            normalized = _normalize_command_for_workspace(
+                str(command).strip(),
+                state.task.workspace_subdir,
+            )
+            canonical = _canonicalize_command(normalized)
+            if not canonical or canonical in blocked or canonical in exhausted:
+                continue
+            if not self.workspace_contract_command_advances_contract(state, normalized):
+                continue
+            return ActionDecision(
+                thought="Use the exact workspace task-contract command before freeform synthesis.",
+                action=CODE_EXECUTE,
+                content=normalized,
+                done=False,
+                decision_source="workspace_contract_direct",
+                retrieval_influenced=False,
+            )
+        return None
+
+    @staticmethod
+    def workspace_contract_direct_active(state: AgentState) -> bool:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        if bool(metadata.get("requires_retrieval", False)):
+            return False
+        if str(metadata.get("memory_source", "")).strip() == "transition_pressure":
+            return False
+        if str(metadata.get("curriculum_kind", "")).strip() == "adjacent_success":
+            return False
+        if bool(metadata.get("synthetic_worker", False)):
+            return False
+        if isinstance(metadata.get("synthetic_edit_plan"), list) and metadata.get("synthetic_edit_plan"):
+            return False
+        if int(metadata.get("shared_repo_order", 0) or 0) > 0:
+            return False
+        workflow_guard = metadata.get("workflow_guard", {})
+        workflow_guard = dict(workflow_guard) if isinstance(workflow_guard, dict) else {}
+        if str(workflow_guard.get("worker_branch", "")).strip():
+            return False
+        if str(workflow_guard.get("shared_repo_id", "")).strip():
+            return False
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        if str(verifier.get("kind", "")).strip() == "git_repo_review":
+            return False
+        if verifier.get("required_merged_branches"):
+            return False
+        return bool(
+            state.task.expected_files
+            or state.task.expected_file_contents
+            or state.task.forbidden_files
+        )
+
+    def workspace_contract_command_advances_contract(
+        self,
+        state: AgentState,
+        command: str,
+    ) -> bool:
+        normalized = str(command).strip()
+        if not normalized or self.workspace_contract_observation_command(normalized):
+            return False
+        control_score = self._host._command_control_score(state, normalized)
+        adjusted_control_score = control_score + max(
+            0,
+            self._host._software_work_phase_gate_command_score(state, normalized),
+        )
+        if adjusted_control_score < 0:
+            return False
+        if self._host._first_step_command_covers_required_artifacts(state, normalized):
+            return True
+        task_paths = self.workspace_contract_task_paths(state)
+        if any(path in normalized for path in task_paths):
+            return True
+        return self.workspace_contract_preparation_command_mentions_parent(state, normalized)
+
+    @staticmethod
+    def workspace_contract_observation_command(command: str) -> bool:
+        normalized = str(command).lstrip()
+        observation_prefixes = (
+            "cat ",
+            "grep ",
+            "rg ",
+            "ls ",
+            "find ",
+            "test ",
+            "[ ",
+        )
+        return normalized.startswith(observation_prefixes)
+
+    @staticmethod
+    def workspace_contract_task_paths(state: AgentState) -> list[str]:
+        paths: list[str] = []
+        for path in (
+            list(state.task.expected_files)
+            + list(state.task.expected_file_contents.keys())
+            + list(state.task.forbidden_files)
+        ):
+            normalized = str(path).strip()
+            if normalized and normalized not in paths:
+                paths.append(normalized)
+        return paths
+
+    def workspace_contract_preparation_command_mentions_parent(
+        self,
+        state: AgentState,
+        command: str,
+    ) -> bool:
+        normalized = str(command).strip()
+        if not normalized.startswith(("mkdir ", "mkdir -p ", "rm ", "rm -f ", "chmod ")):
+            return False
+        parent_dirs = {
+            str(Path(path).parent)
+            for path in self.workspace_contract_task_paths(state)
+            if str(Path(path).parent) not in {"", "."}
+        }
+        return any(parent in normalized for parent in parent_dirs)
 
     @staticmethod
     def shared_repo_unresolved_required_branches(
@@ -638,6 +806,15 @@ class PolicyWorkflowAdapter:
     def pre_context_synthetic_edit_plan_direct_decision(self, state: AgentState) -> ActionDecision | None:
         return self.synthetic_edit_plan_direct_decision(state, blocked_commands=[])
 
+    def pre_context_shared_repo_worker_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        return self.shared_repo_worker_direct_decision(state, blocked_commands=[])
+
+    def pre_context_workspace_contract_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        return self.workspace_contract_direct_decision(
+            state,
+            blocked_commands=sorted(state.all_failed_command_signatures()),
+        )
+
     def pre_context_shared_repo_integrator_direct_decision(self, state: AgentState) -> ActionDecision | None:
         decision = self.shared_repo_integrator_segment_direct_decision(state, blocked_commands=[])
         if decision is None:
@@ -712,7 +889,9 @@ class PolicyWorkflowAdapter:
 
     def pre_context_trusted_retrieval_carryover_decision(self, state: AgentState) -> ActionDecision | None:
         role = self._host._normalized_role(state)
-        if role not in {"planner", "critic"}:
+        if role not in {"planner", "critic", "executor"}:
+            return None
+        if role == "executor" and not self.trusted_retrieval_executor_direct_allowed(state):
             return None
         if not self.trusted_retrieval_carryover_active(state):
             return None
@@ -743,6 +922,14 @@ class PolicyWorkflowAdapter:
             retrieval_influenced=True,
             decision_source="trusted_retrieval_carryover_direct",
         )
+
+    @staticmethod
+    def trusted_retrieval_executor_direct_allowed(state: AgentState) -> bool:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        if bool(metadata.get("requires_retrieval", False)):
+            return True
+        active_subgoal = str(getattr(state, "active_subgoal", "") or "").strip().lower()
+        return active_subgoal.startswith("materialize expected artifact ")
 
     def pre_context_recovery_exhaustion_decision(self, state: AgentState) -> ActionDecision | None:
         if self._host._normalized_role(state) != "critic":
@@ -967,7 +1154,24 @@ class PolicyWorkflowAdapter:
         return True
 
     @staticmethod
+    def transition_pressure_task_active(state: AgentState) -> bool:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        benchmark_family = str(metadata.get("benchmark_family", "")).strip().lower()
+        memory_source = str(metadata.get("memory_source", "")).strip().lower()
+        return benchmark_family == "transition_pressure" or memory_source == "transition_pressure"
+
+    @staticmethod
+    def trusted_retrieval_carryover_disabled(state: AgentState) -> bool:
+        return PolicyWorkflowAdapter.transition_pressure_task_active(state)
+
+    @staticmethod
+    def deterministic_fallback_disabled(state: AgentState) -> bool:
+        return PolicyWorkflowAdapter.transition_pressure_task_active(state)
+
+    @staticmethod
     def trusted_retrieval_carryover_active(state: AgentState) -> bool:
+        if PolicyWorkflowAdapter.trusted_retrieval_carryover_disabled(state):
+            return False
         if not state.history:
             return False
         metadata = dict(getattr(state.task, "metadata", {}) or {})
@@ -983,6 +1187,8 @@ class PolicyWorkflowAdapter:
         *,
         blocked_commands: set[str],
     ) -> list[dict[str, object]]:
+        if self.trusted_retrieval_carryover_disabled(state):
+            return []
         trusted_commands = state.graph_summary.get("trusted_retrieval_command_counts", {})
         if not isinstance(trusted_commands, dict):
             return []
@@ -997,6 +1203,10 @@ class PolicyWorkflowAdapter:
             if count <= 0:
                 continue
             if not self.command_matches_current_repair_surface(state, command_text):
+                continue
+            if self.trusted_retrieval_direct_requires_task_path_match(state) and not self.command_mentions_current_task_paths(
+                state, command_text
+            ):
                 continue
             control_score = self._host._command_control_score(state, command_text)
             total_score = control_score + self.trusted_retrieval_carryover_match_bonus(state, command_text)
@@ -1015,6 +1225,23 @@ class PolicyWorkflowAdapter:
                 )
             )
             seen.add(canonical)
+        for source_candidate in self.trusted_retrieval_source_task_bundle_candidates(
+            state,
+            blocked_commands=blocked_commands,
+        ):
+            canonical = _canonicalize_command(str(source_candidate.get("command", "")).strip())
+            if canonical and canonical not in seen and canonical not in blocked_commands:
+                candidates.append(
+                    (
+                        (
+                            -int(source_candidate.get("total_score", 0) or 0),
+                            -int(source_candidate.get("count", 0) or 0),
+                            str(source_candidate.get("command", "")),
+                        ),
+                        source_candidate,
+                    )
+                )
+                seen.add(canonical)
         generated_materialize = self.trusted_retrieval_carryover_materialize_candidate(
             state,
             trusted_commands=trusted_commands,
@@ -1052,6 +1279,174 @@ class PolicyWorkflowAdapter:
                 seen.add(canonical)
         candidates.sort(key=lambda item: item[0])
         return [payload for _, payload in candidates]
+
+    def trusted_retrieval_source_task_bundle_candidates(
+        self,
+        state: AgentState,
+        *,
+        blocked_commands: set[str],
+    ) -> list[dict[str, object]]:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        source_task_id = str(metadata.get("source_task", "")).strip()
+        if not bool(metadata.get("requires_retrieval", False)) or not source_task_id:
+            return []
+        expected_paths = [
+            str(value).strip()
+            for value in [*state.task.expected_files, *state.task.expected_file_contents.keys()]
+            if str(value).strip()
+        ]
+        forbidden_paths = [str(value).strip() for value in state.task.forbidden_files if str(value).strip()]
+        if len(expected_paths) + len(forbidden_paths) < 4:
+            return []
+        try:
+            host_config = getattr(self._host, "config", None)
+            bank = TaskBank(config=host_config) if host_config is not None else TaskBank()
+            source_task = bank.get(source_task_id)
+        except Exception:
+            return []
+        candidates: list[tuple[tuple[int, int, str], dict[str, object]]] = []
+        seen: set[str] = set()
+        source_commands: list[tuple[str, bool]] = [
+            (str(command).strip(), False) for command in getattr(source_task, "suggested_commands", [])[:8]
+        ]
+        source_commands.extend(
+            (command, True)
+            for command in self.trusted_retrieval_source_task_report_commands(source_task_id)
+        )
+        for raw_command, runtime_backed in source_commands:
+            if not raw_command:
+                continue
+            command_text = _normalize_command_for_workspace(raw_command, state.task.workspace_subdir)
+            canonical = _canonicalize_command(command_text)
+            if not canonical or canonical in blocked_commands or canonical in seen:
+                continue
+            if not self.command_matches_current_repair_surface(state, command_text):
+                continue
+            expected_hits = sum(1 for path in expected_paths if path and path.lower() in command_text.lower())
+            forbidden_hits = sum(1 for path in forbidden_paths if path and path.lower() in command_text.lower())
+            cleanup_candidate = self.trusted_retrieval_source_task_cleanup_candidate_allowed(
+                state,
+                command_text,
+                expected_hits=expected_hits,
+                forbidden_hits=forbidden_hits,
+                runtime_backed=runtime_backed,
+            )
+            if expected_hits + forbidden_hits < 3 and not cleanup_candidate:
+                continue
+            if expected_hits <= 1 and self.verification_or_report_command(command_text):
+                continue
+            control_score = self._host._command_control_score(state, command_text)
+            if control_score <= 0:
+                continue
+            total_score = control_score + 10 + (expected_hits * 2) + (forbidden_hits * 2)
+            if runtime_backed:
+                total_score += 2
+            if cleanup_candidate:
+                total_score += 4
+            candidates.append(
+                (
+                    (-total_score, -expected_hits, command_text),
+                    {
+                        "command": command_text,
+                        "count": max(1, expected_hits + forbidden_hits),
+                        "control_score": control_score,
+                        "total_score": total_score,
+                        "span_id": self.trusted_retrieval_source_task_span_id(source_task_id, command_text),
+                        "generated": False,
+                        "source_task_bundle": True,
+                        "source_task_runtime": runtime_backed,
+                    },
+                )
+            )
+            seen.add(canonical)
+        candidates.sort(key=lambda item: item[0])
+        return [payload for _, payload in candidates]
+
+    def trusted_retrieval_source_task_report_commands(self, source_task_id: str) -> list[str]:
+        host_config = getattr(self._host, "config", None)
+        commands: list[str] = []
+        seen: set[str] = set()
+        pattern = f"task_report_{source_task_id}_*.json"
+        roots = self.trusted_retrieval_source_task_report_roots(host_config)
+        for root in roots:
+            for path in sorted(root.glob(pattern), reverse=True)[:6]:
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(payload.get("report_kind", "")).strip() != "unattended_task_report":
+                    continue
+                if str(payload.get("task_id", "")).strip() != source_task_id:
+                    continue
+                if not bool(payload.get("success", False)):
+                    continue
+                report_commands = payload.get("commands", [])
+                if not isinstance(report_commands, list):
+                    continue
+                for entry in report_commands:
+                    if not isinstance(entry, dict):
+                        continue
+                    command = str(entry.get("command", "")).strip()
+                    canonical = _canonicalize_command(command)
+                    if not canonical or canonical in seen:
+                        continue
+                    commands.append(command)
+                    seen.add(canonical)
+        return commands
+
+    @staticmethod
+    def trusted_retrieval_source_task_report_roots(host_config: object) -> list[Path]:
+        if host_config is None:
+            return []
+        roots: list[Path] = []
+        seen: set[str] = set()
+        run_reports_dir = getattr(host_config, "run_reports_dir", None)
+        candidates = [run_reports_dir]
+        if run_reports_dir is not None:
+            run_reports_path = Path(run_reports_dir)
+            if run_reports_path.name != "reports":
+                candidates.append(run_reports_path.parent)
+        trajectories_root = getattr(host_config, "trajectories_root", None)
+        if trajectories_root is not None:
+            candidates.append(Path(trajectories_root) / "reports")
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            root = Path(candidate)
+            if not root.exists():
+                continue
+            marker = str(root.resolve())
+            if marker in seen:
+                continue
+            roots.append(root)
+            seen.add(marker)
+        return roots
+
+    @staticmethod
+    def trusted_retrieval_source_task_cleanup_candidate_allowed(
+        state: AgentState,
+        command: str,
+        *,
+        expected_hits: int,
+        forbidden_hits: int,
+        runtime_backed: bool,
+    ) -> bool:
+        if not runtime_backed or forbidden_hits <= 0 or expected_hits > 0:
+            return False
+        unresolved_expected = {
+            str(item).strip()
+            for item in state.world_model_summary.get("missing_expected_artifacts", [])
+            if str(item).strip()
+        }
+        unresolved_expected.update(
+            str(item).strip()
+            for item in state.world_model_summary.get("unsatisfied_expected_contents", [])
+            if str(item).strip()
+        )
+        if unresolved_expected:
+            return False
+        normalized = str(command).strip().lower()
+        return any(str(path).strip().lower() in normalized for path in state.task.forbidden_files)
 
     def trusted_retrieval_carryover_match_bonus(self, state: AgentState, command: str) -> int:
         trusted_commands = state.graph_summary.get("trusted_retrieval_command_counts", {})
@@ -1185,8 +1580,8 @@ class PolicyWorkflowAdapter:
             diagnosis_path = str(diagnosis.get("path", "")).strip()
             if diagnosis_path and diagnosis_path in state.task.expected_file_contents:
                 path = diagnosis_path
-        if not path or path not in state.task.expected_file_contents:
-            return None
+        if path and path not in state.task.expected_file_contents:
+            path = ""
         unsatisfied = {
             str(item).strip()
             for item in state.world_model_summary.get("unsatisfied_expected_contents", [])
@@ -1197,6 +1592,22 @@ class PolicyWorkflowAdapter:
             for item in state.world_model_summary.get("missing_expected_artifacts", [])
             if str(item).strip()
         }
+        if not path:
+            ordered_expected_paths: list[str] = []
+            for value in list(state.task.expected_files) + list(state.task.expected_file_contents.keys()):
+                candidate = str(value).strip()
+                if not candidate or candidate in ordered_expected_paths:
+                    continue
+                ordered_expected_paths.append(candidate)
+            for candidate in ordered_expected_paths:
+                if candidate not in state.task.expected_file_contents:
+                    continue
+                if (unsatisfied or missing) and candidate not in unsatisfied and candidate not in missing:
+                    continue
+                path = candidate
+                break
+        if not path or path not in state.task.expected_file_contents:
+            return None
         if (unsatisfied or missing) and path not in unsatisfied and path not in missing:
             return None
         return path, str(state.task.expected_file_contents.get(path, ""))
@@ -1235,6 +1646,15 @@ class PolicyWorkflowAdapter:
             return True
         if self._host._subgoal_alignment_score(state, command) > 0:
             return True
+        if self.command_mentions_current_task_paths(state, command):
+            return True
+        return False
+
+    @staticmethod
+    def command_mentions_current_task_paths(state: AgentState, command: str) -> bool:
+        normalized = str(command).strip().lower()
+        if not normalized:
+            return False
         for value in (
             list(state.task.expected_files)
             + list(state.task.expected_file_contents.keys())
@@ -1244,6 +1664,19 @@ class PolicyWorkflowAdapter:
             if candidate_path and candidate_path in normalized:
                 return True
         return False
+
+    @staticmethod
+    def trusted_retrieval_direct_requires_task_path_match(state: AgentState) -> bool:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        requires_retrieval = bool(metadata.get("requires_retrieval", False))
+        difficulty = str(metadata.get("difficulty", metadata.get("task_difficulty", ""))).strip().lower()
+        horizon = str(
+            getattr(state, "world_model_summary", {}).get(
+                "horizon",
+                metadata.get("horizon", metadata.get("task_horizon", "")),
+            )
+        ).strip().lower()
+        return requires_retrieval and (horizon == "long_horizon" or difficulty in {"cross_component", "multi_system"})
 
     @staticmethod
     def recent_successful_command_suffix(state: AgentState) -> list[str]:
@@ -1301,6 +1734,11 @@ class PolicyWorkflowAdapter:
     def trusted_retrieval_procedure_span_id(commands: list[str]) -> str:
         digest = hashlib.sha1("||".join(commands).encode("utf-8")).hexdigest()[:12]
         return f"graph:trusted_retrieval:procedure:{digest}"
+
+    @staticmethod
+    def trusted_retrieval_source_task_span_id(source_task_id: str, command: str) -> str:
+        digest = hashlib.sha1(f"{source_task_id}|{command}".encode("utf-8")).hexdigest()[:12]
+        return f"graph:trusted_retrieval:source_task:{digest}"
 
     @staticmethod
     def _safe_int(value: object, default: int) -> int:

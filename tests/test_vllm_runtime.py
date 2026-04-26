@@ -151,6 +151,30 @@ def test_provider_health_check_uses_vllm_runtime_manager(tmp_path, monkeypatch):
     assert check.detail == "vllm autostarted and is now ready"
 
 
+def test_provider_health_check_uses_model_stack_healthz(tmp_path):
+    config = KernelConfig(
+        provider="model_stack",
+        model_stack_host="http://127.0.0.1:8001",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        runtime_database_path=tmp_path / "var" / "runtime" / "agentkernel.sqlite3",
+    )
+    seen = {}
+
+    def fake_urlopen(req, timeout=0):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        return _FakeHTTPResponse(200)
+
+    check = preflight.provider_health_check(config, urlopen=fake_urlopen)
+
+    assert check.name == "provider_health"
+    assert check.passed is True
+    assert check.detail == "model_stack responded with status 200"
+    assert seen == {"url": "http://127.0.0.1:8001/healthz", "timeout": 5}
+
+
 def test_build_default_policy_requires_vllm_runtime_ready(tmp_path, monkeypatch):
     config = _vllm_config(tmp_path)
     seen: dict[str, object] = {}
@@ -195,6 +219,7 @@ def test_build_default_policy_requires_vllm_runtime_ready(tmp_path, monkeypatch)
         context_provider_factory=lambda **kwargs: None,
         ollama_client_cls=lambda **kwargs: None,
         vllm_client_cls=FakeVLLMClient,
+        model_stack_client_cls=lambda **kwargs: None,
         mock_client_factory=lambda: None,
         hybrid_client_factory=lambda: None,
     )

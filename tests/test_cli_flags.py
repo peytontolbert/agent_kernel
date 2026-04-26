@@ -3,6 +3,7 @@ import importlib.util
 from io import StringIO
 import json
 import os
+import sqlite3
 import sys
 
 from agent_kernel.config import KernelConfig
@@ -623,6 +624,16 @@ def test_run_repeated_improvement_cycles_streams_child_output(monkeypatch, tmp_p
             seen["cmd"] = cmd
             seen["cwd"] = cwd
             seen["env"] = env
+            db_path = Path(env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"])
+            if not db_path.is_absolute():
+                db_path = Path(cwd) / db_path
+            with sqlite3.connect(db_path) as conn:
+                seen["runtime_db_tables"] = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
             self.stdout = FakeStdout()
 
         def wait(self):
@@ -715,6 +726,7 @@ def test_run_repeated_improvement_cycles_streams_child_output(monkeypatch, tmp_p
     assert seen["env"]["AGENT_KERNEL_TOLBERT_DEVICE"] == "cuda:2"
     assert "AGENT_KERNEL_TOLBERT_CONFIDENCE_THRESHOLD" in seen["env"]
     assert "AGENT_KERNEL_CAPABILITY_MODULES_PATH" in seen["env"]
+    assert {"episodes", "cycle_records"}.issubset(seen["runtime_db_tables"])
     output = stream.getvalue()
     assert "[cycle:cycle-1] task 1/1 hello_task" in output
     assert "subsystem=policy final_state=retain" in output

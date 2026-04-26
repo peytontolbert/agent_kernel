@@ -39,7 +39,7 @@ from ..schemas import (
     classify_verification_reason,
     episode_success_criteria,
 )
-from ..state import AgentState
+from ..state import AgentState, _canonicalize_command
 
 
 def verification_payload(
@@ -70,6 +70,25 @@ def verification_payload(
         controllability=controllability,
         failure_codes=failure_codes,
     ).to_payload()
+
+
+def _shared_repo_integrator_segment_made_progress(
+    state: AgentState,
+    *,
+    decision_source: str,
+    command: str,
+    command_result: CommandResult | None,
+) -> bool:
+    if decision_source != "shared_repo_integrator_segment_direct":
+        return False
+    if command_result is None:
+        return False
+    if int(command_result.exit_code) != 0 or bool(command_result.timed_out):
+        return False
+    canonical = _canonicalize_command(command)
+    if not canonical:
+        return False
+    return canonical not in state.all_successful_command_signatures()
 
 
 def resume_or_initialize_run(
@@ -573,6 +592,16 @@ def execute_step(
             failure_signals.append("no_state_progress")
         if command_result is not None and list(transition.get("regressions", [])):
             failure_signals.append("state_regression")
+    if _shared_repo_integrator_segment_made_progress(
+        state,
+        decision_source=str(decision.decision_source),
+        command=str(decision.content),
+        command_result=command_result,
+    ):
+        transition["progress_delta"] = max(float(transition.get("progress_delta", 0.0)), 0.001)
+        transition["no_progress"] = False
+        transition["state_change_score"] = max(int(transition.get("state_change_score", 0) or 0), 1)
+        failure_signals = [signal for signal in failure_signals if signal != "no_state_progress"]
     if (
         kernel.universe_model is not None
         and decision.action == CODE_EXECUTE

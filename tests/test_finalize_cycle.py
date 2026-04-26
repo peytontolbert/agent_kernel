@@ -3,11 +3,19 @@ import importlib.util
 import json
 from io import StringIO
 import pytest
+from types import SimpleNamespace
 from subprocess import CompletedProcess
 import sys
 
 from agent_kernel import cycle_runner
 from agent_kernel.config import KernelConfig
+from agent_kernel.extensions.improvement.cycle_finalize_support import (
+    aggregate_confirmation_confidence,
+    effective_required_confirmation_runs,
+)
+from agent_kernel.extensions.improvement.cycle_preview_support import (
+    retention_eval_config,
+)
 from agent_kernel.improvement import (
     ImprovementCycleRecord,
     ImprovementExperiment,
@@ -46,6 +54,65 @@ def _load_run_repeated_improvement_cycles_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_repeated_cycle_report_runtime_state_overrides_tmp_path_heuristic():
+    module = _load_run_repeated_improvement_cycles_module()
+
+    report = {
+        "cycle_id": "cycle:transition_model:test",
+        "final_state": "reject",
+        "final_reason": "candidate produced no measurable runtime influence",
+        "decision_reason_code": "candidate_runtime_influence_missing",
+        "subsystem": "transition_model",
+        "active_artifact_path": "/tmp/agentkernel_scout/trajectories/transition_model/transition_model_proposals.json",
+        "artifact_path": "/tmp/agentkernel_scout/trajectories/transition_model/transition_model_proposals.json",
+        "candidate_artifact_path": "/tmp/agentkernel_scout/trajectories/improvement/candidates/candidate.json",
+        "artifact_kind": "transition_model_policy_set",
+        "decision_state": {
+            "decision_owner": "child_native",
+            "decision_credit": "child_native",
+            "decision_conversion_state": "runtime_managed",
+            "retention_state": "reject",
+            "retention_basis": "candidate_runtime_influence_missing",
+            "closeout_mode": "natural",
+        },
+        "current_cycle_records": [
+            {
+                "cycle_id": "cycle:transition_model:test",
+                "state": "reject",
+                "subsystem": "transition_model",
+                "action": "finalize_cycle",
+                "artifact_path": "/tmp/agentkernel_scout/trajectories/transition_model/transition_model_proposals.json",
+                "artifact_kind": "transition_model_policy_set",
+                "reason": "candidate produced no measurable runtime influence",
+                "candidate_artifact_path": "/tmp/agentkernel_scout/trajectories/improvement/candidates/candidate.json",
+                "active_artifact_path": "/tmp/agentkernel_scout/trajectories/transition_model/transition_model_proposals.json",
+                "metrics_summary": {
+                    "decision_reason_code": "candidate_runtime_influence_missing",
+                },
+            }
+        ],
+    }
+
+    decision = module._decision_record_from_cycle_report(report)
+
+    assert decision is not None
+    assert module._record_is_runtime_managed_decision(decision) is True
+    assert decision["decision_state"]["decision_conversion_state"] == "runtime_managed"
+    assert decision["decision_state"]["decision_owner"] == "child_native"
+    assert module._production_decisions([decision]) == [decision]
+    assert module._non_runtime_managed_decisions([decision]) == []
+    isolation = module._candidate_isolation_summary(
+        [decision],
+        {
+            "cycle:transition_model:test": {
+                "candidate_artifact_path": "/tmp/agentkernel_scout/trajectories/improvement/candidates/candidate.json",
+                "active_artifact_path": "/tmp/agentkernel_scout/trajectories/transition_model/transition_model_proposals.json",
+            }
+        },
+    )
+    assert isolation["runtime_managed_distinct_candidate_and_active_paths"] == 1
 
 
 def _generated_candidate_payload(cycles_path: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -91,6 +158,29 @@ def test_autonomous_runtime_eval_flags_preserve_explicit_false_over_existing_art
     assert flags["include_verifier_memory"] is False
     assert flags["include_benchmark_candidates"] is False
     assert flags["include_verifier_candidates"] is False
+
+
+def test_retention_eval_config_disables_learning_candidate_persistence(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        improvement_reports_dir=tmp_path / "improvement_reports",
+        run_reports_dir=tmp_path / "reports",
+    )
+    artifact_path = tmp_path / "candidate.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+
+    scoped = retention_eval_config(
+        base_config=config,
+        subsystem="transition_model",
+        artifact_path=artifact_path,
+        scope="preview_baseline",
+    )
+
+    assert scoped.persist_episode_memory is False
+    assert scoped.persist_learning_candidates is False
+    assert scoped.storage_write_learning_exports is False
 
 
 def test_autonomous_runtime_eval_flags_auto_enable_when_flag_is_omitted(tmp_path):
@@ -1061,7 +1151,11 @@ def test_finalize_cycle_persists_terminal_cycle_records_to_sqlite_runtime_store(
         "materialize_retained_retrieval_asset_bundle",
         lambda **kwargs: tmp_path / "retrieval" / "bundle_manifest.json",
     )
-    monkeypatch.setattr(module.cycle_runner, "_write_cycle_report", lambda **kwargs: None)
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "_write_cycle_report",
+        lambda **kwargs: config.improvement_reports_dir / "cycle_report_cycle_test_holdout-guard-callable.json",
+    )
 
     state, reason = module.cycle_runner.finalize_cycle(
         config=config,
@@ -1127,7 +1221,11 @@ def test_finalize_cycle_promotes_strategy_lineage_to_closeout_records(tmp_path, 
             "compatibility": {},
         },
     )
-    monkeypatch.setattr(module.cycle_runner, "_write_cycle_report", lambda **kwargs: None)
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "_write_cycle_report",
+        lambda **kwargs: config.improvement_reports_dir / "cycle_report_cycle_test_holdout-guard-callable.json",
+    )
 
     state, reason = module.cycle_runner.finalize_cycle(
         config=config,
@@ -1239,6 +1337,114 @@ def test_finalize_cycle_reuses_preview_result_without_rerunning_preview(tmp_path
     assert reason == "retrieval candidate did not satisfy the retained retrieval gate"
     assert "finalize phase=preview_reused subsystem=retrieval" in progress_messages
     assert not any("phase=preview_baseline_eval" in message for message in progress_messages)
+
+
+def test_finalize_cycle_keeps_callable_prior_retained_guard_for_holdout(tmp_path, monkeypatch):
+    module = _load_finalize_module()
+    config = KernelConfig(
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+        transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+        prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+    )
+    config.ensure_directories()
+    active_path = config.transition_model_proposals_path
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(json.dumps({"artifact_kind": "transition_model_policy_set"}), encoding="utf-8")
+    candidate_path = tmp_path / "transition_model" / "candidate.json"
+    candidate_path.write_text(json.dumps({"artifact_kind": "transition_model_policy_set"}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "preview_candidate_retention",
+        lambda **kwargs: {
+            "active_artifact_path": str(active_path),
+            "baseline": EvalMetrics(total=10, passed=8, average_steps=1.5),
+            "candidate": EvalMetrics(total=10, passed=9, average_steps=1.2),
+            "evidence": {},
+            "compatibility": {},
+            "payload": {"artifact_kind": "transition_model_policy_set"},
+            "state": "retain",
+            "reason": "candidate improved",
+            "reason_code": "",
+            "gate": {"required_confirmation_runs": 1},
+            "phase_gate_report": {"passed": True, "failures": []},
+            "prior_retained_comparison": {"baseline_pass_rate": 0.8, "candidate_pass_rate": 0.9},
+            "prior_retained_guard_reason": "shadowed-string-value",
+            "prior_retained_guard_reason_code": "guard_code",
+            "baseline_flags": {"include_generated": True},
+            "candidate_flags": {"include_generated": True, "include_failure_generated": True},
+        },
+    )
+    monkeypatch.setattr(
+        module.cycle_runner.cycle_finalize_support,
+        "run_confirmation_phase",
+        lambda **kwargs: {
+            "state": kwargs["state"],
+            "reason": kwargs["reason"],
+            "confirmation_baseline_runs": [kwargs["baseline"]],
+            "confirmation_candidate_runs": [kwargs["candidate"]],
+        },
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_holdout(**kwargs):
+        seen["prior_retained_guard_reason_fn"] = kwargs["prior_retained_guard_reason_fn"]
+        return {
+            "state": "reject",
+            "reason": "stopped after holdout wiring check",
+            "baseline": kwargs["baseline"],
+            "candidate": kwargs["candidate"],
+            "evidence": dict(kwargs["evidence"]),
+            "phase_gate_report": dict(kwargs["phase_gate_report"]),
+            "prior_retained_comparison": kwargs["prior_retained_comparison"],
+            "prior_retained_guard_reason": "",
+            "prior_retained_guard_reason_code": "",
+            "confirmation_baseline_runs": list(kwargs["confirmation_baseline_runs"]),
+            "confirmation_candidate_runs": list(kwargs["confirmation_candidate_runs"]),
+        }
+
+    monkeypatch.setattr(module.cycle_runner.cycle_finalize_support, "run_holdout_phase", fake_holdout)
+    monkeypatch.setattr(
+        module.cycle_runner.cycle_finalize_support,
+        "aggregate_confirmation_confidence",
+        lambda **kwargs: {
+            "state": kwargs["state"],
+            "reason": kwargs["reason"],
+            "evidence": dict(kwargs["evidence"]),
+        },
+    )
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "apply_artifact_retention_decision",
+        lambda **kwargs: {
+            "artifact_kind": "transition_model_policy_set",
+            "artifact_lifecycle_state": "rejected",
+            "artifact_sha256": "",
+            "previous_artifact_sha256": "",
+            "rollback_artifact_path": "",
+            "artifact_snapshot_path": "",
+            "compatibility": {},
+        },
+    )
+    monkeypatch.setattr(
+        module.cycle_runner,
+        "_write_cycle_report",
+        lambda **kwargs: config.improvement_reports_dir / "cycle_report_cycle_test_holdout-guard-callable.json",
+    )
+
+    state, reason = module.cycle_runner.finalize_cycle(
+        config=config,
+        subsystem="transition_model",
+        cycle_id="cycle:test:holdout-guard-callable",
+        artifact_path=candidate_path,
+        active_artifact_path=active_path,
+    )
+
+    assert callable(seen["prior_retained_guard_reason_fn"])
+    assert state == "reject"
+    assert reason == "stopped after holdout wiring check"
 
 
 def test_finalize_cycle_records_machine_readable_unchanged_candidate_reason_code(tmp_path, monkeypatch):
@@ -4212,6 +4418,26 @@ def test_comparison_task_limit_for_retention_caps_non_retrieval_preview_budget()
     ) == 16
 
 
+def test_comparison_task_limit_for_retention_reduces_a4_transition_model_preview_budget():
+    assert cycle_runner._comparison_task_limit_for_retention(
+        "transition_model",
+        task_limit=24,
+        payload=None,
+        flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 8
+
+
 def test_comparison_task_limit_for_retention_caps_retrieval_preview_budget():
     assert cycle_runner._comparison_task_limit_for_retention(
         "retrieval",
@@ -4219,6 +4445,30 @@ def test_comparison_task_limit_for_retention_caps_retrieval_preview_budget():
         payload={"preview_controls": {}},
         capability_modules_path=None,
     ) == 8
+
+
+def test_run_improvement_cycle_caps_a4_required_family_retrieval_compare_budget():
+    module = _load_run_improvement_cycle_module()
+    config = KernelConfig(compare_feature_max_tasks=40)
+    args = SimpleNamespace(
+        task_limit=120,
+        prefer_retrieval_observe=True,
+        priority_benchmark_family=["integration", "project", "repository", "repo_chore", "repo_sandbox"],
+    )
+
+    assert module._comparison_task_limit(config, args) == 24
+
+
+def test_run_improvement_cycle_keeps_default_compare_budget_without_a4_required_family_set():
+    module = _load_run_improvement_cycle_module()
+    config = KernelConfig(compare_feature_max_tasks=40)
+    args = SimpleNamespace(
+        task_limit=120,
+        prefer_retrieval_observe=True,
+        priority_benchmark_family=["integration", "project", "repository", "tooling", "workflow"],
+    )
+
+    assert module._comparison_task_limit(config, args) == 40
 
 
 def test_holdout_task_limit_for_retention_caps_non_retrieval_holdout_budget():
@@ -4229,12 +4479,299 @@ def test_holdout_task_limit_for_retention_caps_non_retrieval_holdout_budget():
     ) == 16
 
 
+def test_holdout_task_limit_for_retention_reduces_a4_transition_model_holdout_budget():
+    assert cycle_runner._holdout_task_limit_for_retention(
+        "transition_model",
+        comparison_task_limit=24,
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 8
+
+
 def test_holdout_generated_schedule_limit_for_retention_matches_non_retrieval_holdout_budget():
     assert cycle_runner._holdout_generated_schedule_limit_for_retention(
         "transition_model",
         comparison_task_limit=12,
         capability_modules_path=None,
     ) == 12
+
+
+def test_holdout_generated_schedule_limit_for_retention_reduces_a4_transition_model_generated_budget():
+    assert cycle_runner._holdout_generated_schedule_limit_for_retention(
+        "transition_model",
+        comparison_task_limit=24,
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 8
+
+
+def test_effective_required_confirmation_runs_reduces_a4_transition_model_route():
+    assert effective_required_confirmation_runs(
+        "transition_model",
+        {"required_confirmation_runs": 2},
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 1
+
+
+def test_effective_required_confirmation_runs_keeps_default_outside_a4_transition_model_route():
+    assert effective_required_confirmation_runs(
+        "transition_model",
+        {"required_confirmation_runs": 2},
+        baseline_flags={"task_limit": 24},
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": ["integration", "project", "repository", "tooling", "workflow"],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 2
+    assert effective_required_confirmation_runs(
+        "retrieval",
+        {"required_confirmation_runs": 2},
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        capability_modules_path=None,
+    ) == 2
+
+
+def test_aggregate_confirmation_confidence_relaxes_saturated_a4_transition_model_pass_rate_tie(
+    tmp_path,
+):
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(cycles_path=cycles_path)
+    config = KernelConfig(
+        improvement_cycles_path=cycles_path,
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+    )
+    config.ensure_directories()
+    artifact_path = tmp_path / "candidate.json"
+    managed_active_artifact_path = tmp_path / "active.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    managed_active_artifact_path.write_text("{}", encoding="utf-8")
+
+    result = aggregate_confirmation_confidence(
+        config=config,
+        planner=planner,
+        subsystem="transition_model",
+        cycle_id="cycle:test:a4-confirmation-override",
+        artifact_path=artifact_path,
+        managed_active_artifact_path=managed_active_artifact_path,
+        gate={"confirmation_confidence_z": 1.0},
+        compatibility={},
+        protocol_metrics={},
+        strategy_candidate=None,
+        state="retain",
+        reason="candidate improved",
+        evidence={"transition_model_improvement_count": 5},
+        confirmation_baseline_runs=[],
+        confirmation_candidate_runs=[],
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        progress=None,
+        confirmation_confidence_report_fn=lambda *args, **kwargs: {
+            "run_count": 2,
+            "baseline_pass_rate_mean": 1.0,
+            "candidate_pass_rate_mean": 1.0,
+            "pass_rate_delta_conservative_lower_bound": -0.05882352941176472,
+            "paired_trace_non_regression_rate_lower_bound": 0.9411764705882353,
+            "paired_trajectory_non_regression_rate_lower_bound": 0.9411764705882353,
+            "paired_trajectory_exact_match_rate_lower_bound": 0.9411764705882353,
+            "regressed_trace_task_count": 0,
+            "regressed_trajectory_task_count": 0,
+            "step_delta_upper_bound": 0.0,
+            "step_delta_stderr": 0.0,
+            "step_delta_spread": 0.0,
+        },
+        confirmation_confidence_failures_fn=lambda *args, **kwargs: [
+            "candidate confirmation conservative pass-rate bound remained too weak"
+        ],
+    )
+
+    assert result["state"] == "retain"
+    assert result["reason"] == "candidate improved"
+    assert result["evidence"]["confirmation_direct_a4_saturated_pass_rate_override_applied"] is True
+
+
+def test_aggregate_confirmation_confidence_keeps_pass_rate_failure_when_a4_trace_regresses(
+    tmp_path,
+):
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(cycles_path=cycles_path)
+    config = KernelConfig(
+        improvement_cycles_path=cycles_path,
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+    )
+    config.ensure_directories()
+    artifact_path = tmp_path / "candidate.json"
+    managed_active_artifact_path = tmp_path / "active.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    managed_active_artifact_path.write_text("{}", encoding="utf-8")
+
+    result = aggregate_confirmation_confidence(
+        config=config,
+        planner=planner,
+        subsystem="transition_model",
+        cycle_id="cycle:test:a4-confirmation-no-override",
+        artifact_path=artifact_path,
+        managed_active_artifact_path=managed_active_artifact_path,
+        gate={"confirmation_confidence_z": 1.0},
+        compatibility={},
+        protocol_metrics={},
+        strategy_candidate=None,
+        state="retain",
+        reason="candidate improved",
+        evidence={"transition_model_improvement_count": 5},
+        confirmation_baseline_runs=[],
+        confirmation_candidate_runs=[],
+        baseline_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        candidate_flags={
+            "task_limit": 24,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        progress=None,
+        confirmation_confidence_report_fn=lambda *args, **kwargs: {
+            "run_count": 2,
+            "baseline_pass_rate_mean": 1.0,
+            "candidate_pass_rate_mean": 1.0,
+            "pass_rate_delta_conservative_lower_bound": -0.05882352941176472,
+            "paired_trace_non_regression_rate_lower_bound": 0.7,
+            "paired_trajectory_non_regression_rate_lower_bound": 0.9411764705882353,
+            "paired_trajectory_exact_match_rate_lower_bound": 0.9411764705882353,
+            "regressed_trace_task_count": 1,
+            "regressed_trajectory_task_count": 0,
+            "step_delta_upper_bound": 0.0,
+            "step_delta_stderr": 0.0,
+            "step_delta_spread": 0.0,
+        },
+        confirmation_confidence_failures_fn=lambda *args, **kwargs: [
+            "candidate confirmation conservative pass-rate bound remained too weak"
+        ],
+    )
+
+    assert result["state"] == "reject"
+    assert result["reason"] == "candidate confirmation conservative pass-rate bound remained too weak"
+    assert result["evidence"]["confirmation_direct_a4_saturated_pass_rate_override_applied"] is False
 
 
 def test_run_repeated_improvement_cycles_uses_default_external_manifest_bundle_when_unset():
@@ -4422,6 +4959,45 @@ def test_priority_family_yield_summary_counts_neutral_retrieval_support_retain_a
     assert summary["family_summaries"]["repository"]["retained_positive_delta_decisions"] == 1
 
 
+def test_priority_family_yield_summary_counts_transition_model_control_delta_retain_as_gain():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    summary = module._priority_family_yield_summary(
+        [
+            {
+                "state": "retain",
+                "subsystem": "transition_model",
+                "final_reason": "transition-model candidate improved retained bad-transition guidance without broader regression",
+                "baseline_average_steps": 1.0,
+                "candidate_average_steps": 1.0,
+                "metrics_summary": {
+                    "phase_gate_passed": True,
+                    "baseline_pass_rate": 1.0,
+                    "candidate_pass_rate": 1.0,
+                    "transition_model_scoring_control_delta_count": 6,
+                    "family_pass_rate_delta": {
+                        "project": 0.0,
+                        "repository": 0.0,
+                    },
+                },
+            }
+        ],
+        ["project", "repository"],
+    )
+
+    assert summary["priority_families_with_retained_gain"] == ["project", "repository"]
+    assert summary["priority_families_with_signal_but_no_retained_gain"] == []
+    assert summary["family_summaries"]["project"]["retained_positive_delta_decisions"] == 1
+    assert summary["family_summaries"]["project"]["retained_support_gain_decisions"] == 1
+    assert summary["family_summaries"]["project"]["retained_support_gain_score"] == 0.05
+    assert summary["family_summaries"]["repository"]["retained_support_gain_score"] == 0.05
+
+
 def test_record_counts_as_retained_gain_accepts_neutral_retrieval_support_retain():
     repo_root = Path(__file__).resolve().parents[1]
     script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
@@ -4440,6 +5016,31 @@ def test_record_counts_as_retained_gain_accepts_neutral_retrieval_support_retain
             "candidate_pass_rate": 1.0,
             "baseline_average_steps": 2.0,
             "candidate_average_steps": 2.0,
+        }
+    )
+
+
+def test_record_counts_as_retained_gain_accepts_transition_model_control_delta_retain():
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_repeated_improvement_cycles.py"
+    spec = importlib.util.spec_from_file_location("run_repeated_improvement_cycles", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._record_counts_as_retained_gain(
+        {
+            "final_state": "retain",
+            "subsystem": "transition_model",
+            "phase_gate_passed": True,
+            "baseline_pass_rate": 1.0,
+            "candidate_pass_rate": 1.0,
+            "baseline_average_steps": 1.0,
+            "candidate_average_steps": 1.0,
+            "metrics_summary": {
+                "family_pass_rate_delta": {"project": 0.0},
+                "transition_model_scoring_control_delta_count": 6,
+            },
         }
     )
 
@@ -8456,6 +9057,42 @@ def test_run_improvement_cycle_observation_eval_kwargs_prefer_low_cost_for_expli
     assert flags["include_failure_generated"] is False
 
 
+def test_run_improvement_cycle_observation_eval_kwargs_can_prefer_retrieval_tasks_for_explicit_priority(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = KernelConfig()
+    args = module.argparse.Namespace(
+        include_episode_memory=False,
+        include_skill_memory=False,
+        include_skill_transfer=False,
+        include_operator_memory=False,
+        include_tool_memory=False,
+        include_verifier_memory=False,
+        include_curriculum=False,
+        include_failure_curriculum=False,
+        task_limit=128,
+        max_observation_seconds=15.0,
+        priority_benchmark_family=["integration", "project", "repository", "tooling", "workflow"],
+        priority_benchmark_family_weight=[],
+        prefer_retrieval_observe=True,
+    )
+
+    flags = module._observation_eval_kwargs(config, args)
+
+    assert flags["priority_benchmark_families"] == ["integration", "project", "repository", "tooling", "workflow"]
+    assert flags["prefer_low_cost_tasks"] is False
+    assert flags["prefer_retrieval_tasks"] is True
+    assert flags["prefer_long_horizon_tasks"] is True
+    assert flags["restrict_to_priority_benchmark_families"] is True
+    assert flags["include_generated"] is False
+    assert flags["include_failure_generated"] is False
+
+
 def test_run_improvement_cycle_observation_eval_kwargs_caps_observe_probe_but_preserves_campaign_task_limit(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     script_path = repo_root / "scripts" / "run_improvement_cycle.py"
@@ -8486,6 +9123,52 @@ def test_run_improvement_cycle_observation_eval_kwargs_caps_observe_probe_but_pr
     assert flags["requested_task_limit"] == 32
     assert flags["observation_task_limit"] == 8
     assert flags["task_limit"] == 8
+
+
+def test_run_improvement_cycle_run_observation_eval_preserves_probe_limit_without_time_budget(monkeypatch, tmp_path):
+    module = _load_run_improvement_cycle_module()
+
+    captured: dict[str, object] = {}
+
+    def fake_run_eval(*, config, progress_label=None, **kwargs):
+        captured["config"] = config
+        captured["progress_label"] = progress_label
+        captured["kwargs"] = dict(kwargs)
+        return "metrics"
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+
+    result = module._run_observation_eval(
+        config=KernelConfig(),
+        eval_kwargs={
+            "task_limit": 8,
+            "requested_task_limit": 120,
+            "observation_task_limit": 8,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+            "prefer_retrieval_tasks": True,
+            "prefer_long_horizon_tasks": True,
+        },
+        progress_label="observe-preserve-probe",
+        max_observation_seconds=0.0,
+    )
+
+    assert result["metrics"] == "metrics"
+    assert captured["kwargs"]["task_limit"] == 8
+    assert captured["kwargs"]["priority_benchmark_families"] == [
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+        "repo_sandbox",
+    ]
+    assert captured["kwargs"]["restrict_to_priority_benchmark_families"] is True
 
 
 def test_run_improvement_cycle_observation_eval_kwargs_preserve_explicit_bounded_curriculum_flags(tmp_path):
@@ -9560,6 +10243,123 @@ def test_run_improvement_cycle_honors_excluded_subsystems_even_when_all_candidat
         assert records == []
 
 
+def test_run_improvement_cycle_allows_explicit_transition_model_fallback_when_filtered(tmp_path, monkeypatch):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "run_improvement_cycle.py"
+    spec = importlib.util.spec_from_file_location("run_improvement_cycle", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    finalized: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        module,
+        "run_eval",
+        lambda **kwargs: EvalMetrics(total=10, passed=10, average_steps=1.0),
+    )
+    qwen_experiment = ImprovementExperiment("qwen_adapter", "qwen pressure", 5, 0.05, 2, 0.10, {})
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "rank_experiments",
+        lambda self, metrics: [qwen_experiment],
+    )
+    monkeypatch.setattr(
+        module.ImprovementPlanner,
+        "select_portfolio_campaign",
+        lambda self, metrics, max_candidates=1, **kwargs: [qwen_experiment],
+    )
+    monkeypatch.setattr(
+        module,
+        "finalize_cycle",
+        lambda **kwargs: (finalized.append(kwargs) or "reject", "finalized"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_select_variants_for_campaign",
+        lambda **kwargs: (
+            module.ImprovementSearchBudget(
+                scope="variant",
+                width=1,
+                max_width=1,
+                strategy="stubbed",
+                top_score=0.1,
+                selected_ids=["recovery_bias"],
+                reasons=[],
+            ),
+            [
+                module.ImprovementVariant(
+                    subsystem="transition_model",
+                    variant_id="recovery_bias",
+                    description="stubbed transition-model variant",
+                    expected_gain=0.05,
+                    estimated_cost=1,
+                    score=0.05,
+                    controls={},
+                )
+            ],
+            {},
+        ),
+    )
+
+    def _write_stub_artifact(**kwargs):
+        artifact_path = kwargs["candidate_artifact_path_obj"]
+        artifact_path.write_text(json.dumps({"artifact_kind": "transition_model_policy_set"}), encoding="utf-8")
+        return {
+            "artifact": str(artifact_path),
+            "action": "propose_transition_model_update",
+            "artifact_kind": "transition_model_policy_set",
+        }
+
+    monkeypatch.setattr(module, "_generate_candidate_artifact", _write_stub_artifact)
+    monkeypatch.setattr(
+        module,
+        "_candidate_preflight_compatibility",
+        lambda **kwargs: {"compatible": True, "violations": []},
+    )
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            improvement_cycles_path=cycles_path,
+            candidate_artifacts_root=tmp_path / "candidates",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+            benchmark_candidates_path=tmp_path / "benchmarks" / "benchmark_candidates.json",
+            tool_candidates_path=tmp_path / "tools" / "tool_candidates.json",
+            curriculum_proposals_path=tmp_path / "curriculum" / "curriculum_proposals.json",
+            operator_classes_path=tmp_path / "operators" / "operator_classes.json",
+            transition_model_proposals_path=tmp_path / "transition_model" / "transition_model_proposals.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_improvement_cycle.py",
+            "--exclude-subsystem",
+            "qwen_adapter",
+            "--allow-transition-model-fallback",
+            "--progress-label",
+            "transition-fallback-test",
+        ],
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    module.main()
+
+    assert [call["subsystem"] for call in finalized] == ["transition_model"]
+    assert (
+        "[cycle:transition-fallback-test] campaign fallback "
+        "reason=explicit_transition_model_lane_repair selected_from_fallback=1 "
+        "excluded_subsystems=qwen_adapter"
+    ) in stderr.getvalue()
+    assert "[cycle:transition-fallback-test] campaign 1/1 select subsystem=transition_model" in stderr.getvalue()
+
+
 def test_run_improvement_cycle_falls_back_to_ranked_candidates_when_portfolio_is_fully_excluded(
     tmp_path, monkeypatch
 ):
@@ -10579,6 +11379,63 @@ def test_finalize_cycle_materializes_retrieval_asset_bundle_on_retain(tmp_path, 
     assert payload["cycle_id"] == "cycle:retrieval:test"
 
 
+def test_finalize_improvement_cycle_materializes_replay_copy_for_rejected_artifact(tmp_path, monkeypatch):
+    module = _load_finalize_module()
+    artifact_path = tmp_path / "transition_model" / "transition_model_proposals.json"
+    replay_path = tmp_path / "transition_model" / ".replay_candidates" / "transition_model_proposals.replay.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    replay_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "transition_model_policy_set",
+                "lifecycle_state": "rejected",
+                "retention_decision": {"state": "reject", "reason": "old reject"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    replay_path.write_text(
+        json.dumps({"artifact_kind": "transition_model_policy_set", "lifecycle_state": "proposed"}),
+        encoding="utf-8",
+    )
+
+    finalized = {}
+
+    def fake_finalize_cycle(**kwargs):
+        finalized.update(kwargs)
+        return ("reject", "test replay")
+
+    monkeypatch.setattr(module, "materialize_replay_candidate_artifact", lambda *args, **kwargs: replay_path)
+    monkeypatch.setattr(module.cycle_runner, "finalize_cycle", fake_finalize_cycle)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            transition_model_proposals_path=artifact_path,
+            improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "finalize_improvement_cycle.py",
+            "--subsystem",
+            "transition_model",
+            "--cycle-id",
+            "cycle:transition_model:test-replay",
+            "--artifact-path",
+            str(artifact_path),
+        ],
+    )
+
+    module.main()
+
+    assert finalized["artifact_path"] == replay_path
+
+
 def test_run_improvement_cycle_selects_best_previewed_sibling_variant(tmp_path, monkeypatch):
     repo_root = Path(__file__).resolve().parents[1]
     script_path = repo_root / "scripts" / "run_improvement_cycle.py"
@@ -11466,6 +12323,92 @@ def test_preview_candidate_retention_keeps_retrieval_benchmark_probe_under_prior
     )
 
 
+def test_preview_candidate_retention_prefers_retrieval_tasks_for_direct_a4_transition_model_route(
+    tmp_path, monkeypatch
+):
+    module = _load_finalize_module()
+    active_path = tmp_path / "transition_model" / "transition_model_proposals.json"
+    candidate_path = tmp_path / "candidates" / "transition_model_candidate.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    active_payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "transition_model_policy_set",
+        "lifecycle_state": "retained",
+        "generation_focus": "recovery_bias",
+        "controls": {"recovery_command_bonus": 4, "progress_command_bonus": 4},
+        "retention_gate": {"min_pass_rate_delta_abs": 0.0},
+    }
+    candidate_payload = {
+        "spec_version": "asi_v1",
+        "artifact_kind": "transition_model_policy_set",
+        "lifecycle_state": "proposed",
+        "generation_focus": "recovery_bias",
+        "controls": {"recovery_command_bonus": 5, "progress_command_bonus": 5},
+        "retention_gate": {"min_pass_rate_delta_abs": 0.0},
+    }
+    active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+    candidate_path.write_text(json.dumps(candidate_payload), encoding="utf-8")
+
+    config = KernelConfig(
+        trajectories_root=tmp_path / "episodes",
+        transition_model_proposals_path=active_path,
+        improvement_cycles_path=tmp_path / "improvement" / "cycles.jsonl",
+        improvement_reports_dir=tmp_path / "improvement" / "reports",
+    )
+    config.ensure_directories()
+    seen_flags = []
+
+    def fake_evaluate(*, config, subsystem, flags, progress_label):
+        del config, subsystem, progress_label
+        seen_flags.append(dict(flags))
+        return EvalMetrics(total=4, passed=4, average_steps=1.0)
+
+    monkeypatch.setattr(module.cycle_runner, "evaluate_subsystem_metrics", fake_evaluate)
+    monkeypatch.setattr(module.cycle_runner, "compare_to_prior_retained", lambda **kwargs: None)
+
+    module.cycle_runner.preview_candidate_retention(
+        config=config,
+        subsystem="transition_model",
+        artifact_path=candidate_path,
+        active_artifact_path=active_path,
+        cycle_id="cycle:transition_model:test",
+        include_curriculum=True,
+        include_failure_curriculum=True,
+        task_limit=24,
+        priority_benchmark_families=[
+            "integration",
+            "project",
+            "repository",
+            "repo_chore",
+            "repo_sandbox",
+        ],
+        restrict_to_priority_benchmark_families=True,
+    )
+
+    assert len(seen_flags) == 2
+    assert all(flags["task_limit"] == 8 for flags in seen_flags)
+    assert all(flags["restrict_to_priority_benchmark_families"] is True for flags in seen_flags)
+    assert all(flags["prefer_low_cost_tasks"] is False for flags in seen_flags)
+    assert all(flags["prefer_retrieval_tasks"] is True for flags in seen_flags)
+    assert all(flags["prefer_long_horizon_tasks"] is True for flags in seen_flags)
+    assert all(flags["include_discovered_tasks"] is True for flags in seen_flags)
+    assert all(
+        flags["priority_benchmark_families"]
+        == [
+            "integration",
+            "project",
+            "repository",
+            "repo_chore",
+            "repo_sandbox",
+            "transition_pressure",
+        ]
+        for flags in seen_flags
+    )
+    assert all(flags["include_generated"] is True for flags in seen_flags)
+    assert all(flags["include_failure_generated"] is True for flags in seen_flags)
+
+
 def test_preview_candidate_retention_uses_bounded_retrieval_preview_controls(tmp_path, monkeypatch):
     module = _load_finalize_module()
     active_path = tmp_path / "retrieval" / "retrieval_proposals.json"
@@ -11863,6 +12806,103 @@ def test_compare_to_prior_retained_keeps_retrieval_benchmark_probe_under_priorit
         == {"benchmark_candidate", "integration", "project", "repository"}
         for call in seen_calls
     )
+
+
+def test_compare_to_prior_retained_prefers_retrieval_tasks_for_direct_a4_transition_model_route(
+    tmp_path, monkeypatch
+):
+    module = _load_finalize_module()
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    snapshot_path = tmp_path / ".artifact_history" / "transition_model.cycle_prior.post_retain.json"
+    artifact_path = tmp_path / "transition_model" / "transition_model_proposals.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    retained_payload = {
+        "artifact_kind": "transition_model_policy_set",
+        "generation_focus": "recovery_bias",
+        "controls": {"recovery_command_bonus": 4, "progress_command_bonus": 4},
+    }
+    candidate_payload = {
+        "artifact_kind": "transition_model_policy_set",
+        "generation_focus": "recovery_bias",
+        "controls": {"recovery_command_bonus": 5, "progress_command_bonus": 5},
+        "lifecycle_state": "proposed",
+    }
+    snapshot_path.write_text(json.dumps(retained_payload), encoding="utf-8")
+    artifact_path.write_text(json.dumps(candidate_payload), encoding="utf-8")
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes", cycles_path=cycles_path)
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:transition_model:prior",
+            state="retain",
+            subsystem="transition_model",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="transition_model_policy_set",
+            reason="retained prior baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+    seen_calls = []
+
+    def fake_evaluate(*, config, subsystem, flags, progress_label):
+        del config, subsystem, progress_label
+        seen_calls.append(dict(flags))
+        return EvalMetrics(total=4, passed=4, average_steps=1.0)
+
+    monkeypatch.setattr(module.cycle_runner, "evaluate_subsystem_metrics", fake_evaluate)
+
+    comparison = module.cycle_runner.compare_to_prior_retained(
+        config=KernelConfig(
+            improvement_cycles_path=cycles_path,
+            transition_model_proposals_path=artifact_path,
+            prompt_proposals_path=tmp_path / "prompts" / "prompt_proposals.json",
+        ),
+        planner=planner,
+        subsystem="transition_model",
+        artifact_path=artifact_path,
+        cycles_path=cycles_path,
+        before_cycle_id="cycle:transition_model:current",
+        flags={
+            "include_generated": True,
+            "include_failure_generated": True,
+            "priority_benchmark_families": [
+                "integration",
+                "project",
+                "repository",
+                "repo_chore",
+                "repo_sandbox",
+            ],
+            "restrict_to_priority_benchmark_families": True,
+        },
+        payload=candidate_payload,
+        task_limit=24,
+    )
+
+    assert comparison is not None
+    assert len(seen_calls) == 2
+    assert all(call["task_limit"] == 8 for call in seen_calls)
+    assert all(call["restrict_to_priority_benchmark_families"] is True for call in seen_calls)
+    assert all(call["prefer_low_cost_tasks"] is False for call in seen_calls)
+    assert all(call["prefer_retrieval_tasks"] is True for call in seen_calls)
+    assert all(call["prefer_long_horizon_tasks"] is True for call in seen_calls)
+    assert all(call["include_discovered_tasks"] is True for call in seen_calls)
+    assert all(
+        call["priority_benchmark_families"]
+        == [
+            "integration",
+            "project",
+            "repository",
+            "repo_chore",
+            "repo_sandbox",
+            "transition_pressure",
+        ]
+        for call in seen_calls
+    )
+    assert all(call["include_generated"] is True for call in seen_calls)
+    assert all(call["include_failure_generated"] is True for call in seen_calls)
 
 
 def test_compare_to_prior_retained_falls_back_to_bounded_retrieval_task_limit_without_preview_controls(

@@ -948,6 +948,7 @@ def _retention_criteria_manifest(
             "priority_benchmark_family_allocation_compensation": priority_benchmark_family_allocation_compensation,
             "priority_benchmark_family_live_routing": priority_benchmark_family_live_routing,
             "autonomous_frontier_curriculum_pressure": autonomous_frontier_curriculum_pressure,
+            "excluded_subsystems": _ordered_unique_strings(getattr(args, "exclude_subsystem", [])),
             "include_episode_memory": bool(args.include_episode_memory),
             "include_skill_memory": bool(args.include_skill_memory),
             "include_skill_transfer": bool(args.include_skill_transfer),
@@ -1348,6 +1349,10 @@ def _run_command(
         weight = float(priority_benchmark_family_weights.get(family, 0.0) or 0.0)
         if weight > 0.0:
             cmd.extend(["--priority-benchmark-family-weight", f"{family}={weight:.6f}"])
+    for excluded_subsystem in _ordered_unique_strings(getattr(args, "exclude_subsystem", [])):
+        cmd.extend(["--exclude-subsystem", excluded_subsystem])
+    if getattr(args, "allow_transition_model_fallback", False):
+        cmd.append("--allow-transition-model-fallback")
     for flag, enabled in (
         ("--include-episode-memory", args.include_episode_memory),
         ("--include-skill-memory", args.include_skill_memory),
@@ -1718,6 +1723,8 @@ def _family_transfer_summary(results: list[dict[str, object]]) -> dict[str, obje
             "observed_estimated_cost": 0.0,
             "retained_positive_delta_decisions": 0,
             "retained_positive_pass_rate_delta_sum": 0.0,
+            "retained_support_gain_decisions": 0,
+            "retained_support_gain_score": 0.0,
             "retained_estimated_cost": 0.0,
         }
         for family in target_families
@@ -1752,6 +1759,8 @@ def _family_transfer_summary(results: list[dict[str, object]]) -> dict[str, obje
             retained_positive_pass_rate_delta_sum = float(
                 yield_summary.get("retained_positive_pass_rate_delta_sum", 0.0) or 0.0
             )
+            retained_support_gain_decisions = int(yield_summary.get("retained_support_gain_decisions", 0) or 0)
+            retained_support_gain_score = float(yield_summary.get("retained_support_gain_score", 0.0) or 0.0)
             observed_estimated_cost = float(yield_summary.get("observed_estimated_cost", 0.0) or 0.0)
             retained_estimated_cost = float(yield_summary.get("retained_estimated_cost", 0.0) or 0.0)
             observed = family in required_families_with_reports or family in external_benchmark_families or observed_decisions > 0
@@ -1775,6 +1784,12 @@ def _family_transfer_summary(results: list[dict[str, object]]) -> dict[str, obje
             family_summary["retained_positive_pass_rate_delta_sum"] = float(
                 family_summary["retained_positive_pass_rate_delta_sum"]
             ) + retained_positive_pass_rate_delta_sum
+            family_summary["retained_support_gain_decisions"] = int(
+                family_summary["retained_support_gain_decisions"]
+            ) + retained_support_gain_decisions
+            family_summary["retained_support_gain_score"] = float(
+                family_summary["retained_support_gain_score"]
+            ) + retained_support_gain_score
             family_summary["retained_estimated_cost"] = float(family_summary["retained_estimated_cost"]) + retained_estimated_cost
     families_observed = [family for family in target_families if int(family_summaries[family]["runs_with_observation"]) > 0]
     families_with_retained_gain = [
@@ -1833,10 +1848,13 @@ def _family_transfer_timeline(results: list[dict[str, object]]) -> dict[str, obj
             retained_positive_pass_rate_delta_sum = float(
                 yield_summary.get("retained_positive_pass_rate_delta_sum", 0.0) or 0.0
             )
+            retained_support_gain_decisions = int(yield_summary.get("retained_support_gain_decisions", 0) or 0)
+            retained_support_gain_score = float(yield_summary.get("retained_support_gain_score", 0.0) or 0.0)
             retained_estimated_cost = float(yield_summary.get("retained_estimated_cost", 0.0) or 0.0)
+            retained_transfer_gain_score = retained_positive_pass_rate_delta_sum + retained_support_gain_score
             retained_return_on_cost = 0.0
             if retained_estimated_cost > 0.0:
-                retained_return_on_cost = retained_positive_pass_rate_delta_sum / retained_estimated_cost
+                retained_return_on_cost = retained_transfer_gain_score / retained_estimated_cost
             timelines[family].append(
                 {
                     "run_index": int(result.get("run_index", 0) or 0),
@@ -1852,6 +1870,9 @@ def _family_transfer_timeline(results: list[dict[str, object]]) -> dict[str, obj
                     "retained_gain": retained_positive_delta_decisions > 0,
                     "retained_positive_delta_decisions": retained_positive_delta_decisions,
                     "retained_positive_pass_rate_delta_sum": retained_positive_pass_rate_delta_sum,
+                    "retained_support_gain_decisions": retained_support_gain_decisions,
+                    "retained_support_gain_score": retained_support_gain_score,
+                    "retained_transfer_gain_score": retained_transfer_gain_score,
                     "retained_estimated_cost": retained_estimated_cost,
                     "retained_return_on_cost": retained_return_on_cost,
                 }
@@ -1872,8 +1893,8 @@ def _family_transfer_timeline(results: list[dict[str, object]]) -> dict[str, obj
             families_with_repeated_observation.append(family)
         if len(retained_gain_runs) > 1:
             families_with_repeated_retained_gain.append(family)
-            first_delta = float(retained_gain_runs[0].get("retained_positive_pass_rate_delta_sum", 0.0) or 0.0)
-            latest_delta = float(retained_gain_runs[-1].get("retained_positive_pass_rate_delta_sum", 0.0) or 0.0)
+            first_delta = float(retained_gain_runs[0].get("retained_transfer_gain_score", 0.0) or 0.0)
+            latest_delta = float(retained_gain_runs[-1].get("retained_transfer_gain_score", 0.0) or 0.0)
             if latest_delta + 1e-12 >= first_delta:
                 families_with_non_declining_repeated_retained_gain.append(family)
                 first_return_on_cost = float(retained_gain_runs[0].get("retained_return_on_cost", 0.0) or 0.0)
@@ -1923,6 +1944,7 @@ def _family_transfer_investment_ranking(results: list[dict[str, object]]) -> dic
             else 0.0
         )
         latest_pass_rate_delta = float(latest_entry.get("retained_positive_pass_rate_delta_sum", 0.0) or 0.0)
+        latest_transfer_gain_score = float(latest_entry.get("retained_transfer_gain_score", 0.0) or 0.0)
         category = "unobserved"
         if family in timeline["families_with_cost_acceptable_non_declining_repeated_retained_gain"]:
             category = "cost_acceptable_persistent"
@@ -1951,6 +1973,7 @@ def _family_transfer_investment_ranking(results: list[dict[str, object]]) -> dic
                 "latest_return_on_cost": latest_return_on_cost,
                 "average_return_on_cost": average_return_on_cost,
                 "latest_retained_pass_rate_delta": latest_pass_rate_delta,
+                "latest_retained_transfer_gain_score": latest_transfer_gain_score,
                 "observed_runs": len(observed_runs),
                 "retained_gain_runs": len(retained_gain_runs),
                 "cost_acceptable_persistent": family in timeline["families_with_cost_acceptable_non_declining_repeated_retained_gain"],
@@ -2059,10 +2082,14 @@ def _frontier_expansion_summary(results: list[dict[str, object]]) -> dict[str, o
                 0,
                 int(family_yield.get("retained_positive_delta_decisions", 0) or 0),
             )
+            retained_support_gain_decisions = max(
+                0,
+                int(family_yield.get("retained_support_gain_decisions", 0) or 0),
+            )
             if observed_decisions > 0:
                 signaled_families.append(family)
                 signal_run_counts_by_family[family] = int(signal_run_counts_by_family.get(family, 0)) + 1
-            if retained_positive_delta_decisions > 0:
+            if retained_positive_delta_decisions > 0 or retained_support_gain_decisions > 0:
                 retained_gain_families.append(family)
                 retained_gain_run_counts_by_family[family] = int(retained_gain_run_counts_by_family.get(family, 0)) + 1
         required_sampled_family_count = max(required_sampled_family_count, min(2, len(_ordered_unique_strings(target_families))))
@@ -2772,6 +2799,8 @@ def main() -> None:
     parser.add_argument("--adaptive-search", action="store_true")
     parser.add_argument("--task-limit", type=int, default=0)
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
+    parser.add_argument("--exclude-subsystem", action="append", default=[])
+    parser.add_argument("--allow-transition-model-fallback", action="store_true")
     parser.add_argument("--include-episode-memory", action="store_true")
     parser.add_argument("--include-skill-memory", action="store_true")
     parser.add_argument("--include-skill-transfer", action="store_true")
@@ -2781,6 +2810,7 @@ def main() -> None:
     parser.add_argument("--include-curriculum", action="store_true")
     parser.add_argument("--include-failure-curriculum", action="store_true")
     args = parser.parse_args()
+    args.exclude_subsystem = _ordered_unique_strings(args.exclude_subsystem)
 
     config = KernelConfig()
     if args.provider:

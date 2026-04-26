@@ -1,0 +1,213 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_required_family_multi_job_execution",
+    "status": "supported",
+    "summary": "Delegated queue completed multi-job shared-repo roots across integration, repository, and repo_chore families under an isolated mock runtime."
+  },
+  "created_at": "2026-04-25T03:22:00Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py -k \"project_parallel_release_task_decomposes or decomposes_parallel_workers\"",
+      "result": "2 passed, 70 deselected",
+      "covered_surfaces": [
+        "built-in project-family decomposition",
+        "shared-repo worker decomposition baseline"
+      ]
+    },
+    "isolated_cli_required_family_multijob_drain": {
+      "queue_root": "/tmp/agentkernel_a5_remaining_multijob_20260425",
+      "provider": "mock",
+      "enqueue_commands": [
+        "python scripts/run_job_queue.py enqueue --task-id integration_parallel_failover_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id repository_parallel_audit_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id repo_chore_parallel_notice_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1"
+      ],
+      "drain_command": "python scripts/run_job_queue.py drain --limit 9 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "manifest_tasks_added": [
+        {
+          "task_id": "integration_parallel_failover_task",
+          "benchmark_family": "integration",
+          "shared_repo_id": "integration_parallel_failover",
+          "required_worker_branches": [
+            "worker/gateway-routes",
+            "worker/failover-runbook"
+          ]
+        },
+        {
+          "task_id": "repository_parallel_audit_task",
+          "benchmark_family": "repository",
+          "shared_repo_id": "repository_parallel_audit",
+          "required_worker_branches": [
+            "worker/service-status",
+            "worker/audit-docs"
+          ]
+        },
+        {
+          "task_id": "repo_chore_parallel_notice_task",
+          "benchmark_family": "repo_chore",
+          "shared_repo_id": "repo_chore_parallel_notice",
+          "required_worker_branches": [
+            "worker/notice-docs",
+            "worker/cleanup-index"
+          ]
+        }
+      ],
+      "queue_totals": {
+        "total_jobs": 9,
+        "completed_success": 9,
+        "worker_jobs": 6,
+        "integrator_jobs": 3,
+        "promotable_jobs_after_worker_filter_fix": 3,
+        "active_leases_after_completion": 0,
+        "checkpointed_jobs": 9,
+        "reported_jobs": 9
+      },
+      "family_counts": {
+        "integration": 3,
+        "repo_chore": 3,
+        "repository": 3
+      },
+      "required_family_multi_job_surface": {
+        "required_remaining_families": [
+          "integration",
+          "repository",
+          "repo_chore"
+        ],
+        "present": [
+          "integration",
+          "repository",
+          "repo_chore"
+        ],
+        "missing": []
+      },
+      "jobs": [
+        {
+          "task_id": "integration_parallel_failover_task__worker__worker_gateway-routes",
+          "benchmark_family": "integration",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "integration_parallel_failover_task__worker__worker_failover-runbook",
+          "benchmark_family": "integration",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repository_parallel_audit_task__worker__worker_service-status",
+          "benchmark_family": "repository",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repository_parallel_audit_task__worker__worker_audit-docs",
+          "benchmark_family": "repository",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repo_chore_parallel_notice_task__worker__worker_notice-docs",
+          "benchmark_family": "repo_chore",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repo_chore_parallel_notice_task__worker__worker_cleanup-index",
+          "benchmark_family": "repo_chore",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "integration_parallel_failover_task",
+          "benchmark_family": "integration",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repository_parallel_audit_task",
+          "benchmark_family": "repository",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "repo_chore_parallel_notice_task",
+          "benchmark_family": "repo_chore",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        }
+      ]
+    }
+  },
+  "open_limits": [
+    "This is required-family multi-job substrate evidence, not an A5 promotion claim.",
+    "The isolated CLI run used provider=mock and disabled command containment, so it is not production-equivalent runtime evidence.",
+    "Shared-repo reports still show hidden_side_effect_risk=true because git runtime artifacts are broad; clean side-effect breadth is covered by the separate single-job broad-family packet.",
+    "The main remaining A5 proof gap is production-equivalent provider recovery."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

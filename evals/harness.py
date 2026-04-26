@@ -199,6 +199,121 @@ def _emit_eval_progress(progress_label: str | None, message: str) -> None:
     print(f"[eval:{progress_label}] {message}", file=sys.stderr, flush=True)
 
 
+def _is_retryable_tolbert_startup_failure(error_text: object) -> bool:
+    normalized = str(error_text or "").strip().lower()
+    if not normalized:
+        return False
+    return (
+        "tolbert service failed to become ready" in normalized
+        or "tolbert service exited before startup ready" in normalized
+    )
+
+
+def _should_prewarm_tolbert_for_eval(
+    *,
+    active_config: KernelConfig,
+    task_limit: int | None,
+    requested_priority_families: Sequence[str],
+    restrict_to_priority_benchmark_families: bool,
+    prefer_retrieval_tasks: bool,
+    include_discovered_tasks: bool,
+) -> bool:
+    if not bool(active_config.use_tolbert_context):
+        return False
+    if not bool(prefer_retrieval_tasks) or not bool(include_discovered_tasks):
+        return False
+    if not bool(restrict_to_priority_benchmark_families):
+        return False
+    if task_limit is None or int(task_limit) <= 0 or int(task_limit) > 24:
+        return False
+    requested = {str(value).strip() for value in requested_priority_families if str(value).strip()}
+    required = {
+        "integration",
+        "project",
+        "repository",
+        "repo_chore",
+        "repo_sandbox",
+        "transition_pressure",
+    }
+    return required.issubset(requested)
+
+
+def _prewarm_tolbert_for_eval(kernel: AgentKernel, *, progress_label: str | None) -> None:
+    policy = getattr(kernel, "policy", None)
+    context_provider = getattr(policy, "context_provider", None)
+    client = getattr(context_provider, "client", None)
+    retrieval_config_fn = getattr(context_provider, "_retrieval_config", None)
+    ensure_process = getattr(client, "_ensure_process", None)
+    query = getattr(client, "query", None)
+    retrieval_config = retrieval_config_fn() if callable(retrieval_config_fn) else {}
+    if not callable(ensure_process) and not callable(query):
+        return
+    warmup_deadline_seconds = max(
+        5.0,
+        float(getattr(client, "service_startup_timeout_seconds", 0.0) or 0.0)
+        + float(getattr(client, "service_startup_grace_seconds", 0.0) or 0.0)
+        + 15.0,
+    )
+    started_at = time.monotonic()
+    attempt = 0
+    last_error = ""
+    while True:
+        attempt += 1
+        try:
+            _emit_eval_progress(progress_label, f"phase=tolbert_prewarm attempt={attempt}")
+            if callable(query):
+                query(
+                    query_text="agentkernel tolbert warmup",
+                    branch_results=max(1, int(retrieval_config.get("tolbert_branch_results", 1) or 1)),
+                    global_results=max(1, int(retrieval_config.get("tolbert_global_results", 1) or 1)),
+                    confidence_threshold=float(retrieval_config.get("tolbert_confidence_threshold", 0.0) or 0.0),
+                    top_branches=1,
+                    branch_confidence_margin=float(
+                        retrieval_config.get("tolbert_branch_confidence_margin", 0.12) or 0.12
+                    ),
+                    low_confidence_widen_threshold=float(
+                        retrieval_config.get("tolbert_low_confidence_widen_threshold", 0.6) or 0.6
+                    ),
+                    ancestor_branch_levels=max(
+                        0,
+                        int(retrieval_config.get("tolbert_ancestor_branch_levels", 0) or 0),
+                    ),
+                    low_confidence_branch_multiplier=float(
+                        retrieval_config.get("tolbert_low_confidence_branch_multiplier", 2.0) or 2.0
+                    ),
+                    low_confidence_global_multiplier=float(
+                        retrieval_config.get("tolbert_low_confidence_global_multiplier", 2.0) or 2.0
+                    ),
+                    timeout_seconds=max(
+                        1.0,
+                        min(
+                            float(getattr(client, "service_timeout_seconds", 15.0) or 15.0),
+                            15.0,
+                        ),
+                    ),
+                )
+            elif callable(ensure_process):
+                ensure_process()
+            _emit_eval_progress(progress_label, f"phase=tolbert_prewarm_ready attempt={attempt}")
+            return
+        except Exception as exc:
+            last_error = str(exc).strip() or exc.__class__.__name__
+            if not _is_retryable_tolbert_startup_failure(last_error):
+                _emit_eval_progress(
+                    progress_label,
+                    f"phase=tolbert_prewarm_failed attempt={attempt} reason=non_retryable",
+                )
+                return
+            if time.monotonic() - started_at >= warmup_deadline_seconds:
+                _emit_eval_progress(
+                    progress_label,
+                    "phase=tolbert_prewarm_failed "
+                    f"attempt={attempt} reason=timeout detail={last_error[:160]}",
+                )
+                return
+            time.sleep(1.0)
+
+
 def _should_emit_task_progress(index: int, total: int) -> bool:
     return index == 1 or index == total or index % 10 == 0
 
@@ -3035,6 +3150,18 @@ def _cleanup_scoped_runtime_state(config: KernelConfig) -> None:
                 shutil.rmtree(path, ignore_errors=True)
         except OSError:
             continue
+    runtime_db_path = getattr(config, "runtime_database_path", None)
+    if runtime_db_path:
+        runtime_db = Path(runtime_db_path)
+        for candidate in (
+            runtime_db,
+            runtime_db.with_name(f"{runtime_db.name}-wal"),
+            runtime_db.with_name(f"{runtime_db.name}-shm"),
+        ):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _scoped_config(base_config: KernelConfig, scope: str, **overrides) -> KernelConfig:
@@ -3042,6 +3169,7 @@ def _scoped_config(base_config: KernelConfig, scope: str, **overrides) -> Kernel
         base_config,
         workspace_root=_scoped_path(base_config.workspace_root, scope),
         trajectories_root=_scoped_path(base_config.trajectories_root, scope),
+        runtime_database_path=_scoped_path(base_config.runtime_database_path, scope),
         skills_path=_scoped_path(base_config.skills_path, scope),
         operator_classes_path=_scoped_path(base_config.operator_classes_path, scope),
         tool_candidates_path=_scoped_path(base_config.tool_candidates_path, scope),
@@ -3127,6 +3255,7 @@ def _scoped_config(base_config: KernelConfig, scope: str, **overrides) -> Kernel
         config.run_reports_dir,
         config.run_checkpoints_dir,
         config.unattended_workspace_snapshot_root,
+        config.runtime_database_path.parent,
     ):
         directory.mkdir(parents=True, exist_ok=True)
     config.improvement_cycles_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3236,6 +3365,7 @@ def run_eval(
     priority_benchmark_family_weights: dict[str, object] | None = None,
     prefer_low_cost_tasks: bool = False,
     prefer_long_horizon_tasks: bool = False,
+    prefer_retrieval_tasks: bool = False,
     restrict_to_priority_benchmark_families: bool = False,
     progress_label: str | None = None,
     progress_snapshot_path: Path | None = None,
@@ -3328,7 +3458,8 @@ def run_eval(
                     if (str(getattr(task, "metadata", {}).get("benchmark_family", "bounded")).strip() or "bounded")
                     in requested_priority_family_set
                 ]
-                tasks = _drop_retrieval_companions_when_sources_present(tasks)
+                if not prefer_retrieval_tasks:
+                    tasks = _drop_retrieval_companions_when_sources_present(tasks)
             if task_limit is not None and task_limit > 0 and len(tasks) > task_limit:
                 effective_priority_families = list(requested_priority_families)
                 if not effective_priority_families:
@@ -3340,6 +3471,7 @@ def run_eval(
                     priority_family_weights=priority_benchmark_family_weights,
                     prefer_low_cost_tasks=prefer_low_cost_tasks,
                     prefer_long_horizon_tasks=prefer_long_horizon_tasks,
+                    prefer_retrieval_tasks=prefer_retrieval_tasks,
                     required_executable_families=active_config.unattended_trust_required_benchmark_families,
                 )
         completed_primary_tasks: list = []
@@ -3528,6 +3660,15 @@ def run_eval(
         results: list[EpisodeRecord] = []
         if include_primary_tasks:
             kernel = AgentKernel(config=active_config)
+            if _should_prewarm_tolbert_for_eval(
+                active_config=active_config,
+                task_limit=task_limit,
+                requested_priority_families=requested_priority_families,
+                restrict_to_priority_benchmark_families=restrict_to_priority_benchmark_families,
+                prefer_retrieval_tasks=prefer_retrieval_tasks,
+                include_discovered_tasks=include_discovered_tasks,
+            ):
+                _prewarm_tolbert_for_eval(kernel, progress_label=progress_label)
             results = _run_tasks_with_progress(
                 tasks,
                 kernel,
@@ -5014,8 +5155,39 @@ def _limit_tasks_for_compare(
     priority_family_weights: dict[str, object] | None = None,
     prefer_low_cost_tasks: bool = False,
     prefer_long_horizon_tasks: bool = False,
+    prefer_retrieval_tasks: bool = False,
     required_executable_families: Sequence[str] | None = None,
 ) -> list:
+    exact_replay_retrieval_task_ids = {
+        "deployment_manifest_retrieval_task",
+        "repository_migration_wave_retrieval_task",
+        "integration_failover_drill_retrieval_task",
+        "tooling_release_contract_retrieval_task",
+        "project_release_cutover_retrieval_task",
+        "release_packet_retrieval_task",
+        "report_rollup_retrieval_task",
+        "repo_cleanup_review_retrieval_task",
+        "repo_patch_review_retrieval_task",
+    }
+
+    def _retrieval_priority_key(task) -> tuple[int, int, str]:
+        metadata = getattr(task, "metadata", {}) or {}
+        task_id = str(getattr(task, "task_id", "")).strip()
+        requires_retrieval = bool(metadata.get("requires_retrieval", False))
+        replay_rank = (
+            0
+            if task_id in exact_replay_retrieval_task_ids
+            else 1
+            if requires_retrieval
+            else 2
+        )
+        return (
+            replay_rank,
+            _long_horizon_priority_key(task) if prefer_long_horizon_tasks else 0,
+            int(not bool(metadata.get("light_supervision_candidate", False))),
+            str(task_id),
+        )
+
     grouped: dict[str, list] = {}
     for task in tasks:
         family = str(task.metadata.get("benchmark_family", "bounded"))
@@ -5025,14 +5197,17 @@ def _limit_tasks_for_compare(
         for family in list(required_executable_families or [])
         if str(family).strip()
     }
-    if prefer_low_cost_tasks and required_executable_family_set:
+    if prefer_low_cost_tasks and required_executable_family_set and not prefer_retrieval_tasks:
         for family, family_tasks in list(grouped.items()):
             if family not in required_executable_family_set:
                 continue
             executable_tasks = _drop_retrieval_companions_when_sources_present(family_tasks)
             if executable_tasks:
                 grouped[family] = executable_tasks
-    if prefer_low_cost_tasks:
+    if prefer_retrieval_tasks:
+        for family_tasks in grouped.values():
+            family_tasks.sort(key=_retrieval_priority_key)
+    elif prefer_low_cost_tasks:
         for family, family_tasks in grouped.items():
             if family in required_executable_family_set:
                 if prefer_long_horizon_tasks:

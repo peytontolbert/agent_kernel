@@ -1,0 +1,128 @@
+{
+  "evidence_kind": "a5_live_vllm_repeated_control_cycle_continuation_check",
+  "created_at": "2026-04-25T14:12:59Z",
+  "status": "passed",
+  "root": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425",
+  "provider": "vllm",
+  "model": "Qwen/Qwen3.5-9B",
+  "runtime": {
+    "workspace_root": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/workspace",
+    "queue_path": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/queue/queue.json",
+    "runtime_state_path": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/queue/runtime_state.json",
+    "reports_dir": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports",
+    "episodes_root": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/episodes",
+    "database_path": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/runtime.sqlite3"
+  },
+  "jobs": [
+    {
+      "task_id": "integration_parallel_failover_task__worker__worker_gateway-routes",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "integration_parallel_failover_task__worker__worker_failover-runbook",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repo_chore_parallel_notice_task__worker__worker_notice-docs",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repo_chore_parallel_notice_task__worker__worker_cleanup-index",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "integration_parallel_failover_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_integrator_segment_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repo_chore_parallel_notice_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_integrator_segment_direct"],
+      "hidden_side_effect_risk": false
+    }
+  ],
+  "families": ["integration", "repo_chore"],
+  "control_cycle_shape": {
+    "enqueue_calls": 2,
+    "drain_invocations": 6,
+    "drain_limit": 1,
+    "runtime_history_events": 18,
+    "lease_acquisitions": 6,
+    "lease_releases": 6,
+    "final_active_leases": 0
+  },
+  "trust_status": {
+    "overall_status": "trusted",
+    "reports": 6,
+    "success_rate": 1.0,
+    "unsafe_ambiguous_rate": 0.0,
+    "hidden_side_effect_risk_rate": 0.0,
+    "blocked_jobs": 0,
+    "promotable_jobs_before_promotion": 2,
+    "promotable_jobs_after_promotion": 0
+  },
+  "acceptance_promotion": {
+    "promoted_jobs": [
+      {
+        "task_id": "integration_parallel_failover_task",
+        "job_id": "job:integration_parallel_failover_task:20260425T140924819508Z:55a84402",
+        "promoted_at": "2026-04-25T14:15:35.353622+00:00",
+        "detail": "a5-live-vllm-repeated-control-continuation-r5"
+      },
+      {
+        "task_id": "repo_chore_parallel_notice_task",
+        "job_id": "job:repo_chore_parallel_notice_task:20260425T140949690809Z:f67c4e27",
+        "promoted_at": "2026-04-25T14:15:55.683353+00:00",
+        "detail": "a5-live-vllm-repeated-control-continuation-r5"
+      }
+    ],
+    "acceptance_verifier_passed": 2,
+    "remaining_promotable_jobs_after_promotion": 0
+  },
+  "patches_validated": [
+    {
+      "path": "agent_kernel/extensions/policy_workflow_adapter.py",
+      "summary": "synthetic shared-repo workers can execute task-contract suggested commands before context compilation via shared_repo_worker_direct"
+    },
+    {
+      "path": "agent_kernel/ops/preflight.py",
+      "summary": "shared-repo integrators account for required worker-branch outputs as managed side-effect paths"
+    },
+    {
+      "path": "datasets/task_bank/default_tasks.json",
+      "summary": "required-family shared-repo worker tasks preserve sibling baseline files"
+    }
+  ],
+  "verification": [
+    "pytest -q tests/test_policy.py::test_llm_policy_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_shared_repo_integrator_skips_context_compile_for_first_merge_segment tests/test_job_queue.py::test_project_parallel_release_task_decomposes_into_project_family_workers",
+    "pytest -q tests/test_preflight.py::test_summarize_workspace_side_effects_accounts_for_required_worker_branch_outputs tests/test_preflight.py::test_summarize_workspace_side_effects_keeps_non_git_unexpected_changes_for_git_tasks tests/test_preflight.py::test_summarize_workspace_side_effects_ignores_git_internal_changes_for_git_tasks",
+    "python -m py_compile agent_kernel/extensions/policy_workflow_adapter.py agent_kernel/extensions/policy_decision_support.py agent_kernel/policy.py tests/test_policy.py",
+    "python -m py_compile agent_kernel/ops/preflight.py tests/test_preflight.py",
+    "python -m json.tool datasets/task_bank/default_tasks.json"
+  ],
+  "reports": [
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_integration_parallel_failover_task_20260425T140924819508Z_55a84402.json",
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_integration_parallel_failover_task__worker__worker_failover-runbook_20260425T140924813360Z_3ab6f70f.json",
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_integration_parallel_failover_task__worker__worker_gateway-routes_20260425T140924806370Z_362a5bdd.json",
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_repo_chore_parallel_notice_task_20260425T140949690809Z_f67c4e27.json",
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_repo_chore_parallel_notice_task__worker__worker_cleanup-index_20260425T140949674083Z_8d0c9fb7.json",
+    "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425/reports/job_report_job_repo_chore_parallel_notice_task__worker__worker_notice-docs_20260425T140949661798Z_445c01a1.json"
+  ],
+  "interpretation": "This is a clean A5-substrate continuation proof for live-vLLM persistent queue operation: two heterogeneous shared-repo objectives, four child workers, two integrators, six separate drain invocations, no blocked jobs, trusted final status, two accepted parent promotions, and zero hidden side-effect risk."
+}

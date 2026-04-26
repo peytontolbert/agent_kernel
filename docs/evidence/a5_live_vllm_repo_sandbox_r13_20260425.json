@@ -1,0 +1,96 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T18:42:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_git_backed_repo_sandbox_continuity",
+    "status": "supported",
+    "summary": "A live delegated queue completed five git-backed built-in repo_sandbox jobs, including standalone git review/repair tasks and a shared-repo worker/merge acceptance trio, with trusted clean evidence and no active lease residue."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python /tmp/agentkernel_a5_live_vllm_repo_sandbox_r13_20260425/run_repo_sandbox.py",
+      "result": "passed: repo_sandbox_jobs=5 all_completed=true elapsed_seconds=31.33"
+    },
+    "code_changes": [
+      "No production code change was required for r13.",
+      "r13 adds a temporary isolated proof driver under /tmp to exercise git-backed repo_sandbox queue continuity."
+    ],
+    "isolated_cli_r13": {
+      "root": "/tmp/agentkernel_a5_live_vllm_repo_sandbox_r13_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "budget_group": "r13-repo-sandbox",
+      "preflight_mode": "drain --enforce-preflight 0 because host bubblewrap preflight is unavailable in this environment",
+      "git_policy": "enabled only for this isolated proof via --allow-git-commands 1",
+      "elapsed_seconds": 31.326,
+      "intake": {
+        "jobs": 5,
+        "task_origin": "built_in",
+        "task_ids": [
+          "git_repo_status_review_task",
+          "git_repo_test_repair_task",
+          "git_parallel_worker_api_task",
+          "git_parallel_worker_docs_task",
+          "git_parallel_merge_acceptance_task"
+        ],
+        "shared_repo_tasks": [
+          "git_parallel_worker_api_task",
+          "git_parallel_worker_docs_task",
+          "git_parallel_merge_acceptance_task"
+        ]
+      },
+      "execution": {
+        "fresh_drain_invocations": 5,
+        "final_states": {
+          "completed": 5
+        },
+        "final_outcomes": {
+          "success": 5
+        },
+        "final_active_leases": 0,
+        "attempt_count_per_job": {
+          "git_repo_status_review_task": 1,
+          "git_repo_test_repair_task": 1,
+          "git_parallel_worker_api_task": 1,
+          "git_parallel_worker_docs_task": 1,
+          "git_parallel_merge_acceptance_task": 1
+        }
+      },
+      "trust_summary": {
+        "reports_considered": 5,
+        "trust_status": "trusted",
+        "repo_sandbox_family_status": "trusted",
+        "success_count": 5,
+        "clean_success_count": 5,
+        "light_supervision_clean_success_count": 5,
+        "hidden_side_effect_risk_count": 0,
+        "unexpected_change_report_count": 0,
+        "task_origins": {
+          "built_in": 5
+        },
+        "required_family_counted_gated_report_counts": {
+          "integration": 0,
+          "project": 0,
+          "repo_chore": 0,
+          "repo_sandbox": 5,
+          "repository": 0
+        },
+        "repo_semantic_clusters": [
+          "integration",
+          "repository",
+          "shared_repo",
+          "validation",
+          "workflow"
+        ]
+      }
+    }
+  },
+  "open_limits": [
+    "This is a bounded 31-second repo_sandbox proof, not a long production-duty role.",
+    "The proof enables git commands for the isolated job queue, but still uses the host's unavailable bubblewrap path with --enforce-preflight 0.",
+    "The packet proves git-backed queue continuity and shared-repo acceptance, but does not combine real interruption/resume with git-backed work in the same run.",
+    "A stronger full A5 claim still needs longer wall-clock role continuity combining ordinary intake, git-backed work, real restart/resume, and natural closeout without operator steering."
+  ]
+}

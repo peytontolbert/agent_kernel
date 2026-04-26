@@ -2,12 +2,23 @@
 
 ## Default path
 
-The preferred live runtime is local `vllm` plus a strict TOLBERT service subprocess. The current code defaults in [`agent_kernel/config.py`](/data/agentkernel/agent_kernel/config.py) and the native shell wrappers still point at `ollama` unless overridden through environment variables or CLI flags.
+The default unattended proof path is the seeded `provider=vllm` runtime with TOLBERT context and
+retrieval still enabled. The broader seed runtime for open-ended work is still local `vllm` plus a strict TOLBERT
+service subprocess, so external `vllm`/`ollama` remains part of the overall live posture in
+[`agent_kernel/config.py`](/data/agentkernel/agent_kernel/config.py).
 
 This is the current seed runtime posture:
 
 - `vllm` is the authoritative free-form decoder
 - the live TOLBERT service is the authoritative encoder/retrieval compiler slice
+- `provider=hybrid` now binds the retained Tolbert-family decoder as the provider surface rather than
+  falling back to deterministic task commands, and it prefers the retained universal-decoder bundle
+  when that bundle is materialized
+- retained Tolbert primary routing now includes state-conditioned decoder generation, not only
+  bounded candidate enumeration plus hybrid rescoring
+- `provider=tolbert` is retained only as a backward-compatible alias for `provider=hybrid`
+- [`scripts/run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py) now
+  defaults unattended child runs back to the configured seed provider unless a provider is explicitly requested
 - the broader TOLBERT family in this repo is the target encoder-latent-decoder universal runtime documented in [`tolbert_liftoff.md`](/data/agentkernel/docs/tolbert_liftoff.md)
 - future TOLBERT-family checkpoint takeover is a retained-gate milestone, not a naming trick
 
@@ -46,8 +57,10 @@ Important `KernelConfig` defaults from [`agent_kernel/config.py`](/data/agentker
 - `use_skills=1`
 - `use_graph_memory=1`
 - `use_world_model=1`
+- `use_universe_model=1`
 - `use_planner=1`
 - `use_role_specialization=1`
+- `persist_learning_candidates=1`
 - `use_prompt_proposals=1`
 - `use_curriculum_proposals=1`
 - `use_retrieval_proposals=1`
@@ -59,6 +72,31 @@ Important `KernelConfig` defaults from [`agent_kernel/config.py`](/data/agentker
 - `checkpoint_history_step_window=24`
 - `timeout_seconds=20`
 
+## Resource Resolution
+
+The runtime now has a small explicit resource substrate for selected active inputs.
+
+- base prompt templates resolve through [`agent_kernel/resource_registry.py`](/data/agentkernel/agent_kernel/resource_registry.py)
+- builtin subsystem artifacts are registered from [`datasets/kernel_metadata.json`](/data/agentkernel/datasets/kernel_metadata.json)
+- [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py) now loads `system` and `decision` prompt templates through that registry
+- [`agent_kernel/universe_model.py`](/data/agentkernel/agent_kernel/universe_model.py) now resolves `universe_constitution`, `operating_envelope`, and legacy `universe_contract` through resource ids instead of path-specialized loading
+
+This is a first `RSPL-lite` slice rather than a complete resource substrate. The covered surfaces are documented in [`resource_protocol.md`](/data/agentkernel/docs/resource_protocol.md).
+
+Runtime shape note:
+
+- `KernelConfig.claimed_runtime_shape()` now treats `bounded_autonomous` as a decoder-native claim rather than a
+  pure world/governance claim
+- that claim now requires a retained native decoder posture in addition to `use_graph_memory=1` and
+  `use_world_model=1`
+- if you want a smaller runnable kernel without those surfaces, use [`KernelConfig.executable_floor(...)`](/data/agentkernel/agent_kernel/config.py:603) instead of weakening the bounded-autonomous mode
+
+Strict executable floor:
+
+- use [`KernelConfig.executable_floor(...)`](/data/agentkernel/agent_kernel/config.py:603) when you want the closed-loop executor without ASI-runtime enrichments or self-improvement closeout hooks
+- that preset disables `use_tolbert_context`, `use_skills`, `use_graph_memory`, `use_world_model`, `use_universe_model`, `use_planner`, `use_role_specialization`, and `persist_learning_candidates`
+- episode persistence remains on, so the floor still ends in a normal `EpisodeRecord` plus saved episode artifact
+
 The loop in [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py) enriches state before each decision:
 
 - graph summary from prior episodes
@@ -66,6 +104,25 @@ The loop in [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py) enr
 - short verifier-oriented plan
 - current acting role
 - TOLBERT `ContextPacket`
+
+`loop.py` is now narrower than before. The live step loop still stays there, but support glue around it now lives in:
+
+- [`agent_kernel/ops/loop_runtime_support.py`](/data/agentkernel/agent_kernel/ops/loop_runtime_support.py:1) for provider/client construction, shared-repo materialization and publish flows, and post-episode learning-candidate persistence helpers
+- [`agent_kernel/ops/loop_checkpointing.py`](/data/agentkernel/agent_kernel/ops/loop_checkpointing.py:1) for checkpoint payload serialization, resume state reconstruction, and setup-history loading
+- [`agent_kernel/ops/loop_progress.py`](/data/agentkernel/agent_kernel/ops/loop_progress.py:1) for progress-event shaping
+- [`agent_kernel/extensions/planner_recovery.py`](/data/agentkernel/agent_kernel/extensions/planner_recovery.py:1) for planner-recovery artifact synthesis and ranking helpers
+
+The runtime no longer reaches most learned/modeling surfaces directly from the loop and policy modules.
+[`agent_kernel/runtime_modeling_adapter.py`](/data/agentkernel/agent_kernel/runtime_modeling_adapter.py:1)
+now provides the lazy seam for:
+
+- context-provider construction
+- retained model artifact loading
+- hybrid scoring, world-signal inference, and retained decoder generation
+- latent-state enrichment hooks
+- bounded decoder/action-generation helpers plus the state-conditioned hybrid decoder path
+
+That keeps optional TOLBERT/modeling support behaviorally available without making direct modeling imports the architectural boundary of the runtime core.
 
 The canonical task loop for this repository is:
 
@@ -80,7 +137,8 @@ Current code mapping:
 - `simulate likely transitions`: score stop and command candidates through world-model rollout
 - `plan candidates`: maintain subgoals and planner recovery artifacts
 - `choose via policy`: route through planner, executor, or critic policy paths
-- `execute`: run the chosen bounded command in the sandbox
+- `execute`: apply pre-execution universe governance, then run the chosen bounded command in the sandbox when not blocked
+  Shared-repo-gated, task-scoped git mutations such as integrator merge steps are now treated as allowed bounded workflow actions rather than blanket `git_write_conflict` violations, while destructive git patterns remain blocked
 - `verify`: apply deterministic verifier checks against the task contract
 - `critique`: attach verifier/subgoal diagnoses and critic recovery state
 - `update memory/models`: persist episode memory and learned candidates, then continue until termination
@@ -191,10 +249,13 @@ The `long_horizon_success` focus biases policy and rollout control toward:
 - training datasets and autobuild readiness that weight and count long-horizon supervision explicitly instead of treating it as generic task mass
 - liftoff and retained-vs-baseline comparison slices that require explicit non-regression on long-horizon subsets before promotion
 
-The live unattended gap map for the current kernel work lives in
-[`docs/coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md).
-Use it as the compact evidence-backed summary of which runtime surfaces still
-matter most for compounding coding agency.
+The single current kernel-gap dashboard now lives in
+[`docs/kernel_gap_dashboard.md`](/data/agentkernel/docs/kernel_gap_dashboard.md).
+Use it first when you want the current blocker ranking, then open
+[`docs/coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md)
+for the live bottleneck detail and
+[`docs/live_evidence_proof_gap_audit.md`](/data/agentkernel/docs/live_evidence_proof_gap_audit.md)
+for the proof-state detail.
 
 When a retained `tolbert_model_bundle` exposes a hybrid runtime with world-model
 support, the live loop now also probes that retained runtime before the first
@@ -405,13 +466,16 @@ Supported providers are:
 
 - `ollama`
 - `vllm`
+- `model_stack`
 - `mock`
 
-`ollama` and `vllm` are the live paths. `mock` is mainly used by tests and skips retrieval-required tasks in eval.
+`ollama`, `vllm`, and `model_stack` are live paths. `mock` is mainly used by tests and skips retrieval-required tasks in eval.
 
 ## Provider behavior
 
 For `ollama`, the client sends `think: false` to avoid structured output being placed only in Ollama’s thinking field. The parser still accepts JSON from either `response` or `thinking` as a fallback.
+
+For `model_stack`, Agent Kernel talks to the local Model Stack serving API: `/healthz` for preflight and `/v1/generate` for token generation. Because that API is token-based rather than chat-compatible, configure a tokenizer root through `AGENT_KERNEL_MODEL_STACK_TOKENIZER_PATH` or `AGENT_KERNEL_MODEL_STACK_MODEL_DIR`; the client loads `data.tokenizer.get_tokenizer` from `AGENT_KERNEL_MODEL_STACK_REPO_PATH`.
 
 Useful LLM settings:
 
@@ -422,6 +486,10 @@ Useful LLM settings:
 - `AGENT_KERNEL_LLM_SUMMARY_MAX_CHARS`
 - `AGENT_KERNEL_OLLAMA_HOST`
 - `AGENT_KERNEL_VLLM_HOST`
+- `AGENT_KERNEL_MODEL_STACK_HOST`
+- `AGENT_KERNEL_MODEL_STACK_MODEL_DIR`
+- `AGENT_KERNEL_MODEL_STACK_TOKENIZER_PATH`
+- `AGENT_KERNEL_MODEL_STACK_REPO_PATH`
 - `AGENT_KERNEL_VLLM_API_KEY`
 - `CUDA_VISIBLE_DEVICES`
 
@@ -489,8 +557,9 @@ Those are eval-time analysis lanes, not separate product surfaces.
 
 ## Universal family definition
 
-In this repo, `TOLBERT` no longer means only the original ontology encoder.
-It means the full retained model family with these coordinated surfaces:
+In this repo, seeded `TOLBERT` refers to the original ontology
+encoder/retrieval/compiler path. The retained modeled runtime lane is the
+`hybrid` path, which currently carries these coordinated surfaces:
 
 - encoder surface for hierarchy-aware representation and retrieval
 - latent/state-space surface for long-horizon task state
@@ -499,10 +568,11 @@ It means the full retained model family with these coordinated surfaces:
 - policy/value/stop/risk heads that plug into kernel routing and acceptance
 
 The current live service path in [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
-is the seed compiler member of that family. The hybrid runtime under
+is the seeded compiler path. The hybrid runtime under
 [`agent_kernel/modeling/tolbert/`](/data/agentkernel/agent_kernel/modeling/tolbert)
-is the first internal latent/runtime member. The seed `vllm` stack remains active
-until retained TOLBERT-family checkpoints earn authority through the liftoff gate.
+is the first retained latent/runtime member. The seed `vllm` stack remains
+active until retained hybrid checkpoints earn authority through the liftoff
+gate.
 
 `run_eval.py` also exposes memory/eval lanes that the older docs did not list:
 

@@ -120,6 +120,8 @@ def classify_run_outcome(
 
     if all(_step_non_committal_failure(step) for step in command_steps):
         return "safe_stop", [episode.termination_reason or "non_committal_failure"]
+    if all(_step_explicit_verification_failure(step) for step in command_steps):
+        return "safe_stop", [episode.termination_reason or "verification_failed"]
 
     return "unsafe_ambiguous", [episode.termination_reason or "unverified_side_effect_risk"]
 
@@ -143,7 +145,8 @@ def build_unattended_task_report(
     if outcome_reasons_override is not None:
         outcome_reasons = [reason.strip() for reason in outcome_reasons_override if reason.strip()]
     workspace = Path(episode.workspace) if episode is not None else config.workspace_root / task.workspace_subdir
-    command_steps = [step for step in (episode.steps if episode is not None else []) if step.action == CODE_EXECUTE]
+    episode_steps = list(episode.steps if episode is not None else [])
+    command_steps = [step for step in episode_steps if step.action == CODE_EXECUTE]
     after_workspace_snapshot = capture_workspace_snapshot(workspace)
     side_effects = summarize_workspace_side_effects(
         before_snapshot=before_workspace_snapshot or {},
@@ -197,6 +200,17 @@ def build_unattended_task_report(
         side_effects=side_effects,
         preflight=preflight,
     )
+    retrieval_trace = _episode_retrieval_trace(episode_steps)
+    failure_origin = _report_failure_origin(
+        episode_steps=episode_steps,
+        preflight=preflight,
+    )
+    failure_reason = _report_failure_reason(
+        episode_steps=episode_steps,
+        preflight=preflight,
+        outcome_reasons=outcome_reasons,
+    )
+    last_decision_source = _report_last_decision_source(episode_steps)
     return {
         "report_kind": "unattended_task_report",
         "generated_at": datetime.now(UTC).isoformat(),
@@ -212,6 +226,13 @@ def build_unattended_task_report(
             if termination_reason_override
             else episode.termination_reason if episode is not None else "preflight_failed"
         ),
+        "failure_origin": failure_origin,
+        "failure_reason": failure_reason,
+        "last_decision_source": last_decision_source,
+        "trusted_retrieval_steps": retrieval_trace["trusted_retrieval_steps"],
+        "selected_retrieval_span_ids": retrieval_trace["selected_retrieval_span_ids"],
+        "retrieval_influenced_steps": retrieval_trace["retrieval_influenced_steps"],
+        "policy_trace": _report_policy_trace(episode_steps),
         "task_metadata": dict(task.metadata),
         "task_contract": task_contract,
         "trust_scope": trust_scope,
@@ -237,6 +258,12 @@ def build_unattended_task_report(
             "accounted_change_files": len(side_effects["accounted_change_files"]),
             "unexpected_change_files": len(side_effects["unexpected_change_files"]),
             "hidden_side_effect_risk": side_effects["hidden_side_effect_risk"],
+            "episode_steps": len(episode_steps),
+            "policy_terminated_steps": sum(
+                1 for step in episode_steps if str(step.verification.get("outcome_label", "")).strip() == "policy_terminated"
+            ),
+            "trusted_retrieval_steps": retrieval_trace["trusted_retrieval_steps"],
+            "retrieval_influenced_steps": retrieval_trace["retrieval_influenced_steps"],
         },
         "commands": [_serialize_command_step(step) for step in command_steps],
         "capability_usage": capability_usage,
@@ -665,6 +692,13 @@ def _provider_health_check(
             name="provider_health",
             detail_label="ollama",
             url=f"{config.ollama_host.rstrip('/')}/api/tags",
+            opener=opener,
+        )
+    if provider == "model_stack":
+        return _http_health_check(
+            name="provider_health",
+            detail_label="model_stack",
+            url=f"{config.model_stack_host.rstrip('/')}/healthz",
             opener=opener,
         )
     if provider == "vllm":
@@ -1279,17 +1313,62 @@ def _side_effect_contract_paths(task: TaskSpec | None) -> tuple[set[str], set[st
     if task is None:
         return set(), set()
     workflow_guard = _workflow_guard(task)
+    verifier = task.metadata.get("semantic_verifier", {})
+    semantic_verifier = dict(verifier) if isinstance(verifier, dict) else {}
     managed_paths = _normalized_path_set(
         list(task.expected_files)
         + list(task.expected_file_contents)
         + list(task.forbidden_files)
         + [str(value) for value in workflow_guard.get("managed_paths", []) if str(value).strip()]
+        + _integrator_required_worker_managed_paths(task, semantic_verifier)
     )
     delete_paths = _normalized_path_set(
         list(task.forbidden_files)
         + [str(value) for value in workflow_guard.get("delete_paths", []) if str(value).strip()]
     )
     return managed_paths, delete_paths
+
+
+def _integrator_required_worker_managed_paths(task: TaskSpec, semantic_verifier: dict[str, Any]) -> list[str]:
+    workflow_guard = _workflow_guard(task)
+    if not workflow_guard.get("shared_repo_id"):
+        return []
+    if workflow_guard.get("worker_branch"):
+        return []
+    required_branches = {
+        str(value).strip()
+        for value in semantic_verifier.get("required_merged_branches", [])
+        if str(value).strip()
+    }
+    if not required_branches:
+        return []
+    managed: list[str] = []
+    for worker_spec in task.metadata.get("parallel_workers", []):
+        if not isinstance(worker_spec, dict):
+            continue
+        worker_branch = str(worker_spec.get("worker_branch", "")).strip()
+        if worker_branch not in required_branches:
+            continue
+        managed.extend(
+            str(value).strip()
+            for value in worker_spec.get("expected_changed_paths", [])
+            if str(value).strip()
+        )
+        managed.extend(
+            str(value).strip()
+            for value in worker_spec.get("claimed_paths", [])
+            if str(value).strip()
+        )
+        expected_file_contents = worker_spec.get("expected_file_contents", {})
+        if isinstance(expected_file_contents, dict):
+            managed.extend(str(value).strip() for value in expected_file_contents if str(value).strip())
+        for rule in worker_spec.get("report_rules", []):
+            if not isinstance(rule, dict):
+                continue
+            path = str(rule.get("path", "")).strip()
+            if path:
+                managed.append(path)
+    return managed
 
 
 def _normalized_path_set(paths: list[str]) -> set[str]:
@@ -1390,6 +1469,100 @@ def _serialize_command_step(step: StepRecord) -> dict[str, Any]:
     }
 
 
+def _episode_retrieval_trace(steps: list[StepRecord]) -> dict[str, Any]:
+    selected_span_ids: list[str] = []
+    trusted_retrieval_steps = 0
+    retrieval_influenced_steps = 0
+    for step in steps:
+        span_id = str(step.selected_retrieval_span_id or "").strip()
+        if span_id and span_id not in selected_span_ids:
+            selected_span_ids.append(span_id)
+        if bool(step.trust_retrieval):
+            trusted_retrieval_steps += 1
+        if bool(step.retrieval_influenced):
+            retrieval_influenced_steps += 1
+    return {
+        "trusted_retrieval_steps": trusted_retrieval_steps,
+        "selected_retrieval_span_ids": selected_span_ids,
+        "retrieval_influenced_steps": retrieval_influenced_steps,
+    }
+
+
+def _report_last_decision_source(steps: list[StepRecord]) -> str | None:
+    for step in reversed(steps):
+        decision_source = str(step.decision_source).strip()
+        if decision_source:
+            return decision_source
+    return None
+
+
+def _report_failure_origin(
+    *,
+    episode_steps: list[StepRecord],
+    preflight: PreflightReport | None,
+) -> str | None:
+    for step in reversed(episode_steps):
+        failure_origin = str(step.failure_origin).strip()
+        if failure_origin:
+            return failure_origin
+    if preflight is not None and not preflight.passed:
+        failed_checks = _required_failed_preflight_checks(preflight)
+        if failed_checks:
+            return failed_checks[0]
+    return None
+
+
+def _report_failure_reason(
+    *,
+    episode_steps: list[StepRecord],
+    preflight: PreflightReport | None,
+    outcome_reasons: list[str],
+) -> str | None:
+    for step in reversed(episode_steps):
+        verification = step.verification if isinstance(step.verification, dict) else {}
+        reasons = verification.get("reasons", [])
+        if isinstance(reasons, list):
+            for reason in reasons:
+                normalized = str(reason).strip()
+                if normalized:
+                    return normalized
+    if preflight is not None and not preflight.passed:
+        failed_checks = _required_failed_preflight_checks(preflight)
+        if failed_checks:
+            failed_lookup = {check.name: check for check in preflight.checks}
+            detail = str(failed_lookup.get(failed_checks[0]).detail if failed_checks[0] in failed_lookup else "").strip()
+            return detail or f"preflight_failed:{failed_checks[0]}"
+    for reason in outcome_reasons:
+        normalized = str(reason).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _report_policy_trace(steps: list[StepRecord]) -> list[dict[str, Any]]:
+    trace: list[dict[str, Any]] = []
+    for step in steps[-5:]:
+        verification = step.verification if isinstance(step.verification, dict) else {}
+        trace.append(
+            {
+                "index": int(step.index),
+                "action": str(step.action).strip(),
+                "decision_source": str(step.decision_source).strip(),
+                "verification_passed": bool(verification.get("passed", False)),
+                "verification_reasons": [
+                    str(value).strip()
+                    for value in list(verification.get("reasons", []) or [])
+                    if str(value).strip()
+                ],
+                "failure_origin": str(step.failure_origin).strip() or None,
+                "selected_retrieval_span_id": str(step.selected_retrieval_span_id or "").strip() or None,
+                "retrieval_influenced": bool(step.retrieval_influenced),
+                "trust_retrieval": bool(step.trust_retrieval),
+            }
+        )
+    return trace
+
+
 def _execution_source_summary(command_steps: list[StepRecord]) -> dict[str, int]:
     summary = {
         "decoder_generated": 0,
@@ -1417,6 +1590,11 @@ def _execution_source_summary(command_steps: list[StepRecord]) -> dict[str, int]
 def _step_non_committal_failure(step: StepRecord) -> bool:
     exit_code = _step_exit_code(step)
     return _step_blocked(step) or _step_timed_out(step) or (exit_code is not None and exit_code != 0)
+
+
+def _step_explicit_verification_failure(step: StepRecord) -> bool:
+    verification = step.verification if isinstance(step.verification, dict) else {}
+    return bool(verification) and not bool(verification.get("passed"))
 
 
 def _step_exit_code(step: StepRecord) -> int | None:

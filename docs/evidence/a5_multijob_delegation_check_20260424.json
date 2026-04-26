@@ -1,0 +1,196 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_multi_job_delegation",
+    "status": "supported",
+    "summary": "Delegated queue can decompose and complete a shared-repo acceptance task through worker jobs plus an integrator under an isolated mock runtime."
+  },
+  "created_at": "2026-04-24T23:33:34Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py -k \"promotable_cli_excludes or acceptance_review_cli_isolates or acceptance_review_json_includes or completes_mock_job or resumes_interrupted_job_without_active_lease or skips_live_leased_in_progress_job or writes_progress_sidecar or decomposes_parallel_workers or defers_integrator_until_worker_dependencies_complete or rotates_budget_group_when_consecutive_limit_hit or allows_same_budget_group_when_no_other_runnable_exists\"",
+      "result": "12 passed, 58 deselected",
+      "covered_surfaces": [
+        "completed mock delegated job",
+        "checkpoint persistence",
+        "stale in-progress resume without active lease",
+        "live leased job skip",
+        "progress sidecar",
+        "parallel worker decomposition",
+        "integrator dependency deferral",
+        "budget-group anti-starvation rotation",
+        "same-budget selection when no alternative is runnable",
+        "acceptance review isolates integrators",
+        "worker jobs are not promotable even when their report omits synthetic_worker"
+      ]
+    },
+    "isolated_cli_decomposition": {
+      "queue_root": "/tmp/agentkernel_a5_multijob",
+      "provider": "mock",
+      "command": "python scripts/run_job_queue.py enqueue --task-id git_parallel_merge_acceptance_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "job_count": 3,
+      "queue_totals": {
+        "total_jobs": 3,
+        "runnable_jobs": 2,
+        "runnable_workers": 2,
+        "blocked_jobs": 1,
+        "promotable_jobs": 0
+      },
+      "state_counts": {
+        "queued": 3
+      },
+      "blocker_counts": {
+        "dependency": 1
+      },
+      "benchmark_families": {
+        "repo_sandbox": {
+          "total_jobs": 3,
+          "runnable_jobs": 2,
+          "blocked_jobs": 1,
+          "worker_jobs": 2,
+          "integrator_jobs": 1,
+          "budget_groups": [
+            "family_repo_sandbox"
+          ]
+        }
+      },
+      "jobs": [
+        {
+          "task_id": "git_parallel_worker_api_task",
+          "state": "queued",
+          "priority": 6,
+          "budget_group": "family_repo_sandbox",
+          "role": "worker",
+          "runnable": true,
+          "notes": "[auto_worker_for:git_parallel_merge_acceptance_task]"
+        },
+        {
+          "task_id": "git_parallel_worker_docs_task",
+          "state": "queued",
+          "priority": 6,
+          "budget_group": "family_repo_sandbox",
+          "role": "worker",
+          "runnable": true,
+          "notes": "[auto_worker_for:git_parallel_merge_acceptance_task]"
+        },
+        {
+          "task_id": "git_parallel_merge_acceptance_task",
+          "state": "queued",
+          "priority": 5,
+          "budget_group": "family_repo_sandbox",
+          "role": "integrator",
+          "runnable": false,
+          "blocked": true,
+          "blockers": [
+            "dependency"
+          ],
+          "required_worker_branches": [
+            "worker/api-status",
+            "worker/docs-status"
+          ],
+          "dependency_job_count": 2,
+          "notes": "[auto_integrator]"
+        }
+      ],
+      "structural_surface": {
+        "workflow_shape": [
+          "shared_repo_parallel",
+          "shared_repo_parallel+multi_branch_validation"
+        ],
+        "family_aliases": [
+          "repository",
+          "workflow",
+          "integration"
+        ]
+      }
+    },
+    "isolated_cli_completed_drain": {
+      "command": "python scripts/run_job_queue.py drain --limit 3 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "drained_jobs": 3,
+      "queue_totals": {
+        "total_jobs": 3,
+        "runnable_jobs": 0,
+        "runnable_workers": 0,
+        "blocked_jobs": 0,
+        "promotable_jobs_after_worker_filter_fix": 1
+      },
+      "state_counts": {
+        "completed": 3
+      },
+      "decision_counts": {
+        "selected:runnable_worker": 2,
+        "selected:runnable_integrator": 1
+      },
+      "trust_summary": {
+        "reports_considered": 3,
+        "success_count": 3,
+        "clean_success_count": 3,
+        "benchmark_families": [
+          "repo_sandbox"
+        ],
+        "distinct_clean_success_task_roots": 3,
+        "repo_semantic_clusters": [
+          "integration",
+          "repository",
+          "shared_repo",
+          "workflow"
+        ]
+      },
+      "active_leases_after_completion": 0,
+      "jobs": [
+        {
+          "task_id": "git_parallel_worker_api_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "expected_branch": "worker/api-status",
+          "verifier_passed": true
+        },
+        {
+          "task_id": "git_parallel_worker_docs_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "expected_branch": "worker/docs-status",
+          "verifier_passed": true
+        },
+        {
+          "task_id": "git_parallel_merge_acceptance_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "target_branch": "main",
+          "merged_branches": [
+            "worker/api-status",
+            "worker/docs-status"
+          ],
+          "verifier_passed": true
+        }
+      ],
+      "patched_gap": {
+        "issue": "Completed auto-worker reports omitted synthetic_worker=true, causing status to classify all three completed jobs as promotable before the readiness fix.",
+        "fix": "scripts/run_job_queue.py now excludes worker jobs from promotable status even when their report omits synthetic_worker.",
+        "verification": "Recomputing readiness over the completed isolated queue reports promotable_jobs=1 with only the integrator promotable."
+      }
+    }
+  },
+  "open_limits": [
+    "This is multi-job delegation substrate evidence, not an A5 claim.",
+    "The isolated CLI run completed the shared-repo worker and integrator chain under provider=mock, not non-mock production-equivalent runtime constraints.",
+    "A stronger A5 packet still needs repeated live multi-job completion with durable queue resume across interruption and broader family coverage."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

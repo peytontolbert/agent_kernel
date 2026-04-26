@@ -1,0 +1,101 @@
+{
+  "evidence_id": "a5_live_vllm_multijob_project_release_check_20260425",
+  "created_at": "2026-04-25T05:10:43Z",
+  "claim": "Live vLLM delegated queue execution can complete a dependency-gated multi-job shared-repo project objective with two worker branches and a gated integrator.",
+  "provider": {
+    "name": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "host": "http://127.0.0.1:8000"
+  },
+  "queue_root": "/tmp/agentkernel_a5_vllm_multijob_clean_20260425",
+  "task": {
+    "integrator_task_id": "project_parallel_release_task",
+    "benchmark_family": "project",
+    "required_worker_branches": [
+      "worker/api-plan",
+      "worker/ops-cutover"
+    ]
+  },
+  "patches_validated": [
+    {
+      "file": "agent_kernel/ops/loop_run_support.py",
+      "change": "Zero-exit first-time shared_repo_integrator_segment_direct segments now count as workflow progress, preventing generic no_state_progress safe-stop before the report/commit segment."
+    },
+    {
+      "file": "datasets/task_bank/default_tasks.json",
+      "change": "project_parallel_release_task now accounts for deterministic worker report artifacts in expected files, expected contents, semantic verifier expected_changed_paths, and workflow_guard claimed_paths."
+    }
+  ],
+  "jobs": [
+    {
+      "task_id": "project_parallel_release_task__worker__worker_api-plan",
+      "job_id": "job:project_parallel_release_task__worker__worker_api-plan:20260425T051043805485Z:a6d0551d",
+      "state": "completed",
+      "outcome": "success",
+      "outcome_reasons": [
+        "verification_passed"
+      ]
+    },
+    {
+      "task_id": "project_parallel_release_task__worker__worker_ops-cutover",
+      "job_id": "job:project_parallel_release_task__worker__worker_ops-cutover:20260425T051043812121Z:ebd3d3ed",
+      "state": "completed",
+      "outcome": "success",
+      "outcome_reasons": [
+        "verification_passed"
+      ]
+    },
+    {
+      "task_id": "project_parallel_release_task",
+      "job_id": "job:project_parallel_release_task:20260425T051043833968Z:7bc6e8b8",
+      "state": "completed",
+      "outcome": "success",
+      "outcome_reasons": [
+        "verification_passed"
+      ]
+    }
+  ],
+  "integrator": {
+    "report_path": "/tmp/agentkernel_a5_vllm_multijob_clean_20260425/reports/job_report_job_project_parallel_release_task_20260425T051043833968Z_7bc6e8b8.json",
+    "termination_reason": "success",
+    "command_steps": 4,
+    "zero_exit_steps": 4,
+    "verified_steps": 1,
+    "decision_sources": [
+      "shared_repo_integrator_segment_direct"
+    ],
+    "commands": [
+      "git merge --no-ff worker/api-plan -m 'merge worker/api-plan'",
+      "git merge --no-ff worker/ops-cutover -m 'merge worker/ops-cutover'",
+      "tests/test_api.sh && tests/test_ops.sh",
+      "mkdir -p reports && printf 'accepted worker/api-plan for docs/api_plan.md and worker/ops-cutover for ops/cutover.txt into main without collisions\\n' > reports/merge_report.txt && printf 'api suite passed; ops suite passed\\n' > reports/test_report.txt && git add reports/merge_report.txt reports/test_report.txt && git commit -m 'record project release reports'"
+    ],
+    "target_branch": "main",
+    "expected_branch": "main",
+    "verifier_passed": true,
+    "hidden_side_effect_risk": false,
+    "unexpected_change_files": 0,
+    "accounted_change_files": 71
+  },
+  "queue_final": {
+    "completed_jobs": 3,
+    "safe_stop_jobs": 0,
+    "failed_jobs": 0,
+    "active_leases": 0
+  },
+  "verification": [
+    {
+      "command": "python -m json.tool datasets/task_bank/default_tasks.json",
+      "result": "passed"
+    },
+    {
+      "command": "pytest -q tests/test_loop.py::test_kernel_solves_project_parallel_release_task_when_git_policy_enabled tests/test_loop.py::test_kernel_solves_parallel_merge_task_when_git_policy_enabled tests/test_job_queue.py::test_project_parallel_release_task_decomposes_into_project_family_workers",
+      "result": "3 passed"
+    },
+    {
+      "command": "git -C /tmp/agentkernel_a5_vllm_multijob_clean_20260425/workspace/_shared_repo_runtime/project_parallel_release/clones/main status --short",
+      "result": "clean"
+    }
+  ],
+  "a5_interpretation": "This closes the previously open live-provider multi-job breadth gap for a project-family shared-repo objective. It strengthens A5 substrate but does not by itself prove multi-job interruption recovery or repeated long-duration role ownership across heterogeneous jobs."
+}

@@ -1,0 +1,104 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_project_family_multi_job_execution",
+    "status": "supported",
+    "summary": "Delegated queue decomposed and completed a project-family shared-repo task through two worker jobs plus one dependency-gated integrator under an isolated mock runtime."
+  },
+  "created_at": "2026-04-25T02:35:00Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py -k \"project_parallel_release_task_decomposes or decomposes_parallel_workers or defers_integrator_until_worker_dependencies_complete or stale_lease_and_resumes_orphaned or promotable_cli_excludes\"",
+      "result": "6 passed, 66 deselected",
+      "covered_surfaces": [
+        "project-family shared-repo worker decomposition",
+        "parallel worker decomposition",
+        "integrator dependency deferral",
+        "stale lease recovery",
+        "worker promotion filtering"
+      ]
+    },
+    "isolated_cli_project_multijob_drain": {
+      "queue_root": "/tmp/agentkernel_a5_project_multijob_r2_20260425",
+      "provider": "mock",
+      "enqueue_command": "python scripts/run_job_queue.py enqueue --task-id project_parallel_release_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "drain_command": "python scripts/run_job_queue.py drain --limit 3 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "manifest_task_added": {
+        "task_id": "project_parallel_release_task",
+        "benchmark_family": "project",
+        "shared_repo_id": "project_parallel_release",
+        "required_worker_branches": [
+          "worker/api-plan",
+          "worker/ops-cutover"
+        ]
+      },
+      "queue_totals": {
+        "total_jobs": 3,
+        "completed_success": 3,
+        "worker_jobs": 2,
+        "integrator_jobs": 1,
+        "promotable_jobs_after_worker_filter_fix": 1,
+        "active_leases_after_completion": 0,
+        "checkpointed_jobs": 3,
+        "reported_jobs": 3
+      },
+      "family_counts": {
+        "project": 3
+      },
+      "jobs": [
+        {
+          "task_id": "project_parallel_release_task__worker__worker_api-plan",
+          "benchmark_family": "project",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "project_parallel_release_task__worker__worker_ops-cutover",
+          "benchmark_family": "project",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        },
+        {
+          "task_id": "project_parallel_release_task",
+          "benchmark_family": "project",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": true
+        }
+      ],
+      "patched_gap": {
+        "issue": "Multi-job decomposition had no built-in non-repo_sandbox task surface; the first project task contract also omitted worker report artifacts from expected_changed_paths.",
+        "fix": "Added project_parallel_release_task with two explicit project-family worker specs and included each worker report artifact in its verifier expected_changed_paths.",
+        "verification": "The fresh isolated drain completed both project workers and the project integrator with outcome=success and zero active leases."
+      }
+    }
+  },
+  "open_limits": [
+    "This is project-family multi-job substrate evidence, not an A5 promotion claim.",
+    "The isolated CLI run used provider=mock and disabled command containment, so it is not production-equivalent runtime evidence.",
+    "Shared-repo reports still show hidden_side_effect_risk=true because git runtime artifacts are broad; this packet proves multi-job handoff breadth, not clean side-effect breadth.",
+    "Multi-job breadth for integration, repository, and repo_chore remains open."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

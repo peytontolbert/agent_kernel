@@ -1,0 +1,111 @@
+{
+  "evidence_id": "a5_live_vllm_multijob_interruption_recovery_check_20260425",
+  "created_at": "2026-04-25T05:20:46Z",
+  "claim": "Live vLLM delegated queue execution can recover a dependency-gated multi-job shared-repo integrator after hard process interruption.",
+  "provider": {
+    "name": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "host": "http://127.0.0.1:8000"
+  },
+  "queue_root": "/tmp/agentkernel_a5_vllm_multijob_recovery_20260425",
+  "task": {
+    "integrator_task_id": "project_parallel_release_task",
+    "benchmark_family": "project",
+    "required_worker_branches": [
+      "worker/api-plan",
+      "worker/ops-cutover"
+    ]
+  },
+  "pre_interruption": {
+    "worker_jobs_completed": 2,
+    "remaining_job": {
+      "task_id": "project_parallel_release_task",
+      "job_id": "job:project_parallel_release_task:20260425T051903302495Z:b764a603",
+      "state": "queued",
+      "attempt_count": 0,
+      "scheduler_selected_count": 0
+    }
+  },
+  "interruption": {
+    "killed_runner_pid": 3380910,
+    "runner_returncode": -9,
+    "lease_seen": {
+      "job_id": "job:project_parallel_release_task:20260425T051903302495Z:b764a603",
+      "runner_id": "server:3380910",
+      "workspace_path": "/tmp/agentkernel_a5_vllm_multijob_recovery_20260425/workspace/_shared_repo_runtime/project_parallel_release/clones/main",
+      "checkpoint_path": "/tmp/agentkernel_a5_vllm_multijob_recovery_20260425/checkpoints/job_project_parallel_release_task_20260425T051903302495Z_b764a603.json",
+      "report_path": "/tmp/agentkernel_a5_vllm_multijob_recovery_20260425/reports/job_report_job_project_parallel_release_task_20260425T051903302495Z_b764a603.json"
+    },
+    "post_kill_queue_shape": {
+      "state": "in_progress",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_error": "",
+      "checkpoint_path_present": true,
+      "report_path_present": true,
+      "active_lease_runner_id": "server:3380910"
+    }
+  },
+  "recovery": {
+    "lease_reap_event": {
+      "event": "lease_reaped",
+      "job_id": "job:project_parallel_release_task:20260425T051903302495Z:b764a603",
+      "detail": "stale runner server:3380910",
+      "recorded_at": "2026-04-25T05:20:45.510362+00:00"
+    },
+    "reacquired_runner_id": "server:3382472",
+    "final_integrator": {
+      "state": "completed",
+      "outcome": "success",
+      "outcome_reasons": [
+        "verification_passed"
+      ],
+      "attempt_count": 2,
+      "scheduler_selected_count": 2,
+      "last_error": "",
+      "report_path": "/tmp/agentkernel_a5_vllm_multijob_recovery_20260425/reports/job_report_job_project_parallel_release_task_20260425T051903302495Z_b764a603.json"
+    }
+  },
+  "integrator_report": {
+    "termination_reason": "success",
+    "command_steps": 4,
+    "zero_exit_steps": 4,
+    "verified_steps": 1,
+    "decision_sources": [
+      "shared_repo_integrator_segment_direct"
+    ],
+    "commands": [
+      "git merge --no-ff worker/api-plan -m 'merge worker/api-plan'",
+      "git merge --no-ff worker/ops-cutover -m 'merge worker/ops-cutover'",
+      "tests/test_api.sh && tests/test_ops.sh",
+      "mkdir -p reports && printf 'accepted worker/api-plan for docs/api_plan.md and worker/ops-cutover for ops/cutover.txt into main without collisions\\n' > reports/merge_report.txt && printf 'api suite passed; ops suite passed\\n' > reports/test_report.txt && git add reports/merge_report.txt reports/test_report.txt && git commit -m 'record project release reports'"
+    ],
+    "verifier_passed": true,
+    "hidden_side_effect_risk": false,
+    "unexpected_change_files": 0,
+    "accounted_change_files": 71,
+    "rollback_performed": false,
+    "rollback_verification_passed": true
+  },
+  "queue_final": {
+    "completed_jobs": 3,
+    "safe_stop_jobs": 0,
+    "failed_jobs": 0,
+    "active_leases": 0
+  },
+  "verification": [
+    {
+      "command": "git -C /tmp/agentkernel_a5_vllm_multijob_recovery_20260425/workspace/_shared_repo_runtime/project_parallel_release/clones/main status --short",
+      "result": "clean"
+    },
+    {
+      "command": "test -f /tmp/agentkernel_a5_vllm_multijob_recovery_20260425/checkpoints/job_project_parallel_release_task_20260425T051903302495Z_b764a603.json",
+      "result": "passed"
+    },
+    {
+      "command": "test -f /tmp/agentkernel_a5_vllm_multijob_recovery_20260425/reports/job_report_job_project_parallel_release_task_20260425T051903302495Z_b764a603.json",
+      "result": "passed"
+    }
+  ],
+  "a5_interpretation": "This closes the live-provider multi-job hard interruption recovery proof for a project-family shared-repo objective. It strengthens A5 substrate but does not by itself prove repeated long-duration role ownership across heterogeneous jobs or the custom model_stack live path."
+}

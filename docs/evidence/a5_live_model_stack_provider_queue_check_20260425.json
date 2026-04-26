@@ -1,0 +1,84 @@
+{
+  "evidence_id": "a5_live_model_stack_provider_queue_check_20260425",
+  "created_at": "2026-04-25T05:40:20Z",
+  "claim": "Agent Kernel can connect to a live local model_stack server and complete a delegated queue job with provider=model_stack. This is a runtime/provider wiring proof, not a same-weights proof against the live vLLM Qwen model.",
+  "provider": {
+    "name": "model_stack",
+    "host": "http://127.0.0.1:8001",
+    "model": "model-stack-tiny-local",
+    "model_dir": "/tmp/agentkernel_model_stack_tiny_20260425/model",
+    "repo_path": "/data/agentkernel/other_repos/model-stack"
+  },
+  "server": {
+    "started_with": "MODEL_DIR=/tmp/agentkernel_model_stack_tiny_20260425/model PYTHONPATH=/data/agentkernel/other_repos/model-stack /home/peyton/miniconda3/envs/ai/bin/python -m uvicorn serve.api:app --host 127.0.0.1 --port 8001",
+    "artifact_creation": "Tiny local ModelConfig(d_model=32,n_heads=4,n_layers=1,d_ff=64,vocab_size=256,dtype=float32) saved with runtime.checkpoint.save_pretrained.",
+    "healthz": {
+      "status": "ok",
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "kv_cache_backend": "paged"
+    },
+    "generate_probe": {
+      "request": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ]
+        ],
+        "max_new_tokens": 4,
+        "do_sample": false,
+        "temperature": 0.0
+      },
+      "response": {
+        "output_ids": [
+          [
+            1,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        ]
+      }
+    }
+  },
+  "queue_root": "/tmp/agentkernel_a5_model_stack_queue_20260425",
+  "job": {
+    "task_id": "git_repo_status_review_task",
+    "job_id": "job:git_repo_status_review_task:20260425T054019782446Z:61118bc6",
+    "state": "completed",
+    "outcome": "success",
+    "outcome_reasons": [
+      "verification_passed"
+    ],
+    "provider": "model_stack",
+    "model": "model-stack-tiny-local",
+    "last_error": "",
+    "report_path": "/tmp/agentkernel_a5_model_stack_queue_20260425/reports/job_report_job_git_repo_status_review_task_20260425T054019782446Z_61118bc6.json"
+  },
+  "report": {
+    "termination_reason": "success",
+    "command_steps": 1,
+    "zero_exit_steps": 1,
+    "verified_steps": 1,
+    "last_decision_source": "git_repo_review_direct",
+    "hidden_side_effect_risk": false,
+    "unexpected_change_files": 0
+  },
+  "queue_final": {
+    "completed_jobs": 1,
+    "safe_stop_jobs": 0,
+    "failed_jobs": 0,
+    "active_leases": 0
+  },
+  "limitations": [
+    "The queue job used a deterministic git_repo_review_direct command path, not a model_stack-generated JSON decision.",
+    "The tiny model-stack artifact proves local server/runtime connectivity, health, and token generation, not useful language-model decision quality.",
+    "The model artifact was a randomly initialized tiny Model Stack TransformerLM and was not the Qwen/Qwen3.5-9B weights served by the live vLLM server on 127.0.0.1:8000."
+  ],
+  "a5_interpretation": "This closes the custom model_stack live server/model-dir wiring proof at the provider and delegated-queue level. It does not close same-weight model-stack inference for the current vLLM Qwen runtime. A stronger future proof would use a real instruction-tuned model_stack artifact that emits parseable Agent Kernel JSON decisions, ideally loaded from the same family of weights used by the production live-provider run."
+}

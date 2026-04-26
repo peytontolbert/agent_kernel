@@ -150,6 +150,7 @@ def _job_readiness(
     promotable = bool(
         acceptance_ready
         and not promoted
+        and not worker_job
         and acceptance.get("synthetic_worker", 0) != 1
         and (
             acceptance.get("merged_branches")
@@ -315,6 +316,88 @@ def _queue_blocker_counts(jobs_with_readiness: list[tuple[object, dict[str, obje
                 continue
             counts[token] = counts.get(token, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _queue_role_closeout(
+    jobs_with_readiness: list[tuple[object, dict[str, object]]],
+    leases: list[dict[str, object]],
+    trust: dict[str, object],
+) -> dict[str, object]:
+    jobs = [job for job, _ in jobs_with_readiness]
+    active_leases = [lease for lease in leases if isinstance(lease, dict)]
+    assessment = trust.get("overall_assessment", {}) if isinstance(trust, dict) else {}
+    if not isinstance(assessment, dict):
+        assessment = {}
+    trust_status = str(assessment.get("status", "")).strip() or "unknown"
+    trust_passed = bool(assessment.get("passed", False)) and trust_status == "trusted"
+    completed_success_jobs = [
+        job
+        for job in jobs
+        if str(getattr(job, "state", "")).strip() == "completed"
+        and str(getattr(job, "outcome", "")).strip() == "success"
+    ]
+    unfinished_jobs = [
+        job
+        for job in jobs
+        if str(getattr(job, "state", "")).strip() not in TERMINAL_JOB_STATES
+    ]
+    terminal_non_success_jobs = [
+        job
+        for job in jobs
+        if str(getattr(job, "state", "")).strip() in TERMINAL_JOB_STATES
+        and not (
+            str(getattr(job, "state", "")).strip() == "completed"
+            and str(getattr(job, "outcome", "")).strip() == "success"
+        )
+    ]
+    blocked_jobs = [
+        job
+        for job, readiness in jobs_with_readiness
+        if bool(readiness.get("blocked", False))
+        and str(getattr(job, "state", "")).strip() not in TERMINAL_JOB_STATES
+    ]
+    total_jobs = len(jobs)
+    queue_empty_success = (
+        total_jobs > 0
+        and len(completed_success_jobs) == total_jobs
+        and not unfinished_jobs
+        and not terminal_non_success_jobs
+    )
+    closeout_ready = queue_empty_success and not active_leases and trust_passed
+    if closeout_ready:
+        mode = "queue_empty_trusted"
+    elif total_jobs == 0:
+        mode = "no_jobs"
+    elif active_leases:
+        mode = "active_leases"
+    elif terminal_non_success_jobs:
+        mode = "terminal_non_success"
+    elif blocked_jobs:
+        mode = "blocked_open_work"
+    elif unfinished_jobs:
+        mode = "open_work"
+    elif queue_empty_success:
+        mode = "queue_empty_untrusted"
+    else:
+        mode = "unknown"
+    return {
+        "closeout_ready": closeout_ready,
+        "closeout_mode": mode,
+        "operator_steering_required": not closeout_ready,
+        "total_jobs": total_jobs,
+        "completed_success_jobs": len(completed_success_jobs),
+        "unfinished_jobs": len(unfinished_jobs),
+        "terminal_non_success_jobs": len(terminal_non_success_jobs),
+        "blocked_open_jobs": len(blocked_jobs),
+        "active_leases": len(active_leases),
+        "trust_status": trust_status,
+        "trust_passed": trust_passed,
+        "unfinished_job_ids": [str(getattr(job, "job_id", "")).strip() for job in unfinished_jobs],
+        "terminal_non_success_job_ids": [
+            str(getattr(job, "job_id", "")).strip() for job in terminal_non_success_jobs
+        ],
+        "blocked_open_job_ids": [str(getattr(job, "job_id", "")).strip() for job in blocked_jobs],
+    }
 
 
 def _queue_family_rollups(jobs_with_readiness: list[tuple[object, dict[str, object]]]) -> dict[str, dict[str, object]]:
@@ -730,6 +813,20 @@ def _build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--decompose-workers", choices=("0", "1"), default="0")
     _add_runtime_override_args(enqueue)
 
+    enqueue_manifest = subparsers.add_parser("enqueue-manifest")
+    enqueue_manifest.add_argument("--manifest-path", action="append", required=True)
+    enqueue_manifest.add_argument("--task-id", action="append", default=None)
+    enqueue_manifest.add_argument("--family", action="append", default=None)
+    enqueue_manifest.add_argument("--limit", type=int, default=0)
+    enqueue_manifest.add_argument("--priority-start", type=int, default=100)
+    enqueue_manifest.add_argument("--priority-step", type=int, default=-1)
+    enqueue_manifest.add_argument("--budget-group", default="default")
+    enqueue_manifest.add_argument("--deadline", default="")
+    enqueue_manifest.add_argument("--notes", default="")
+    enqueue_manifest.add_argument("--decompose-workers", choices=("0", "1"), default="0")
+    enqueue_manifest.add_argument("--json", action="store_true")
+    _add_runtime_override_args(enqueue_manifest)
+
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--state", action="append", default=None)
     list_parser.add_argument("--show-blockers", choices=("0", "1"), default="0")
@@ -822,6 +919,87 @@ def main() -> None:
             print(
                 f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
                 f"priority={job.priority} budget_group={job.budget_group}"
+            )
+        return
+
+    if args.command == "enqueue-manifest":
+        manifest_paths = tuple(str(path).strip() for path in args.manifest_path if str(path).strip())
+        manifest_bank = TaskBank(config=config, external_task_manifests=manifest_paths)
+        requested_task_ids = [str(task_id).strip() for task_id in (args.task_id or []) if str(task_id).strip()]
+        requested_task_id_set = set(requested_task_ids)
+        requested_families = {str(family).strip() for family in (args.family or []) if str(family).strip()}
+        manifest_tasks = [
+            task
+            for task in manifest_bank.list()
+            if str(task.metadata.get("task_origin", "")).strip() == "external_manifest"
+            and (not requested_task_id_set or task.task_id in requested_task_id_set)
+            and (not requested_families or str(task.metadata.get("benchmark_family", "")).strip() in requested_families)
+        ]
+        if requested_task_ids:
+            task_by_id = {task.task_id: task for task in manifest_tasks}
+            manifest_tasks = [task_by_id[task_id] for task_id in requested_task_ids if task_id in task_by_id]
+        limit = max(0, int(args.limit))
+        if limit:
+            manifest_tasks = manifest_tasks[:limit]
+        if not manifest_tasks:
+            print("enqueue_manifest no_matching_tasks=1", file=sys.stderr)
+            raise SystemExit(1)
+        records: list[dict[str, object]] = []
+        priority = int(args.priority_start)
+        for task in manifest_tasks:
+            runtime_overrides = _runtime_overrides_from_args(args)
+            runtime_overrides["task_payload"] = task.to_dict()
+            jobs = enqueue_with_parallel_worker_decomposition(
+                queue,
+                bank=manifest_bank,
+                task_id=task.task_id,
+                priority=priority,
+                budget_group=args.budget_group,
+                deadline_at=str(args.deadline).strip(),
+                notes=str(args.notes).strip(),
+                runtime_overrides=runtime_overrides,
+                max_queued_jobs_for_budget_group=max(0, int(config.delegated_job_max_queued_per_budget_group)),
+            ) if args.decompose_workers == "1" else [
+                queue.enqueue(
+                    task_id=task.task_id,
+                    priority=priority,
+                    budget_group=args.budget_group,
+                    deadline_at=str(args.deadline).strip(),
+                    notes=str(args.notes).strip(),
+                    runtime_overrides=runtime_overrides,
+                    max_queued_jobs_for_budget_group=max(0, int(config.delegated_job_max_queued_per_budget_group)),
+                    task_bank=manifest_bank,
+                )
+            ]
+            for job in jobs:
+                record = {
+                    "job_id": job.job_id,
+                    "state": job.state,
+                    "task_id": job.task_id,
+                    "priority": job.priority,
+                    "budget_group": job.budget_group,
+                    "benchmark_family": str(task.metadata.get("benchmark_family", "")).strip(),
+                    "external_manifest_path": str(task.metadata.get("external_manifest_path", "")).strip(),
+                }
+                records.append(record)
+                if not getattr(args, "json", False):
+                    print(
+                        f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
+                        f"priority={job.priority} budget_group={job.budget_group} "
+                        f"benchmark_family={record['benchmark_family']}"
+                    )
+            priority += int(args.priority_step)
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "manifest_paths": list(manifest_paths),
+                        "selected_task_count": len(manifest_tasks),
+                        "enqueued_job_count": len(records),
+                        "enqueued_jobs": records,
+                    },
+                    indent=2,
+                )
             )
         return
 
@@ -1293,6 +1471,11 @@ def main() -> None:
         family_rollups = _queue_family_rollups(jobs_with_readiness)
         structural_class_rollups = _queue_structural_class_rollups(jobs_with_readiness)
         active_lease_roles = _active_lease_role_rollup(jobs_with_readiness, leases if isinstance(leases, list) else [])
+        role_closeout = _queue_role_closeout(
+            jobs_with_readiness,
+            leases if isinstance(leases, list) else [],
+            trust if isinstance(trust, dict) else {},
+        )
         if json_mode:
             payload = {
                 "policy": dict(policy) if isinstance(policy, dict) else {},
@@ -1346,6 +1529,7 @@ def main() -> None:
                     if isinstance(snapshot.get("budget_groups", {}), dict)
                     else {},
                     "active_lease_roles": active_lease_roles,
+                    "role_closeout": role_closeout,
                     "active_leases": [
                         dict(lease)
                         for lease in leases
@@ -1419,6 +1603,19 @@ def main() -> None:
             "scheduler_streak "
             f"budget_group={str(scheduler.get('last_selected_budget_group', '')).strip() or '-'} "
             f"consecutive={int(scheduler.get('consecutive_budget_group_selections', 0))}"
+        )
+        print(
+            "role_closeout "
+            f"ready={int(bool(role_closeout['closeout_ready']))} "
+            f"mode={role_closeout['closeout_mode']} "
+            f"total_jobs={int(role_closeout['total_jobs'])} "
+            f"completed_success_jobs={int(role_closeout['completed_success_jobs'])} "
+            f"unfinished_jobs={int(role_closeout['unfinished_jobs'])} "
+            f"terminal_non_success_jobs={int(role_closeout['terminal_non_success_jobs'])} "
+            f"blocked_open_jobs={int(role_closeout['blocked_open_jobs'])} "
+            f"active_leases={int(role_closeout['active_leases'])} "
+            f"trust_status={role_closeout['trust_status']} "
+            f"operator_steering_required={int(bool(role_closeout['operator_steering_required']))}"
         )
         print(
             "active_roles "

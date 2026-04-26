@@ -1,0 +1,142 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T18:33:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_repeated_real_process_restart_resume",
+    "status": "supported",
+    "summary": "Five live delegated queue drains were interrupted with SIGINT during bounded external-manifest tasks across the required families; each job remained resumable and a fresh drain invocation completed it successfully with no active lease residue."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python /tmp/agentkernel_a5_live_vllm_repeated_real_restart_r11_20260425/run_repeated_restart.py",
+      "result": "passed: repeated_restart_events=5 all_completed=true"
+    },
+    "supporting_regressions": [
+      {
+        "command": "/home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_job_queue.py::test_drain_stops_after_interrupted_job tests/test_job_queue.py::test_run_next_delegated_job_resumes_interrupted_job_without_active_lease tests/test_job_queue.py::test_run_next_delegated_job_reaps_stale_lease_and_resumes_orphaned_job tests/test_job_queue.py::test_run_next_delegated_job_skips_live_leased_in_progress_job",
+        "result": "passed: 4 job queue resume/reaping tests passed in 2.96s"
+      },
+      {
+        "command": "/home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_verifier.py::test_sandbox_blocks_unknown_host_executable tests/test_verifier.py::test_sandbox_allows_bounded_sleep_and_times_out",
+        "result": "passed: 2 sandbox executable-boundary tests passed in 1.29s"
+      }
+    ],
+    "code_changes": [
+      "No new production code change was required for r11 after the r10 sandbox sleep regression.",
+      "r11 adds a temporary isolated external manifest and proof driver under /tmp to exercise repeated real process restart/resume."
+    ],
+    "isolated_cli_r11": {
+      "root": "/tmp/agentkernel_a5_live_vllm_repeated_real_restart_r11_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "external_manifest_path": "/tmp/agentkernel_a5_live_vllm_repeated_real_restart_r11_20260425/manifests/repeated_restart_tasks.json",
+      "budget_group": "r11-repeated-restart",
+      "preflight_mode": "drain --enforce-preflight 0 because host bubblewrap preflight is unavailable in this environment",
+      "interrupt": {
+        "signal": "SIGINT",
+        "delay_seconds": 2.0,
+        "interrupted_jobs": 5,
+        "forced_kill_count": 0,
+        "post_interrupt_states": {
+          "in_progress": 5
+        },
+        "post_interrupt_last_error": {
+          "runner interrupted": 5
+        },
+        "post_interrupt_active_leases": 0
+      },
+      "resume": {
+        "fresh_drain_invocations_after_interrupt": 5,
+        "final_states": {
+          "completed": 5
+        },
+        "final_outcomes": {
+          "success": 5
+        },
+        "attempt_count_per_job": {
+          "external_r11_project_restart_task": 2,
+          "external_r11_repository_restart_task": 2,
+          "external_r11_integration_restart_task": 2,
+          "external_r11_repo_chore_restart_task": 2,
+          "external_r11_repo_sandbox_restart_task": 2
+        },
+        "final_active_leases": 0,
+        "runtime_event_pattern_per_job": [
+          "lease_acquired",
+          "lease_released:state=in_progress",
+          "lease_acquired",
+          "lease_released:state=completed"
+        ]
+      },
+      "trust_summary": {
+        "reports_considered": 5,
+        "trust_status": "trusted",
+        "success_count": 5,
+        "clean_success_count": 5,
+        "light_supervision_clean_success_count": 5,
+        "hidden_side_effect_risk_count": 0,
+        "unexpected_change_report_count": 0,
+        "task_origins": {
+          "external_manifest": 5
+        },
+        "required_family_counted_gated_report_counts": {
+          "integration": 1,
+          "project": 1,
+          "repo_chore": 1,
+          "repo_sandbox": 1,
+          "repository": 1
+        }
+      },
+      "task_results": [
+        {
+          "task_id": "external_r11_project_restart_task",
+          "benchmark_family": "project",
+          "post_interrupt_state": "in_progress",
+          "final_state": "completed",
+          "final_outcome": "success",
+          "attempt_count": 2
+        },
+        {
+          "task_id": "external_r11_repository_restart_task",
+          "benchmark_family": "repository",
+          "post_interrupt_state": "in_progress",
+          "final_state": "completed",
+          "final_outcome": "success",
+          "attempt_count": 2
+        },
+        {
+          "task_id": "external_r11_integration_restart_task",
+          "benchmark_family": "integration",
+          "post_interrupt_state": "in_progress",
+          "final_state": "completed",
+          "final_outcome": "success",
+          "attempt_count": 2
+        },
+        {
+          "task_id": "external_r11_repo_chore_restart_task",
+          "benchmark_family": "repo_chore",
+          "post_interrupt_state": "in_progress",
+          "final_state": "completed",
+          "final_outcome": "success",
+          "attempt_count": 2
+        },
+        {
+          "task_id": "external_r11_repo_sandbox_restart_task",
+          "benchmark_family": "repo_sandbox",
+          "post_interrupt_state": "in_progress",
+          "final_state": "completed",
+          "final_outcome": "success",
+          "attempt_count": 2
+        }
+      ]
+    }
+  },
+  "open_limits": [
+    "This proves repeated real restart/resume on five bounded external-manifest tasks; it is still not a long endurance run.",
+    "The tasks are designed restart probes with exact workspace contracts, so broader non-fixture production-duty workloads still need evidence.",
+    "The host environment lacks working bubblewrap preflight, so this packet uses the same explicit --enforce-preflight 0 live-drain path as r10.",
+    "A stronger full A5 claim still needs longer wall-clock role continuity with ordinary queue intake, restart/resume, closeout, and no operator steering."
+  ]
+}

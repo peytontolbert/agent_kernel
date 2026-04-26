@@ -249,6 +249,21 @@ def _retained_conversion_gap_summary(planner, *, recent_cycle_window: int = 8) -
             subsystem=subsystem,
             recent_cycle_window=recent_cycle_window,
         )
+    transition_model_summary = dict(summaries.get("transition_model", {}) or {})
+    if (
+        int(transition_model_summary.get("total_decisions", 0) or 0) <= 0
+        and (
+            int(transition_model_summary.get("selected_cycles", 0) or 0) > 0
+            or int(transition_model_summary.get("no_yield_cycles", 0) or 0) > 0
+        )
+    ):
+        wider_window = max(12, recent_cycle_window * 2)
+        extended_transition_model_summary = planner.recent_subsystem_activity_summary(
+            subsystem="transition_model",
+            recent_cycle_window=wider_window,
+        )
+        if isinstance(extended_transition_model_summary, dict):
+            summaries["transition_model"] = dict(extended_transition_model_summary)
     selected_cycles = sum(int(summary.get("selected_cycles", 0) or 0) for summary in summaries.values())
     retained_cycles = sum(int(summary.get("retained_cycles", 0) or 0) for summary in summaries.values())
     total_decisions = sum(int(summary.get("total_decisions", 0) or 0) for summary in summaries.values())
@@ -276,6 +291,39 @@ def _retained_conversion_gap_summary(planner, *, recent_cycle_window: int = 8) -
         ),
         "subsystem_activity": summaries,
     }
+
+
+def _a4_runtime_conversion_transition_model_priority(
+    retained_conversion_gap: dict[str, object],
+) -> bool:
+    subsystem_activity = retained_conversion_gap.get("subsystem_activity", {})
+    subsystem_activity = dict(subsystem_activity) if isinstance(subsystem_activity, dict) else {}
+    transition_model_activity = subsystem_activity.get("transition_model", {})
+    transition_model_activity = (
+        dict(transition_model_activity) if isinstance(transition_model_activity, dict) else {}
+    )
+    curriculum_activity = subsystem_activity.get("curriculum", {})
+    curriculum_activity = dict(curriculum_activity) if isinstance(curriculum_activity, dict) else {}
+    transition_model_has_decision_reject = (
+        int(transition_model_activity.get("total_decisions", 0) or 0) > 0
+        and int(transition_model_activity.get("rejected_cycles", 0) or 0) > 0
+        and str(transition_model_activity.get("last_decision_state", "")).strip() == "reject"
+    )
+    curriculum_is_still_unresolved = (
+        (
+            int(curriculum_activity.get("no_yield_cycles", 0) or 0) > 0
+            or int(curriculum_activity.get("recent_incomplete_cycles", 0) or 0) > 0
+        )
+        and str(curriculum_activity.get("last_decision_state", "")).strip() == ""
+    )
+    curriculum_already_retained = (
+        int(curriculum_activity.get("retained_cycles", 0) or 0) > 0
+        and int(curriculum_activity.get("total_decisions", 0) or 0) > 0
+        and str(curriculum_activity.get("last_decision_state", "")).strip() == "retain"
+    )
+    return transition_model_has_decision_reject and (
+        curriculum_is_still_unresolved or curriculum_already_retained
+    )
 
 
 def _effective_trust_summary(planner, metrics: EvalMetrics) -> dict[str, object]:
@@ -485,11 +533,16 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
     broad_observe_signal = planner._broad_coding_observe_diversification_signal(metrics)
     primary_only_broad_observe = bool(broad_observe_signal.get("primary_only_broad_observe", False))
     retained_conversion_gap = _retained_conversion_gap_summary(planner)
+    direct_transition_model_priority = _a4_runtime_conversion_transition_model_priority(
+        retained_conversion_gap,
+    )
     broad_observe_curriculum_priority = (
         bool(broad_observe_signal.get("active", False))
         and primary_only_broad_observe
         and not bool(broad_observe_signal.get("retrieval_emergency", False))
         and (
+            direct_transition_model_priority
+            or
             bool(retained_conversion_gap.get("active", False))
             or (
             _external_only_bootstrap_trust_gap(trust_summary)
@@ -786,35 +839,76 @@ def rank_experiments(planner, metrics: EvalMetrics) -> list[ImprovementExperimen
             ),
         }
         curriculum_expected_gain = round(max(0.03, min(0.05, observed_family_count * 0.01)), 4)
-        existing_curriculum_index = next(
-            (index for index, candidate in enumerate(candidates) if candidate.subsystem == "curriculum"),
+        if direct_transition_model_priority:
+            transition_model_reason = (
+                "required-family breadth is already counted and transition-model already reached a "
+                "decision-bearing reject, so the next retained-conversion rerun should ratchet "
+                "transition-model before replaying curriculum"
+            )
+            transition_model_evidence = {
+                **curriculum_evidence,
+                "a4_runtime_conversion_priority": True,
+                "decision_bearing_transition_model_retry": True,
+            }
+            existing_transition_model_index = next(
+                (index for index, candidate in enumerate(candidates) if candidate.subsystem == "transition_model"),
+                None,
+            )
+            if existing_transition_model_index is None:
+                candidates.append(
+                    ImprovementExperiment(
+                        subsystem="transition_model",
+                        reason=transition_model_reason,
+                        priority=6,
+                        expected_gain=max(0.05, curriculum_expected_gain),
+                        estimated_cost=2,
+                        score=0.0,
+                        evidence=transition_model_evidence,
+                    )
+                )
+            else:
+                existing_transition_model = candidates[existing_transition_model_index]
+                merged_evidence = dict(existing_transition_model.evidence)
+                merged_evidence.update(transition_model_evidence)
+                candidates[existing_transition_model_index] = ImprovementExperiment(
+                    subsystem="transition_model",
+                    reason=transition_model_reason,
+                    priority=max(6, int(existing_transition_model.priority)),
+                    expected_gain=max(0.05, curriculum_expected_gain, float(existing_transition_model.expected_gain)),
+                    estimated_cost=min(2, int(existing_transition_model.estimated_cost)),
+                    score=0.0,
+                    evidence=merged_evidence,
+                )
+        else:
+            existing_curriculum_index = next(
+                (index for index, candidate in enumerate(candidates) if candidate.subsystem == "curriculum"),
             None,
-        )
-        if existing_curriculum_index is None:
-            candidates.append(
-                ImprovementExperiment(
+                )
+            if existing_curriculum_index is None:
+                candidates.append(
+                    ImprovementExperiment(
+                        subsystem="curriculum",
+                        reason=curriculum_reason,
+                        priority=5,
+                        expected_gain=curriculum_expected_gain,
+                        estimated_cost=3,
+                        score=0.0,
+                        evidence=curriculum_evidence,
+                    )
+                )
+            else:
+                existing_curriculum = candidates[existing_curriculum_index]
+                merged_evidence = dict(existing_curriculum.evidence)
+                merged_evidence.update(curriculum_evidence)
+                candidates[existing_curriculum_index] = ImprovementExperiment(
                     subsystem="curriculum",
                     reason=curriculum_reason,
-                    priority=5,
-                    expected_gain=curriculum_expected_gain,
-                    estimated_cost=3,
+                    priority=max(5, int(existing_curriculum.priority)),
+                    expected_gain=max(curriculum_expected_gain, float(existing_curriculum.expected_gain)),
+                    estimated_cost=min(3, int(existing_curriculum.estimated_cost)),
                     score=0.0,
-                    evidence=curriculum_evidence,
+                    evidence=merged_evidence,
                 )
-            )
-        else:
-            existing_curriculum = candidates[existing_curriculum_index]
-            merged_evidence = dict(existing_curriculum.evidence)
-            merged_evidence.update(curriculum_evidence)
-            candidates[existing_curriculum_index] = ImprovementExperiment(
-                subsystem="curriculum",
-                reason=curriculum_reason,
-                priority=max(5, int(existing_curriculum.priority)),
-                expected_gain=max(curriculum_expected_gain, float(existing_curriculum.expected_gain)),
-                estimated_cost=min(3, int(existing_curriculum.estimated_cost)),
-                score=0.0,
-                evidence=merged_evidence,
-            )
     repo_world_model_total = sum(
         int(metrics.total_by_benchmark_family.get(family, 0))
         for family in ("repo_sandbox", "repo_chore", "repository", "project", "integration")

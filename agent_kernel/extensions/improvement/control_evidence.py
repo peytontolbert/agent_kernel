@@ -846,6 +846,24 @@ def transition_model_improvement_count(
     return improvements
 
 
+def transition_model_scoring_control_delta_count(
+    baseline_controls: dict[str, object],
+    candidate_controls: dict[str, object],
+) -> int:
+    improvements = 0
+    for key in (
+        "repeat_command_penalty",
+        "regressed_path_command_penalty",
+        "recovery_command_bonus",
+        "progress_command_bonus",
+        "long_horizon_repeat_command_penalty",
+        "long_horizon_progress_command_bonus",
+    ):
+        if int(candidate_controls.get(key, 0) or 0) > int(baseline_controls.get(key, 0) or 0):
+            improvements += 1
+    return improvements
+
+
 def transition_model_evidence(
     baseline_controls: dict[str, object],
     candidate_controls: dict[str, object],
@@ -867,6 +885,10 @@ def transition_model_evidence(
             candidate_controls,
             baseline_signatures=baseline_signatures,
             candidate_signatures=candidate_signatures,
+        ),
+        "transition_model_scoring_control_delta_count": transition_model_scoring_control_delta_count(
+            baseline_controls,
+            candidate_controls,
         ),
         "transition_signature_count": len(candidate_signatures),
         "transition_signature_count_delta": len(candidate_signatures) - len(baseline_signatures),
@@ -926,6 +948,7 @@ __all__ = [
     "transition_model_controls_from_payload",
     "transition_model_evidence",
     "transition_model_improvement_count",
+    "transition_model_scoring_control_delta_count",
     "transition_model_signatures_from_payload",
     "trust_control_evidence",
     "trust_control_improvement_count",

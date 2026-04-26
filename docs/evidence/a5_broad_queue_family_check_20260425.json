@@ -1,0 +1,139 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_broad_family_queue_execution",
+    "status": "supported",
+    "summary": "Delegated queue completed isolated mock jobs across integration, project, repository, repo_chore, and bounded families with reports, checkpoints, and zero active leases."
+  },
+  "created_at": "2026-04-25T01:51:00Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py",
+      "result": "71 passed",
+      "covered_surfaces": [
+        "delegated queue claim/finalize lifecycle",
+        "runtime lease governance",
+        "stale lease recovery",
+        "worker/integrator decomposition",
+        "acceptance promotion filtering",
+        "workspace rollback on bounded non-success",
+        "worker-command diagnostics"
+      ]
+    },
+    "isolated_cli_broad_family_drain": {
+      "queue_root": "/tmp/agentkernel_a5_broad_queue_20260425",
+      "provider": "mock",
+      "enqueue_commands": [
+        "python scripts/run_job_queue.py enqueue --task-id incident_matrix_task --priority 5 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id report_rollup_task --priority 5 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id repository_audit_packet_task --priority 5 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id repo_notice_review_task --priority 5 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+        "python scripts/run_job_queue.py enqueue --task-id hello_task --priority 4 --provider mock --use-tolbert-context 0 --allow-git-commands 1"
+      ],
+      "drain_command": "python scripts/run_job_queue.py drain --limit 5 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "queue_totals": {
+        "total_jobs": 5,
+        "completed_success": 5,
+        "active_leases_after_completion": 0,
+        "checkpointed_jobs": 5,
+        "reported_jobs": 5
+      },
+      "family_counts": {
+        "bounded": 1,
+        "integration": 1,
+        "project": 1,
+        "repo_chore": 1,
+        "repository": 1
+      },
+      "required_family_surface": {
+        "required_non_repo_sandbox_families": [
+          "integration",
+          "project",
+          "repository",
+          "repo_chore"
+        ],
+        "present": [
+          "integration",
+          "project",
+          "repository",
+          "repo_chore"
+        ],
+        "missing": []
+      },
+      "jobs": [
+        {
+          "task_id": "incident_matrix_task",
+          "benchmark_family": "integration",
+          "budget_group": "family_integration",
+          "state": "completed",
+          "outcome": "success",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": false
+        },
+        {
+          "task_id": "report_rollup_task",
+          "benchmark_family": "project",
+          "budget_group": "family_project",
+          "state": "completed",
+          "outcome": "success",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": false
+        },
+        {
+          "task_id": "repository_audit_packet_task",
+          "benchmark_family": "repository",
+          "budget_group": "family_repository",
+          "state": "completed",
+          "outcome": "success",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": false
+        },
+        {
+          "task_id": "repo_notice_review_task",
+          "benchmark_family": "repo_chore",
+          "budget_group": "family_repo_chore",
+          "state": "completed",
+          "outcome": "success",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": false
+        },
+        {
+          "task_id": "hello_task",
+          "benchmark_family": "bounded",
+          "budget_group": "family_bounded",
+          "state": "completed",
+          "outcome": "success",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "checkpoint_exists": true,
+          "report_exists": true,
+          "hidden_side_effect_risk": false
+        }
+      ],
+      "runtime_history": {
+        "lease_acquired": 5,
+        "scheduler_budget_group_selected": 5,
+        "lease_released": 5
+      }
+    }
+  },
+  "open_limits": [
+    "This is broad-family persistent queue substrate evidence, not an A5 promotion claim.",
+    "The isolated CLI run used provider=mock and disabled command containment, so it is not production-equivalent runtime evidence.",
+    "This packet proves single-job queue breadth across required non-repo_sandbox families; multi-job breadth is still only proven on repo_sandbox."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

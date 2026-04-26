@@ -22,6 +22,7 @@ _TRANSITION_MODEL_GENERATION_FOCI = catalog_string_set("transition_model", "gene
 _SHELL_TOKEN_RE = re.compile(r"""'[^']*'|"[^"]*"|&&|\|\||>>|<<|[|;<>]|[^\s]+""")
 _PATH_LIKE_SUFFIXES = catalog_string_set("transition_model", "path_like_suffixes")
 _PATH_TARGET_COMMANDS = catalog_string_set("transition_model", "path_target_commands")
+_TRANSITION_PRIORITY_FAMILIES = {"integration", "project", "repository", "repo_chore", "repo_sandbox", "transition_pressure"}
 
 
 def transition_model_controls(
@@ -79,12 +80,41 @@ def build_transition_model_proposal_artifact(
 ) -> dict[str, object]:
     generation_focus = normalized_generation_focus(focus)
     baseline_controls = runtime_transition_model_controls(current_payload)
+    baseline_generation_focus = runtime_transition_model_generation_focus(current_payload)
     summary = transition_model_summary(memory_root)
     controls = transition_model_controls(
         summary,
         focus=None if generation_focus == "balanced" else generation_focus,
         baseline=baseline_controls,
     )
+    if generation_focus == "repeat_avoidance" and baseline_generation_focus == "repeat_avoidance":
+        controls["repeat_command_penalty"] = max(int(controls["repeat_command_penalty"]), int(baseline_controls.get("repeat_command_penalty", 0) or 0) + 1)
+        controls["progress_command_bonus"] = max(int(controls["progress_command_bonus"]), int(baseline_controls.get("progress_command_bonus", 0) or 0) + 1)
+        controls["max_signatures"] = max(int(controls["max_signatures"]), int(baseline_controls.get("max_signatures", 0) or 0) + 1)
+    elif generation_focus == "regression_guard" and baseline_generation_focus == "regression_guard":
+        controls["regressed_path_command_penalty"] = max(
+            int(controls["regressed_path_command_penalty"]),
+            int(baseline_controls.get("regressed_path_command_penalty", 0) or 0) + 1,
+        )
+        controls["recovery_command_bonus"] = max(
+            int(controls["recovery_command_bonus"]),
+            int(baseline_controls.get("recovery_command_bonus", 0) or 0) + 1,
+        )
+        controls["max_signatures"] = max(int(controls["max_signatures"]), int(baseline_controls.get("max_signatures", 0) or 0) + 1)
+    elif generation_focus == "recovery_bias" and baseline_generation_focus == "recovery_bias":
+        controls["recovery_command_bonus"] = max(
+            int(controls["recovery_command_bonus"]),
+            int(baseline_controls.get("recovery_command_bonus", 0) or 0) + 1,
+        )
+        controls["progress_command_bonus"] = max(
+            int(controls["progress_command_bonus"]),
+            int(baseline_controls.get("progress_command_bonus", 0) or 0) + 1,
+        )
+        controls["long_horizon_progress_command_bonus"] = max(
+            int(controls["long_horizon_progress_command_bonus"]),
+            int(baseline_controls.get("long_horizon_progress_command_bonus", 0) or 0) + 1,
+        )
+        controls["max_signatures"] = max(int(controls["max_signatures"]), int(baseline_controls.get("max_signatures", 0) or 0) + 1)
     signatures = _merged_transition_signatures(
         runtime_transition_model_signatures(current_payload),
         transition_failure_signatures(
@@ -152,6 +182,13 @@ def runtime_transition_model_signatures(payload: object) -> list[dict[str, objec
     if effective is None:
         return []
     return _normalize_signatures(effective.get("signatures", []))
+
+
+def runtime_transition_model_generation_focus(payload: object) -> str:
+    effective = _runtime_transition_model_payload(payload)
+    if effective is None:
+        return ""
+    return normalized_generation_focus(effective.get("generation_focus"))
 
 
 def _runtime_transition_model_payload(payload: object) -> dict[str, object] | None:
@@ -526,8 +563,28 @@ def _merged_transition_signatures(
         signatures.append(entry)
     return sorted(
         signatures,
-        key=lambda item: (-int(item.get("support", 0)), str(item.get("signal", "")), str(item.get("command", ""))),
+        key=_transition_signature_priority_key,
     )[: max(1, int(max_signatures))]
+
+
+def _transition_signature_priority_key(item: dict[str, object]) -> tuple[int, int, int, int, str, str]:
+    difficulty = str(item.get("difficulty", "")).strip()
+    benchmark_family = str(item.get("benchmark_family", "")).strip()
+    signal = str(item.get("signal", "")).strip()
+    command = str(item.get("command", "")).strip()
+    support = int(item.get("support", 0) or 0)
+    long_horizon_priority = 0 if difficulty == "long_horizon" else 1
+    generated_priority = 1 if difficulty == "generated" else 0
+    family_priority = 0 if benchmark_family in _TRANSITION_PRIORITY_FAMILIES else 1
+    regression_priority = 0 if signal == "state_regression" else 1
+    return (
+        long_horizon_priority,
+        generated_priority,
+        family_priority,
+        -support,
+        signal,
+        command,
+    )
 
 
 def _proposals(summary: dict[str, object], focus: str) -> list[dict[str, object]]:

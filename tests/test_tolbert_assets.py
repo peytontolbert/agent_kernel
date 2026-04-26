@@ -560,6 +560,59 @@ def test_materialize_retained_retrieval_asset_bundle_writes_manifest_and_assets(
     assert manifest["runtime_paths"]["cache_paths"] == [str(cache_path)]
 
 
+def test_materialize_retained_retrieval_asset_bundle_aligns_runtime_metadata_to_checkpoint_root(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    retrieval_path = tmp_path / "retrieval" / "retrieval_proposals.json"
+    bundle_manifest_path = tmp_path / "retrieval" / "retrieval_asset_bundle.json"
+    runtime_dir = tmp_path / "var" / "tolbert" / "agentkernel"
+    checkpoints_dir = runtime_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoints_dir / "tolbert_epoch10.pt"
+    checkpoint_path.write_bytes(b"stub")
+    cache_path = runtime_dir / "retrieval_cache" / "agentkernel__tolbert_epoch10.pt"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"cache")
+    config_path = runtime_dir / "config_agentkernel.json"
+    nodes_path = runtime_dir / "nodes_agentkernel.jsonl"
+    label_map_path = runtime_dir / "label_map_agentkernel.json"
+    source_spans_path = runtime_dir / "source_spans_agentkernel.jsonl"
+    for path in (config_path, nodes_path, label_map_path, source_spans_path):
+        path.write_text("{}", encoding="utf-8")
+    retrieval_path.parent.mkdir(parents=True, exist_ok=True)
+    retrieval_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "retained",
+                "asset_strategy": "balanced_rebuild",
+                "asset_controls": {},
+                "asset_rebuild_plan": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        retrieval_proposals_path=retrieval_path,
+        retrieval_asset_bundle_path=bundle_manifest_path,
+        tolbert_checkpoint_path=str(checkpoint_path),
+        tolbert_cache_paths=(str(cache_path),),
+    )
+
+    manifest_path = materialize_retained_retrieval_asset_bundle(
+        repo_root=repo_root,
+        config=config,
+        cycle_id="cycle:retrieval:checkpoint_root",
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["runtime_paths"]["checkpoint_path"] == str(checkpoint_path)
+    assert manifest["runtime_paths"]["config_path"] == str(config_path)
+    assert manifest["runtime_paths"]["nodes_path"] == str(nodes_path)
+    assert manifest["runtime_paths"]["label_map_path"] == str(label_map_path)
+    assert manifest["runtime_paths"]["source_spans_paths"] == [str(source_spans_path)]
+    assert manifest["runtime_paths"]["cache_paths"] == [str(cache_path)]
+
+
 def test_retained_tolbert_runtime_paths_prefer_bundle_manifest(tmp_path: Path) -> None:
     bundle_manifest_path = tmp_path / "retrieval" / "retrieval_asset_bundle.json"
     runtime_dir = tmp_path / "runtime"
@@ -606,6 +659,64 @@ def test_retained_tolbert_runtime_paths_prefer_bundle_manifest(tmp_path: Path) -
 
     assert runtime_paths["tolbert_config_path"] == str(config_path)
     assert runtime_paths["tolbert_checkpoint_path"] == str(checkpoint_path)
+    assert runtime_paths["tolbert_nodes_path"] == str(nodes_path)
+    assert runtime_paths["tolbert_label_map_path"] == str(label_map_path)
+    assert runtime_paths["tolbert_source_spans_paths"] == (str(source_spans_path),)
+    assert runtime_paths["tolbert_cache_paths"] == (str(cache_path),)
+
+
+def test_retained_tolbert_runtime_paths_aligns_bundle_metadata_to_checkpoint_runtime_root(tmp_path: Path) -> None:
+    bundle_manifest_path = tmp_path / "retrieval" / "retrieval_asset_bundle.json"
+    bundle_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    bundle_dir = tmp_path / "retrieval" / "tolbert_bundle"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    for path in (
+        bundle_dir / "config_agentkernel.json",
+        bundle_dir / "nodes_agentkernel.jsonl",
+        bundle_dir / "label_map_agentkernel.json",
+        bundle_dir / "source_spans_agentkernel.jsonl",
+    ):
+        path.write_text("{}", encoding="utf-8")
+
+    runtime_dir = tmp_path / "var" / "tolbert" / "agentkernel"
+    checkpoints_dir = runtime_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoints_dir / "tolbert_epoch10.pt"
+    checkpoint_path.write_bytes(b"stub")
+    cache_path = runtime_dir / "retrieval_cache" / "agentkernel__tolbert_epoch10.pt"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"cache")
+    config_path = runtime_dir / "config_agentkernel.json"
+    nodes_path = runtime_dir / "nodes_agentkernel.jsonl"
+    label_map_path = runtime_dir / "label_map_agentkernel.json"
+    source_spans_path = runtime_dir / "source_spans_agentkernel.jsonl"
+    for path in (config_path, nodes_path, label_map_path, source_spans_path):
+        path.write_text("{}", encoding="utf-8")
+
+    bundle_manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "tolbert_retrieval_asset_bundle",
+                "lifecycle_state": "retained",
+                "runtime_paths": {
+                    "config_path": str(bundle_dir / "config_agentkernel.json"),
+                    "checkpoint_path": str(checkpoint_path),
+                    "nodes_path": str(bundle_dir / "nodes_agentkernel.jsonl"),
+                    "label_map_path": str(bundle_dir / "label_map_agentkernel.json"),
+                    "source_spans_paths": [str(bundle_dir / "source_spans_agentkernel.jsonl")],
+                    "cache_paths": [str(cache_path)],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = KernelConfig(retrieval_asset_bundle_path=bundle_manifest_path)
+
+    runtime_paths = retained_tolbert_runtime_paths(config, repo_root=tmp_path)
+
+    assert runtime_paths["tolbert_checkpoint_path"] == str(checkpoint_path)
+    assert runtime_paths["tolbert_config_path"] == str(config_path)
     assert runtime_paths["tolbert_nodes_path"] == str(nodes_path)
     assert runtime_paths["tolbert_label_map_path"] == str(label_map_path)
     assert runtime_paths["tolbert_source_spans_paths"] == (str(source_spans_path),)

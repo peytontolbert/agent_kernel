@@ -57,6 +57,7 @@ def compare_to_prior_retained(
     merge_priority_families_fn: Callable[..., tuple[list[str], dict[str, float]]],
     holdout_generated_schedule_limit_for_retention_fn: Callable[..., int],
     apply_priority_family_restriction_fn: Callable[..., None],
+    apply_direct_a4_transition_model_compare_preferences_fn: Callable[..., None],
     retention_eval_config_fn: Callable[..., KernelConfig],
     call_tolbert_preview_eval_fn: Callable[..., object],
     retention_evidence_fn: Callable[..., dict[str, object]],
@@ -88,6 +89,7 @@ def compare_to_prior_retained(
         subsystem,
         task_limit=task_limit,
         payload=payload,
+        flags=flags,
         capability_modules_path=config.capability_modules_path,
     )
     scoped_flags = apply_retrieval_bounded_preview_filters_fn(
@@ -134,6 +136,8 @@ def compare_to_prior_retained(
     holdout_generated_schedule_limit = holdout_generated_schedule_limit_for_retention_fn(
         subsystem,
         comparison_task_limit=comparison_task_limit,
+        baseline_flags=scoped_flags,
+        candidate_flags=scoped_flags,
         capability_modules_path=config.capability_modules_path,
     )
     if holdout_generated_schedule_limit > 0:
@@ -148,6 +152,12 @@ def compare_to_prior_retained(
         restrict_to_priority_families=restrict_to_priority_families,
         merged_priority_families=merged_priority_families,
         preserve_generated_lanes=preserve_generated_lanes,
+    )
+    apply_direct_a4_transition_model_compare_preferences_fn(
+        subsystem,
+        flags=scoped_flags,
+        comparison_task_limit=comparison_task_limit,
+        capability_modules_path=config.capability_modules_path,
     )
     baseline_config = retention_eval_config_fn(
         base_config=config,
@@ -270,6 +280,7 @@ def preview_candidate_retention(
     autonomous_runtime_eval_flags_fn: Callable[..., dict[str, bool]],
     apply_retrieval_bounded_preview_filters_fn: Callable[..., dict[str, object]],
     apply_priority_family_restriction_fn: Callable[..., None],
+    apply_direct_a4_transition_model_compare_preferences_fn: Callable[..., None],
     call_tolbert_preview_eval_fn: Callable[..., object],
     retention_evidence_fn: Callable[..., dict[str, object]],
     candidate_matches_active_artifact_fn: Callable[[Path, Path], bool],
@@ -296,10 +307,16 @@ def preview_candidate_retention(
                 parsed,
                 capability_modules_path=config.capability_modules_path,
             )
+    comparison_flags = {
+        "task_limit": task_limit,
+        "priority_benchmark_families": list(priority_benchmark_families or []),
+        "restrict_to_priority_benchmark_families": restrict_to_priority_benchmark_families,
+    }
     comparison_task_limit = comparison_task_limit_for_retention_fn(
         subsystem,
         task_limit=task_limit,
         payload=artifact_payload,
+        flags=comparison_flags,
         capability_modules_path=config.capability_modules_path,
     )
     allow_payload_overrides = _allow_payload_priority_overrides(
@@ -371,6 +388,12 @@ def preview_candidate_retention(
         merged_priority_families=merged_priority_families,
         preserve_generated_lanes=preserve_generated_lanes,
     )
+    apply_direct_a4_transition_model_compare_preferences_fn(
+        subsystem,
+        flags=baseline_flags,
+        comparison_task_limit=comparison_task_limit,
+        capability_modules_path=config.capability_modules_path,
+    )
     candidate_flags.update(
         {
             "include_discovered_tasks": include_discovered_tasks or candidate_flags["include_discovered_tasks"],
@@ -402,6 +425,12 @@ def preview_candidate_retention(
         restrict_to_priority_families=restrict_to_priority_benchmark_families,
         merged_priority_families=merged_priority_families,
         preserve_generated_lanes=preserve_generated_lanes,
+    )
+    apply_direct_a4_transition_model_compare_preferences_fn(
+        subsystem,
+        flags=candidate_flags,
+        comparison_task_limit=comparison_task_limit,
+        capability_modules_path=config.capability_modules_path,
     )
     _emit(f"finalize phase=preview_baseline_eval subsystem={subsystem}")
     baseline = call_tolbert_preview_eval_fn(

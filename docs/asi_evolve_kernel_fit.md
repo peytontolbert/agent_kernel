@@ -75,12 +75,18 @@ Required fields:
 - `selected_variant_id`
 - `strategy_candidate_id`
 - `strategy_candidate_kind`
+- `strategy_origin`
 - `motivation`
 - `controls`
 - `actor_summary`
 - `results_summary`
 - `retention_state`
 - `retained_gain`
+
+Cycle-record surfaces must also carry `strategy_origin` beside `strategy_candidate_id` and
+`strategy_candidate_kind` through observe, select, generate, preview/evaluate, final closeout, and
+retention-outcome records; otherwise live discovered-strategy selections are not auditable until
+strategy-memory finalization.
 - `analysis_lesson`
 - `score`
 - `visit_count`

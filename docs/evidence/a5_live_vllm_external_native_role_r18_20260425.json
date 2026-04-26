@@ -1,0 +1,125 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T20:50:08Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_external_manifest_native_closeout_role_continuity",
+    "status": "supported",
+    "summary": "A longer live delegated queue role generated fresh external-manifest work across all five required families, ran four separated intake/drain windows with 240-second pauses, and closed through the product-native queue.role_closeout surface as queue_empty_trusted with no operator steering required."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python -m py_compile /tmp/agentkernel_a5_live_vllm_external_native_role_r18_20260425/run_external_native_role.py && /home/peyton/miniconda3/envs/ai/bin/python /tmp/agentkernel_a5_live_vllm_external_native_role_r18_20260425/run_external_native_role.py",
+      "result": "passed: external_native_role_jobs=10 all_completed=true elapsed_seconds=769.09 role_closeout=queue_empty_trusted"
+    },
+    "code_changes": [
+      "No additional production code change was required after r17.",
+      "r18 adds a temporary isolated proof driver under /tmp that generates a fresh external task manifest and uses only scripts/run_job_queue.py enqueue, drain, and status for execution and closeout."
+    ],
+    "isolated_cli_r18": {
+      "root": "/tmp/agentkernel_a5_live_vllm_external_native_role_r18b_20260425",
+      "driver": "/tmp/agentkernel_a5_live_vllm_external_native_role_r18_20260425/run_external_native_role.py",
+      "generated_manifest": "/tmp/agentkernel_a5_live_vllm_external_native_role_r18b_20260425/manifests/external_native_tasks.json",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "preflight_mode": "drain --enforce-preflight 0 because host bubblewrap preflight is unavailable in this environment",
+      "elapsed_seconds": 769.093,
+      "role_windows": {
+        "window_count": 4,
+        "pause_seconds_between_windows": 240.0,
+        "windows": [
+          "external-required-a",
+          "external-required-b",
+          "external-git-repo-sandbox",
+          "external-required-c"
+        ],
+        "native_closeout_gate": {
+          "closeout_ready": true,
+          "closeout_mode": "queue_empty_trusted",
+          "operator_steering_required": false,
+          "total_jobs": 10,
+          "completed_success_jobs": 10,
+          "unfinished_jobs": 0,
+          "terminal_non_success_jobs": 0,
+          "blocked_open_jobs": 0,
+          "active_leases": 0,
+          "trust_status": "trusted",
+          "trust_passed": true
+        }
+      },
+      "selection": {
+        "selector": "fresh generated external manifest written by the isolated proof driver; enqueue used production TaskBank external manifest loading and default family budget-group inference",
+        "task_origins": {
+          "external_manifest": 10
+        },
+        "external_tasks": [
+          "external_r18_integration_route_matrix_task",
+          "external_r18_project_owner_map_task",
+          "external_r18_repository_module_index_task",
+          "external_r18_repo_chore_cleanup_notice_task",
+          "external_r18_integration_failover_ledger_task",
+          "external_r18_repo_sandbox_branch_probe_task",
+          "external_r18_repo_sandbox_release_note_task",
+          "external_r18_project_readiness_gate_task",
+          "external_r18_repository_contract_audit_task",
+          "external_r18_repo_chore_dependency_refresh_task"
+        ],
+        "git_backed_external_tasks": [
+          "external_r18_repo_sandbox_branch_probe_task",
+          "external_r18_repo_sandbox_release_note_task"
+        ]
+      },
+      "execution": {
+        "jobs": 10,
+        "fresh_drain_invocations": 10,
+        "final_states": {
+          "completed": 10
+        },
+        "final_outcomes": {
+          "success": 10
+        },
+        "final_active_leases": 0
+      },
+      "trust_summary": {
+        "reports_considered": 10,
+        "trust_status": "trusted",
+        "success_count": 10,
+        "clean_success_count": 10,
+        "light_supervision_clean_success_count": 10,
+        "hidden_side_effect_risk_count": 0,
+        "unexpected_change_report_count": 0,
+        "task_origins": {
+          "external_manifest": 10
+        },
+        "benchmark_families": [
+          "integration",
+          "project",
+          "repo_chore",
+          "repo_sandbox",
+          "repository"
+        ],
+        "required_family_counted_gated_report_counts": {
+          "integration": 2,
+          "project": 2,
+          "repo_chore": 2,
+          "repo_sandbox": 2,
+          "repository": 2
+        },
+        "required_family_clean_task_root_counts": {
+          "integration": 2,
+          "project": 2,
+          "repo_chore": 2,
+          "repo_sandbox": 2,
+          "repository": 2
+        }
+      }
+    }
+  },
+  "open_limits": [
+    "This is a 769-second role proof, substantially longer than r16 but still not a multi-hour or multi-day production-duty role.",
+    "The workload is less task-bank-bound because all 10 jobs come from a generated external manifest, but the manifest is still proof-driver generated rather than product/user intake.",
+    "The host environment lacks working bubblewrap preflight, so this packet uses the same explicit --enforce-preflight 0 live-drain path as r10 through r17.",
+    "A stronger full A5 claim still needs multi-hour continuity and product-native user/workstream intake beyond generated proof manifests."
+  ]
+}

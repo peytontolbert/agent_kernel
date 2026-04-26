@@ -1,0 +1,635 @@
+{
+  "subsystems": {
+    "base_flags": {
+      "include_discovered_tasks": true,
+      "include_episode_memory": true,
+      "include_skill_memory": false,
+      "include_skill_transfer": false,
+      "include_operator_memory": false,
+      "include_tool_memory": false,
+      "include_verifier_memory": false,
+      "include_benchmark_candidates": false,
+      "include_verifier_candidates": false,
+      "include_generated": true,
+      "include_failure_generated": true
+    },
+    "builtin_specs": [
+      {
+        "subsystem": "benchmark",
+        "base_subsystem": "benchmark",
+        "artifact_path_attr": "benchmark_candidates_path",
+        "generator_kind": "benchmark",
+        "artifact_kind": "benchmark_candidate_set",
+        "action": "synthesize_benchmarks",
+        "candidate_flag_updates": {
+          "include_benchmark_candidates": true
+        }
+      },
+      {
+        "subsystem": "skills",
+        "base_subsystem": "skills",
+        "artifact_path_attr": "skills_path",
+        "generator_kind": "skills",
+        "artifact_kind": "skill_set",
+        "action": "extract_skills",
+        "candidate_flag_updates": {
+          "include_skill_memory": true
+        }
+      },
+      {
+        "subsystem": "operators",
+        "base_subsystem": "operators",
+        "artifact_path_attr": "operator_classes_path",
+        "generator_kind": "operators",
+        "artifact_kind": "operator_class_set",
+        "action": "extract_operators",
+        "baseline_flag_updates": {
+          "include_skill_transfer": true
+        },
+        "candidate_flag_updates": {
+          "include_operator_memory": true
+        }
+      },
+      {
+        "subsystem": "tooling",
+        "base_subsystem": "tooling",
+        "artifact_path_attr": "tool_candidates_path",
+        "generator_kind": "tooling",
+        "artifact_kind": "tool_candidate_set",
+        "action": "extract_tools",
+        "candidate_flag_updates": {
+          "include_tool_memory": true
+        }
+      },
+      {
+        "subsystem": "verifier",
+        "base_subsystem": "verifier",
+        "artifact_path_attr": "verifier_contracts_path",
+        "generator_kind": "verifier",
+        "artifact_kind": "verifier_candidate_set",
+        "action": "synthesize_verifiers",
+        "candidate_flag_updates": {
+          "include_verifier_candidates": true
+        }
+      },
+      {
+        "subsystem": "retrieval",
+        "base_subsystem": "retrieval",
+        "artifact_path_attr": "retrieval_proposals_path",
+        "proposal_toggle_attr": "use_retrieval_proposals",
+        "generator_kind": "retrieval",
+        "artifact_kind": "retrieval_policy_set",
+        "action": "propose_retrieval_update",
+        "baseline_flag_updates": {
+          "include_benchmark_candidates": true
+        },
+        "candidate_flag_updates": {
+          "include_benchmark_candidates": true
+        }
+      },
+      {
+        "subsystem": "tolbert_model",
+        "base_subsystem": "tolbert_model",
+        "artifact_path_attr": "tolbert_model_artifact_path",
+        "proposal_toggle_attr": "use_tolbert_model_artifacts",
+        "generator_kind": "tolbert_model",
+        "artifact_kind": "tolbert_model_bundle",
+        "action": "propose_tolbert_model_update",
+        "baseline_flag_updates": {
+          "include_benchmark_candidates": true
+        },
+        "candidate_flag_updates": {
+          "include_benchmark_candidates": true
+        }
+      },
+      {
+        "subsystem": "qwen_adapter",
+        "base_subsystem": "qwen_adapter",
+        "artifact_path_attr": "qwen_adapter_artifact_path",
+        "generator_kind": "qwen_adapter",
+        "artifact_kind": "qwen_adapter_bundle",
+        "action": "propose_qwen_adapter_update",
+        "baseline_flag_updates": {
+          "include_benchmark_candidates": true
+        },
+        "candidate_flag_updates": {
+          "include_benchmark_candidates": true
+        }
+      },
+      {
+        "subsystem": "policy",
+        "base_subsystem": "policy",
+        "artifact_path_attr": "prompt_proposals_path",
+        "proposal_toggle_attr": "use_prompt_proposals",
+        "generator_kind": "policy",
+        "artifact_kind": "prompt_proposal_set",
+        "action": "propose_prompt_update"
+      },
+      {
+        "subsystem": "universe",
+        "base_subsystem": "universe",
+        "artifact_path_attr": "universe_contract_path",
+        "generator_kind": "universe",
+        "artifact_kind": "universe_contract",
+        "action": "propose_universe_update"
+      },
+      {
+        "subsystem": "universe_constitution",
+        "base_subsystem": "universe",
+        "artifact_path_attr": "universe_constitution_path",
+        "generator_kind": "universe_constitution",
+        "artifact_kind": "universe_constitution",
+        "action": "propose_universe_constitution_update"
+      },
+      {
+        "subsystem": "operating_envelope",
+        "base_subsystem": "universe",
+        "artifact_path_attr": "operating_envelope_path",
+        "generator_kind": "operating_envelope",
+        "artifact_kind": "operating_envelope",
+        "action": "propose_operating_envelope_update"
+      },
+      {
+        "subsystem": "curriculum",
+        "base_subsystem": "curriculum",
+        "artifact_path_attr": "curriculum_proposals_path",
+        "proposal_toggle_attr": "use_curriculum_proposals",
+        "generator_kind": "curriculum",
+        "artifact_kind": "curriculum_proposal_set",
+        "action": "propose_curriculum_update"
+      },
+      {
+        "subsystem": "world_model",
+        "base_subsystem": "world_model",
+        "artifact_path_attr": "world_model_proposals_path",
+        "proposal_toggle_attr": "use_world_model",
+        "generator_kind": "world_model",
+        "artifact_kind": "world_model_policy_set",
+        "action": "propose_world_model_update"
+      },
+      {
+        "subsystem": "state_estimation",
+        "base_subsystem": "state_estimation",
+        "artifact_path_attr": "state_estimation_proposals_path",
+        "proposal_toggle_attr": "use_state_estimation_proposals",
+        "generator_kind": "state_estimation",
+        "artifact_kind": "state_estimation_policy_set",
+        "action": "propose_state_estimation_update"
+      },
+      {
+        "subsystem": "trust",
+        "base_subsystem": "trust",
+        "artifact_path_attr": "trust_proposals_path",
+        "proposal_toggle_attr": "use_trust_proposals",
+        "generator_kind": "trust",
+        "artifact_kind": "trust_policy_set",
+        "action": "propose_trust_update"
+      },
+      {
+        "subsystem": "recovery",
+        "base_subsystem": "recovery",
+        "artifact_path_attr": "recovery_proposals_path",
+        "proposal_toggle_attr": "use_recovery_proposals",
+        "generator_kind": "recovery",
+        "artifact_kind": "recovery_policy_set",
+        "action": "propose_recovery_update"
+      },
+      {
+        "subsystem": "delegation",
+        "base_subsystem": "delegation",
+        "artifact_path_attr": "delegation_proposals_path",
+        "proposal_toggle_attr": "use_delegation_proposals",
+        "generator_kind": "delegation",
+        "artifact_kind": "delegated_runtime_policy_set",
+        "action": "propose_delegation_update"
+      },
+      {
+        "subsystem": "operator_policy",
+        "base_subsystem": "operator_policy",
+        "artifact_path_attr": "operator_policy_proposals_path",
+        "proposal_toggle_attr": "use_operator_policy_proposals",
+        "generator_kind": "operator_policy",
+        "artifact_kind": "operator_policy_set",
+        "action": "propose_operator_policy_update"
+      },
+      {
+        "subsystem": "transition_model",
+        "base_subsystem": "transition_model",
+        "artifact_path_attr": "transition_model_proposals_path",
+        "proposal_toggle_attr": "use_transition_model_proposals",
+        "generator_kind": "transition_model",
+        "artifact_kind": "transition_model_policy_set",
+        "action": "propose_transition_model_update"
+      },
+      {
+        "subsystem": "capabilities",
+        "base_subsystem": "capabilities",
+        "artifact_path_attr": "capability_modules_path",
+        "generator_kind": "capabilities",
+        "artifact_kind": "capability_module_set",
+        "action": "propose_capability_update"
+      }
+    ]
+  },
+  "capabilities": {
+    "shell_operators": ["&&", "|", "||", ";", "&", "<", "<<", ">", ">>"],
+    "filesystem_commands": ["cat", "mkdir", "rm", "mv", "cp", "touch", "grep", "test", "tee"],
+    "builtin_capability_names": [
+      "workspace_fs",
+      "workspace_exec",
+      "git_commands",
+      "generated_path_mutation",
+      "http_request"
+    ],
+    "tier_order": {
+      "none": 0,
+      "read": 1,
+      "write": 2,
+      "admin": 3
+    },
+    "adapter_catalog": {
+      "github": {
+        "label": "GitHub",
+        "default_capabilities": ["github_read"],
+        "default_settings": {
+          "http_allowed_hosts": ["api.github.com", "uploads.github.com"],
+          "repo_scopes": [],
+          "account_scopes": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["repo_metadata", "readme", "releases", "account_profile"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {
+          "github_read": {
+            "access_tier": "read",
+            "write_tier": "none",
+            "read_only": true
+          },
+          "github_repo_write": {
+            "access_tier": "write",
+            "write_tier": "branch_only",
+            "read_only": false
+          }
+        }
+      },
+      "youtube": {
+        "label": "YouTube",
+        "default_capabilities": ["youtube_read"],
+        "default_settings": {
+          "http_allowed_hosts": ["www.googleapis.com"],
+          "account_scopes": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["seed_urls"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {
+          "youtube_read": {
+            "access_tier": "read",
+            "write_tier": "none",
+            "read_only": true
+          }
+        }
+      },
+      "twitter": {
+        "label": "Twitter",
+        "default_capabilities": ["twitter_read"],
+        "default_settings": {
+          "http_allowed_hosts": ["api.twitter.com"],
+          "account_scopes": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["seed_urls"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {
+          "twitter_read": {
+            "access_tier": "read",
+            "write_tier": "none",
+            "read_only": true
+          },
+          "twitter_post": {
+            "access_tier": "write",
+            "write_tier": "content_post",
+            "read_only": false
+          }
+        }
+      },
+      "gitlab": {
+        "label": "GitLab",
+        "default_capabilities": ["gitlab_read"],
+        "default_settings": {
+          "http_allowed_hosts": ["gitlab.com"],
+          "repo_scopes": [],
+          "account_scopes": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["project_metadata", "readme", "releases", "merge_requests", "account_profile"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {
+          "gitlab_read": {
+            "access_tier": "read",
+            "write_tier": "none",
+            "read_only": true
+          },
+          "gitlab_repo_write": {
+            "access_tier": "write",
+            "write_tier": "branch_merge_request",
+            "read_only": false
+          }
+        }
+      },
+      "slack": {
+        "label": "Slack",
+        "default_capabilities": ["slack_read"],
+        "default_settings": {
+          "http_allowed_hosts": ["slack.com"],
+          "account_scopes": [],
+          "channel_scopes": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["channel_history", "channel_pins", "account_profile"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {
+          "slack_read": {
+            "access_tier": "read",
+            "write_tier": "none",
+            "read_only": true
+          },
+          "slack_post": {
+            "access_tier": "write",
+            "write_tier": "channel_message",
+            "read_only": false
+          }
+        }
+      },
+      "generic_http": {
+        "label": "Generic HTTP",
+        "default_capabilities": ["http_service_read"],
+        "default_settings": {
+          "http_allowed_hosts": [],
+          "corpus_seed_urls": [],
+          "corpus_modes": ["seed_urls"],
+          "access_tier": "read",
+          "write_tier": "none",
+          "read_only": true
+        },
+        "capability_defaults": {}
+      }
+    }
+  },
+  "task_bank": {
+    "synthetic_lineage_task_suffixes": [
+      "_episode_replay",
+      "_verifier_replay",
+      "_discovered",
+      "_transition_pressure",
+      "_skill_replay",
+      "_skill_transfer",
+      "_tool_replay",
+      "_benchmark_candidate",
+      "_verifier_candidate"
+    ],
+    "synthetic_lineage_benchmark_families": [
+      "episode_memory",
+      "verifier_memory",
+      "discovered_task",
+      "transition_pressure",
+      "skill_memory",
+      "skill_transfer",
+      "tool_memory",
+      "operator_memory",
+      "benchmark_candidate",
+      "verifier_candidate"
+    ],
+    "synthetic_lineage_memory_sources": [
+      "episode",
+      "verifier",
+      "discovered_task",
+      "transition_pressure",
+      "skill",
+      "skill_transfer",
+      "tool",
+      "operator"
+    ]
+  },
+  "unattended_controller": {
+    "focuses": [
+      "balanced",
+      "recovery_alignment",
+      "discovered_task_adaptation"
+    ],
+    "binary_features": [
+      "allow_kernel_autobuild",
+      "liftoff_shadow",
+      "liftoff_reject",
+      "liftoff_retain"
+    ],
+    "nonnegative_features": [
+      "retained_cycles",
+      "rejected_cycles",
+      "failed_decisions",
+      "productive_depth_gain",
+      "depth_drift_pressure",
+      "long_horizon_retained_gain",
+      "family_regression_count",
+      "generated_family_regression_count",
+      "low_confidence_pressure",
+      "retrieval_regression",
+      "breadth_pressure",
+      "priority_family_retained_gain",
+      "priority_family_yield_gap",
+      "frontier_failure_motif_gain",
+      "frontier_failure_motif_pressure",
+      "frontier_repo_setting_gain",
+      "frontier_repo_setting_pressure",
+      "intermediate_decision_gain",
+      "subsystem_reject_pressure",
+      "subsystem_retain_pressure"
+    ],
+    "state_feature_order": [
+      "bias",
+      "retained_cycles",
+      "rejected_cycles",
+      "pass_rate_delta",
+      "step_delta",
+      "productive_depth_gain",
+      "depth_drift_pressure",
+      "long_horizon_retained_gain",
+      "failed_decisions",
+      "family_regression",
+      "generated_family_regression",
+      "family_regression_count",
+      "generated_family_regression_count",
+      "low_confidence_pressure",
+      "retrieval_regression",
+      "breadth_pressure",
+      "priority_family_retained_gain",
+      "priority_family_yield_gap",
+      "frontier_failure_motif_gain",
+      "frontier_failure_motif_pressure",
+      "frontier_repo_setting_gain",
+      "frontier_repo_setting_pressure",
+      "intermediate_decision_gain",
+      "subsystem_reject_pressure",
+      "subsystem_retain_pressure",
+      "allow_kernel_autobuild",
+      "liftoff_shadow",
+      "liftoff_reject",
+      "liftoff_retain"
+    ],
+    "action_feature_order": [
+      "bias",
+      "focus_balanced",
+      "focus_recovery_alignment",
+      "focus_discovered_task_adaptation",
+      "adaptive_search",
+      "cycles_norm",
+      "campaign_width_norm",
+      "variant_width_norm",
+      "task_limit_log2_norm",
+      "task_step_floor_log2_norm",
+      "priority_family_count_norm",
+      "priority_broad_required"
+    ],
+    "transition_context_state_features": [
+      "bias",
+      "retained_cycles",
+      "rejected_cycles",
+      "pass_rate_delta",
+      "step_delta",
+      "productive_depth_gain",
+      "depth_drift_pressure",
+      "long_horizon_retained_gain",
+      "failed_decisions",
+      "family_regression",
+      "generated_family_regression",
+      "low_confidence_pressure",
+      "retrieval_regression",
+      "breadth_pressure",
+      "priority_family_retained_gain",
+      "priority_family_yield_gap",
+      "frontier_failure_motif_gain",
+      "frontier_failure_motif_pressure",
+      "frontier_repo_setting_gain",
+      "frontier_repo_setting_pressure",
+      "intermediate_decision_gain"
+    ],
+    "priority_broad_required_families": [
+      "project",
+      "repository",
+      "integration"
+    ],
+    "discovered_state_features": [
+      {
+        "name": "novel_subsystem_capability_gain",
+        "nonnegative": true,
+        "reward_weight": 2.5
+      },
+      {
+        "name": "strategy_hook_coverage",
+        "nonnegative": true,
+        "reward_weight": 1.5
+      }
+    ]
+  },
+  "tolbert_model": {
+    "default_build_policy": {
+      "allow_kernel_autobuild": false,
+      "allow_kernel_rebuild": false,
+      "require_synthetic_dataset": true,
+      "require_head_targets": true,
+      "require_long_horizon_head_targets": true,
+      "min_total_examples": 512,
+      "min_synthetic_examples": 64,
+      "min_policy_examples": 256,
+      "min_transition_examples": 256,
+      "min_value_examples": 256,
+      "min_stop_examples": 128,
+      "min_long_horizon_trajectory_examples": 4,
+      "min_long_horizon_policy_examples": 4,
+      "min_long_horizon_transition_examples": 4,
+      "min_long_horizon_value_examples": 4,
+      "min_long_horizon_stop_examples": 1
+    },
+    "shared_store_groups": [
+      "assets",
+      "dataset",
+      "universal_dataset",
+      "training",
+      "retrieval_cache",
+      "hybrid_runtime",
+      "universal_runtime"
+    ],
+    "hard_proposal_families": [
+      "integration",
+      "project",
+      "repository"
+    ],
+    "medium_proposal_families": [
+      "benchmark_candidate",
+      "repo_chore",
+      "repo_sandbox",
+      "tooling",
+      "verifier_candidate",
+      "workflow"
+    ]
+  },
+  "trust": {
+    "default_required_benchmark_families": [
+      "repo_chore",
+      "repo_sandbox",
+      "project",
+      "repository",
+      "integration"
+    ]
+  },
+  "retained_extensions": {
+    "schema_version": "retained_ontology_extensions_v1",
+    "entries": []
+  },
+  "runtime_defaults": {
+    "unattended_allowed_benchmark_families": [
+      "bounded",
+      "micro",
+      "workflow",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox",
+      "tooling",
+      "integration",
+      "episode_memory",
+      "skill_memory",
+      "skill_transfer",
+      "operator_memory",
+      "verifier_memory",
+      "tool_memory",
+      "benchmark_candidate",
+      "verifier_candidate"
+    ],
+    "unattended_generated_path_prefixes": [
+      "dist",
+      "build",
+      "node_modules",
+      "coverage",
+      ".pytest_cache",
+      "__pycache__"
+    ],
+    "frontier_step_floor_families": [
+      "integration",
+      "project",
+      "repo_sandbox",
+      "repository",
+      "tooling"
+    ]
+  }
+}

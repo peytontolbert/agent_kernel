@@ -180,6 +180,12 @@ class LLMDecisionPolicy(Policy):
             pre_context_synthetic_edit = self._pre_context_synthetic_edit_plan_direct_decision(state)
             if pre_context_synthetic_edit is not None:
                 return self._apply_pre_context_tolbert_route(state, pre_context_synthetic_edit)
+            pre_context_workspace_contract = self._pre_context_workspace_contract_direct_decision(state)
+            if pre_context_workspace_contract is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_workspace_contract)
+            pre_context_shared_repo_worker = self._pre_context_shared_repo_worker_direct_decision(state)
+            if pre_context_shared_repo_worker is not None:
+                return self._apply_pre_context_tolbert_route(state, pre_context_shared_repo_worker)
             pre_context_shared_repo_integrator = self._pre_context_shared_repo_integrator_direct_decision(state)
             if pre_context_shared_repo_integrator is not None:
                 return self._apply_pre_context_tolbert_route(state, pre_context_shared_repo_integrator)
@@ -210,11 +216,11 @@ class LLMDecisionPolicy(Policy):
                     state.context_packet = self.context_provider.compile(state)
                 except Exception as exc:
                     error_text = str(exc)
-                    if (
-                        require_live_llm_coding_control
-                        and bool(self.config.use_tolbert_context)
+                    retryable_tolbert_startup_failure = (
+                        bool(self.config.use_tolbert_context)
                         and self._is_retryable_tolbert_startup_failure(error_text)
-                    ):
+                    )
+                    if retryable_tolbert_startup_failure:
                         state.context_packet = None
                         context_compile_warning = {
                             "status": "degraded",
@@ -229,6 +235,18 @@ class LLMDecisionPolicy(Policy):
                             degrade_reason="tolbert_startup_failure",
                             retryable=True,
                         )
+                        if not require_live_llm_coding_control:
+                            fallback = self.fallback_decision(
+                                state,
+                                failure_origin="retrieval_failure",
+                                error_text=error_text,
+                            )
+                            if fallback is not None:
+                                fallback.proposal_metadata = dict(getattr(fallback, "proposal_metadata", {}) or {})
+                                fallback.proposal_metadata["context_compile_degraded"] = dict(
+                                    context_compile_warning
+                                )
+                                return fallback
                     else:
                         raise ContextCompilationError(f"context packet compilation failed: {exc}") from exc
                 finally:
@@ -606,6 +624,17 @@ class LLMDecisionPolicy(Policy):
             blocked_commands=blocked_commands,
         )
 
+    def _shared_repo_worker_direct_decision(
+        self,
+        state: AgentState,
+        *,
+        blocked_commands: list[str],
+    ) -> ActionDecision | None:
+        return self.workflow_adapter.shared_repo_worker_direct_decision(
+            state,
+            blocked_commands=blocked_commands,
+        )
+
     _shared_repo_unresolved_required_branches = staticmethod(
         PolicyWorkflowAdapter.shared_repo_unresolved_required_branches
     )
@@ -682,6 +711,12 @@ class LLMDecisionPolicy(Policy):
 
     def _pre_context_synthetic_edit_plan_direct_decision(self, state: AgentState) -> ActionDecision | None:
         return self.workflow_adapter.pre_context_synthetic_edit_plan_direct_decision(state)
+
+    def _pre_context_shared_repo_worker_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        return self.workflow_adapter.pre_context_shared_repo_worker_direct_decision(state)
+
+    def _pre_context_workspace_contract_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        return self.workflow_adapter.pre_context_workspace_contract_direct_decision(state)
 
     def _pre_context_shared_repo_integrator_direct_decision(self, state: AgentState) -> ActionDecision | None:
         return self.workflow_adapter.pre_context_shared_repo_integrator_direct_decision(state)

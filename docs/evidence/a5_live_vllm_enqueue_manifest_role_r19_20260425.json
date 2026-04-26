@@ -1,0 +1,107 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T21:10:38Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "product_native_manifest_intake_queue_role",
+    "status": "supported",
+    "summary": "The delegated queue now has a product-native enqueue-manifest intake command. In an isolated live-vLLM run, that command ingested the default external breadth manifest, embedded portable task payloads into queued jobs, drained all 10 jobs successfully, and closed through queue.role_closeout as queue_empty_trusted."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python -m py_compile scripts/run_job_queue.py tests/test_job_queue.py && /home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_job_queue.py && /home/peyton/miniconda3/envs/ai/bin/python -m py_compile /tmp/agentkernel_a5_live_vllm_enqueue_manifest_role_r19_20260425/run_enqueue_manifest_role.py && /home/peyton/miniconda3/envs/ai/bin/python /tmp/agentkernel_a5_live_vllm_enqueue_manifest_role_r19_20260425/run_enqueue_manifest_role.py",
+      "result": "passed: full job queue suite, 74 passed in 21.64s; enqueue_manifest_role_jobs=10 all_completed=true elapsed_seconds=25.78 role_closeout=queue_empty_trusted"
+    },
+    "code_changes": [
+      "scripts/run_job_queue.py adds enqueue-manifest, a batch workstream intake command that loads external manifests through TaskBank, filters by task/family/limit, enqueues via DelegatedJobQueue, and supports JSON output.",
+      "enqueue-manifest embeds each resolved external task as runtime_overrides.task_payload so later drains do not depend on the manifest path remaining configured.",
+      "tests/test_job_queue.py covers JSON enqueue-manifest output, family budget inference, priority assignment, and embedded external task payload metadata."
+    ],
+    "isolated_cli_r19": {
+      "root": "/tmp/agentkernel_a5_live_vllm_enqueue_manifest_role_r19_20260425",
+      "driver": "/tmp/agentkernel_a5_live_vllm_enqueue_manifest_role_r19_20260425/run_enqueue_manifest_role.py",
+      "manifest": "/data/agentkernel/datasets/task_manifests/default_external_breadth_tasks.json",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "preflight_mode": "drain --enforce-preflight 0 because host bubblewrap preflight is unavailable in this environment",
+      "elapsed_seconds": 25.775,
+      "product_intake": {
+        "command": "scripts/run_job_queue.py enqueue-manifest --manifest-path /data/agentkernel/datasets/task_manifests/default_external_breadth_tasks.json --priority-start 190 --json",
+        "selected_task_count": 10,
+        "enqueued_job_count": 10,
+        "embedded_task_payload_count": 10,
+        "budget_groups": [
+          "family_integration",
+          "family_project",
+          "family_repo_chore",
+          "family_repo_sandbox",
+          "family_repository"
+        ]
+      },
+      "execution": {
+        "jobs": 10,
+        "fresh_drain_invocations": 10,
+        "final_states": {
+          "completed": 10
+        },
+        "final_outcomes": {
+          "success": 10
+        },
+        "final_active_leases": 0
+      },
+      "native_closeout_gate": {
+        "closeout_ready": true,
+        "closeout_mode": "queue_empty_trusted",
+        "operator_steering_required": false,
+        "total_jobs": 10,
+        "completed_success_jobs": 10,
+        "unfinished_jobs": 0,
+        "terminal_non_success_jobs": 0,
+        "blocked_open_jobs": 0,
+        "active_leases": 0,
+        "trust_status": "trusted",
+        "trust_passed": true
+      },
+      "trust_summary": {
+        "reports_considered": 10,
+        "trust_status": "trusted",
+        "success_count": 10,
+        "clean_success_count": 10,
+        "light_supervision_clean_success_count": 10,
+        "hidden_side_effect_risk_count": 0,
+        "unexpected_change_report_count": 0,
+        "task_origins": {
+          "external_manifest": 10
+        },
+        "benchmark_families": [
+          "integration",
+          "project",
+          "repo_chore",
+          "repo_sandbox",
+          "repository"
+        ],
+        "required_family_counted_gated_report_counts": {
+          "integration": 2,
+          "project": 2,
+          "repo_chore": 2,
+          "repo_sandbox": 2,
+          "repository": 2
+        },
+        "required_family_clean_task_root_counts": {
+          "integration": 2,
+          "project": 2,
+          "repo_chore": 2,
+          "repo_sandbox": 2,
+          "repository": 2
+        }
+      }
+    }
+  },
+  "open_limits": [
+    "This packet proves product-native manifest intake plus native closeout, but it is intentionally short and does not replace r18's longer continuity evidence.",
+    "The manifest is the repo's default external breadth manifest, not a live product/user issue stream.",
+    "The host environment lacks working bubblewrap preflight, so this packet uses the same explicit --enforce-preflight 0 live-drain path as r10 through r18.",
+    "A stronger full A5 claim still needs multi-hour continuity with product/user workstream intake."
+  ]
+}

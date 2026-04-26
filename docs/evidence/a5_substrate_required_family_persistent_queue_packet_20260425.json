@@ -1,0 +1,65 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T15:08:37Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_required_family_persistent_queue_repeated_control",
+    "status": "supported",
+    "summary": "Live-vLLM persistent queue handled repeated delegated shared-repo objectives across all required families with accepted parent promotions and zero hidden side-effect risk."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_policy.py::test_llm_policy_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_explicit_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_shared_repo_integrator_skips_context_compile_for_first_merge_segment tests/test_preflight.py::test_summarize_workspace_side_effects_accounts_for_required_worker_branch_outputs tests/test_preflight.py::test_summarize_workspace_side_effects_keeps_non_git_unexpected_changes_for_git_tasks tests/test_preflight.py::test_summarize_workspace_side_effects_ignores_git_internal_changes_for_git_tasks",
+      "result": "passed in focused runs"
+    },
+    "isolated_cli_r5_integration_repo_chore": {
+      "source_packet": "/data/agentkernel/docs/evidence/a5_live_vllm_repeated_control_cycle_continuation_check_20260425.json",
+      "root": "/tmp/agentkernel_a5_live_vllm_continuation_r5_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "families": ["integration", "repo_chore"],
+      "enqueue_calls": 2,
+      "drain_invocations": 6,
+      "completed_jobs": 6,
+      "successful_jobs": 6,
+      "accepted_parent_promotions": 2,
+      "blocked_jobs": 0,
+      "final_active_leases": 0,
+      "hidden_side_effect_risk_rate": 0.0,
+      "trust_status": "trusted"
+    },
+    "isolated_cli_r6_project_repository_repo_sandbox": {
+      "source_packet": "/data/agentkernel/docs/evidence/a5_live_vllm_remaining_required_families_continuation_check_20260425.json",
+      "root": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "families": ["project", "repository", "repo_sandbox"],
+      "enqueue_calls": 3,
+      "drain_invocations": 9,
+      "completed_jobs": 9,
+      "successful_jobs": 9,
+      "accepted_parent_promotions": 3,
+      "blocked_jobs": 0,
+      "final_active_leases": 0,
+      "hidden_side_effect_risk_rate": 0.0,
+      "trust_status": "trusted"
+    },
+    "combined_summary": {
+      "required_families": ["integration", "repo_chore", "project", "repository", "repo_sandbox"],
+      "total_enqueue_calls": 5,
+      "total_drain_invocations": 15,
+      "total_completed_jobs": 15,
+      "total_successful_jobs": 15,
+      "total_accepted_parent_promotions": 5,
+      "final_active_leases_each_packet": 0,
+      "blocked_jobs_each_packet": 0,
+      "hidden_side_effect_risk_rate_each_packet": 0.0
+    }
+  },
+  "open_limits": [
+    "This supports A5_substrate, not a full indefinite A5 production-duty claim.",
+    "The proof is bounded to isolated live-vLLM queue packets and direct shared-repo worker/integrator routes.",
+    "A stronger A5 claim still needs longer-duration role persistence, resume/interruption repetition, and broader non-fixture production workloads."
+  ]
+}

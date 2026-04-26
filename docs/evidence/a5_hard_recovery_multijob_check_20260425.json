@@ -1,0 +1,120 @@
+{
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "isolated_mock_hard_interruption_multi_job_recovery",
+    "status": "supported",
+    "summary": "Delegated queue recovered a shared-repo multi-job root after a hard-killed worker runner left an in-progress job with a stale active lease and no last_error."
+  },
+  "created_at": "2026-04-25T01:40:00Z",
+  "evidence": {
+    "focused_tests": {
+      "command": "pytest -q tests/test_job_queue.py -k \"stale_lease_and_resumes_orphaned or resumes_interrupted_job_without_active_lease or skips_live_leased_in_progress_job or promotable_cli_excludes or decomposes_parallel_workers or defers_integrator_until_worker_dependencies_complete\"",
+      "result": "7 passed, 64 deselected",
+      "covered_surfaces": [
+        "stale active lease reaping",
+        "orphaned in-progress job resumption without last_error",
+        "interrupted job resumption with last_error",
+        "live leased job skip",
+        "worker promotion filtering",
+        "parallel worker decomposition",
+        "integrator dependency deferral"
+      ]
+    },
+    "full_queue_tests": {
+      "command": "pytest -q tests/test_job_queue.py",
+      "result": "71 passed",
+      "covered_surfaces": [
+        "delegated queue claim/finalize lifecycle",
+        "runtime lease governance",
+        "stale lease recovery",
+        "worker/integrator decomposition",
+        "acceptance promotion filtering",
+        "workspace rollback on bounded non-success",
+        "worker-command diagnostics"
+      ]
+    },
+    "isolated_cli_hard_interruption_recovery": {
+      "queue_root": "/tmp/agentkernel_a5_hard_recovery_20260425",
+      "provider": "mock",
+      "enqueue_command": "python scripts/run_job_queue.py enqueue --task-id git_release_train_acceptance_task --priority 5 --decompose-workers 1 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "interrupted_command": "python scripts/run_job_queue.py drain --limit 1 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "interruption": {
+        "method": "SIGKILL",
+        "runner_pid": 2875687,
+        "interrupted_task_id": "git_release_train_worker_api_task",
+        "post_kill_job_state": "in_progress",
+        "post_kill_last_error": "",
+        "post_kill_checkpoint_path_present": true,
+        "post_kill_report_path_present": true,
+        "post_kill_active_leases": 1
+      },
+      "recovery_command": "python scripts/run_job_queue.py drain --limit 4 --enforce-preflight 0 --provider mock --use-tolbert-context 0 --allow-git-commands 1",
+      "recovery_result": {
+        "drained_jobs": 4,
+        "completed_success": 4,
+        "lease_reaped_count": 1,
+        "active_leases_after_completion": 0,
+        "recovered_worker_attempt_count": 2,
+        "promotable_jobs_after_worker_filter_fix": 1
+      },
+      "jobs": [
+        {
+          "task_id": "git_release_train_worker_api_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 2,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true
+        },
+        {
+          "task_id": "git_release_train_worker_docs_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true
+        },
+        {
+          "task_id": "git_release_train_worker_ops_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "worker",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": false,
+          "checkpoint_exists": true,
+          "report_exists": true
+        },
+        {
+          "task_id": "git_release_train_acceptance_task",
+          "state": "completed",
+          "outcome": "success",
+          "role": "integrator",
+          "attempt_count": 1,
+          "acceptance_ready": true,
+          "promotable_after_fix": true,
+          "checkpoint_exists": true,
+          "report_exists": true
+        }
+      ],
+      "patched_gap": {
+        "issue": "A hard-killed runner could leave an in-progress job with a stale active lease and no last_error; the next runner skipped that job instead of resuming it.",
+        "fix": "Runtime snapshots now reap stale same-host leases, and in-progress jobs with persisted checkpoint/report paths are resumable when no active lease remains.",
+        "verification": "The recovery drain reaped one stale lease, completed the interrupted worker on attempt_count=2, then completed the remaining workers and dependency-gated integrator."
+      }
+    }
+  },
+  "open_limits": [
+    "This is hard interruption/recovery substrate evidence, not an A5 promotion claim.",
+    "The isolated CLI run used provider=mock and disabled command containment, so it is not production-equivalent runtime evidence.",
+    "A stronger A5 packet still needs production-equivalent provider recovery and broader family coverage beyond repo_sandbox."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "spec_version": "asi_v1"
+}

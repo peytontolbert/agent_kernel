@@ -1,0 +1,60 @@
+{
+  "artifact_kind": "model_stack_generated_decision_queue_check",
+  "generated_at": "2026-04-25T06:55:00Z",
+  "status": "bounded_failure",
+  "provider": "model_stack",
+  "model": "meta-llama/Llama-3.2-3B",
+  "model_stack_server": {
+    "host": "http://127.0.0.1:8001",
+    "snapshot_dir": "/data/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062",
+    "device": "cuda:0 under CUDA_VISIBLE_DEVICES=1",
+    "dtype": "torch.bfloat16",
+    "healthz_status": "ok"
+  },
+  "agent_kernel_client_controls": {
+    "prompt_token_budget_env": "AGENT_KERNEL_MODEL_STACK_PROMPT_TOKEN_BUDGET",
+    "decision_max_tokens_env": "AGENT_KERNEL_MODEL_STACK_DECISION_MAX_TOKENS",
+    "http_wall_timeout": true,
+    "focused_tests": [
+      "tests/test_llm.py::test_vllm_client_uses_structured_chat_completion",
+      "tests/test_llm.py::test_model_stack_client_uses_token_generation_endpoint",
+      "tests/test_llm.py::test_model_stack_client_recovers_from_transient_generation_failure",
+      "tests/test_llm.py::test_model_stack_client_accepts_decision_token_budget_override",
+      "tests/test_llm.py::test_post_json_enforces_wall_timeout"
+    ],
+    "focused_test_result": "5 passed"
+  },
+  "queue_run": {
+    "root": "/tmp/agentkernel_a5_model_stack_llama3b_json_queue_r5_20260425",
+    "task_id": "hello_task",
+    "job_id": "job:hello_task:20260425T064722797794Z:7dccee33",
+    "prompt_token_budget": 128,
+    "decision_max_tokens": "16,32",
+    "timeout_seconds": 20,
+    "preflight_passed": true,
+    "provider_health_passed": true,
+    "execution_containment": "disabled_by_config",
+    "state": "safe_stop",
+    "outcome": "safe_stop",
+    "failure_origin": "controller_failure",
+    "failure_reason": "Model Stack did not return a parseable JSON decision: text='' response=None last_error=Model Stack request failed after 1 attempts: Model Stack request exceeded wall timeout 20s [controller_failure]",
+    "commands_executed": 0,
+    "hidden_side_effect_risk": false
+  },
+  "interpretation": {
+    "closed_gap": "The generated-decision path no longer hangs unbounded; slow model-stack calls are converted into bounded controller failures.",
+    "remaining_gap": "Real-weight model-stack LLaMA 3B generation is too slow for full Agent Kernel queue prompts under the current runtime and prompt shape.",
+    "not_blocked_by": [
+      "provider registration",
+      "queue enqueue/drain plumbing",
+      "preflight provider health",
+      "containment configuration",
+      "tokenizer path wiring"
+    ],
+    "next_shortest_paths": [
+      "Use the existing vLLM Qwen live provider for A4/A5 lane evidence while model-stack runtime performance is optimized separately.",
+      "Add a tiny model-stack decision-smoke task with a purpose-built minimal prompt if the immediate goal is only generated JSON viability.",
+      "Optimize model-stack prefill/decode or use an instruction-tuned LLaMA-family snapshot before claiming model-stack-generated queue success."
+    ]
+  }
+}

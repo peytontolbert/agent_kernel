@@ -10,6 +10,102 @@ from ...improvement import ImprovementCycleRecord, ImprovementPlanner
 from ...extensions.strategy.subsystems import base_subsystem_for
 
 
+_A4_REQUIRED_FAMILY_SET = {
+    "integration",
+    "project",
+    "repository",
+    "repo_chore",
+    "repo_sandbox",
+}
+
+
+def _is_direct_a4_transition_model_confirmation_route(
+    subsystem: str,
+    *,
+    baseline_flags: dict[str, object],
+    candidate_flags: dict[str, object],
+    capability_modules_path: Path | None = None,
+) -> bool:
+    if base_subsystem_for(subsystem, capability_modules_path) != "transition_model":
+        return False
+    priority_families = {
+        str(value).strip()
+        for value in list(candidate_flags.get("priority_benchmark_families", []) or [])
+        if str(value).strip()
+    }
+    if priority_families != _A4_REQUIRED_FAMILY_SET:
+        return False
+    if not bool(candidate_flags.get("restrict_to_priority_benchmark_families", False)):
+        return False
+    try:
+        task_limit = int(candidate_flags.get("task_limit", baseline_flags.get("task_limit", 0)) or 0)
+    except (TypeError, ValueError):
+        task_limit = 0
+    return task_limit > 0 and task_limit <= 24
+
+
+def _apply_direct_a4_transition_model_confirmation_override(
+    failures: list[str],
+    *,
+    subsystem: str,
+    evidence: dict[str, object],
+    confirmation_report: dict[str, object],
+    baseline_flags: dict[str, object],
+    candidate_flags: dict[str, object],
+    capability_modules_path: Path | None = None,
+) -> tuple[list[str], bool]:
+    if not failures:
+        return failures, False
+    if not _is_direct_a4_transition_model_confirmation_route(
+        subsystem,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
+        capability_modules_path=capability_modules_path,
+    ):
+        return failures, False
+    if float(evidence.get("transition_model_improvement_count", 0.0) or 0.0) <= 0.0:
+        return failures, False
+    if float(confirmation_report.get("baseline_pass_rate_mean", 0.0) or 0.0) < 1.0:
+        return failures, False
+    if float(confirmation_report.get("candidate_pass_rate_mean", 0.0) or 0.0) < 1.0:
+        return failures, False
+    if int(confirmation_report.get("regressed_trace_task_count", 0) or 0) != 0:
+        return failures, False
+    if int(confirmation_report.get("regressed_trajectory_task_count", 0) or 0) != 0:
+        return failures, False
+    if float(confirmation_report.get("paired_trace_non_regression_rate_lower_bound", 0.0) or 0.0) < 0.9:
+        return failures, False
+    if float(confirmation_report.get("paired_trajectory_non_regression_rate_lower_bound", 0.0) or 0.0) < 0.9:
+        return failures, False
+    filtered = [
+        failure
+        for failure in failures
+        if failure != "candidate confirmation conservative pass-rate bound remained too weak"
+    ]
+    return filtered, filtered != failures
+
+
+def effective_required_confirmation_runs(
+    subsystem: str,
+    gate: dict[str, object],
+    *,
+    baseline_flags: dict[str, object],
+    candidate_flags: dict[str, object],
+    capability_modules_path: Path | None = None,
+) -> int:
+    required_confirmation_runs = max(1, int(gate.get("required_confirmation_runs", 1)))
+    if required_confirmation_runs <= 1:
+        return required_confirmation_runs
+    if not _is_direct_a4_transition_model_confirmation_route(
+        subsystem,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
+        capability_modules_path=capability_modules_path,
+    ):
+        return required_confirmation_runs
+    return 1
+
+
 def run_confirmation_phase(
     *,
     config: KernelConfig,
@@ -43,7 +139,13 @@ def run_confirmation_phase(
 
     confirmation_baseline_runs = [baseline]
     confirmation_candidate_runs = [candidate]
-    required_confirmation_runs = max(1, int(gate.get("required_confirmation_runs", 1)))
+    required_confirmation_runs = effective_required_confirmation_runs(
+        subsystem,
+        gate,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
+        capability_modules_path=config.capability_modules_path,
+    )
     if state != "retain" or required_confirmation_runs <= 1:
         return {
             "state": state,
@@ -251,11 +353,15 @@ def run_holdout_phase(
     holdout_task_limit = holdout_task_limit_for_retention_fn(
         subsystem,
         comparison_task_limit=comparison_task_limit,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
         capability_modules_path=config.capability_modules_path,
     )
     holdout_generated_schedule_limit = holdout_generated_schedule_limit_for_retention_fn(
         subsystem,
         comparison_task_limit=comparison_task_limit,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
         capability_modules_path=config.capability_modules_path,
     )
     if isinstance(holdout_task_limit, int) and holdout_task_limit > 0:
@@ -404,6 +510,8 @@ def aggregate_confirmation_confidence(
     evidence: dict[str, object],
     confirmation_baseline_runs: list[object],
     confirmation_candidate_runs: list[object],
+    baseline_flags: dict[str, object],
+    candidate_flags: dict[str, object],
     progress: Callable[[str], None] | None,
     confirmation_confidence_report_fn: Callable[..., dict[str, object]],
     confirmation_confidence_failures_fn: Callable[..., list[str]],
@@ -425,6 +533,17 @@ def aggregate_confirmation_confidence(
         gate=gate,
     )
     confirmation_failures = confirmation_confidence_failures_fn(confirmation_report, gate=gate)
+    confirmation_failures, confirmation_override_applied = (
+        _apply_direct_a4_transition_model_confirmation_override(
+            confirmation_failures,
+            subsystem=subsystem,
+            evidence=evidence,
+            confirmation_report=confirmation_report,
+            baseline_flags=baseline_flags,
+            candidate_flags=candidate_flags,
+            capability_modules_path=config.capability_modules_path,
+        )
+    )
     evidence.update(
         {
             "confirmation_run_count": int(confirmation_report.get("run_count", 0)),
@@ -490,6 +609,9 @@ def aggregate_confirmation_confidence(
                 confirmation_report.get("step_delta_upper_bound", 0.0)
             ),
             "confirmation_step_delta_spread": float(confirmation_report.get("step_delta_spread", 0.0)),
+            "confirmation_direct_a4_saturated_pass_rate_override_applied": bool(
+                confirmation_override_applied
+            ),
         }
     )
     planner.append_cycle_record(

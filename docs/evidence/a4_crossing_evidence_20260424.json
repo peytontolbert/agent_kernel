@@ -1,0 +1,81 @@
+{
+  "artifacts": {
+    "active_artifact_path": "trajectories/transition_model/transition_model_proposals.json",
+    "artifact_lifecycle_state": "retained",
+    "artifact_sha256": "364f54e5398e701fc0ff22a34cfbe796d84c384865c36684d1db57f19e7b2ff2",
+    "candidate_artifact_path": "trajectories/improvement/candidates/transition_model/cycle_transition_model_20260423T152657358105Z_604f5429_recovery_bias/.replay_candidates/transition_model_proposals.cycle_transition_model_20260423T223800Z_604f5429r6.json"
+  },
+  "claim": {
+    "level": "A4",
+    "scope": "narrow_direct_transition_model_route",
+    "status": "supported",
+    "summary": "Retained child-native runtime-managed natural closeout on the direct five-family transition_model route."
+  },
+  "created_at": "2026-04-24T22:50:22.135919+00:00",
+  "decision_state": {
+    "closeout_mode": "natural",
+    "decision_conversion_state": "runtime_managed",
+    "decision_owner": "child_native",
+    "final_reason": "transition-model candidate improved retained bad-transition guidance without broader regression",
+    "final_state": "retain",
+    "retention_basis": "transition-model candidate improved retained bad-transition guidance without broader regression"
+  },
+  "gates": {
+    "artifact_compatible": true,
+    "child_native_decision": true,
+    "natural_closeout": true,
+    "non_regressive_trace": true,
+    "non_regressive_trajectory": true,
+    "phase_gates_passed": true,
+    "required_family_surface_present": true,
+    "retained": true,
+    "runtime_managed_artifact_path": true,
+    "runtime_managed_conversion": true,
+    "transition_model_improved": true
+  },
+  "metrics": {
+    "average_step_delta": 0.0,
+    "baseline_pass_rate": 1.0,
+    "candidate_pass_rate": 1.0,
+    "confirmation_run_count": 2,
+    "paired_task_non_regression_lower_bound": 0.9411764705882353,
+    "paired_trace_non_regression_lower_bound": 0.9411764705882353,
+    "paired_trajectory_non_regression_lower_bound": 0.9411764705882353,
+    "pass_rate_delta": 0.0,
+    "regressed_trace_task_count": 0,
+    "regressed_trajectory_task_count": 0,
+    "transition_model_improvement_count": 5,
+    "transition_signature_count": 13
+  },
+  "open_limits": [
+    "This packet supports a narrow direct A4 crossing anchor, not a broad A5 claim.",
+    "Fresh official campaigns still need to repeat or package this route reliably.",
+    "Patch55 is negative hardening evidence for a later candidate, not a disproof of this source cycle."
+  ],
+  "report_kind": "autonomy_evidence_packet",
+  "required_families": {
+    "missing": [],
+    "present": [
+      "integration",
+      "project",
+      "repo_chore",
+      "repo_sandbox",
+      "repository"
+    ],
+    "required": [
+      "integration",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox"
+    ]
+  },
+  "source": {
+    "created_at": "2026-04-23T23:13:04.821640+00:00",
+    "cycle_id": "cycle:transition_model:20260423T223800Z:604f5429r6",
+    "source_report_path": "trajectories/improvement/reports/cycle_report_cycle_transition_model_20260423T223800Z_604f5429r6.json",
+    "source_report_sha256": "797e3cdb489f2179b2d2260f2ae0dc7d83ee403e5da65b9022d2367bd7c33e11",
+    "subsystem": "transition_model"
+  },
+  "spec_version": "asi_v1"
+}

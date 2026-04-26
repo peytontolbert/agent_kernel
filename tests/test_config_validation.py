@@ -77,6 +77,26 @@ def test_kernel_accepts_tolbert_provider_alias_at_startup(tmp_path):
     assert kernel.config.normalized_provider() == "hybrid"
 
 
+def test_kernel_accepts_model_stack_provider_alias_at_startup(tmp_path, monkeypatch):
+    class FakeModelStackClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("agent_kernel.loop.ModelStackClient", FakeModelStackClient)
+    config = KernelConfig(
+        provider="model-stack",
+        model_stack_host="http://127.0.0.1:8001",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    kernel = AgentKernel(config=config)
+
+    assert kernel.config.normalized_provider() == "model_stack"
+    assert kernel.policy.client.__class__ is FakeModelStackClient
+
+
 def test_kernel_rejects_nonpositive_timeout_at_startup(tmp_path):
     config = KernelConfig(
         provider="mock",

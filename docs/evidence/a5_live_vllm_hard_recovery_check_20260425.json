@@ -1,0 +1,66 @@
+{
+  "packet_kind": "a5_live_provider_hard_recovery_check",
+  "generated_at": "2026-04-25T04:39:00Z",
+  "claim_state": "substrate_evidence_not_full_a5",
+  "provider": "vllm",
+  "model_name": "Qwen/Qwen3.5-9B",
+  "provider_endpoint": "http://127.0.0.1:8000",
+  "isolated_queue_root": "/tmp/agentkernel_a5_vllm_hard_recovery_r2_20260425",
+  "task_id": "incident_matrix_task",
+  "job_id": "job:incident_matrix_task:20260425T043700476541Z:0f53eb94",
+  "interruption": {
+    "method": "SIGKILL",
+    "killed_runner_pid": 3295528,
+    "killed_after_active_lease": true,
+    "post_kill_job_state": "in_progress",
+    "post_kill_last_error": "",
+    "post_kill_checkpoint_path_present": true,
+    "post_kill_report_path_present": true,
+    "post_kill_active_lease_count": 1
+  },
+  "recovery": {
+    "stale_lease_reaped": true,
+    "lease_reaped_detail": "stale runner server:3295528",
+    "recovery_runner_pid": 3297462,
+    "final_job_state": "completed",
+    "final_outcome": "success",
+    "attempt_count": 2,
+    "scheduler_selected_count": 2,
+    "active_lease_count_after": 0,
+    "last_error_after": "",
+    "report_path": "/tmp/agentkernel_a5_vllm_hard_recovery_r2_20260425/reports/job_report_job_incident_matrix_task_20260425T043700476541Z_0f53eb94.json",
+    "checkpoint_path": "/tmp/agentkernel_a5_vllm_hard_recovery_r2_20260425/checkpoints/job_incident_matrix_task_20260425T043700476541Z_0f53eb94.json"
+  },
+  "recovered_run_report": {
+    "outcome": "success",
+    "command_steps": 1,
+    "decision_source": "llm",
+    "llm_generated_commands": 1,
+    "verification_passed": true,
+    "hidden_side_effect_risk": false,
+    "trusted_retrieval_steps": 0,
+    "retrieval_influenced_steps": 0,
+    "command": "mkdir -p alerts runbook summary && printf 'incident triaged\\n' > alerts/open.txt && printf 'rollback queued\\n' > runbook/steps.txt && printf 'owner platform\\n' > summary/owner.txt"
+  },
+  "queue_history_markers": [
+    "runner claimed job attempt=1",
+    "lease_acquired runner=server:3295528",
+    "lease_reaped stale runner server:3295528",
+    "runner claimed job attempt=2",
+    "lease_acquired runner=server:3297462",
+    "job finished with outcome=success",
+    "lease_released state=completed"
+  ],
+  "a5_interpretation": {
+    "closes_gap": "live provider stale-lease hard interruption/recovery for a delegated queue job",
+    "does_not_close": [
+      "custom model_stack live server/model-dir proof",
+      "live provider multi-job interruption/recovery",
+      "full A5 persistent role claim"
+    ],
+    "next_shortest_steps": [
+      "Run one live-provider multi-job decomposition and recovery slice.",
+      "Start model-stack with a concrete MODEL_DIR/tokenizer path and repeat bounded queue plus recovery proof."
+    ]
+  }
+}

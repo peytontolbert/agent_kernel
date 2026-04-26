@@ -1,0 +1,72 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T18:02:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_persistent_queue_resume_recovery",
+    "status": "supported",
+    "summary": "Live-vLLM delegated queue resumed an interrupted in-progress job, reaped a stale orphan lease, and completed a six-job persistent queue sweep across separate drain invocations."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_job_queue.py::test_drain_stops_after_interrupted_job tests/test_job_queue.py::test_run_next_delegated_job_resumes_interrupted_job_without_active_lease tests/test_job_queue.py::test_run_next_delegated_job_reaps_stale_lease_and_resumes_orphaned_job tests/test_job_queue.py::test_run_next_delegated_job_skips_live_leased_in_progress_job",
+      "result": "4 passed in 2.96s"
+    },
+    "isolated_cli_r9": {
+      "root": "/tmp/agentkernel_a5_live_vllm_resume_recovery_r9_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "drain_invocations": 6,
+      "terminal_jobs": 6,
+      "completed_jobs": 6,
+      "successful_jobs": 6,
+      "safe_stop_jobs": 0,
+      "blocked_jobs_at_closeout": 0,
+      "final_active_leases": 0,
+      "hidden_side_effect_risk_count": 0,
+      "unexpected_change_file_reports": 0,
+      "trust_status": "trusted",
+      "queue_state_counts": {
+        "completed": 6
+      },
+      "resume_cases": [
+        {
+          "task_id": "deployment_manifest_task",
+          "job_id": "job:deployment_manifest_task:20260425T180058657844Z:037a0018",
+          "case": "interrupted_in_progress_without_active_lease",
+          "history_events": ["queued", "interrupted", "claimed", "scheduler_decision", "completed"],
+          "final_outcome": "success",
+          "attempt_count": 1
+        },
+        {
+          "task_id": "schema_alignment_task",
+          "job_id": "job:schema_alignment_task:20260425T180102223267Z:e468d25a",
+          "case": "orphaned_in_progress_with_stale_lease_reaped",
+          "runtime_events": ["lease_acquired", "lease_reaped", "lease_acquired", "lease_released"],
+          "final_outcome": "success",
+          "attempt_count": 2
+        }
+      ],
+      "successful_task_ids": [
+        "api_contract_task",
+        "deployment_manifest_task",
+        "project_release_cutover_task",
+        "repo_cleanup_review_task",
+        "schema_alignment_task",
+        "service_mesh_task"
+      ],
+      "passing_required_families_in_packet": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repository"
+      ]
+    }
+  },
+  "open_limits": [
+    "This packet proves bounded resume/reaping substrate behavior with simulated interruption and stale lease injection, not a long real crash endurance run.",
+    "The proof uses task-bank workspace contracts; it complements r5, r6, and r8 but does not replace broader non-fixture production workload evidence.",
+    "A stronger full A5 claim still needs longer-duration persistent role operation, real process interruption/resume repetition, and broader non-fixture production workloads."
+  ]
+}

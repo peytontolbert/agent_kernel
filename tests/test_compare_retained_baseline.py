@@ -138,6 +138,126 @@ def test_compare_retained_baseline_restores_prior_snapshot_and_reports_delta(tmp
     assert restored_payload["skills"][0]["skill_id"] == "current"
 
 
+def test_compare_retained_baseline_forwards_bounded_route_args_and_writes_json(tmp_path, monkeypatch, capsys):
+    module = _load_compare_module()
+    artifact_path = tmp_path / "transition_model" / "transition_model_proposals.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "transition_model_policy_set",
+                "lifecycle_state": "retained",
+                "controls": {},
+                "signatures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path = (
+        tmp_path
+        / ".artifact_history"
+        / "transition_model_proposals.cycle_transition_model_1.post_retain.json"
+    )
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "transition_model_policy_set",
+                "lifecycle_state": "retained",
+                "controls": {},
+                "signatures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cycles_path = tmp_path / "improvement" / "cycles.jsonl"
+    planner = ImprovementPlanner(memory_root=tmp_path / "episodes")
+    planner.append_cycle_record(
+        cycles_path,
+        ImprovementCycleRecord(
+            cycle_id="cycle:transition_model:1",
+            state="retain",
+            subsystem="transition_model",
+            action="finalize_cycle",
+            artifact_path=str(artifact_path),
+            artifact_kind="transition_model_policy_set",
+            reason="retained prior baseline",
+            metrics_summary={},
+            artifact_snapshot_path=str(snapshot_path),
+        ),
+    )
+
+    observed_kwargs: list[dict[str, object]] = []
+    observed_runtime_paths: list[tuple[str, str]] = []
+    run_results = [
+        EvalMetrics(total=4, passed=4, average_steps=1.0),
+        EvalMetrics(total=4, passed=4, average_steps=1.0),
+    ]
+
+    def fake_run_eval(*, config, **kwargs):
+        observed_runtime_paths.append((str(config.runtime_database_path), str(config.trajectories_root)))
+        observed_kwargs.append(dict(kwargs))
+        return run_results.pop(0)
+
+    monkeypatch.setattr(module, "run_eval", fake_run_eval)
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            transition_model_proposals_path=artifact_path,
+            improvement_cycles_path=cycles_path,
+        ),
+    )
+    output_json = tmp_path / "reports" / "compare.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retained_baseline.py",
+            "--subsystem",
+            "transition_model",
+            "--cycles-path",
+            str(cycles_path),
+            "--artifact-path",
+            str(artifact_path),
+            "--task-limit",
+            "24",
+            "--priority-benchmark-family",
+            "integration",
+            "--priority-benchmark-family",
+            "project",
+            "--restrict-to-priority-benchmark-families",
+            "--prefer-retrieval-tasks",
+            "--include-discovered-tasks",
+            "--output-json",
+            str(output_json),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+
+    assert len(observed_kwargs) == 2
+    for kwargs in observed_kwargs:
+        assert kwargs["task_limit"] == 24
+        assert kwargs["priority_benchmark_families"] == ["integration", "project"]
+        assert kwargs["restrict_to_priority_benchmark_families"] is True
+        assert kwargs["prefer_retrieval_tasks"] is True
+        assert kwargs["include_discovered_tasks"] is True
+    assert len(observed_runtime_paths) == 2
+    assert observed_runtime_paths[0][0] != observed_runtime_paths[1][0]
+    assert observed_runtime_paths[0][0] != str(KernelConfig().runtime_database_path)
+    assert observed_runtime_paths[1][0] != str(KernelConfig().runtime_database_path)
+    assert payload["task_limit"] == 24
+    assert payload["priority_benchmark_families"] == ["integration", "project"]
+    assert payload["restrict_to_priority_benchmark_families"] is True
+    assert payload["prefer_retrieval_tasks"] is True
+    assert payload["include_discovered_tasks"] is True
+    assert f"output_json={output_json}" in output
+
+
 def test_compare_retained_baseline_reports_family_proposal_gate_failure_reason(tmp_path, monkeypatch, capsys):
     module = _load_compare_module()
     artifact_path = tmp_path / "tolbert_model" / "artifact.json"

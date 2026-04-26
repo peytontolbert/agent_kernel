@@ -778,7 +778,17 @@ def _comparison_task_limit(config: KernelConfig, args: argparse.Namespace) -> in
     positive_limits = [value for value in (requested, default_cap) if value > 0]
     if not positive_limits:
         return None
-    return min(positive_limits)
+    bounded_limit = min(positive_limits)
+    if bool(getattr(args, "prefer_retrieval_observe", False)):
+        required_a4_families = {"integration", "project", "repository", "repo_chore", "repo_sandbox"}
+        selected_families = {
+            str(value).strip()
+            for value in list(getattr(args, "priority_benchmark_family", []) or [])
+            if str(value).strip()
+        }
+        if required_a4_families.issubset(selected_families):
+            return min(bounded_limit, 24)
+    return bounded_limit
 
 
 def _observation_task_limit(config: KernelConfig, args: argparse.Namespace) -> int | None:
@@ -888,6 +898,40 @@ def _fallback_campaign_from_ranked_experiments(
     return selected
 
 
+def _transition_model_lane_repair_fallback_campaign(
+    *,
+    enabled: bool,
+    excluded_subsystems: set[str],
+    max_candidates: int,
+    planner: ImprovementPlanner,
+    metrics: EvalMetrics,
+) -> list[ImprovementExperiment]:
+    if not enabled or max_candidates <= 0 or "transition_model" in excluded_subsystems:
+        return []
+    experiment = ImprovementExperiment(
+        subsystem="transition_model",
+        reason=(
+            "explicit transition-model lane repair fallback selected because the "
+            "filtered campaign had no decision-bearing candidates"
+        ),
+        priority=6,
+        expected_gain=0.05,
+        estimated_cost=2,
+        score=0.025,
+        evidence={
+            "lane_repair_fallback": True,
+            "fallback_subsystem": "transition_model",
+            "excluded_subsystems": sorted(excluded_subsystems),
+        },
+    )
+    return _fallback_campaign_from_ranked_experiments(
+        [experiment],
+        max_candidates=max_candidates,
+        planner=planner,
+        metrics=metrics,
+    )
+
+
 def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> dict[str, object]:
     requested_task_limit = max(0, int(getattr(args, "task_limit", 0) or 0))
     observation_task_limit = _observation_task_limit(config, args)
@@ -924,7 +968,10 @@ def _observation_eval_kwargs(config: KernelConfig, args: argparse.Namespace) -> 
     ]
     if priority_benchmark_families:
         flags["priority_benchmark_families"] = priority_benchmark_families
-        flags["prefer_low_cost_tasks"] = True
+        flags["prefer_low_cost_tasks"] = not bool(getattr(args, "prefer_retrieval_observe", False))
+        if bool(getattr(args, "prefer_retrieval_observe", False)):
+            flags["prefer_retrieval_tasks"] = True
+            flags["prefer_long_horizon_tasks"] = True
         flags["restrict_to_priority_benchmark_families"] = True
         flags["include_generated"] = False
         flags["include_failure_generated"] = False
@@ -1368,7 +1415,8 @@ def _run_observation_eval(
             tolbert_context_compile_budget_seconds=max(0.25, stage_budget_seconds),
         )
     if budget_seconds <= 0.0:
-        if requested_task_limit > 0:
+        runtime_task_limit = max(0, int(runtime_eval_kwargs.get("task_limit", 0) or 0))
+        if requested_task_limit > 0 and runtime_task_limit <= 0:
             runtime_eval_kwargs["task_limit"] = requested_task_limit
         try:
             return {
@@ -1816,10 +1864,12 @@ def main() -> None:
     parser.add_argument("--max-observation-seconds", type=float, default=0.0)
     parser.add_argument("--priority-benchmark-family", action="append", default=[])
     parser.add_argument("--priority-benchmark-family-weight", action="append", default=[])
+    parser.add_argument("--prefer-retrieval-observe", action="store_true")
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--progress-label", default="")
     parser.add_argument("--protocol-match-id", default="")
     parser.add_argument("--exclude-subsystem", action="append", default=[])
+    parser.add_argument("--allow-transition-model-fallback", action="store_true")
     parser.add_argument("--scope-id", default="")
     parser.add_argument("--_observation-child-payload", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -2272,13 +2322,31 @@ def main() -> None:
                 f"selected_from_ranked_experiments={len(campaign)} "
                 f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
             )
+    if excluded_subsystems and not campaign:
+        transition_fallback = _transition_model_lane_repair_fallback_campaign(
+            enabled=bool(args.allow_transition_model_fallback),
+            excluded_subsystems=excluded_subsystems,
+            max_candidates=(
+                recommended_campaign_budget.width if args.adaptive_search else max(1, args.campaign_width)
+            ),
+            planner=planner,
+            metrics=metrics,
+        )
+        if transition_fallback:
+            campaign = transition_fallback
+            _progress(
+                progress_label,
+                "campaign fallback reason=explicit_transition_model_lane_repair "
+                f"selected_from_fallback={len(campaign)} "
+                f"excluded_subsystems={','.join(sorted(excluded_subsystems))}",
+            )
     campaign_budget = _selected_campaign_budget(
         recommended_budget=recommended_campaign_budget,
         campaign=campaign,
         requested_campaign_width=max(1, args.campaign_width),
     )
     outputs: list[str] = []
-    if excluded_subsystems and not ranked_experiments:
+    if excluded_subsystems and not campaign and not ranked_experiments:
         _progress(
             progress_label,
             "campaign skipped reason=all_ranked_experiments_excluded "

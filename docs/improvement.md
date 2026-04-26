@@ -8,6 +8,51 @@ The canonical outer self-improvement loop for this repository is:
 
 `run tasks -> collect outcomes -> compare against verifiers -> localize failure -> modify policy/planner/world-model/transition-model/prompts/tools -> retest -> retain only verified gains`
 
+For the boundary between self-improvement-core work and auxiliary capability work, see
+[`asi_core.md`](/data/agentkernel/docs/asi_core.md).
+
+## Core Boundary
+
+This document describes the self-improvement minimum, not every helpful capability layer in the repo.
+
+Self-improvement-core work changes:
+
+- how episodes are compiled into reusable evidence
+- how weak surfaces and variants are ranked
+- how candidates and baselines are compared
+- how retention and rejection are decided
+- how those decisions are applied to live artifacts
+
+The irreducible modules are:
+
+- [`agent_kernel/learning_compiler.py`](/data/agentkernel/agent_kernel/learning_compiler.py:80)
+- [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1)
+- [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1)
+- [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py:2797)
+
+Support structure around that minimum includes:
+
+- [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py:40)
+- [`agent_kernel/strategy_memory/`](/data/agentkernel/agent_kernel/strategy_memory)
+- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1)
+- [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1)
+- [`agent_kernel/resource_registry.py`](/data/agentkernel/agent_kernel/resource_registry.py): RSPL-lite active-resource resolution for builtin artifacts and prompt templates
+
+Auxiliary work may still plug into this loop, but it is not the loop itself.
+Examples include:
+
+- one retrieval proposal family
+- one prompt proposal family
+- one curriculum generator
+- one model-specific artifact or decoder surface
+- one unattended-controller or reporting surface
+
+That distinction matters because a stronger proposal surface or better strategy-memory support is not automatically evidence that the irreducible self-improvement engine has improved.
+
+The new resource layer does not replace the retain/reject engine. It standardizes how selected active runtime inputs are addressed and loaded before the improvement loop mutates them. See [`resource_protocol.md`](/data/agentkernel/docs/resource_protocol.md).
+
+The self-evolution layer now also has explicit protocol records for `Reflect` and `Select`. See [`self_evolution_protocol.md`](/data/agentkernel/docs/self_evolution_protocol.md).
+
 In repo terms:
 
 - `run tasks`: execute bounded eval or unattended campaign rounds
@@ -45,6 +90,47 @@ which backs subsystem registry entries, capability adapter catalogs, task-bank l
 unattended-controller feature catalogs, Tolbert build and proposal-family defaults, trust-family defaults,
 unattended runtime policy defaults, and frontier-family step-floor defaults.
 
+## Current Seams
+
+The self-improvement stack is no longer one undifferentiated module.
+The current split is:
+
+- [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1): shared engine dataclasses plus generic target projection, variant orchestration, retention-gate application, and artifact-application helpers
+- [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1): planner orchestration, subsystem-scored experiment ranking, subsystem evidence shaping, compatibility policy, and cycle-record management
+- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1): plugin-layer adapters for subsystem registry access, default variants, external planner experiments, TOLBERT delta/checkpoint helpers, universe bundle helpers, and strategy-memory prior reads through `StrategyPriorStore`
+- [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1): support-side `TaskContractCatalog` wrapper for `TaskBank`-backed contract lookup during compatibility checks
+
+This keeps the core/support boundary tighter:
+
+- strategy-memory pressure reaches the engine through `StrategyPriorStore` instead of a direct engine dependency on the whole `strategy_memory/` package
+- task-supply compatibility reaches retention through `TaskContractCatalog` instead of constructing `TaskBank` inside the core retention path
+- subsystem registry, default-variant, and model-specific helper concerns are now behind the plugin layer instead of raw top-level imports in `improvement.py`
+
+## Retention path
+
+The retain/reject path now has an explicit generic core plus subsystem hooks:
+
+- [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) owns generic ranking helpers, cycle-record persistence helpers, the generic retention-evaluation wrapper, and the generic artifact-application path
+- [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1) still owns subsystem-specific evidence shaping and retention evaluators, but it now registers those evaluators through the plugin layer instead of hard-wiring the full retention protocol into one file-local path
+- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1) now also owns subsystem post-apply lifecycle hooks, including retained retrieval bundle materialization and retained Tolbert liftoff report generation
+
+That means the minimum self-improving loop no longer depends on finalize-only branches for retained side effects. [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py:2797) still orchestrates comparison and finalization, but post-retain subsystem actions are emitted as generic `lifecycle_effects` from the engine apply path and then recorded back into cycle history.
+
+## Learning evidence in retention
+
+Compiled learning artifacts now feed retention directly, not only planner pressure.
+
+- [`agent_kernel/learning_compiler.py`](/data/agentkernel/agent_kernel/learning_compiler.py:80) already emits normalized fields such as `artifact_kind`, `support_count`, `transition_failures`, `applicable_tasks`, and `memory_source`
+- [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:171) now provides `LearningEvidenceAdapter`, which summarizes that compiled store into a generic `learning_evidence` block
+- [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:5863) injects that normalized summary into `retention_evidence`, including top-level fields such as `learning_candidate_count`, `learning_support_total`, `learning_transition_failure_total`, `learning_applicable_task_total`, `learning_memory_sources`, and `learning_has_actionable_support`
+
+The intended rule is:
+
+- planner ranking can still use subsystem-specific learning pressure
+- retention can now see direct learning-store support without re-deriving it from eval deltas
+- subsystem evaluators may use that normalized learning summary as a first-class retain/reject signal when a subsystem has a defensible policy for doing so
+- learning support is only treated as actionable when it is task-grounded and source-attributed, not when it is only a large undifferentiated support total
+
 ## Artifact outputs
 
 Configured paths in [`agent_kernel/config.py`](/data/agentkernel/agent_kernel/config.py):
@@ -66,19 +152,24 @@ Configured paths in [`agent_kernel/config.py`](/data/agentkernel/agent_kernel/co
 [`scripts/run_improvement_cycle.py`](/data/agentkernel/scripts/run_improvement_cycle.py) currently performs:
 
 1. `observe`: run eval and record metrics
-2. `select`: rank experiments, assemble a recent-history-aware portfolio campaign, and pick a variant
-3. `generate`: snapshot any active artifact and write the corresponding candidate artifact
-4. `evaluate`: compare baseline and candidate lanes
-5. `retain` or `reject`: apply the retention gate, record compatibility, and restore the prior active artifact on rejection
-6. `record`: append the final lifecycle outcome to cycle history
+2. `reflect`: normalize the selected failure surface into a `ReflectionRecord` that points at a concrete resource id
+3. `select`: rank experiments, assemble a recent-history-aware portfolio campaign, pick a variant, and write a `SelectionRecord` plus `ResourceEditPlan`
+4. `generate`: snapshot any active artifact and write the corresponding candidate artifact
+5. `candidate preflight`: reject generated artifacts that fail compatibility before preview/finalize
+6. `evaluate`: compare baseline and candidate lanes
+7. `retain` or `reject`: apply the retention gate, fast-fail zero-influence candidates, record compatibility, and restore the prior active artifact on rejection
+8. `record`: append the final lifecycle outcome to cycle history
 
 Cycle IDs are timestamped experiment IDs, for example `cycle:skills:20260319T123456789012Z:1a2b3c4d`.
 
 By default the script runs the whole cycle end to end. Use `--generate-only` when you want to stop after artifact generation and finalize later.
+Internally, that flow now crosses the split above: [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py:2797) still owns end-to-end comparison and finalization orchestration, [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) owns the generic retention-application helpers, and [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1) supplies subsystem-facing evidence and compatibility policy.
+The explicit `Reflect` and `Select` records are built in [`agent_kernel/reflection.py`](/data/agentkernel/agent_kernel/reflection.py) and [`agent_kernel/selection.py`](/data/agentkernel/agent_kernel/selection.py), then threaded through cycle history and candidate artifact `generation_context`.
 Candidate stamping, replay-verified tooling updates, retention finalize writes, rollback restores, rollback receipts, and Tolbert liftoff gate reports now all flow through the runtime supervision atomic helpers, so non-protected lanes can perform real governed retention and rollback actions instead of only compare-only bookkeeping. The supervisor now also consumes candidate-observed benchmark families from the frontier report and treats missing counted gated evidence, bootstrap-only family posture, and missing clean task-root breadth as machine-readable autonomy blockers for the affected retained candidates instead of only reporting those gaps in the trust ledger. Those candidate-family blockers now also feed sticky discovery priority: the next supervisor rounds bias `launch_discovery` toward `trust`/`recovery` work, widen the trust-remediation batch budget when family pressure is higher, and forward both `--priority-benchmark-family` hints and per-family weights so unattended evidence collection chases the exact missing proof instead of rerunning a fixed small probe.
 That closes an important control-path gap, but it does not mean broad coding autonomy is complete. The current kernel still gets a large share of its success from bounded task design, runtime guards, direct retained-vs-candidate paths, and family-specific recovery logic. The remaining product gap is broader unattended trust evidence and wider repeated proof on `repository`, `project`, and `integration`, so governed supervisor actions rest on deeper unattended evidence instead of narrow bootstrap-era coverage.
 The coding path now has parser-backed syntax-motor support in [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py), but it still does not have a fully syntax-native end-to-end coding loop. The larger unattended blocker is conversion into broad runtime-managed coding gains, not mere parser absence. For the current evidence-ranked gap order, see [`coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md).
 Use `--adaptive-search` to let retained-history and score concentration widen campaign or sibling-variant search up to the requested width caps.
+The recorded `campaign_budget` now reflects the actual selected portfolio campaign, not only the raw pre-selection recommendation, so cycle history matches the real subsystem pool that was allowed to generate candidates.
 Campaign selection also uses recent cycle history so near-tied subsystems can rotate instead of letting one recently saturated subsystem dominate repeated autonomous runs.
 For short bounded experiments, `--task-limit` and repeated `--priority-benchmark-family` flags let you constrain the observation pass before candidate generation.
 When you care about real coding capability rather than smoke-test stability, prefer `repo_sandbox`, `repository`, `integration`, `tooling`, and `project` families in that order.
@@ -200,10 +291,13 @@ Use that page as the current coordination source for:
 Parallel supervised work also has a machine-readable lane manifest at
 [`config/supervised_parallel_work_manifest.json`](/data/agentkernel/config/supervised_parallel_work_manifest.json),
 which is the source of truth for cognitive-lane boundaries, owned paths, suggested scoped-run commands, and the required claim-to-close lifecycle contract for parallel agents.
-For the live unattended wave, the compact evidence-backed kernel gap map now
-lives in [`docs/coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md)
-and should be used together with the unattended work queue as the first-pass
-route for replica workers deciding which kernel surface to attack next.
+For the live unattended wave, the first document to open is now
+[`docs/kernel_gap_dashboard.md`](/data/agentkernel/docs/kernel_gap_dashboard.md),
+which consolidates live bottlenecks, substantive kernel gaps, and proof gaps.
+Use it together with the unattended work queue as the first-pass route for
+replica workers deciding which kernel surface to attack next, then drill down
+into [`docs/coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md)
+for live bottleneck detail.
 
 ## Typical commands
 

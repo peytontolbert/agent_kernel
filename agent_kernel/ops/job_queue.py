@@ -568,23 +568,20 @@ class DelegatedRuntimeController:
         self.runner_id = runner_id or f"{socket.gethostname()}:{os.getpid()}"
 
     def snapshot(self, *, config: KernelConfig | None = None) -> dict[str, object]:
-        payload = self._read_payload()
-        policy = (
-            DelegatedResourcePolicy.from_config(config).to_dict()
-            if config is not None
-            else dict(payload.get("policy", {}))
-        )
-        lease_objects = self._leases_from_payload(payload)
-        leases = [lease.to_dict() for lease in lease_objects]
-        return {
-            "spec_version": "asi_v1",
-            "runtime_kind": "delegated_job_runtime_state",
-            "policy": policy,
-            "active_leases": leases,
-            "budget_groups": _active_budget_group_counts(lease_objects),
-            "scheduler": dict(payload.get("scheduler", {})) if isinstance(payload.get("scheduler", {}), dict) else {},
-            "history": [dict(entry) for entry in payload.get("history", []) if isinstance(entry, dict)],
-        }
+        policy = DelegatedResourcePolicy.from_config(config) if config is not None else None
+        with self._locked_state() as payload:
+            self._normalize_state_payload(payload, policy)
+            lease_objects = self._drop_stale_leases(payload)
+            leases = [lease.to_dict() for lease in lease_objects]
+            return {
+                "spec_version": "asi_v1",
+                "runtime_kind": "delegated_job_runtime_state",
+                "policy": policy.to_dict() if policy is not None else dict(payload.get("policy", {})),
+                "active_leases": leases,
+                "budget_groups": _active_budget_group_counts(lease_objects),
+                "scheduler": dict(payload.get("scheduler", {})) if isinstance(payload.get("scheduler", {}), dict) else {},
+                "history": [dict(entry) for entry in payload.get("history", []) if isinstance(entry, dict)],
+            }
 
     def scheduler_state(self) -> dict[str, object]:
         payload = self._read_payload()
@@ -650,10 +647,6 @@ class DelegatedRuntimeController:
             leases = self._drop_stale_leases(payload)
             if len(leases) >= policy.max_concurrent_jobs:
                 return None, "resource_limit:max_concurrent_jobs"
-            if policy.max_active_jobs_per_budget_group > 0:
-                active_in_budget_group = sum(1 for lease in leases if lease.budget_group == job.budget_group)
-                if active_in_budget_group >= policy.max_active_jobs_per_budget_group:
-                    return None, f"resource_limit:budget_group:{job.budget_group}"
             for lease in leases:
                 if lease.workspace_path == str(workspace_path):
                     return None, f"lease_collision:workspace:{workspace_path}"
@@ -669,6 +662,10 @@ class DelegatedRuntimeController:
                     overlap = _claimed_path_overlap(coordination.claimed_paths, lease.claimed_paths)
                     if overlap is not None:
                         return None, f"lease_collision:claimed_path:{coordination.shared_repo_id}:{overlap}"
+            if policy.max_active_jobs_per_budget_group > 0:
+                active_in_budget_group = sum(1 for lease in leases if lease.budget_group == job.budget_group)
+                if active_in_budget_group >= policy.max_active_jobs_per_budget_group:
+                    return None, f"resource_limit:budget_group:{job.budget_group}"
             lease = DelegatedJobLease(
                 job_id=job.job_id,
                 task_id=job.task_id,
@@ -858,7 +855,10 @@ class DelegatedRuntimeController:
             else:
                 handle.seek(0)
                 raw = handle.read().strip()
-                payload = json.loads(raw) if raw else {}
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    payload = {}
             if not isinstance(payload, dict):
                 payload = {}
             try:
@@ -973,7 +973,14 @@ class DelegatedJobQueue:
 
     @staticmethod
     def _resumable_in_progress(job: "DelegatedJob") -> bool:
-        return bool(job.state == "in_progress" and str(job.last_error).strip())
+        return bool(
+            job.state == "in_progress"
+            and (
+                str(job.last_error).strip()
+                or str(job.checkpoint_path).strip()
+                or str(job.report_path).strip()
+            )
+        )
 
     def claim_next(
         self,

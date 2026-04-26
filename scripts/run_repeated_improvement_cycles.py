@@ -353,6 +353,14 @@ def _record_support_signal_summary(record: Mapping[str, object] | None) -> dict[
     family_signal_present = False
     positive_signal = False
     negative_signal = False
+    transition_model_scoring_control_delta_count = 0
+    try:
+        transition_model_scoring_control_delta_count = max(
+            0,
+            int(metrics.get("transition_model_scoring_control_delta_count", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        transition_model_scoring_control_delta_count = 0
     for key in ("family_pass_rate_delta", "generated_family_pass_rate_delta"):
         payload = metrics.get(key, {})
         if not isinstance(payload, Mapping):
@@ -382,6 +390,7 @@ def _record_support_signal_summary(record: Mapping[str, object] | None) -> dict[
         "positive_signal": positive_signal,
         "negative_signal": negative_signal,
         "used_tolbert_successfully": bool(tolbert_summary.get("used_tolbert_successfully", False)),
+        "transition_model_scoring_control_delta_count": transition_model_scoring_control_delta_count,
     }
 
 
@@ -437,15 +446,32 @@ def _record_counts_as_support_retained_gain(record: Mapping[str, object] | None)
     support_signal = _record_support_signal_summary(record)
     if subsystem == "tolbert_model" and bool(support_signal.get("used_tolbert_successfully", False)):
         return True
+    if (
+        subsystem == "transition_model"
+        and int(support_signal.get("transition_model_scoring_control_delta_count", 0) or 0) > 0
+    ):
+        return True
     return bool(
         support_signal.get("family_signal_present", False)
         and not support_signal.get("negative_signal", False)
-        and subsystem in {"retrieval", "tolbert_model"}
+        and subsystem in {"retrieval", "tolbert_model", "transition_model"}
     )
 
 
 def _runtime_env(config: KernelConfig) -> dict[str, str]:
     return config.to_env()
+
+
+def _initialize_child_runtime_database(env: Mapping[str, str]) -> None:
+    storage_backend = str(env.get("AGENT_KERNEL_STORAGE_BACKEND", "sqlite")).strip().lower()
+    if storage_backend != "sqlite":
+        return
+    db_path = str(env.get("AGENT_KERNEL_RUNTIME_DATABASE_PATH", "")).strip()
+    if not db_path:
+        return
+    from agent_kernel.storage import SQLiteKernelStore
+
+    SQLiteKernelStore(Path(db_path))
 
 
 def _parse_progress_fields(line: str) -> dict[str, object]:
@@ -1712,6 +1738,24 @@ def _is_runtime_managed_artifact_path(path: str) -> bool:
     return not (lowered.startswith("/tmp/") or "pytest-" in lowered or "/tests/" in lowered)
 
 
+def _record_decision_conversion_state(record: Mapping[str, object] | None) -> str:
+    payload = record if isinstance(record, Mapping) else {}
+    decision_state = payload.get("decision_state", {})
+    if isinstance(decision_state, Mapping):
+        state = str(decision_state.get("decision_conversion_state", "")).strip()
+        if state:
+            return state
+    artifact_path = (
+        str(payload.get("active_artifact_path", "")).strip()
+        or str(payload.get("artifact_path", "")).strip()
+    )
+    return "runtime_managed" if _is_runtime_managed_artifact_path(artifact_path) else "non_runtime_managed"
+
+
+def _record_is_runtime_managed_decision(record: Mapping[str, object] | None) -> bool:
+    return _record_decision_conversion_state(record) == "runtime_managed"
+
+
 def _reconcile_incomplete_cycles(
     *,
     config: KernelConfig,
@@ -1878,7 +1922,7 @@ def _production_decisions(records: list[dict[str, object]]) -> list[dict[str, ob
         record
         for record in records
         if str(record.get("state", "")) in {"retain", "reject"}
-        and _is_runtime_managed_artifact_path(str(record.get("artifact_path", "")))
+        and _record_is_runtime_managed_decision(record)
     ]
 
 
@@ -1944,7 +1988,7 @@ def _non_runtime_managed_decisions(records: list[dict[str, object]]) -> list[dic
         record
         for record in records
         if str(record.get("state", "")) in {"retain", "reject"}
-        and not _is_runtime_managed_artifact_path(str(record.get("artifact_path", "")))
+        and not _record_is_runtime_managed_decision(record)
     ]
 
 
@@ -2585,8 +2629,6 @@ def _decision_record_from_cycle_report(report: dict[str, object]) -> dict[str, o
                 continue
             if str(record.get("state", "")).strip() not in {"retain", "reject"}:
                 continue
-            if not _is_runtime_managed_artifact_path(str(record.get("artifact_path", ""))):
-                continue
             payload = dict(record)
             if not isinstance(payload.get("decision_state", {}), Mapping) or not payload.get("decision_state"):
                 payload["decision_state"] = _decision_state_from_record(
@@ -2597,12 +2639,21 @@ def _decision_record_from_cycle_report(report: dict[str, object]) -> dict[str, o
                         "final_reason": report.get("final_reason", ""),
                     }
                 )
+            if not _record_is_runtime_managed_decision(payload):
+                continue
             return payload
     final_state = str(report.get("final_state", "")).strip()
     if final_state not in {"retain", "reject"}:
         return None
     artifact_path = str(report.get("active_artifact_path", report.get("artifact_path", ""))).strip()
-    if not _is_runtime_managed_artifact_path(artifact_path):
+    decision_state = _decision_state_from_record(report)
+    if not _record_is_runtime_managed_decision(
+        {
+            "active_artifact_path": artifact_path,
+            "artifact_path": artifact_path,
+            "decision_state": decision_state,
+        }
+    ):
         return None
     evidence = report.get("evidence", {})
     if not isinstance(evidence, dict):
@@ -2633,7 +2684,7 @@ def _decision_record_from_cycle_report(report: dict[str, object]) -> dict[str, o
             "decision_reason_code": str(report.get("decision_reason_code", "")).strip(),
             **evidence,
         },
-        "decision_state": _decision_state_from_record(report),
+        "decision_state": decision_state,
     }
 
 
@@ -2785,7 +2836,7 @@ def _candidate_isolation_summary(
             str(record.get("active_artifact_path", "")).strip()
             or str(generate_record.get("active_artifact_path", "")).strip()
         )
-        runtime_managed = _is_runtime_managed_artifact_path(str(record.get("artifact_path", "")))
+        runtime_managed = _record_is_runtime_managed_decision(record)
         if candidate_path:
             decisions_with_candidate_path += 1
         if active_path:
@@ -3152,6 +3203,8 @@ def _priority_family_yield_summary(
             "retained_neutral_delta_decisions": 0,
             "retained_pass_rate_delta_sum": 0.0,
             "retained_positive_pass_rate_delta_sum": 0.0,
+            "retained_support_gain_decisions": 0,
+            "retained_support_gain_score": 0.0,
             "average_retained_pass_rate_delta": 0.0,
             "best_retained_pass_rate_delta": 0.0,
             "worst_pass_rate_delta": 0.0,
@@ -3207,6 +3260,18 @@ def _priority_family_yield_summary(
                     if delta > 0.0:
                         summary["retained_positive_pass_rate_delta_sum"] = (
                             float(summary["retained_positive_pass_rate_delta_sum"]) + delta
+                        )
+                    elif record_counts_as_gain:
+                        support_signal = _record_support_signal_summary(record)
+                        control_delta_count = int(
+                            support_signal.get("transition_model_scoring_control_delta_count", 0) or 0
+                        )
+                        support_gain_score = min(0.05, 0.01 * max(1, control_delta_count))
+                        summary["retained_support_gain_decisions"] = (
+                            int(summary["retained_support_gain_decisions"]) + 1
+                        )
+                        summary["retained_support_gain_score"] = (
+                            float(summary["retained_support_gain_score"]) + support_gain_score
                         )
                     retained_gain_seen.add(family)
                 elif delta < 0.0:
@@ -5161,6 +5226,7 @@ def main() -> None:
     parser.add_argument("--campaign-label", default="")
     parser.add_argument("--campaign-match-id", default="")
     parser.add_argument("--exclude-subsystem", action="append", default=[])
+    parser.add_argument("--allow-transition-model-fallback", action="store_true")
     parser.add_argument("--include-episode-memory", action="store_true")
     parser.add_argument("--include-skill-memory", action="store_true")
     parser.add_argument("--include-skill-transfer", action="store_true")
@@ -5169,6 +5235,7 @@ def main() -> None:
     parser.add_argument("--include-verifier-memory", action="store_true")
     parser.add_argument("--include-curriculum", action="store_true")
     parser.add_argument("--include-failure-curriculum", action="store_true")
+    parser.add_argument("--prefer-retrieval-observe", action="store_true")
     args = parser.parse_args()
     args.exclude_subsystem = _ordered_unique_strings(args.exclude_subsystem)
     if args.semantic_only_runtime:
@@ -5299,6 +5366,8 @@ def main() -> None:
                 token = str(excluded_subsystem).strip()
                 if token:
                     cmd.extend(["--exclude-subsystem", token])
+            if args.allow_transition_model_fallback:
+                cmd.append("--allow-transition-model-fallback")
             for flag, enabled in (
                 ("--include-episode-memory", args.include_episode_memory),
                 ("--include-skill-memory", args.include_skill_memory),
@@ -5308,6 +5377,7 @@ def main() -> None:
                 ("--include-verifier-memory", args.include_verifier_memory),
                 ("--include-curriculum", args.include_curriculum),
                 ("--include-failure-curriculum", args.include_failure_curriculum),
+                ("--prefer-retrieval-observe", args.prefer_retrieval_observe),
             ):
                 if enabled:
                     cmd.append(flag)
@@ -5319,6 +5389,7 @@ def main() -> None:
                 or str(config.improvement_reports_dir)
             )
             env["AGENT_KERNEL_RUNTIME_DATABASE_PATH"] = str(child_reports_dir / "agentkernel.sqlite3")
+            _initialize_child_runtime_database(env)
             active_cycle_run = {
                 "index": index,
                 "progress_label": campaign_label or f"cycle-{index}",
@@ -6048,7 +6119,7 @@ def main() -> None:
             metrics_summary = generate_record.get("metrics_summary", {})
             if isinstance(metrics_summary, dict) and str(metrics_summary.get("prior_retained_cycle_id", "")).strip():
                 inherited_decisions += 1
-            if _is_runtime_managed_artifact_path(str(record.get("artifact_path", ""))):
+            if _record_is_runtime_managed_decision(record):
                 runtime_managed_decisions += 1
         non_runtime_managed_decision_count = max(0, len(decision_records) - runtime_managed_decisions)
         candidate_isolation_summary = _candidate_isolation_summary(decision_records, generate_index)

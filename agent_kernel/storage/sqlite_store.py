@@ -24,151 +24,170 @@ class SQLiteKernelStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, ensure_schema: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        if ensure_schema:
+            self._initialize_connection(conn)
         return conn
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
-            episode_columns = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_info(episodes)").fetchall()
-            }
-            if episode_columns and "episode_id" not in episode_columns:
-                conn.execute("ALTER TABLE episodes RENAME TO episodes_legacy_v1")
-            conn.executescript(
+        with self._connect(ensure_schema=False) as conn:
+            self._initialize_connection(conn)
+
+    def _initialize_connection(self, conn: sqlite3.Connection) -> None:
+        existing_tables = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        episode_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(episodes)").fetchall()
+        }
+        expected_tables = {
+            "episodes",
+            "learning_candidates",
+            "cycle_records",
+            "delegated_jobs",
+            "runtime_states",
+            "export_manifests",
+        }
+        if expected_tables.issubset(existing_tables) and "episode_id" in episode_columns:
+            return
+        if episode_columns and "episode_id" not in episode_columns:
+            conn.execute("ALTER TABLE episodes RENAME TO episodes_legacy_v1")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS episodes (
+                episode_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                benchmark_family TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                storage_json TEXT NOT NULL,
+                storage_phase TEXT NOT NULL,
+                storage_source_group TEXT NOT NULL,
+                storage_relative_path TEXT NOT NULL,
+                storage_depth INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_task_updated
+                ON episodes(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_episodes_family_success
+                ON episodes(benchmark_family, success, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_episodes_storage_path
+                ON episodes(storage_relative_path);
+
+            CREATE TABLE IF NOT EXISTS learning_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                artifact_kind TEXT NOT NULL,
+                source_task_id TEXT NOT NULL,
+                benchmark_family TEXT NOT NULL,
+                memory_source TEXT NOT NULL,
+                support_count INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_candidates_kind
+                ON learning_candidates(artifact_kind, source_task_id, updated_at);
+
+            CREATE TABLE IF NOT EXISTS cycle_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                output_path TEXT NOT NULL,
+                cycle_id TEXT NOT NULL,
+                subsystem TEXT NOT NULL,
+                state TEXT NOT NULL,
+                selected_variant_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cycle_records_path_id
+                ON cycle_records(output_path, id);
+            CREATE INDEX IF NOT EXISTS idx_cycle_records_cycle
+                ON cycle_records(cycle_id, recorded_at);
+
+            CREATE TABLE IF NOT EXISTS delegated_jobs (
+                queue_path TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(queue_path, job_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_delegated_jobs_state
+                ON delegated_jobs(queue_path, state, updated_at);
+
+            CREATE TABLE IF NOT EXISTS runtime_states (
+                runtime_path TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS export_manifests (
+                export_key TEXT PRIMARY KEY,
+                export_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        legacy_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='episodes_legacy_v1'"
+        ).fetchone()
+        if legacy_exists is not None:
+            legacy_rows = conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS episodes (
-                    episode_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    summary_json TEXT NOT NULL,
-                    benchmark_family TEXT NOT NULL,
-                    success INTEGER NOT NULL,
-                    storage_json TEXT NOT NULL,
-                    storage_phase TEXT NOT NULL,
-                    storage_source_group TEXT NOT NULL,
-                    storage_relative_path TEXT NOT NULL,
-                    storage_depth INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_episodes_task_updated
-                    ON episodes(task_id, updated_at);
-                CREATE INDEX IF NOT EXISTS idx_episodes_family_success
-                    ON episodes(benchmark_family, success, updated_at);
-                CREATE INDEX IF NOT EXISTS idx_episodes_storage_path
-                    ON episodes(storage_relative_path);
-
-                CREATE TABLE IF NOT EXISTS learning_candidates (
-                    candidate_id TEXT PRIMARY KEY,
-                    artifact_kind TEXT NOT NULL,
-                    source_task_id TEXT NOT NULL,
-                    benchmark_family TEXT NOT NULL,
-                    memory_source TEXT NOT NULL,
-                    support_count INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_learning_candidates_kind
-                    ON learning_candidates(artifact_kind, source_task_id, updated_at);
-
-                CREATE TABLE IF NOT EXISTS cycle_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    output_path TEXT NOT NULL,
-                    cycle_id TEXT NOT NULL,
-                    subsystem TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    selected_variant_id TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_cycle_records_path_id
-                    ON cycle_records(output_path, id);
-                CREATE INDEX IF NOT EXISTS idx_cycle_records_cycle
-                    ON cycle_records(cycle_id, recorded_at);
-
-                CREATE TABLE IF NOT EXISTS delegated_jobs (
-                    queue_path TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(queue_path, job_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_delegated_jobs_state
-                    ON delegated_jobs(queue_path, state, updated_at);
-
-                CREATE TABLE IF NOT EXISTS runtime_states (
-                    runtime_path TEXT PRIMARY KEY,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS export_manifests (
-                    export_key TEXT PRIMARY KEY,
-                    export_kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+                SELECT task_id, payload_json, summary_json, benchmark_family, success, storage_json,
+                       storage_phase, storage_source_group, storage_relative_path, storage_depth, updated_at
+                FROM episodes_legacy_v1
+                ORDER BY updated_at, task_id
                 """
-            )
-            legacy_exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='episodes_legacy_v1'"
-            ).fetchone()
-            if legacy_exists is not None:
-                legacy_rows = conn.execute(
+            ).fetchall()
+            for row in legacy_rows:
+                payload_json = str(row["payload_json"])
+                storage_json = str(row["storage_json"])
+                episode_id = self._episode_id_from_payload_json(
+                    task_id=str(row["task_id"]),
+                    payload_json=payload_json,
+                    storage_json=storage_json,
+                )
+                conn.execute(
                     """
-                    SELECT task_id, payload_json, summary_json, benchmark_family, success, storage_json,
-                           storage_phase, storage_source_group, storage_relative_path, storage_depth, updated_at
-                    FROM episodes_legacy_v1
-                    ORDER BY updated_at, task_id
-                    """
-                ).fetchall()
-                for row in legacy_rows:
-                    payload_json = str(row["payload_json"])
-                    storage_json = str(row["storage_json"])
-                    episode_id = self._episode_id_from_payload_json(
-                        task_id=str(row["task_id"]),
-                        payload_json=payload_json,
-                        storage_json=storage_json,
-                    )
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO episodes(
-                            episode_id,
-                            task_id,
-                            payload_json,
-                            summary_json,
-                            benchmark_family,
-                            success,
-                            storage_json,
-                            storage_phase,
-                            storage_source_group,
-                            storage_relative_path,
-                            storage_depth,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            episode_id,
-                            str(row["task_id"]),
-                            payload_json,
-                            str(row["summary_json"]),
-                            str(row["benchmark_family"]),
-                            int(row["success"]),
-                            storage_json,
-                            str(row["storage_phase"]),
-                            str(row["storage_source_group"]),
-                            str(row["storage_relative_path"]),
-                            int(row["storage_depth"]),
-                            str(row["updated_at"]),
-                        ),
-                    )
-                conn.execute("DROP TABLE episodes_legacy_v1")
+                    INSERT OR REPLACE INTO episodes(
+                        episode_id,
+                        task_id,
+                        payload_json,
+                        summary_json,
+                        benchmark_family,
+                        success,
+                        storage_json,
+                        storage_phase,
+                        storage_source_group,
+                        storage_relative_path,
+                        storage_depth,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        episode_id,
+                        str(row["task_id"]),
+                        payload_json,
+                        str(row["summary_json"]),
+                        str(row["benchmark_family"]),
+                        int(row["success"]),
+                        storage_json,
+                        str(row["storage_phase"]),
+                        str(row["storage_source_group"]),
+                        str(row["storage_relative_path"]),
+                        int(row["storage_depth"]),
+                        str(row["updated_at"]),
+                    ),
+                )
+            conn.execute("DROP TABLE episodes_legacy_v1")
 
     @staticmethod
     def _episode_id_from_payload_json(

@@ -46,6 +46,7 @@ class Sandbox:
             "pwd",
             "rm",
             "sed",
+            "sleep",
             "sort",
             "tail",
             "test",

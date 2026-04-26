@@ -640,6 +640,60 @@ def test_run_next_delegated_job_resumes_interrupted_job_without_active_lease(mon
     assert queue.get(queued.job_id).state == "queued"
 
 
+def test_run_next_delegated_job_reaps_stale_lease_and_resumes_orphaned_job(monkeypatch, tmp_path):
+    _install_successful_kernel(monkeypatch)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    job = queue.enqueue(task_id="hello_task", priority=5)
+    claimed = queue.claim(job.job_id)
+    assert claimed is not None
+    checkpoint_path = config.run_checkpoints_dir / "hello.json"
+    report_path = config.run_reports_dir / "hello.json"
+    queue.set_paths(job.job_id, checkpoint_path=checkpoint_path, report_path=report_path)
+    controller = DelegatedRuntimeController(config.delegated_job_runtime_state_path)
+    task = TaskBank(config=config).get("hello_task")
+    lease, reason = controller.acquire(
+        job=claimed,
+        task=task,
+        config=config,
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+    )
+    assert lease is not None
+    assert reason is None
+
+    runtime_payload = json.loads(config.delegated_job_runtime_state_path.read_text(encoding="utf-8"))
+    runtime_payload["active_leases"][0]["runner_pid"] = 999_999_999
+    config.delegated_job_runtime_state_path.write_text(json.dumps(runtime_payload), encoding="utf-8")
+
+    resumed = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+    )
+
+    assert resumed is not None
+    assert resumed.job_id == job.job_id
+    assert resumed.state == "completed"
+    assert resumed.outcome == "success"
+    final_job = queue.get(job.job_id)
+    assert final_job is not None
+    assert final_job.attempt_count == 2
+    final_runtime = json.loads(config.delegated_job_runtime_state_path.read_text(encoding="utf-8"))
+    assert final_runtime["active_leases"] == []
+    assert any(entry["event"] == "lease_reaped" for entry in final_runtime["history"])
+
+
 def test_run_next_delegated_job_skips_live_leased_in_progress_job(monkeypatch, tmp_path):
     _install_successful_kernel(monkeypatch)
     config = KernelConfig(
@@ -816,6 +870,111 @@ def test_run_job_queue_enqueue_cli_infers_family_budget_group_for_default_budget
     assert queue.list_jobs()[0].budget_group == "family_repo_sandbox"
 
 
+def test_run_job_queue_enqueue_manifest_cli_enqueues_external_workstream_json(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    manifest_path = tmp_path / "workstream.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "external_cli_project_task",
+                        "prompt": "Create project.txt.",
+                        "workspace_subdir": "external_cli_project_task",
+                        "suggested_commands": ["printf 'project ready\\n' > project.txt"],
+                        "success_command": "test -f project.txt",
+                        "expected_files": ["project.txt"],
+                        "metadata": {"benchmark_family": "project", "capability": "cli_workstream"},
+                    },
+                    {
+                        "task_id": "external_cli_repository_task",
+                        "prompt": "Create repository.txt.",
+                        "workspace_subdir": "external_cli_repository_task",
+                        "suggested_commands": ["printf 'repository ready\\n' > repository.txt"],
+                        "success_command": "test -f repository.txt",
+                        "expected_files": ["repository.txt"],
+                        "metadata": {"benchmark_family": "repository", "capability": "cli_workstream"},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=tmp_path / "trajectories" / "reports",
+            run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+            delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_queue.py",
+            "enqueue-manifest",
+            "--manifest-path",
+            str(manifest_path),
+            "--priority-start",
+            "9",
+            "--json",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["selected_task_count"] == 2
+    assert payload["enqueued_job_count"] == 2
+    assert [job["task_id"] for job in payload["enqueued_jobs"]] == [
+        "external_cli_project_task",
+        "external_cli_repository_task",
+    ]
+    assert [job["priority"] for job in payload["enqueued_jobs"]] == [9, 8]
+    assert [job["budget_group"] for job in payload["enqueued_jobs"]] == [
+        "family_project",
+        "family_repository",
+    ]
+    queue = DelegatedJobQueue(tmp_path / "trajectories" / "jobs" / "queue.json")
+    jobs = queue.list_jobs()
+    assert [job.task_id for job in jobs] == ["external_cli_project_task", "external_cli_repository_task"]
+    assert [job.budget_group for job in jobs] == ["family_project", "family_repository"]
+    assert jobs[0].runtime_overrides["task_payload"]["metadata"]["task_origin"] == "external_manifest"
+    assert jobs[0].runtime_overrides["task_payload"]["metadata"]["external_manifest_path"] == str(manifest_path)
+
+
+def test_a7_unfamiliar_transfer_manifest_loads_as_held_out_external_tasks():
+    manifest_path = Path(__file__).resolve().parents[1] / "config" / "a7_unfamiliar_transfer_manifest.json"
+    bank = TaskBank(external_task_manifests=(str(manifest_path),))
+    frontier_tasks = [
+        task
+        for task in bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(frontier_tasks) == 5
+    assert {task.metadata["benchmark_family"] for task in frontier_tasks} == {
+        "project",
+        "repository",
+        "integration",
+        "repo_sandbox",
+        "repo_chore",
+    }
+    assert all(task.metadata["task_origin"] == "external_manifest" for task in frontier_tasks)
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer" for task in frontier_tasks)
+    assert all(task.expected_file_contents for task in frontier_tasks)
+
+
 def test_enqueue_with_parallel_worker_decomposition_expands_integrator(tmp_path):
     queue = DelegatedJobQueue(tmp_path / "trajectories" / "jobs" / "queue.json")
 
@@ -841,6 +1000,27 @@ def test_enqueue_with_parallel_worker_decomposition_expands_integrator(tmp_path)
         "worker/api-status",
         "worker/docs-status",
     ]
+
+
+def test_project_parallel_release_task_decomposes_into_project_family_workers(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "trajectories" / "jobs" / "queue.json")
+
+    jobs = enqueue_with_parallel_worker_decomposition(
+        queue,
+        bank=TaskBank(),
+        task_id="project_parallel_release_task",
+        priority=5,
+    )
+
+    assert [job.task_id for job in jobs] == [
+        "project_parallel_release_task__worker__worker_api-plan",
+        "project_parallel_release_task__worker__worker_ops-cutover",
+        "project_parallel_release_task",
+    ]
+    assert [job.budget_group for job in jobs] == ["family_project", "family_project", "family_project"]
+    assert jobs[0].runtime_overrides["task_payload"]["metadata"]["benchmark_family"] == "project"
+    assert jobs[1].runtime_overrides["task_payload"]["metadata"]["benchmark_family"] == "project"
+    assert jobs[-1].runtime_overrides["dependency_job_ids"] == [jobs[0].job_id, jobs[1].job_id]
 
 
 def test_enqueue_with_parallel_worker_decomposition_expands_to_target_parallel_worker_count(tmp_path):
@@ -1330,7 +1510,7 @@ def test_task_bank_heuristically_synthesizes_parallel_workers_from_integrator_co
         {"label": "docs suite", "argv": ["tests/test_docs.sh"]}
     ]
     assert workers[0].suggested_commands
-    assert "sed -i 's#pending#ready#'" in workers[0].suggested_commands[0]
+    assert "sed -i '1s#pending#ready#'" in workers[0].suggested_commands[0]
     token_score = workers[0].metadata["synthetic_edit_plan"][0]["edit_score"]
     assert workers[0].metadata["synthetic_edit_plan"] == [
         {
@@ -1448,7 +1628,7 @@ def test_task_bank_falls_back_to_branch_intent_for_worker_edit_plan():
             ],
         }
     ]
-    assert "sed -i 's#broken#ready#'" in workers[0].suggested_commands[0]
+    assert "sed -i '1s#broken#ready#'" in workers[0].suggested_commands[0]
 
 
 def test_task_bank_synthesizes_line_replace_edit_plan_for_partial_file_update():
@@ -2674,6 +2854,7 @@ def test_run_job_queue_status_cli(monkeypatch, tmp_path):
     assert "queue_family family=bounded total_jobs=1 runnable_jobs=1 blocked_jobs=0 promotable_jobs=0 worker_jobs=0 integrator_jobs=0 budget_groups=campaign-a" in output
     assert "queue_fairness blocked_open_jobs=0 scheduler_selected_total=1 scheduler_blocked_total=0 scheduler_unblock_total=0 oldest_blocked_at=-" in output
     assert "scheduler_streak budget_group=campaign-a consecutive=1" in output
+    assert "role_closeout ready=0 mode=active_leases total_jobs=1 completed_success_jobs=0 unfinished_jobs=1 terminal_non_success_jobs=0 blocked_open_jobs=0 active_leases=1 trust_status=bootstrap operator_steering_required=1" in output
     assert "active_roles total=1 worker_leases=0 integrator_leases=0 other_leases=1 families=bounded:1 budget_groups=campaign-a:1 shared_repos=-" in output
     assert "next_runnable " in output
     assert "task_id=hello_task" in output
@@ -2764,7 +2945,80 @@ def test_run_job_queue_status_json_includes_queue_trust_and_capability_details(m
     assert payload["queue"]["active_lease_roles"]["other_jobs"] == 1
     assert payload["queue"]["active_lease_roles"]["benchmark_families"] == {"bounded": 1}
     assert payload["queue"]["active_lease_roles"]["budget_groups"] == {"campaign-a": 1}
+    assert payload["queue"]["role_closeout"]["closeout_ready"] is False
+    assert payload["queue"]["role_closeout"]["closeout_mode"] == "active_leases"
+    assert payload["queue"]["role_closeout"]["operator_steering_required"] is True
+    assert payload["queue"]["role_closeout"]["active_leases"] == 1
+    assert payload["queue"]["role_closeout"]["trust_status"] == "bootstrap"
     assert payload["queue"]["active_leases"][0]["budget_group"] == "campaign-a"
+
+
+def test_run_job_queue_status_json_reports_trusted_role_closeout(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    runtime_state_path = tmp_path / "trajectories" / "jobs" / "runtime_state.json"
+    queue_path = tmp_path / "trajectories" / "jobs" / "queue.json"
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            model_name="mock-model",
+            use_tolbert_context=False,
+            sandbox_command_containment_mode="disabled",
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=tmp_path / "trajectories" / "reports",
+            run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+            delegated_job_queue_path=queue_path,
+            delegated_job_runtime_state_path=runtime_state_path,
+            delegated_job_max_concurrency=2,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_unattended_trust_ledger",
+        lambda config: {
+            "gated_summary": {
+                "total": 5,
+                "success_rate": 1.0,
+                "unsafe_ambiguous_rate": 0.0,
+                "hidden_side_effect_risk_rate": 0.0,
+            },
+            "overall_assessment": {"status": "trusted", "passed": True},
+            "policy": {"required_benchmark_families": []},
+            "family_summaries": {},
+            "family_assessments": {},
+        },
+    )
+    queue = DelegatedJobQueue(queue_path)
+    job = queue.enqueue(task_id="hello_task", budget_group="campaign-a")
+    queue.finalize(
+        job.job_id,
+        state="completed",
+        checkpoint_path=tmp_path / "trajectories" / "checkpoints" / "hello.json",
+        report_path=tmp_path / "trajectories" / "reports" / "hello.json",
+        outcome="success",
+        outcome_reasons=[],
+    )
+    monkeypatch.setattr(sys, "argv", ["run_job_queue.py", "status", "--json"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    role_closeout = payload["queue"]["role_closeout"]
+    assert role_closeout["closeout_ready"] is True
+    assert role_closeout["closeout_mode"] == "queue_empty_trusted"
+    assert role_closeout["operator_steering_required"] is False
+    assert role_closeout["total_jobs"] == 1
+    assert role_closeout["completed_success_jobs"] == 1
+    assert role_closeout["unfinished_jobs"] == 0
+    assert role_closeout["terminal_non_success_jobs"] == 0
+    assert role_closeout["blocked_open_jobs"] == 0
+    assert role_closeout["active_leases"] == 0
+    assert role_closeout["trust_status"] == "trusted"
 
 
 def test_run_job_queue_status_json_reports_active_integrator_and_worker_leases(monkeypatch, tmp_path):
@@ -3118,6 +3372,89 @@ def test_run_job_queue_promotable_cli_excludes_synthetic_workers(monkeypatch, tm
                 "report_kind": "unattended_task_report",
                 "acceptance_packet": {
                     "synthetic_worker": True,
+                    "expected_branch": "worker/api-status",
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            model_name="mock-model",
+            use_tolbert_context=False,
+            sandbox_command_containment_mode="disabled",
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=reports_dir,
+            run_checkpoints_dir=checkpoints_dir,
+            delegated_job_queue_path=queue_path,
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+        ),
+    )
+    queue = DelegatedJobQueue(queue_path)
+    integrator = queue.enqueue(task_id="git_parallel_merge_acceptance_task")
+    worker = queue.enqueue(task_id="git_parallel_worker_api_task")
+    queue.finalize(
+        integrator.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "integrator.json",
+        report_path=integrator_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+    queue.finalize(
+        worker.job_id,
+        state="completed",
+        checkpoint_path=checkpoints_dir / "worker.json",
+        report_path=worker_report,
+        outcome="success",
+        outcome_reasons=["verification_passed"],
+    )
+
+    monkeypatch.setattr(sys, "argv", ["run_job_queue.py", "promotable"])
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    output = stream.getvalue()
+    assert "task_id=git_parallel_merge_acceptance_task" in output
+    assert "task_id=git_parallel_worker_api_task" not in output
+
+
+def test_run_job_queue_promotable_cli_excludes_worker_jobs_without_synthetic_flag(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    queue_path = tmp_path / "trajectories" / "jobs" / "queue.json"
+    reports_dir = tmp_path / "trajectories" / "reports"
+    checkpoints_dir = tmp_path / "trajectories" / "checkpoints"
+    reports_dir.mkdir(parents=True)
+    checkpoints_dir.mkdir(parents=True)
+    integrator_report = reports_dir / "integrator.json"
+    integrator_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
+                    "required_merged_branches": ["worker/api-status"],
+                    "verifier_result": {"passed": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker_report = reports_dir / "worker.json"
+    worker_report.write_text(
+        json.dumps(
+            {
+                "report_kind": "unattended_task_report",
+                "acceptance_packet": {
+                    "target_branch": "main",
                     "expected_branch": "worker/api-status",
                     "verifier_result": {"passed": True},
                 },

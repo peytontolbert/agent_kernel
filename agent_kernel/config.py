@@ -130,6 +130,11 @@ class KernelConfig:
     ollama_host: str = os.getenv("AGENT_KERNEL_OLLAMA_HOST", "http://127.0.0.1:11434")
     vllm_host: str = os.getenv("AGENT_KERNEL_VLLM_HOST", "http://127.0.0.1:8000")
     vllm_api_key: str = os.getenv("AGENT_KERNEL_VLLM_API_KEY", "")
+    model_stack_host: str = os.getenv("AGENT_KERNEL_MODEL_STACK_HOST", "http://127.0.0.1:8001")
+    model_stack_api_key: str = os.getenv("AGENT_KERNEL_MODEL_STACK_API_KEY", "")
+    model_stack_model_dir: str = os.getenv("AGENT_KERNEL_MODEL_STACK_MODEL_DIR", "")
+    model_stack_tokenizer_path: str = os.getenv("AGENT_KERNEL_MODEL_STACK_TOKENIZER_PATH", "")
+    model_stack_repo_path: str = os.getenv("AGENT_KERNEL_MODEL_STACK_REPO_PATH", "other_repos/model-stack")
     vllm_autostart: bool = os.getenv("AGENT_KERNEL_VLLM_AUTOSTART", "1") == "1"
     vllm_start_command: str = os.getenv("AGENT_KERNEL_VLLM_START_COMMAND", "")
     vllm_start_extra_args: str = os.getenv("AGENT_KERNEL_VLLM_START_EXTRA_ARGS", "")
@@ -631,9 +636,11 @@ class KernelConfig:
 
     @staticmethod
     def normalize_provider_name(provider: str) -> str:
-        normalized = provider.strip().lower()
+        normalized = provider.strip().lower().replace("-", "_")
         if normalized == "tolbert":
             return "hybrid"
+        if normalized == "modelstack":
+            return "model_stack"
         return normalized
 
     @classmethod
@@ -719,7 +726,7 @@ class KernelConfig:
         )
         if native_decoder_ready:
             authority = "retained_native_decoder"
-        elif provider in {"ollama", "vllm"}:
+        elif provider in {"ollama", "vllm", "model_stack"}:
             authority = "external_decoder"
         elif provider == "mock":
             authority = "mock_decoder"
@@ -746,12 +753,14 @@ class KernelConfig:
 
     def validate(self) -> None:
         provider = self.normalized_provider()
-        if provider not in {"mock", "ollama", "vllm", "hybrid"}:
+        if provider not in {"mock", "ollama", "vllm", "hybrid", "model_stack"}:
             raise ValueError(f"unsupported provider: {self.provider}")
         if provider == "ollama" and not self.ollama_host.strip():
             raise ValueError("ollama_host must be non-empty when provider='ollama'")
         if provider == "vllm" and not self.vllm_host.strip():
             raise ValueError("vllm_host must be non-empty when provider='vllm'")
+        if provider == "model_stack" and not self.model_stack_host.strip():
+            raise ValueError("model_stack_host must be non-empty when provider='model_stack'")
         if provider == "vllm" and self.vllm_autostart and not self.vllm_python_bin.strip():
             raise ValueError("vllm_python_bin must be non-empty when vllm autostart is enabled")
         if not self.model_name.strip():

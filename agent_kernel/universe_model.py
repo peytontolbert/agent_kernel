@@ -866,7 +866,7 @@ class UniverseModel:
         assumed_mode = str(assumptions.get("git_write_mode", "operator_gated"))
         actual_mode = str(snapshot.get("git_write_mode", "blocked"))
         workspace_scope = str(snapshot.get("workspace_write_scope", "task_only"))
-        if actual_mode == "task_scoped" and workspace_scope == "shared_repo_gated":
+        if actual_mode == "task_scoped" and workspace_scope in {"shared_repo_gated", "task_only"}:
             return False
         return assumed_mode in {"blocked", "operator_gated"} or actual_mode == "blocked"
 

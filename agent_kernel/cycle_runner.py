@@ -167,6 +167,9 @@ _is_retryable_tolbert_startup_failure = cycle_tolbert_runtime.is_retryable_tolbe
 _new_tolbert_runtime_summary = cycle_tolbert_runtime.new_tolbert_runtime_summary
 _ordered_unique_stage_names = cycle_tolbert_runtime.ordered_unique_stage_names
 _apply_priority_family_restriction = cycle_preview_support.apply_priority_family_restriction
+_apply_direct_a4_transition_model_compare_preferences = (
+    cycle_preview_support.apply_direct_a4_transition_model_compare_preferences
+)
 _normalize_tolbert_runtime_summary = cycle_tolbert_runtime.normalize_tolbert_runtime_summary
 _mark_tolbert_stage = cycle_tolbert_runtime.mark_tolbert_stage
 _finalize_tolbert_runtime_summary = cycle_tolbert_runtime.finalize_tolbert_runtime_summary
@@ -276,6 +279,9 @@ def compare_to_prior_retained(
         merge_priority_families_fn=_merge_priority_families,
         holdout_generated_schedule_limit_for_retention_fn=_holdout_generated_schedule_limit_for_retention,
         apply_priority_family_restriction_fn=_apply_priority_family_restriction,
+        apply_direct_a4_transition_model_compare_preferences_fn=(
+            _apply_direct_a4_transition_model_compare_preferences
+        ),
         retention_eval_config_fn=_retention_eval_config,
         call_tolbert_preview_eval_fn=_call_tolbert_preview_eval,
         retention_evidence_fn=retention_evidence,
@@ -336,13 +342,16 @@ def preview_candidate_retention(
         autonomous_runtime_eval_flags_fn=autonomous_runtime_eval_flags,
         apply_retrieval_bounded_preview_filters_fn=_apply_retrieval_bounded_preview_filters,
         apply_priority_family_restriction_fn=_apply_priority_family_restriction,
+        apply_direct_a4_transition_model_compare_preferences_fn=(
+            _apply_direct_a4_transition_model_compare_preferences
+        ),
         call_tolbert_preview_eval_fn=_call_tolbert_preview_eval,
         retention_evidence_fn=retention_evidence,
         candidate_matches_active_artifact_fn=_candidate_matches_active_artifact,
         evaluate_artifact_retention_fn=evaluate_artifact_retention,
         autonomous_phase_gate_report_fn=autonomous_phase_gate_report,
         compare_to_prior_retained_fn=compare_to_prior_retained,
-        prior_retained_guard_reason_fn=prior_retained_guard_reason,
+        prior_retained_guard_reason_fn=_prior_retained_guard_reason_fn,
         prior_retained_guard_reason_code_fn=_prior_retained_guard_reason_code,
         retention_reason_code_fn=_retention_reason_code,
         finalize_tolbert_runtime_summary_fn=_finalize_tolbert_runtime_summary,
@@ -355,7 +364,7 @@ def _prior_retained_metrics_summary(comparison: dict[str, object] | None) -> dic
 
 
 autonomous_phase_gate_report = cycle_retention_reasoning.autonomous_phase_gate_report
-prior_retained_guard_reason = cycle_retention_reasoning.prior_retained_guard_reason
+_prior_retained_guard_reason_fn = cycle_retention_reasoning.prior_retained_guard_reason
 _tolbert_prior_retained_selection_signal_fallback_satisfied = (
     cycle_retention_reasoning.tolbert_prior_retained_selection_signal_fallback_satisfied
 )
@@ -363,6 +372,9 @@ _prior_retained_guard_reason_code = cycle_retention_reasoning.prior_retained_gua
 _retention_reason_code_for_text = cycle_retention_reasoning.retention_reason_code_for_text
 _retention_reason_code = cycle_retention_reasoning.retention_reason_code
 _promotion_block_reason_code = cycle_retention_reasoning.promotion_block_reason_code
+# Backward-compatible export for tests and local callers. Internal callsites use
+# the underscored alias to avoid shadowing it with preview-result strings.
+prior_retained_guard_reason = _prior_retained_guard_reason_fn
 
 
 def _is_runtime_managed_artifact_path(path: str) -> bool:
@@ -642,7 +654,7 @@ def finalize_cycle(
         autonomous_phase_gate_report_fn=autonomous_phase_gate_report,
         evaluate_artifact_retention_fn=evaluate_artifact_retention,
         compare_to_prior_retained_fn=compare_to_prior_retained,
-        prior_retained_guard_reason_fn=prior_retained_guard_reason,
+        prior_retained_guard_reason_fn=_prior_retained_guard_reason_fn,
         prior_retained_guard_reason_code_fn=_prior_retained_guard_reason_code,
         phase_gate_metrics_summary_fn=_phase_gate_metrics_summary,
         cycle_id_safe_fn=cycle_id_safe,
@@ -675,6 +687,8 @@ def finalize_cycle(
         evidence=evidence,
         confirmation_baseline_runs=confirmation_baseline_runs,
         confirmation_candidate_runs=confirmation_candidate_runs,
+        baseline_flags=baseline_flags,
+        candidate_flags=candidate_flags,
         progress=_emit,
         confirmation_confidence_report_fn=confirmation_confidence_report,
         confirmation_confidence_failures_fn=confirmation_confidence_failures,

@@ -120,7 +120,19 @@ This evidence is used to distinguish:
 
 **Plan Risk**
 
-Command-level governance scoring remains available as a fallback, but the universe layer now also evaluates the plan surface across the available task commands:
+Command-level governance scoring still exists, but the universe layer is no longer only advisory. `UniverseModel.should_block_command(...)` now turns deterministic conflicts into explicit pre-execution block decisions, and `AgentKernel.run_task()` consults that result before `Sandbox.run()`. Blocked commands fail the step as `governance_rejected` instead of using sandbox rejection as the first hard stop.
+
+The deterministic block surface currently covers cases such as:
+
+- forbidden command-pattern matches
+- network access conflicts
+- writable-path scope conflicts
+- git-write conflicts
+- destructive or privileged command classes
+- remote execution
+- unbounded execution under bounded-step governance
+
+The universe layer also evaluates the plan surface across the available task commands:
 
 - cumulative mutation surface
 - rollback coverage

@@ -1,0 +1,1808 @@
+{
+  "improvement": {
+    "world_model_control_keys": [
+      "expected_artifact_score_weight",
+      "preserved_artifact_score_weight",
+      "forbidden_artifact_penalty",
+      "forbidden_cleanup_score_weight",
+      "workflow_branch_target_score_weight",
+      "workflow_changed_path_score_weight",
+      "workflow_generated_path_score_weight",
+      "workflow_report_path_score_weight",
+      "workflow_preserved_path_score_weight",
+      "required_tests_score_weight",
+      "required_merges_score_weight",
+      "long_horizon_scaffold_bonus",
+      "retrieved_expected_artifact_score_weight",
+      "retrieved_forbidden_artifact_penalty",
+      "retrieved_preserved_artifact_score_weight",
+      "retrieved_workflow_changed_path_score_weight",
+      "retrieved_workflow_report_path_score_weight"
+    ],
+    "world_model_planning_control_keys": [
+      "include_preserved_artifact_steps",
+      "prefer_preserved_artifacts_first",
+      "append_preservation_subgoal",
+      "max_preserved_artifacts"
+    ],
+    "world_model_proposal_areas": [
+      "workflow_alignment",
+      "conflict_avoidance",
+      "preservation_bias",
+      "branch_targeting"
+    ],
+    "world_model_generation_foci": [
+      "balanced",
+      "workflow_alignment",
+      "preservation_bias",
+      "conflict_avoidance"
+    ],
+    "recovery_control_keys": [
+      "snapshot_before_execution",
+      "rollback_on_runner_exception",
+      "rollback_on_failed_outcome",
+      "rollback_on_safe_stop",
+      "verify_post_rollback_file_count",
+      "max_post_rollback_file_count"
+    ],
+    "recovery_proposal_areas": [
+      "rollback_safety",
+      "snapshot_coverage"
+    ],
+    "recovery_generation_foci": [
+      "balanced",
+      "rollback_safety",
+      "snapshot_coverage"
+    ],
+    "delegation_control_keys": [
+      "delegated_job_max_concurrency",
+      "delegated_job_max_active_per_budget_group",
+      "delegated_job_max_queued_per_budget_group",
+      "delegated_job_max_artifact_bytes",
+      "delegated_job_max_subprocesses_per_job",
+      "command_timeout_seconds",
+      "llm_timeout_seconds",
+      "max_steps"
+    ],
+    "delegation_proposal_areas": [
+      "throughput_balance",
+      "queue_elasticity",
+      "worker_depth"
+    ],
+    "delegation_generation_foci": [
+      "balanced",
+      "throughput_balance",
+      "queue_elasticity",
+      "worker_depth"
+    ],
+    "tolbert_model_generation_foci": [
+      "balanced",
+      "recovery_alignment",
+      "discovered_task_adaptation"
+    ],
+    "tolbert_model_surface_keys": [
+      "encoder_surface",
+      "latent_dynamics_surface",
+      "decoder_surface",
+      "world_model_surface",
+      "retrieval_surface",
+      "policy_head",
+      "value_head",
+      "transition_head",
+      "risk_head",
+      "stop_head",
+      "latent_state",
+      "universal_runtime"
+    ],
+    "tolbert_runtime_policy_keys": [
+      "shadow_benchmark_families",
+      "primary_benchmark_families",
+      "min_path_confidence",
+      "require_trusted_retrieval",
+      "fallback_to_vllm_on_low_confidence",
+      "allow_direct_command_primary",
+      "allow_skill_primary",
+      "primary_min_command_score",
+      "use_encoder_context",
+      "use_decoder_head",
+      "use_value_head",
+      "use_transition_head",
+      "use_world_model_head",
+      "use_risk_head",
+      "use_stop_head",
+      "use_policy_head",
+      "use_latent_state"
+    ],
+    "tolbert_decoder_policy_keys": [
+      "allow_retrieval_guidance",
+      "allow_skill_commands",
+      "allow_task_suggestions",
+      "allow_stop_decision",
+      "min_stop_completion_ratio",
+      "max_task_suggestions"
+    ],
+    "tolbert_action_generation_policy_keys": [
+      "enabled",
+      "max_candidates",
+      "proposal_score_bias",
+      "novel_command_bonus",
+      "verifier_alignment_bonus",
+      "expected_file_template_bonus",
+      "cleanup_template_bonus",
+      "min_family_support",
+      "template_preferences"
+    ],
+    "tolbert_rollout_policy_keys": [
+      "predicted_progress_gain_weight",
+      "predicted_conflict_penalty_weight",
+      "predicted_preserved_bonus_weight",
+      "predicted_workflow_bonus_weight",
+      "latent_progress_bonus_weight",
+      "latent_risk_penalty_weight",
+      "recover_from_stall_bonus_weight",
+      "stop_completion_weight",
+      "stop_missing_expected_penalty_weight",
+      "stop_forbidden_penalty_weight",
+      "stop_preserved_penalty_weight",
+      "stable_stop_bonus_weight"
+    ],
+    "tolbert_liftoff_gate_keys": [
+      "min_pass_rate_delta",
+      "max_step_regression",
+      "max_regressed_families",
+      "require_universal_decoder_eval",
+      "min_universal_decoder_exact_match_delta",
+      "min_universal_decoder_token_f1_delta",
+      "min_universal_decoder_win_rate_delta",
+      "require_generated_lane_non_regression",
+      "require_failure_recovery_non_regression",
+      "require_long_horizon_non_regression",
+      "require_long_horizon_novel_command_non_regression",
+      "require_long_horizon_world_feedback_non_regression",
+      "require_shadow_signal",
+      "min_shadow_episodes_per_promoted_family",
+      "require_family_novel_command_evidence",
+      "proposal_gate_by_benchmark_family",
+      "require_unsafe_ambiguous_non_regression",
+      "require_hidden_side_effect_non_regression",
+      "require_success_hidden_side_effect_non_regression",
+      "require_trust_gate_pass",
+      "require_trust_success_non_regression",
+      "require_trust_unsafe_non_regression",
+      "require_trust_hidden_side_effect_non_regression",
+      "require_trust_success_hidden_side_effect_non_regression",
+      "require_takeover_drift_eval",
+      "takeover_drift_step_budget",
+      "takeover_drift_wave_task_limit",
+      "takeover_drift_max_waves",
+      "max_takeover_drift_pass_rate_regression",
+      "max_takeover_drift_unsafe_ambiguous_rate_regression",
+      "max_takeover_drift_hidden_side_effect_rate_regression",
+      "max_takeover_drift_trust_success_rate_regression",
+      "max_takeover_drift_trust_unsafe_ambiguous_rate_regression"
+    ],
+    "tolbert_build_policy_keys": [
+      "allow_kernel_autobuild",
+      "allow_kernel_rebuild",
+      "require_synthetic_dataset",
+      "require_head_targets",
+      "require_long_horizon_head_targets",
+      "min_total_examples",
+      "min_synthetic_examples",
+      "min_policy_examples",
+      "min_transition_examples",
+      "min_value_examples",
+      "min_stop_examples",
+      "min_long_horizon_trajectory_examples",
+      "min_long_horizon_policy_examples",
+      "min_long_horizon_transition_examples",
+      "min_long_horizon_value_examples",
+      "min_long_horizon_stop_examples",
+      "ready_total_examples",
+      "ready_synthetic_examples",
+      "ready_policy_examples",
+      "ready_transition_examples",
+      "ready_value_examples",
+      "ready_stop_examples",
+      "ready_long_horizon_trajectory_examples",
+      "ready_long_horizon_policy_examples",
+      "ready_long_horizon_transition_examples",
+      "ready_long_horizon_value_examples",
+      "ready_long_horizon_stop_examples"
+    ],
+    "artifact_validation_profiles": {
+      "world_model": {
+        "generation_focuses": [
+          "balanced",
+          "workflow_alignment",
+          "preservation_bias",
+          "conflict_avoidance"
+        ],
+        "control_schema": "world_model_behavior_controls_v1",
+        "checks": ["world_model_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "world_model artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "expected_artifact_score_weight",
+              "preserved_artifact_score_weight",
+              "forbidden_artifact_penalty",
+              "forbidden_cleanup_score_weight",
+              "workflow_branch_target_score_weight",
+              "workflow_changed_path_score_weight",
+              "workflow_generated_path_score_weight",
+              "workflow_report_path_score_weight",
+              "workflow_preserved_path_score_weight",
+              "required_tests_score_weight",
+              "required_merges_score_weight",
+              "long_horizon_scaffold_bonus",
+              "retrieved_expected_artifact_score_weight",
+              "retrieved_forbidden_artifact_penalty",
+              "retrieved_preserved_artifact_score_weight",
+              "retrieved_workflow_changed_path_score_weight",
+              "retrieved_workflow_report_path_score_weight"
+            ],
+            "unknown_key_error": "world_model control is unsupported: {key}",
+            "default_rule": {
+              "kind": "number",
+              "min": 0.0,
+              "type_error": "world_model control {key} must be numeric",
+              "range_error": "world_model control {key} must be non-negative"
+            }
+          },
+          {
+            "field": "planning_controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "world_model artifact must contain a non-empty planning_controls object",
+            "allowed_keys": [
+              "include_preserved_artifact_steps",
+              "prefer_preserved_artifacts_first",
+              "append_preservation_subgoal",
+              "max_preserved_artifacts"
+            ],
+            "unknown_key_error": "world_model planning control is unsupported: {key}",
+            "field_rules": {
+              "include_preserved_artifact_steps": {
+                "kind": "boolean",
+                "error": "world_model planning control include_preserved_artifact_steps must be boolean"
+              },
+              "prefer_preserved_artifacts_first": {
+                "kind": "boolean",
+                "error": "world_model planning control prefer_preserved_artifacts_first must be boolean"
+              },
+              "append_preservation_subgoal": {
+                "kind": "boolean",
+                "error": "world_model planning control append_preservation_subgoal must be boolean"
+              },
+              "max_preserved_artifacts": {
+                "kind": "int",
+                "min": 0,
+                "error": "world_model planning control max_preserved_artifacts must be a non-negative integer"
+              }
+            }
+          }
+        ]
+      },
+      "universe": {
+        "generation_focuses": [
+          "balanced",
+          "governance",
+          "verification",
+          "operator_scope",
+          "environment_envelope"
+        ],
+        "checks": ["universe_controls"],
+        "sections": [
+          {
+            "field": "governance",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "skip_for_artifact_kinds": ["operating_envelope"],
+            "missing_error": "universe artifact must contain a non-empty governance object",
+            "allowed_keys": [
+              "require_verification",
+              "require_bounded_steps",
+              "prefer_reversible_actions",
+              "respect_task_forbidden_artifacts",
+              "respect_preserved_artifacts"
+            ],
+            "unknown_key_error": "universe governance control is unsupported: {key}",
+            "default_rule": {
+              "kind": "boolean",
+              "error": "universe governance control {key} must be boolean"
+            }
+          },
+          {
+            "field": "action_risk_controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "skip_for_artifact_kinds": ["universe_constitution"],
+            "missing_error": "universe artifact must contain a non-empty action_risk_controls object",
+            "allowed_keys": [
+              "destructive_mutation_penalty",
+              "git_mutation_penalty",
+              "inline_destructive_interpreter_penalty",
+              "network_fetch_penalty",
+              "privileged_command_penalty",
+              "read_only_discovery_bonus",
+              "remote_execution_penalty",
+              "reversible_file_operation_bonus",
+              "scope_escape_penalty",
+              "unbounded_execution_penalty",
+              "verification_bonus"
+            ],
+            "unknown_key_error": "universe action risk control is unsupported: {key}",
+            "default_rule": {
+              "kind": "int",
+              "min": 1,
+              "error": "universe action risk control {key} must be a positive integer"
+            }
+          },
+          {
+            "field": "environment_assumptions",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "skip_for_artifact_kinds": ["universe_constitution"],
+            "missing_error": "universe artifact must contain a non-empty environment_assumptions object",
+            "field_rules": {
+              "git_write_mode": {
+                "kind": "enum",
+                "normalize": "lower",
+                "values": ["blocked", "operator_gated", "task_scoped"],
+                "required": true,
+                "error": "universe environment assumption git_write_mode must be one of ['blocked', 'operator_gated', 'task_scoped']"
+              },
+              "network_access_mode": {
+                "kind": "enum",
+                "normalize": "lower",
+                "values": ["allowlist_only", "blocked", "open"],
+                "required": true,
+                "error": "universe environment assumption network_access_mode must be one of ['allowlist_only', 'blocked', 'open']"
+              },
+              "workspace_write_scope": {
+                "kind": "enum",
+                "normalize": "lower",
+                "values": ["task_only", "generated_only", "shared_repo_gated"],
+                "required": true,
+                "error": "universe environment assumption workspace_write_scope must be one of ['generated_only', 'shared_repo_gated', 'task_only']"
+              },
+              "require_path_scoped_mutations": {
+                "kind": "boolean",
+                "required": true,
+                "error": "universe environment assumption require_path_scoped_mutations must be boolean"
+              },
+              "require_rollback_on_mutation": {
+                "kind": "boolean",
+                "required": true,
+                "error": "universe environment assumption require_rollback_on_mutation must be boolean"
+              }
+            }
+          },
+          {
+            "field": "invariants",
+            "kind": "list_nonempty_strings",
+            "required": true,
+            "skip_for_artifact_kinds": ["operating_envelope"],
+            "missing_error": "universe artifact must contain a non-empty invariants list"
+          },
+          {
+            "field": "forbidden_command_patterns",
+            "kind": "list_nonempty_strings",
+            "required": true,
+            "skip_for_artifact_kinds": ["operating_envelope"],
+            "missing_error": "universe artifact must contain a non-empty forbidden_command_patterns list"
+          },
+          {
+            "field": "preferred_command_prefixes",
+            "kind": "list_nonempty_strings",
+            "required": true,
+            "skip_for_artifact_kinds": ["operating_envelope"],
+            "missing_error": "universe artifact must contain a non-empty preferred_command_prefixes list"
+          }
+        ]
+      },
+      "state_estimation": {
+        "generation_focuses": [
+          "balanced",
+          "transition_normalization",
+          "risk_sensitivity",
+          "recovery_bias"
+        ],
+        "control_schema": "state_estimation_controls_v1",
+        "checks": ["state_estimation_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "state_estimation artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "no_progress_progress_epsilon",
+              "min_state_change_score_for_progress",
+              "regression_path_budget",
+              "regression_severity_weight",
+              "progress_recovery_credit"
+            ],
+            "unknown_key_error": "state_estimation control is unsupported: {key}",
+            "field_rules": {
+              "no_progress_progress_epsilon": {
+                "kind": "number",
+                "error": "state_estimation control no_progress_progress_epsilon must be numeric"
+              },
+              "min_state_change_score_for_progress": {
+                "kind": "int",
+                "min": 0,
+                "error": "state_estimation control min_state_change_score_for_progress must be a non-negative integer"
+              },
+              "regression_path_budget": {
+                "kind": "int",
+                "min": 0,
+                "error": "state_estimation control regression_path_budget must be a non-negative integer"
+              },
+              "regression_severity_weight": {
+                "kind": "number",
+                "min": 0.0,
+                "type_error": "state_estimation control regression_severity_weight must be numeric",
+                "range_error": "state_estimation control regression_severity_weight must be non-negative"
+              },
+              "progress_recovery_credit": {
+                "kind": "number",
+                "min": 0.0,
+                "type_error": "state_estimation control progress_recovery_credit must be numeric",
+                "range_error": "state_estimation control progress_recovery_credit must be non-negative"
+              }
+            }
+          },
+          {
+            "field": "latent_controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "state_estimation artifact must contain a non-empty latent_controls object",
+            "allowed_keys": [
+              "advancing_completion_ratio",
+              "advancing_progress_delta",
+              "improving_progress_delta",
+              "regressing_progress_delta",
+              "regressive_regression_count",
+              "blocked_forbidden_count",
+              "active_path_budget",
+              "learned_world_progress_threshold",
+              "learned_world_risk_threshold",
+              "learned_world_blend_weight"
+            ],
+            "unknown_key_error": "state_estimation latent control is unsupported: {key}",
+            "field_rules": {
+              "advancing_completion_ratio": {
+                "kind": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "type_error": "state_estimation latent control advancing_completion_ratio must be numeric",
+                "range_error": "state_estimation latent control advancing_completion_ratio must stay within [0.0, 1.0]"
+              },
+              "regressive_regression_count": {
+                "kind": "int",
+                "min": 1,
+                "error": "state_estimation latent control regressive_regression_count must be a positive integer"
+              },
+              "blocked_forbidden_count": {
+                "kind": "int",
+                "min": 1,
+                "error": "state_estimation latent control blocked_forbidden_count must be a positive integer"
+              },
+              "active_path_budget": {
+                "kind": "int",
+                "min": 1,
+                "error": "state_estimation latent control active_path_budget must be a positive integer"
+              }
+            },
+            "default_rule": {
+              "kind": "number",
+              "error": "state_estimation latent control {key} must be numeric"
+            }
+          },
+          {
+            "field": "policy_controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "state_estimation artifact must contain a non-empty policy_controls object",
+            "allowed_keys": [
+              "regressive_path_match_bonus",
+              "regressive_cleanup_bonus",
+              "blocked_command_bonus",
+              "advancing_path_match_bonus",
+              "trusted_retrieval_path_bonus",
+              "learned_world_progress_bonus",
+              "learned_world_risk_penalty"
+            ],
+            "unknown_key_error": "state_estimation policy control is unsupported: {key}",
+            "default_rule": {
+              "kind": "int",
+              "min": 0,
+              "error": "state_estimation policy control {key} must be a non-negative integer"
+            }
+          },
+          {
+            "field": "transition_summary",
+            "kind": "object",
+            "required": true,
+            "missing_error": "state_estimation artifact must contain a transition_summary object"
+          }
+        ]
+      },
+      "trust": {
+        "generation_focuses": [
+          "balanced",
+          "safety",
+          "breadth",
+          "stability"
+        ],
+        "control_schema": "unattended_trust_controls_v1",
+        "checks": ["trust_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "trust artifact must contain a non-empty controls object",
+            "field_rules": {
+              "required_benchmark_families": {
+                "kind": "list_nonempty_strings",
+                "error": "trust control required_benchmark_families must be a non-empty list"
+              },
+              "recent_report_limit": {
+                "kind": "int",
+                "min": 0,
+                "error": "trust control recent_report_limit must be a non-negative integer"
+              },
+              "bootstrap_min_reports": {
+                "kind": "int",
+                "min": 0,
+                "error": "trust control bootstrap_min_reports must be a non-negative integer"
+              },
+              "breadth_min_reports": {
+                "kind": "int",
+                "min": 0,
+                "error": "trust control breadth_min_reports must be a non-negative integer"
+              },
+              "min_distinct_families": {
+                "kind": "int",
+                "min": 0,
+                "error": "trust control min_distinct_families must be a non-negative integer"
+              },
+              "min_success_rate": {
+                "kind": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "type_error": "trust control min_success_rate must be numeric",
+                "range_error": "trust control min_success_rate must stay within [0.0, 1.0]"
+              },
+              "max_unsafe_ambiguous_rate": {
+                "kind": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "type_error": "trust control max_unsafe_ambiguous_rate must be numeric",
+                "range_error": "trust control max_unsafe_ambiguous_rate must stay within [0.0, 1.0]"
+              },
+              "max_hidden_side_effect_rate": {
+                "kind": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "type_error": "trust control max_hidden_side_effect_rate must be numeric",
+                "range_error": "trust control max_hidden_side_effect_rate must stay within [0.0, 1.0]"
+              },
+              "max_success_hidden_side_effect_rate": {
+                "kind": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "type_error": "trust control max_success_hidden_side_effect_rate must be numeric",
+                "range_error": "trust control max_success_hidden_side_effect_rate must stay within [0.0, 1.0]"
+              }
+            }
+          }
+        ]
+      },
+      "recovery": {
+        "generation_focuses": [
+          "balanced",
+          "rollback_safety",
+          "snapshot_coverage"
+        ],
+        "control_schema": "workspace_recovery_controls_v1",
+        "checks": ["recovery_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "recovery artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "snapshot_before_execution",
+              "rollback_on_runner_exception",
+              "rollback_on_failed_outcome",
+              "rollback_on_safe_stop",
+              "verify_post_rollback_file_count",
+              "max_post_rollback_file_count"
+            ],
+            "unknown_key_error": "recovery control is unsupported: {key}",
+            "field_rules": {
+              "max_post_rollback_file_count": {
+                "kind": "int",
+                "min": 0,
+                "error": "recovery control max_post_rollback_file_count must be a non-negative integer"
+              }
+            },
+            "default_rule": {
+              "kind": "boolean",
+              "error": "recovery control {key} must be boolean"
+            }
+          }
+        ]
+      },
+      "delegation": {
+        "generation_focuses": [
+          "balanced",
+          "throughput_balance",
+          "queue_elasticity",
+          "worker_depth"
+        ],
+        "control_schema": "delegated_resource_controls_v1",
+        "checks": ["delegation_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "delegation artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "delegated_job_max_concurrency",
+              "delegated_job_max_active_per_budget_group",
+              "delegated_job_max_queued_per_budget_group",
+              "delegated_job_max_artifact_bytes",
+              "delegated_job_max_subprocesses_per_job",
+              "command_timeout_seconds",
+              "llm_timeout_seconds",
+              "max_steps"
+            ],
+            "unknown_key_error": "delegation control is unsupported: {key}",
+            "default_rule": {
+              "kind": "int",
+              "min": 0,
+              "error": "delegation control {key} must be a non-negative integer"
+            }
+          }
+        ]
+      },
+      "operator_policy": {
+        "generation_focuses": [
+          "balanced",
+          "family_breadth",
+          "git_http_scope",
+          "generated_path_scope"
+        ],
+        "control_schema": "unattended_operator_controls_v1",
+        "checks": ["operator_policy_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "operator_policy artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "unattended_allowed_benchmark_families",
+              "unattended_allow_git_commands",
+              "unattended_allow_http_requests",
+              "unattended_http_allowed_hosts",
+              "unattended_http_timeout_seconds",
+              "unattended_http_max_body_bytes",
+              "unattended_allow_generated_path_mutations",
+              "unattended_generated_path_prefixes"
+            ],
+            "unknown_key_error": "operator_policy control is unsupported: {key}",
+            "field_rules": {
+              "unattended_allow_git_commands": {
+                "kind": "boolean",
+                "error": "operator_policy control unattended_allow_git_commands must be boolean"
+              },
+              "unattended_allow_http_requests": {
+                "kind": "boolean",
+                "error": "operator_policy control unattended_allow_http_requests must be boolean"
+              },
+              "unattended_allow_generated_path_mutations": {
+                "kind": "boolean",
+                "error": "operator_policy control unattended_allow_generated_path_mutations must be boolean"
+              },
+              "unattended_http_timeout_seconds": {
+                "kind": "int",
+                "min": 1,
+                "error": "operator_policy control unattended_http_timeout_seconds must be a positive integer"
+              },
+              "unattended_http_max_body_bytes": {
+                "kind": "int",
+                "min": 1,
+                "error": "operator_policy control unattended_http_max_body_bytes must be a positive integer"
+              },
+              "unattended_allowed_benchmark_families": {
+                "kind": "list_nonempty_strings",
+                "error": "operator_policy control unattended_allowed_benchmark_families must be a non-empty list"
+              },
+              "unattended_http_allowed_hosts": {
+                "kind": "list_nonempty_strings",
+                "error": "operator_policy control unattended_http_allowed_hosts must be a non-empty list"
+              },
+              "unattended_generated_path_prefixes": {
+                "kind": "list_nonempty_strings",
+                "error": "operator_policy control unattended_generated_path_prefixes must be a non-empty list"
+              }
+            }
+          }
+        ]
+      },
+      "transition_model": {
+        "generation_focuses": [
+          "balanced",
+          "repeat_avoidance",
+          "regression_guard",
+          "recovery_bias"
+        ],
+        "control_schema": "transition_model_controls_v1",
+        "checks": ["transition_model_controls"],
+        "sections": [
+          {
+            "field": "controls",
+            "kind": "object",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "transition_model artifact must contain a non-empty controls object",
+            "allowed_keys": [
+              "repeat_command_penalty",
+              "regressed_path_command_penalty",
+              "recovery_command_bonus",
+              "progress_command_bonus",
+              "long_horizon_repeat_command_penalty",
+              "long_horizon_progress_command_bonus",
+              "max_signatures"
+            ],
+            "unknown_key_error": "transition_model control is unsupported: {key}",
+            "default_rule": {
+              "kind": "int",
+              "min": 1,
+              "error": "transition_model control {key} must be a positive integer"
+            }
+          },
+          {
+            "field": "signatures",
+            "kind": "list",
+            "required": true,
+            "missing_error": "transition_model artifact must contain a signatures list",
+            "item_error": "every transition_model signature must be an object",
+            "item_fields": {
+              "signal": {
+                "kind": "enum",
+                "values": ["no_state_progress", "state_regression"],
+                "required": true,
+                "error": "transition_model signature must contain a supported signal"
+              },
+              "command": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "transition_model signature must contain a non-empty command"
+              },
+              "command_pattern": {
+                "kind": "string_nonempty_if_present",
+                "skip_values": ["", null],
+                "error": "transition_model signature command_pattern must be a non-empty string when present"
+              },
+              "support": {
+                "kind": "int",
+                "min": 1,
+                "required": true,
+                "error": "transition_model signature support must be a positive integer"
+              },
+              "regressions": {
+                "kind": "list",
+                "error": "transition_model signature regressions must be a list"
+              }
+            }
+          }
+        ]
+      },
+      "benchmark": {
+        "checks": ["benchmark_proposals"],
+        "sections": [
+          {
+            "field": "proposals",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty proposals list",
+            "item_error": "every benchmark proposal must be an object",
+            "item_fields": {
+              "proposal_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every benchmark proposal must contain a proposal_id"
+              },
+              "source_task_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every benchmark proposal must contain a source_task_id"
+              },
+              "benchmark_family": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every benchmark proposal must contain a benchmark_family"
+              },
+              "kind": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every benchmark proposal must contain a kind"
+              },
+              "prompt": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every benchmark proposal must contain a prompt"
+              }
+            }
+          }
+        ]
+      },
+      "verifier": {
+        "checks": ["verifier_contracts"],
+        "sections": [
+          {
+            "field": "proposals",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty proposals list",
+            "item_error": "every verifier proposal must be an object",
+            "item_fields": {
+              "proposal_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every verifier proposal must contain a proposal_id"
+              },
+              "source_task_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every verifier proposal must contain a source_task_id"
+              },
+              "benchmark_family": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every verifier proposal must contain a benchmark_family"
+              },
+              "contract": {
+                "kind": "object",
+                "required": true,
+                "error": "every verifier proposal must contain a contract object"
+              }
+            }
+          }
+        ]
+      },
+      "policy": {
+        "checks": ["prompt_proposals"],
+        "sections": [
+          {
+            "field": "proposals",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty proposals list",
+            "item_error": "every prompt proposal must be an object",
+            "item_fields": {
+              "area": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every prompt proposal must contain an area"
+              },
+              "priority": {
+                "kind": "int",
+                "min": 1,
+                "required": true,
+                "error": "every prompt proposal must contain a positive integer priority"
+              },
+              "reason": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every prompt proposal must contain a reason"
+              },
+              "suggestion": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every prompt proposal must contain a suggestion"
+              }
+            }
+          }
+        ]
+      },
+      "curriculum": {
+        "checks": ["curriculum_proposals"],
+        "sections": [
+          {
+            "field": "proposals",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty proposals list",
+            "item_error": "every curriculum proposal must be an object",
+            "item_fields": {
+              "area": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every curriculum proposal must contain an area"
+              },
+              "priority": {
+                "kind": "int",
+                "min": 1,
+                "required": true,
+                "error": "every curriculum proposal must contain a positive integer priority"
+              },
+              "reason": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every curriculum proposal must contain a reason"
+              },
+              "suggestion": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every curriculum proposal must contain a suggestion"
+              }
+            }
+          }
+        ]
+      },
+      "retrieval": {
+        "checks": ["retrieval_overrides"],
+        "sections": [
+          {
+            "field": "overrides",
+            "kind": "object",
+            "required": true,
+            "missing_error": "retrieval artifact must contain an overrides object"
+          },
+          {
+            "field": "proposals",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty proposals list",
+            "item_error": "every retrieval proposal must be an object",
+            "item_fields": {
+              "proposal_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every retrieval proposal must contain a proposal_id"
+              },
+              "area": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every retrieval proposal must contain an area"
+              },
+              "reason": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every retrieval proposal must contain a reason"
+              },
+              "overrides": {
+                "kind": "object",
+                "required": true,
+                "error": "every retrieval proposal must contain an overrides object"
+              }
+            }
+          }
+        ]
+      },
+      "tooling": {
+        "checks": ["candidates", "tool_ids", "tool_candidate_contracts"],
+        "sections": [
+          {
+            "field": "candidates",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty candidates list",
+            "item_error": "every tool candidate must be an object",
+            "item_fields": {
+              "spec_version": {
+                "kind": "enum",
+                "values": ["", "asi_v1"],
+                "error": "every tool candidate spec_version must be asi_v1 when present"
+              },
+              "tool_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a tool_id"
+              },
+              "kind": {
+                "kind": "enum",
+                "values": ["local_shell_procedure"],
+                "required": true,
+                "error": "every tool candidate must use kind local_shell_procedure"
+              },
+              "lifecycle_state": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a lifecycle_state"
+              },
+              "promotion_stage": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a promotion_stage"
+              },
+              "source_task_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a source_task_id"
+              },
+              "benchmark_family": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a benchmark_family"
+              },
+              "quality": {
+                "kind": "number",
+                "required": true,
+                "error": "every tool candidate must contain a numeric quality"
+              },
+              "script_name": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a script_name"
+              },
+              "script_body": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every tool candidate must contain a script_body"
+              },
+              "procedure": {
+                "kind": "object",
+                "required": true,
+                "error": "every tool candidate must contain a procedure object"
+              },
+              "task_contract": {
+                "kind": "object",
+                "required": true,
+                "error": "every tool candidate must contain a task_contract object"
+              },
+              "verifier": {
+                "kind": "object",
+                "required": true,
+                "error": "every tool candidate must contain a verifier object"
+              }
+            }
+          }
+        ]
+      },
+      "skills": {
+        "checks": ["skills", "skill_contracts"],
+        "sections": [
+          {
+            "field": "skills",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty skills list",
+            "item_error": "every skill must be an object",
+            "item_fields": {
+              "skill_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every skill must contain a skill_id"
+              },
+              "source_task_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every skill must contain a source_task_id"
+              },
+              "benchmark_family": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every skill must contain a benchmark_family"
+              },
+              "quality": {
+                "kind": "number",
+                "required": true,
+                "error": "every skill must contain a numeric quality"
+              },
+              "procedure": {
+                "kind": "object",
+                "required": true,
+                "error": "every skill must contain a procedure object"
+              },
+              "task_contract": {
+                "kind": "object",
+                "required": true,
+                "error": "every skill must contain a task_contract object"
+              },
+              "verifier": {
+                "kind": "object",
+                "required": true,
+                "error": "every skill must contain a verifier object"
+              }
+            }
+          }
+        ]
+      },
+      "capabilities": {
+        "checks": ["modules"],
+        "sections": [
+          {
+            "field": "modules",
+            "kind": "list",
+            "required": true,
+            "non_empty": true,
+            "missing_error": "artifact must contain a non-empty modules list",
+            "item_error": "every capability module must be an object",
+            "item_fields": {
+              "module_id": {
+                "kind": "string_nonempty",
+                "required": true,
+                "error": "every capability module must contain a module_id"
+              },
+              "capabilities": {
+                "kind": "list",
+                "required": true,
+                "error": "every capability module must contain a capabilities list"
+              },
+              "settings": {
+                "kind": "object_or_null",
+                "error": "every capability module settings entry must be an object"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "artifact_contracts": {
+      "benchmark": {
+        "artifact_kind": "benchmark_candidate_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "retrieval": {
+        "artifact_kind": "retrieval_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "tolbert_model": {
+        "artifact_kind": "tolbert_model_bundle",
+        "lifecycle_states": ["candidate", "retained", "rejected"]
+      },
+      "qwen_adapter": {
+        "artifact_kind": "qwen_adapter_bundle",
+        "lifecycle_states": ["candidate", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "verifier": {
+        "artifact_kind": "verifier_candidate_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "policy": {
+        "artifact_kind": "prompt_proposal_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "universe": {
+        "artifact_kind": ["universe_contract", "universe_constitution", "operating_envelope"],
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "world_model": {
+        "artifact_kind": "world_model_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "state_estimation": {
+        "artifact_kind": "state_estimation_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "trust": {
+        "artifact_kind": "trust_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "recovery": {
+        "artifact_kind": "recovery_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "delegation": {
+        "artifact_kind": "delegated_runtime_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "operator_policy": {
+        "artifact_kind": "operator_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "transition_model": {
+        "artifact_kind": "transition_model_policy_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "curriculum": {
+        "artifact_kind": "curriculum_proposal_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "capabilities": {
+        "artifact_kind": "capability_module_set",
+        "lifecycle_states": ["proposed", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "tooling": {
+        "artifact_kind": "tool_candidate_set",
+        "lifecycle_states": ["candidate", "replay_verified", "retained", "rejected"]
+      },
+      "skills": {
+        "artifact_kind": "skill_set",
+        "lifecycle_states": ["promoted", "retained", "rejected"],
+        "requires_retention_gate": true
+      },
+      "operators": {
+        "artifact_kind": "operator_class_set",
+        "lifecycle_states": ["promoted", "retained", "rejected"],
+        "requires_retention_gate": true
+      }
+    },
+    "capability_surface_artifact_kinds": {
+      "benchmark": "benchmark_candidate_set",
+      "retrieval": "retrieval_policy_set",
+      "tolbert_model": "tolbert_model_bundle",
+      "qwen_adapter": "qwen_adapter_bundle",
+      "verifier": "verifier_candidate_set",
+      "policy": "prompt_proposal_set",
+      "universe": "universe_contract",
+      "world_model": "world_model_policy_set",
+      "state_estimation": "state_estimation_policy_set",
+      "trust": "trust_policy_set",
+      "recovery": "recovery_policy_set",
+      "delegation": "delegated_runtime_policy_set",
+      "operator_policy": "operator_policy_set",
+      "transition_model": "transition_model_policy_set",
+      "curriculum": "curriculum_proposal_set",
+      "tooling": "tool_candidate_set",
+      "skills": "skill_set",
+      "operators": "operator_class_set",
+      "capabilities": "capability_module_set"
+    },
+    "retention_gate_presets": {
+      "benchmark": {
+        "min_pass_rate_delta_abs": 0.02,
+        "require_family_discrimination": true,
+        "max_false_failure_rate": 0.02,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2
+      },
+      "curriculum": {
+        "min_generated_pass_rate_delta_abs": 0.02,
+        "require_failure_recovery_improvement": true,
+        "max_base_lane_regression": 0.0,
+        "max_regressed_families": 0,
+        "max_generated_regressed_families": 0,
+        "required_confirmation_runs": 2
+      },
+      "verifier": {
+        "min_discrimination_gain": 0.02,
+        "max_false_failure_rate": 0.01,
+        "require_contract_strictness": true,
+        "required_confirmation_runs": 2,
+        "require_candidate_family_eval": true
+      },
+      "policy": {
+        "min_pass_rate_delta_abs": 0.01,
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2
+      },
+      "universe": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_universe_improvement": true,
+        "min_prior_retained_universe_cycles": 2,
+        "min_cross_family_support": 2,
+        "constitution_cooldown_cycles": 2
+      },
+      "world_model": {
+        "min_pass_rate_delta_abs": 0.0,
+        "max_step_regression": 0.0,
+        "max_low_confidence_episode_regression": 0,
+        "min_first_step_success_delta": 0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2
+      },
+      "state_estimation": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_state_estimation_improvement": true,
+        "max_no_state_progress_termination_delta": 0,
+        "max_state_regression_trace_delta": 0,
+        "min_paired_trajectory_non_regression_rate": 0.5,
+        "min_regressive_recovery_rate_delta": 0.0
+      },
+      "trust": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_trust_control_improvement": true
+      },
+      "recovery": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_recovery_control_improvement": true
+      },
+      "delegation": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_delegation_control_improvement": true
+      },
+      "operator_policy": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_operator_policy_improvement": true
+      },
+      "transition_model": {
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "required_confirmation_runs": 2,
+        "require_transition_model_improvement": true
+      },
+      "capabilities": {
+        "require_non_regression": true,
+        "max_step_regression": 0.0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "max_regressed_families": 0,
+        "require_capability_surface_growth": true,
+        "required_confirmation_runs": 2
+      },
+      "retrieval": {
+        "min_pass_rate_delta_abs": 0.02,
+        "require_family_discrimination": true,
+        "max_false_failure_rate": 0.02,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "required_confirmation_runs": 2,
+        "max_regressed_families": 0,
+        "max_step_regression": 0.0
+      },
+      "tolbert_model": {
+        "min_pass_rate_delta_abs": 0.0,
+        "max_step_regression": 0.0,
+        "max_regressed_families": 0,
+        "max_low_confidence_episode_regression": 0,
+        "min_first_step_confidence_delta": 0.0,
+        "min_trusted_retrieval_delta": 0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "require_long_horizon_non_regression": true,
+        "require_long_horizon_novel_command_non_regression": true,
+        "require_long_horizon_world_feedback_non_regression": true,
+        "proposal_gate_by_benchmark_family": {},
+        "required_confirmation_runs": 2
+      },
+      "qwen_adapter": {
+        "min_pass_rate_delta_abs": 0.0,
+        "max_step_regression": 0.0,
+        "max_regressed_families": 0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true,
+        "require_support_runtime_only": true,
+        "require_teacher_generation": true,
+        "require_runtime_target_declared": true,
+        "required_confirmation_runs": 2
+      },
+      "skills": {
+        "require_non_regression": true,
+        "max_step_regression": 0.0,
+        "max_regressed_families": 0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true
+      },
+      "tooling": {
+        "require_replay_verification": true,
+        "require_future_task_gain": true,
+        "require_shared_repo_bundle_coherence": true,
+        "max_step_regression": 0.0,
+        "max_regressed_families": 0,
+        "require_generated_lane_non_regression": true,
+        "require_failure_recovery_non_regression": true,
+        "require_validation_family_non_regression": true,
+        "require_validation_family_generated_non_regression": true,
+        "require_validation_family_novel_command_non_regression": true,
+        "require_validation_family_world_feedback_non_regression": true
+      },
+      "operators": {
+        "min_transfer_pass_rate_delta_abs": 0.05,
+        "require_cross_task_support": true,
+        "min_support": 2
+      }
+    }
+  },
+  "operator_policy": {
+    "control_keys": [
+      "unattended_allowed_benchmark_families",
+      "unattended_allow_git_commands",
+      "unattended_allow_http_requests",
+      "unattended_http_allowed_hosts",
+      "unattended_http_timeout_seconds",
+      "unattended_http_max_body_bytes",
+      "unattended_allow_generated_path_mutations",
+      "unattended_generated_path_prefixes"
+    ],
+    "proposal_areas": [
+      "family_breadth",
+      "git_http_scope",
+      "generated_path_scope"
+    ],
+    "generation_foci": [
+      "balanced",
+      "family_breadth",
+      "git_http_scope",
+      "generated_path_scope"
+    ],
+    "default_families": [
+      "bounded",
+      "micro",
+      "workflow",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox",
+      "tooling",
+      "integration"
+    ],
+    "default_generated_prefixes": [
+      "build",
+      "dist",
+      "generated",
+      "reports",
+      "tmp"
+    ]
+  },
+  "state_estimation": {
+    "proposal_areas": [
+      "transition_normalization",
+      "risk_sensitivity",
+      "recovery_bias"
+    ],
+    "generation_foci": [
+      "balanced",
+      "transition_normalization",
+      "risk_sensitivity",
+      "recovery_bias"
+    ],
+    "transition_control_keys": [
+      "no_progress_progress_epsilon",
+      "min_state_change_score_for_progress",
+      "regression_path_budget",
+      "regression_severity_weight",
+      "progress_recovery_credit"
+    ],
+    "latent_control_keys": [
+      "advancing_completion_ratio",
+      "advancing_progress_delta",
+      "improving_progress_delta",
+      "regressing_progress_delta",
+      "regressive_regression_count",
+      "blocked_forbidden_count",
+      "active_path_budget",
+      "learned_world_progress_threshold",
+      "learned_world_risk_threshold",
+      "learned_world_blend_weight"
+    ],
+    "policy_control_keys": [
+      "regressive_path_match_bonus",
+      "regressive_cleanup_bonus",
+      "blocked_command_bonus",
+      "advancing_path_match_bonus",
+      "trusted_retrieval_path_bonus",
+      "learned_world_progress_bonus",
+      "learned_world_risk_penalty"
+    ]
+  },
+  "task_budget": {
+    "frontier_family_step_floors": {
+      "workflow": 8,
+      "project": 12,
+      "repository": 14,
+      "tooling": 14,
+      "integration": 16,
+      "repo_chore": 12,
+      "repo_sandbox": 20,
+      "validation": 12
+    },
+    "difficulty_step_floors": {
+      "retrieval": 8,
+      "environment": 8,
+      "cross_tool": 10,
+      "cross_component": 12,
+      "multi_system": 14,
+      "delegated_review": 10,
+      "git_worker_branch": 10,
+      "git_parallel_merge": 14,
+      "git_conflict_resolution": 16,
+      "git_workflow": 12,
+      "git_test_repair": 12,
+      "long_horizon": 12
+    },
+    "derived_families": [
+      "benchmark_candidate",
+      "discovered_task",
+      "episode_memory",
+      "operator_memory",
+      "skill_memory",
+      "skill_transfer",
+      "tool_memory",
+      "transition_pressure",
+      "verifier_candidate",
+      "verifier_memory"
+    ]
+  },
+  "transition_model": {
+    "control_keys": [
+      "repeat_command_penalty",
+      "regressed_path_command_penalty",
+      "recovery_command_bonus",
+      "progress_command_bonus",
+      "long_horizon_repeat_command_penalty",
+      "long_horizon_progress_command_bonus",
+      "max_signatures"
+    ],
+    "proposal_areas": [
+      "repeat_avoidance",
+      "regression_guard",
+      "recovery_bias",
+      "long_horizon_alignment"
+    ],
+    "generation_foci": [
+      "balanced",
+      "repeat_avoidance",
+      "regression_guard",
+      "recovery_bias"
+    ],
+    "signals": [
+      "no_state_progress",
+      "state_regression"
+    ],
+    "path_like_suffixes": [
+      ".cfg",
+      ".csv",
+      ".env",
+      ".http",
+      ".ini",
+      ".json",
+      ".md",
+      ".py",
+      ".sh",
+      ".sql",
+      ".toml",
+      ".txt",
+      ".yaml",
+      ".yml"
+    ],
+    "path_target_commands": [
+      "cat",
+      "mkdir",
+      "mv",
+      "rm",
+      "touch",
+      "unlink"
+    ]
+  },
+  "universe": {
+    "proposal_areas": [
+      "governance",
+      "verification",
+      "operator_scope",
+      "environment_envelope"
+    ],
+    "generation_foci": [
+      "balanced",
+      "governance",
+      "verification",
+      "operator_scope",
+      "environment_envelope"
+    ],
+    "governance_keys": [
+      "require_verification",
+      "require_bounded_steps",
+      "prefer_reversible_actions",
+      "respect_task_forbidden_artifacts",
+      "respect_preserved_artifacts"
+    ],
+    "action_risk_control_keys": [
+      "destructive_mutation_penalty",
+      "git_mutation_penalty",
+      "inline_destructive_interpreter_penalty",
+      "network_fetch_penalty",
+      "privileged_command_penalty",
+      "read_only_discovery_bonus",
+      "remote_execution_penalty",
+      "reversible_file_operation_bonus",
+      "scope_escape_penalty",
+      "unbounded_execution_penalty",
+      "verification_bonus"
+    ],
+    "environment_assumption_enum_fields": {
+      "git_write_mode": [
+        "blocked",
+        "operator_gated",
+        "task_scoped"
+      ],
+      "network_access_mode": [
+        "blocked",
+        "allowlist_only",
+        "open"
+      ],
+      "workspace_write_scope": [
+        "task_only",
+        "generated_only",
+        "shared_repo_gated"
+      ]
+    },
+    "environment_assumption_bool_fields": [
+      "require_path_scoped_mutations",
+      "require_rollback_on_mutation"
+    ],
+    "default_invariants": [
+      "preserve verifier contract alignment",
+      "prefer measurable reversible progress",
+      "avoid destructive workspace resets",
+      "keep autonomous actions inside bounded runtime policy"
+    ],
+    "default_forbidden_patterns": [
+      "rm -rf /",
+      "git reset --hard",
+      "git checkout --",
+      "curl -s",
+      "curl -fsSL",
+      "wget -qO-",
+      "sudo "
+    ],
+    "default_preferred_prefixes": [
+      "rg ",
+      "sed -n ",
+      "cat ",
+      "ls ",
+      "test ",
+      "pytest",
+      "python -m pytest",
+      "git diff",
+      "git status"
+    ],
+    "default_action_risk_controls": {
+      "destructive_mutation_penalty": 12,
+      "git_mutation_penalty": 6,
+      "inline_destructive_interpreter_penalty": 8,
+      "network_fetch_penalty": 4,
+      "privileged_command_penalty": 10,
+      "read_only_discovery_bonus": 3,
+      "remote_execution_penalty": 8,
+      "reversible_file_operation_bonus": 2,
+      "scope_escape_penalty": 9,
+      "unbounded_execution_penalty": 7,
+      "verification_bonus": 4
+    },
+    "default_environment_assumptions": {
+      "git_write_mode": "operator_gated",
+      "network_access_mode": "blocked",
+      "workspace_write_scope": "task_only",
+      "require_path_scoped_mutations": true,
+      "require_rollback_on_mutation": true
+    },
+    "constitution_proposal_areas": [
+      "governance",
+      "verification",
+      "operator_scope"
+    ],
+    "operating_envelope_proposal_areas": [
+      "environment_envelope",
+      "operator_scope"
+    ],
+    "bundle_filenames": {
+      "universe": "universe_contract.json",
+      "universe_constitution": "universe_constitution.json",
+      "operating_envelope": "operating_envelope.json"
+    }
+  }
+}

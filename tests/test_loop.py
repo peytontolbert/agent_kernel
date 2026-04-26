@@ -3040,6 +3040,55 @@ def test_universe_model_allows_shared_repo_gated_task_scoped_git_merge(tmp_path)
     assert destructive["block_reason"] == "forbidden_pattern"
 
 
+def test_universe_model_allows_task_scoped_git_review_when_git_is_operator_allowed(tmp_path):
+    artifact_path = tmp_path / "universe" / "universe_contract.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "universe_contract",
+                "spec_version": "asi_v1",
+                "lifecycle_state": "retained",
+                "retention_decision": {"state": "retain"},
+                "governance": {
+                    "require_verification": True,
+                    "require_bounded_steps": True,
+                    "prefer_reversible_actions": True,
+                    "respect_task_forbidden_artifacts": True,
+                    "respect_preserved_artifacts": True,
+                },
+                "environment_assumptions": {
+                    "git_write_mode": "operator_gated",
+                    "network_access_mode": "allowlist_only",
+                    "workspace_write_scope": "task_only",
+                    "require_path_scoped_mutations": True,
+                    "require_rollback_on_mutation": True,
+                },
+                "forbidden_command_patterns": ["git reset --hard"],
+                "preferred_command_prefixes": ["pytest"],
+                "proposals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = UniverseModel(
+        config=KernelConfig(
+            universe_contract_path=artifact_path,
+            unattended_allow_git_commands=True,
+        )
+    )
+    task = TaskBank().get("git_repo_status_review_task")
+    summary = model.summarize(task, world_model_summary={})
+
+    review = model.should_block_command(summary, task.suggested_commands[0])
+    destructive = model.should_block_command(summary, "git reset --hard HEAD")
+
+    assert review["blocked"] is False
+    assert "git_write_conflict" not in review["risk_flags"]
+    assert destructive["blocked"] is True
+    assert destructive["block_reason"] == "forbidden_pattern"
+
+
 def test_universe_model_loads_split_constitution_and_operating_envelope(tmp_path):
     constitution_path = tmp_path / "universe" / "universe_constitution.json"
     envelope_path = tmp_path / "universe" / "operating_envelope.json"
@@ -3232,6 +3281,39 @@ def test_kernel_solves_parallel_merge_task_when_git_policy_enabled(tmp_path):
     assert (workspace / "reports" / "merge_report.txt").exists()
     assert (workspace / "reports" / "test_report.txt").read_text(encoding="utf-8") == (
         "api suite passed; docs suite passed\n"
+    )
+
+
+def test_kernel_solves_project_parallel_release_task_when_git_policy_enabled(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        unattended_allow_git_commands=True,
+    )
+
+    bank = TaskBank()
+    workers = bank.parallel_worker_tasks("project_parallel_release_task")
+    kernel = AgentKernel(config=config)
+    try:
+        worker_episodes = [kernel.run_task(worker) for worker in workers]
+        episode = kernel.run_task(bank.get("project_parallel_release_task"))
+    finally:
+        kernel.close()
+
+    assert all(worker.success for worker in worker_episodes)
+    assert episode.success is True
+    workspace = (
+        config.workspace_root
+        / "_shared_repo_runtime"
+        / "project_parallel_release"
+        / "clones"
+        / "main"
+    )
+    assert (workspace / "reports" / "merge_report.txt").exists()
+    assert (workspace / "reports" / "test_report.txt").read_text(encoding="utf-8") == (
+        "api suite passed; ops suite passed\n"
     )
 
 

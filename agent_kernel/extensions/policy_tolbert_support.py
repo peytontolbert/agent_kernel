@@ -701,6 +701,10 @@ def tolbert_ranked_candidates(
         normalized = _canonicalize_command(command)
         if not normalized or normalized in seen or normalized in blocked:
             continue
+        if policy.workflow_adapter.trusted_retrieval_direct_requires_task_path_match(
+            state
+        ) and not policy.workflow_adapter.command_mentions_current_task_paths(state, command):
+            continue
         seen.add(normalized)
         candidates.append(
             {

@@ -1,0 +1,155 @@
+{
+  "evidence_kind": "a5_live_vllm_remaining_required_families_continuation_check",
+  "created_at": "2026-04-25T15:08:37Z",
+  "status": "passed",
+  "root": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425",
+  "provider": "vllm",
+  "model": "Qwen/Qwen3.5-9B",
+  "runtime": {
+    "workspace_root": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/workspace",
+    "queue_path": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/queue/queue.json",
+    "runtime_state_path": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/queue/runtime_state.json",
+    "reports_dir": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports",
+    "episodes_root": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/episodes",
+    "database_path": "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/runtime.sqlite3"
+  },
+  "families": ["project", "repository", "repo_sandbox"],
+  "jobs": [
+    {
+      "task_id": "project_parallel_release_task__worker__worker_api-plan",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "project_parallel_release_task__worker__worker_ops-cutover",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repository_parallel_audit_task__worker__worker_service-status",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repository_parallel_audit_task__worker__worker_audit-docs",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "git_parallel_worker_api_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "git_parallel_worker_docs_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_worker_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "project_parallel_release_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_integrator_segment_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repository_parallel_audit_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_integrator_segment_direct"],
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "git_parallel_merge_acceptance_task",
+      "state": "completed",
+      "outcome": "success",
+      "decision_sources": ["shared_repo_integrator_segment_direct"],
+      "hidden_side_effect_risk": false
+    }
+  ],
+  "control_cycle_shape": {
+    "enqueue_calls": 3,
+    "drain_invocations": 9,
+    "drain_limit": 1,
+    "runtime_history_events": 27,
+    "lease_acquisitions": 9,
+    "lease_releases": 9,
+    "final_active_leases": 0
+  },
+  "trust_status": {
+    "overall_status": "trusted",
+    "reports": 9,
+    "success_rate": 1.0,
+    "unsafe_ambiguous_rate": 0.0,
+    "hidden_side_effect_risk_rate": 0.0,
+    "blocked_jobs": 0,
+    "promotable_jobs_before_promotion": 3,
+    "promotable_jobs_after_promotion": 0
+  },
+  "acceptance_promotion": {
+    "promoted_jobs": [
+      {
+        "task_id": "project_parallel_release_task",
+        "job_id": "job:project_parallel_release_task:20260425T145922905970Z:d7906623",
+        "promoted_at": "2026-04-25T15:07:27.572330+00:00",
+        "detail": "a5-live-vllm-remaining-required-families-r6"
+      },
+      {
+        "task_id": "repository_parallel_audit_task",
+        "job_id": "job:repository_parallel_audit_task:20260425T145951175149Z:e9b9aa45",
+        "promoted_at": "2026-04-25T15:07:46.492604+00:00",
+        "detail": "a5-live-vllm-remaining-required-families-r6"
+      },
+      {
+        "task_id": "git_parallel_merge_acceptance_task",
+        "job_id": "job:git_parallel_merge_acceptance_task:20260425T150011772304Z:9ac90ee6",
+        "promoted_at": "2026-04-25T15:08:13.975383+00:00",
+        "detail": "a5-live-vllm-remaining-required-families-r6"
+      }
+    ],
+    "acceptance_verifier_passed": 3,
+    "remaining_promotable_jobs_after_promotion": 0
+  },
+  "combined_required_family_status": {
+    "paired_with": "/data/agentkernel/docs/evidence/a5_live_vllm_repeated_control_cycle_continuation_check_20260425.json",
+    "required_families_covered_across_r5_r6": [
+      "integration",
+      "repo_chore",
+      "project",
+      "repository",
+      "repo_sandbox"
+    ],
+    "parent_promotions_across_r5_r6": 5,
+    "clean_jobs_across_r5_r6": 15,
+    "total_drain_invocations_across_r5_r6": 15,
+    "final_hidden_side_effect_risk_rate_in_each_proof": 0.0
+  },
+  "verification": [
+    "pytest -q tests/test_policy.py::test_llm_policy_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_explicit_shared_repo_worker_uses_contract_command_before_context_compile tests/test_policy.py::test_llm_policy_shared_repo_integrator_skips_context_compile_for_first_merge_segment",
+    "python -m py_compile agent_kernel/extensions/policy_workflow_adapter.py tests/test_policy.py"
+  ],
+  "reports": [
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_git_parallel_merge_acceptance_task_20260425T150011772304Z_9ac90ee6.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_git_parallel_worker_api_task_20260425T150011736978Z_c904a547.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_git_parallel_worker_docs_task_20260425T150011749590Z_feeef730.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_project_parallel_release_task_20260425T145922905970Z_d7906623.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_project_parallel_release_task__worker__worker_api-plan_20260425T145922893174Z_77a13f44.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_project_parallel_release_task__worker__worker_ops-cutover_20260425T145922899923Z_55de0bdf.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_repository_parallel_audit_task_20260425T145951175149Z_e9b9aa45.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_repository_parallel_audit_task__worker__worker_audit-docs_20260425T145951157408Z_26754a6e.json",
+    "/tmp/agentkernel_a5_live_vllm_remaining_required_families_r6_20260425/reports/job_report_job_repository_parallel_audit_task__worker__worker_service-status_20260425T145951140021Z_e216893e.json"
+  ],
+  "interpretation": "This closes the remaining required-family repeated-control proof when paired with the r5 integration/repo_chore packet: project, repository, and repo_sandbox all completed clean worker-plus-integrator objectives across separate queue drain invocations, with trusted final status, accepted parent promotions, and zero hidden side-effect risk."
+}

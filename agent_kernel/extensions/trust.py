@@ -417,6 +417,13 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
     supervision_modes: dict[str, int] = {}
     repo_semantic_cluster_counts: dict[str, int] = {}
     external_report_count = 0
+    held_out_frontier_report_count = 0
+    held_out_frontier_success_count = 0
+    held_out_frontier_clean_success_count = 0
+    held_out_frontier_benchmark_families: set[str] = set()
+    held_out_frontier_task_roots: set[str] = set()
+    held_out_frontier_clean_success_task_roots: set[str] = set()
+    frontier_slice_counts: dict[str, int] = {}
 
     for report in reports:
         family = _benchmark_family(report)
@@ -461,6 +468,15 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
         if task_origin == "external_manifest":
             external_report_count += 1
             external_benchmark_families.add(family)
+        held_out_frontier = _bool_value(report, ("task_metadata", "held_out_frontier_task"))
+        if held_out_frontier:
+            held_out_frontier_report_count += 1
+            held_out_frontier_benchmark_families.add(family)
+            if task_root:
+                held_out_frontier_task_roots.add(task_root)
+            frontier_slice = _frontier_slice(report)
+            if frontier_slice:
+                frontier_slice_counts[frontier_slice] = frontier_slice_counts.get(frontier_slice, 0) + 1
         outcome = str(report.get("outcome", "unknown")).strip() or "unknown"
         if outcome not in outcome_counts:
             outcome = "unknown"
@@ -482,6 +498,8 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
         if success and task_root:
             success_task_roots.add(task_root)
             task_yield_bucket["success_count"] = int(task_yield_bucket.get("success_count", 0) or 0) + 1
+            if held_out_frontier:
+                held_out_frontier_success_count += 1
             if failure_recovery_report:
                 failure_recovery_success_count += 1
         if _bool_value(report, ("supervision", "independent_execution")):
@@ -508,6 +526,10 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
                 if failure_recovery_report:
                     failure_recovery_clean_success_task_roots.add(task_root)
             task_yield_bucket["clean_success_count"] = int(task_yield_bucket.get("clean_success_count", 0) or 0) + 1
+            if held_out_frontier:
+                held_out_frontier_clean_success_count += 1
+                if task_root:
+                    held_out_frontier_clean_success_task_roots.add(task_root)
             if failure_recovery_report:
                 failure_recovery_clean_success_count += 1
         if rollback_performed:
@@ -562,6 +584,28 @@ def summarize_unattended_reports(reports: list[dict[str, Any]]) -> dict[str, Any
         "external_report_count": external_report_count,
         "distinct_external_benchmark_families": len(external_benchmark_families),
         "external_benchmark_families": sorted(external_benchmark_families),
+        "held_out_frontier_report_count": held_out_frontier_report_count,
+        "held_out_frontier_success_count": held_out_frontier_success_count,
+        "held_out_frontier_clean_success_count": held_out_frontier_clean_success_count,
+        "held_out_frontier_success_rate": _ratio(
+            held_out_frontier_success_count,
+            held_out_frontier_report_count,
+        ),
+        "held_out_frontier_clean_success_rate": _ratio(
+            held_out_frontier_clean_success_count,
+            held_out_frontier_report_count,
+        ),
+        "distinct_held_out_frontier_benchmark_families": len(held_out_frontier_benchmark_families),
+        "held_out_frontier_benchmark_families": sorted(held_out_frontier_benchmark_families),
+        "distinct_held_out_frontier_task_roots": len(held_out_frontier_task_roots),
+        "held_out_frontier_task_roots": sorted(held_out_frontier_task_roots),
+        "distinct_held_out_frontier_clean_success_task_roots": len(
+            held_out_frontier_clean_success_task_roots
+        ),
+        "held_out_frontier_clean_success_task_roots": sorted(
+            held_out_frontier_clean_success_task_roots
+        ),
+        "frontier_slice_counts": dict(sorted(frontier_slice_counts.items())),
         "distinct_repo_semantic_clusters": len(repo_semantic_cluster_counts),
         "repo_semantic_clusters": sorted(repo_semantic_cluster_counts),
         "repo_semantic_cluster_counts": dict(sorted(repo_semantic_cluster_counts.items())),
@@ -853,6 +897,19 @@ def build_unattended_trust_ledger(
         overall_summary.get("distinct_repo_semantic_clusters", 0) or 0
     )
     coverage_summary["repo_semantic_cluster_counts"] = dict(overall_summary.get("repo_semantic_cluster_counts", {}))
+    coverage_summary["held_out_frontier_report_count"] = int(
+        overall_summary.get("held_out_frontier_report_count", 0) or 0
+    )
+    coverage_summary["held_out_frontier_success_count"] = int(
+        overall_summary.get("held_out_frontier_success_count", 0) or 0
+    )
+    coverage_summary["held_out_frontier_clean_success_count"] = int(
+        overall_summary.get("held_out_frontier_clean_success_count", 0) or 0
+    )
+    coverage_summary["held_out_frontier_benchmark_families"] = list(
+        overall_summary.get("held_out_frontier_benchmark_families", [])
+    )
+    coverage_summary["frontier_slice_counts"] = dict(overall_summary.get("frontier_slice_counts", {}))
     coverage_summary["task_yield_bucket_summary"] = (
         dict(overall_summary.get("task_yield_bucket_summary", {}))
         if isinstance(overall_summary.get("task_yield_bucket_summary", {}), dict)
@@ -1182,6 +1239,13 @@ def _task_origin(payload: dict[str, Any]) -> str:
             if origin:
                 return origin
     return "built_in"
+
+
+def _frontier_slice(payload: dict[str, Any]) -> str:
+    task_metadata = payload.get("task_metadata", {})
+    if isinstance(task_metadata, dict):
+        return str(task_metadata.get("frontier_slice", "")).strip()
+    return ""
 
 
 def _task_yield_bucket(task_origin: str) -> str:

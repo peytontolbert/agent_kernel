@@ -111,6 +111,7 @@ def materialize_retained_retrieval_asset_bundle(
         "checkpoint_path": _optional_existing_path(runtime_config.tolbert_checkpoint_path, repo_root=repo_root),
         "cache_paths": _existing_paths(runtime_config.tolbert_cache_paths, repo_root=repo_root),
     }
+    runtime_paths = _checkpoint_aligned_runtime_paths(runtime_paths, repo_root=repo_root)
     manifest = {
         "spec_version": "asi_v1",
         "artifact_kind": "tolbert_retrieval_asset_bundle",
@@ -154,6 +155,7 @@ def retained_tolbert_runtime_paths(
         runtime_paths = bundle.get("runtime_paths", {})
     if not isinstance(runtime_paths, dict):
         runtime_paths = {}
+    runtime_paths = _checkpoint_aligned_runtime_paths(runtime_paths, repo_root=repo_root)
     source_spans_paths = runtime_paths.get("source_spans_paths", config.tolbert_source_spans_paths)
     cache_paths = runtime_paths.get("cache_paths", config.tolbert_cache_paths)
     checkpoint_path = ""
@@ -173,6 +175,44 @@ def retained_tolbert_runtime_paths(
         "tolbert_source_spans_paths": _string_list_or_default(source_spans_paths, config.tolbert_source_spans_paths),
         "tolbert_cache_paths": _string_list_or_default(cache_paths, config.tolbert_cache_paths),
     }
+
+
+def _checkpoint_aligned_runtime_paths(
+    runtime_paths: dict[str, Any],
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    checkpoint_value = _optional_existing_path(
+        _string_or_default(runtime_paths.get("checkpoint_path"), None),
+        repo_root=repo_root,
+    )
+    if not checkpoint_value:
+        return dict(runtime_paths)
+    runtime_root = _checkpoint_runtime_root(Path(checkpoint_value))
+    candidate_config_path = runtime_root / "config_agentkernel.json"
+    candidate_nodes_path = runtime_root / "nodes_agentkernel.jsonl"
+    candidate_label_map_path = runtime_root / "label_map_agentkernel.json"
+    candidate_source_spans_path = runtime_root / "source_spans_agentkernel.jsonl"
+    if not (
+        candidate_config_path.exists()
+        and candidate_nodes_path.exists()
+        and candidate_label_map_path.exists()
+        and candidate_source_spans_path.exists()
+    ):
+        return dict(runtime_paths)
+    return {
+        **runtime_paths,
+        "config_path": str(candidate_config_path),
+        "nodes_path": str(candidate_nodes_path),
+        "label_map_path": str(candidate_label_map_path),
+        "source_spans_paths": [str(candidate_source_spans_path)],
+    }
+
+
+def _checkpoint_runtime_root(checkpoint_path: Path) -> Path:
+    if checkpoint_path.parent.name == "checkpoints":
+        return checkpoint_path.parent.parent
+    return checkpoint_path.parent
 
 
 def _retained_tolbert_model_artifact(

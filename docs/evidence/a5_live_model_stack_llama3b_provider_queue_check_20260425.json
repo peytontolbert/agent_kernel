@@ -1,0 +1,107 @@
+{
+  "evidence_id": "a5_live_model_stack_llama3b_provider_queue_check_20260425",
+  "created_at": "2026-04-25T06:09:00Z",
+  "claim": "Agent Kernel can connect to a live local model_stack server backed by real local LLaMA-family weights and complete a delegated queue job with provider=model_stack.",
+  "provider": {
+    "name": "model_stack",
+    "host": "http://127.0.0.1:8001",
+    "model": "meta-llama/Llama-3.2-3B",
+    "hf_snapshot_dir": "/data/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062",
+    "repo_path": "/data/agentkernel/other_repos/model-stack",
+    "tokenizer_path": "/data/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062"
+  },
+  "server": {
+    "started_with": "CUDA_VISIBLE_DEVICES=1 MODEL_DIR=/tmp/model_stack_hf_llama_runtime MODEL_STACK_HF_LLAMA_SNAPSHOT_DIR=/data/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062 MODEL_STACK_HF_LLAMA_DTYPE=bfloat16 MODEL_STACK_HF_LLAMA_DEVICE_MAP=auto PYTHONPATH=/data/agentkernel/other_repos/model-stack /home/peyton/miniconda3/envs/ai/bin/python -m uvicorn serve.api:app --host 127.0.0.1 --port 8001",
+    "runtime_patch": [
+      "serve/runtime.py now supports MODEL_STACK_HF_LLAMA_SNAPSHOT_DIR / HF_LLAMA_SNAPSHOT_DIR for direct HF LLaMA snapshot loading through build_local_llama_from_snapshot.",
+      "runtime/checkpoint.py now chooses the target device before HF weight assignment to avoid CPU full-model load pressure on this machine.",
+      "specs/config.py and runtime/checkpoint.py now preserve n_kv_heads from HF LLaMA configs so GQA cache allocation matches attention output."
+    ],
+    "healthz": {
+      "status": "ok",
+      "device": "cuda:0",
+      "dtype": "torch.bfloat16",
+      "kv_cache_backend": "paged",
+      "cuda_visible_devices": "1"
+    },
+    "generate_probe": {
+      "request": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ]
+        ],
+        "max_new_tokens": 4,
+        "do_sample": false,
+        "temperature": 0.0
+      },
+      "response": {
+        "output_ids": [
+          [
+            1,
+            2,
+            3,
+            2,
+            702,
+            262,
+            674
+          ]
+        ]
+      }
+    },
+    "gpu_process": {
+      "server_pid": 3486584,
+      "reported_gpu_memory_mib": 7406
+    }
+  },
+  "queue_root": "/tmp/agentkernel_a5_model_stack_llama3b_queue_r2_20260425",
+  "job": {
+    "task_id": "git_repo_status_review_task",
+    "job_id": "job:git_repo_status_review_task:20260425T060841015532Z:713f4abb",
+    "state": "completed",
+    "outcome": "success",
+    "outcome_reasons": [
+      "verification_passed"
+    ],
+    "provider": "model_stack",
+    "model": "meta-llama/Llama-3.2-3B",
+    "attempt_count": 1,
+    "last_error": "",
+    "report_path": "/tmp/agentkernel_a5_model_stack_llama3b_queue_r2_20260425/reports/job_report_job_git_repo_status_review_task_20260425T060841015532Z_713f4abb.json"
+  },
+  "report": {
+    "termination_reason": "success",
+    "command_steps": 1,
+    "zero_exit_steps": 1,
+    "verified_steps": 1,
+    "last_decision_source": "git_repo_review_direct",
+    "supervision_mode": "unattended",
+    "independent_execution": true,
+    "preflight_passed": true,
+    "hidden_side_effect_risk": false,
+    "light_supervision_candidate": true,
+    "light_supervision_success": true,
+    "light_supervision_clean_success": true
+  },
+  "queue_final": {
+    "total_jobs": 1,
+    "completed_jobs": 1,
+    "promotable_jobs": 1,
+    "active_leases": 0
+  },
+  "related_same_weight_qwen_status": {
+    "live_vllm_model": "Qwen/Qwen3.5-9B",
+    "local_qwen_snapshot_dir": "/home/peyton/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "model_stack_qwen_importer": "not present in checked model-stack import surface",
+    "blocker": "Same-weight Qwen model-stack inference remains open until model-stack has a Qwen3.5 config and weight mapper."
+  },
+  "limitations": [
+    "This is a real local-weight model_stack proof, but the served model is LLaMA 3.2 3B, not the Qwen/Qwen3.5-9B weights currently served by vLLM.",
+    "The delegated queue task used the deterministic git_repo_review_direct command path, not a model_stack-generated JSON decision.",
+    "A LLaMA 3.1 8B server attempt was killed during first load on this 31 GiB RAM host; LLaMA 3.2 3B is the viable local proof target for now.",
+    "The default system Python still has a broken namespace-only torch install; model-stack tests and serving used /home/peyton/miniconda3/envs/ai/bin/python."
+  ],
+  "a5_interpretation": "This upgrades the model_stack provider proof from tiny-random runtime wiring to live token generation from real local LLaMA-family weights plus a successful Agent Kernel delegated queue job. It strengthens provider independence for the A4->A5 lane, while same-weight Qwen and model_stack-generated JSON decision quality remain separate open proof targets."
+}

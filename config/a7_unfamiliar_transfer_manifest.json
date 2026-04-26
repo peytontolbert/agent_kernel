@@ -1,0 +1,158 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 1,
+  "purpose": "Held-out coding-domain transfer tasks for testing A6-to-A7 progress without changing core architecture per domain.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true
+  },
+  "tasks": [
+    {
+      "task_id": "a7_unfamiliar_airgapped_release_gate_task",
+      "prompt": "You are in an unfamiliar airgapped release workspace. Build a release readiness packet from the local files only: create release/packet.json and release/checklist.md. The JSON must record service=ledger, version=2026.04, airgapped=true, and checks=[\"manifest\",\"rollback\",\"operator_note\"].",
+      "workspace_subdir": "a7_unfamiliar_airgapped_release_gate_task",
+      "suggested_commands": [
+        "mkdir -p release && printf '{\"service\":\"ledger\",\"version\":\"2026.04\",\"airgapped\":true,\"checks\":[\"manifest\",\"rollback\",\"operator_note\"]}\\n' > release/packet.json && printf '# Release Checklist\\n- manifest\\n- rollback\\n- operator_note\\n' > release/checklist.md"
+      ],
+      "success_command": "test -f release/packet.json && test -f release/checklist.md && grep -q '\"airgapped\":true' release/packet.json && grep -q 'operator_note' release/checklist.md",
+      "expected_files": [
+        "release/packet.json",
+        "release/checklist.md"
+      ],
+      "expected_file_contents": {
+        "release/packet.json": "{\"service\":\"ledger\",\"version\":\"2026.04\",\"airgapped\":true,\"checks\":[\"manifest\",\"rollback\",\"operator_note\"]}\n",
+        "release/checklist.md": "# Release Checklist\n- manifest\n- rollback\n- operator_note\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "environment_novelty",
+        "novelty_axes": [
+          "airgapped_release",
+          "multi_artifact_acceptance"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_unfamiliar_monorepo_adapter_contract_task",
+      "prompt": "In an unfamiliar monorepo adapter layout, create an adapter contract and a verifier note. Write adapters/payments/contract.yaml and validation/payments_adapter.md. The contract must name adapter=payments, protocol=event-v2, input=ledger.entry, output=settlement.request.",
+      "workspace_subdir": "a7_unfamiliar_monorepo_adapter_contract_task",
+      "suggested_commands": [
+        "mkdir -p adapters/payments validation && printf 'adapter: payments\\nprotocol: event-v2\\ninput: ledger.entry\\noutput: settlement.request\\n' > adapters/payments/contract.yaml && printf '# Payments Adapter Validation\\nprotocol event-v2 maps ledger.entry to settlement.request\\n' > validation/payments_adapter.md"
+      ],
+      "success_command": "test -f adapters/payments/contract.yaml && test -f validation/payments_adapter.md && grep -q 'protocol: event-v2' adapters/payments/contract.yaml && grep -q 'settlement.request' validation/payments_adapter.md",
+      "expected_files": [
+        "adapters/payments/contract.yaml",
+        "validation/payments_adapter.md"
+      ],
+      "expected_file_contents": {
+        "adapters/payments/contract.yaml": "adapter: payments\nprotocol: event-v2\ninput: ledger.entry\noutput: settlement.request\n",
+        "validation/payments_adapter.md": "# Payments Adapter Validation\nprotocol event-v2 maps ledger.entry to settlement.request\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "repo_topology_novelty",
+        "novelty_axes": [
+          "adapter_contract",
+          "monorepo_topology"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_unfamiliar_incident_replay_handoff_task",
+      "prompt": "In an unfamiliar incident-replay workflow, create ops/replay_plan.json and handoff/recovery.md. The JSON must include incident_id=INC-2048, replay_window=15m, owner=runtime, and safe_mode=true.",
+      "workspace_subdir": "a7_unfamiliar_incident_replay_handoff_task",
+      "suggested_commands": [
+        "mkdir -p ops handoff && printf '{\"incident_id\":\"INC-2048\",\"replay_window\":\"15m\",\"owner\":\"runtime\",\"safe_mode\":true}\\n' > ops/replay_plan.json && printf '# Recovery Handoff\\nINC-2048 replay runs in safe_mode for 15m under runtime ownership.\\n' > handoff/recovery.md"
+      ],
+      "success_command": "test -f ops/replay_plan.json && test -f handoff/recovery.md && grep -q '\"safe_mode\":true' ops/replay_plan.json && grep -q 'runtime ownership' handoff/recovery.md",
+      "expected_files": [
+        "ops/replay_plan.json",
+        "handoff/recovery.md"
+      ],
+      "expected_file_contents": {
+        "ops/replay_plan.json": "{\"incident_id\":\"INC-2048\",\"replay_window\":\"15m\",\"owner\":\"runtime\",\"safe_mode\":true}\n",
+        "handoff/recovery.md": "# Recovery Handoff\nINC-2048 replay runs in safe_mode for 15m under runtime ownership.\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "workflow_novelty",
+        "novelty_axes": [
+          "incident_replay",
+          "handoff_contract"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_unfamiliar_sandbox_branch_repair_task",
+      "prompt": "In an unfamiliar repo-sandbox repair workspace, create sandbox/repair_plan.md and sandbox/merge_guard.json. The guard must include branch=repair/a7-sandbox, required_checks=[\"unit\",\"lint\",\"contract\"], and merge_allowed=false.",
+      "workspace_subdir": "a7_unfamiliar_sandbox_branch_repair_task",
+      "suggested_commands": [
+        "mkdir -p sandbox && printf '# Sandbox Repair Plan\\n- branch repair/a7-sandbox\\n- run unit, lint, and contract before merge\\n' > sandbox/repair_plan.md && printf '{\"branch\":\"repair/a7-sandbox\",\"required_checks\":[\"unit\",\"lint\",\"contract\"],\"merge_allowed\":false}\\n' > sandbox/merge_guard.json"
+      ],
+      "success_command": "test -f sandbox/repair_plan.md && test -f sandbox/merge_guard.json && grep -q '\"merge_allowed\":false' sandbox/merge_guard.json && grep -q 'contract before merge' sandbox/repair_plan.md",
+      "expected_files": [
+        "sandbox/repair_plan.md",
+        "sandbox/merge_guard.json"
+      ],
+      "expected_file_contents": {
+        "sandbox/repair_plan.md": "# Sandbox Repair Plan\n- branch repair/a7-sandbox\n- run unit, lint, and contract before merge\n",
+        "sandbox/merge_guard.json": "{\"branch\":\"repair/a7-sandbox\",\"required_checks\":[\"unit\",\"lint\",\"contract\"],\"merge_allowed\":false}\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "repo_sandbox_novelty",
+        "novelty_axes": [
+          "branch_repair",
+          "merge_guard"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_unfamiliar_cleanup_retention_policy_task",
+      "prompt": "In an unfamiliar cleanup-retention workspace, create upkeep/retention_policy.toml and upkeep/audit.md. The policy must set max_age_days=30, preserve=[\"reports\",\"checkpoints\"], and delete=[\"tmp\",\"cache\"].",
+      "workspace_subdir": "a7_unfamiliar_cleanup_retention_policy_task",
+      "suggested_commands": [
+        "mkdir -p upkeep && printf 'max_age_days = 30\\npreserve = [\"reports\", \"checkpoints\"]\\ndelete = [\"tmp\", \"cache\"]\\n' > upkeep/retention_policy.toml && printf '# Cleanup Audit\\nPreserve reports and checkpoints; delete tmp and cache after 30 days.\\n' > upkeep/audit.md"
+      ],
+      "success_command": "test -f upkeep/retention_policy.toml && test -f upkeep/audit.md && grep -q 'max_age_days = 30' upkeep/retention_policy.toml && grep -q 'delete tmp and cache' upkeep/audit.md",
+      "expected_files": [
+        "upkeep/retention_policy.toml",
+        "upkeep/audit.md"
+      ],
+      "expected_file_contents": {
+        "upkeep/retention_policy.toml": "max_age_days = 30\npreserve = [\"reports\", \"checkpoints\"]\ndelete = [\"tmp\", \"cache\"]\n",
+        "upkeep/audit.md": "# Cleanup Audit\nPreserve reports and checkpoints; delete tmp and cache after 30 days.\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "policy_novelty",
+        "novelty_axes": [
+          "retention_policy",
+          "cleanup_audit"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    }
+  ]
+}

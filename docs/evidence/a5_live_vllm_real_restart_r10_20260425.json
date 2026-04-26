@@ -1,0 +1,68 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "created_at": "2026-04-25T18:10:00Z",
+  "claim": {
+    "level": "A5_substrate",
+    "scope": "live_vllm_real_process_restart_resume",
+    "status": "supported",
+    "summary": "A live delegated queue drain was interrupted with SIGINT during a bounded external-manifest task, left the job resumable, then a fresh drain invocation resumed and completed it successfully."
+  },
+  "evidence": {
+    "focused_tests": {
+      "command": "/home/peyton/miniconda3/envs/ai/bin/python -m py_compile agent_kernel/sandbox.py tests/test_verifier.py && /home/peyton/miniconda3/envs/ai/bin/python -m pytest -q tests/test_verifier.py::test_sandbox_blocks_unknown_host_executable tests/test_verifier.py::test_sandbox_allows_bounded_sleep_and_times_out",
+      "result": "passed: py_compile clean; 2 sandbox tests passed in 1.29s"
+    },
+    "code_changes": [
+      "Added sleep to the sandbox host executable allowlist.",
+      "Added a regression proving sleep remains bounded by the sandbox timeout."
+    ],
+    "negative_probe": {
+      "root": "/tmp/agentkernel_a5_live_vllm_real_restart_r10_20260425",
+      "result": "sleep was initially blocked by sandbox executable policy and produced a terminal safe_stop; this was treated as a real gap, not positive evidence."
+    },
+    "isolated_cli_r10b": {
+      "root": "/tmp/agentkernel_a5_live_vllm_real_restart_r10b_20260425",
+      "provider": "vllm",
+      "model": "Qwen/Qwen3.5-9B",
+      "external_manifest_path": "/tmp/agentkernel_a5_live_vllm_real_restart_r10b_20260425/manifests/slow_restart_task.json",
+      "task_id": "external_real_restart_slow_task",
+      "budget_group": "r10b_real_restart",
+      "interrupt": {
+        "signal": "SIGINT",
+        "delay_seconds": 2.0,
+        "process_returncode": 0,
+        "forced_kill": false,
+        "post_interrupt_state": "in_progress",
+        "post_interrupt_last_error": "runner interrupted",
+        "post_interrupt_active_leases": 0
+      },
+      "resume": {
+        "fresh_drain_invocations_after_interrupt": 1,
+        "final_state": "completed",
+        "final_outcome": "success",
+        "attempt_count": 2,
+        "final_active_leases": 0,
+        "runtime_events": [
+          "lease_acquired",
+          "lease_released:state=in_progress",
+          "lease_acquired",
+          "lease_released:state=completed"
+        ]
+      },
+      "report_summary": {
+        "success": true,
+        "outcome": "success",
+        "termination_reason": "success",
+        "decision_source": "workspace_contract_direct",
+        "hidden_side_effect_risk": false,
+        "unexpected_change_files": []
+      }
+    }
+  },
+  "open_limits": [
+    "This is a single bounded real restart proof, not a long endurance run.",
+    "The workload is an external manifest task designed to be interruptible; broader non-fixture production workloads still need proof.",
+    "A stronger full A5 claim still needs repeated real restart/resume episodes over longer wall-clock operation."
+  ]
+}

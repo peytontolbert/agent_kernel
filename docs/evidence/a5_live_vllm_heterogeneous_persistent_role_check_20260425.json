@@ -1,0 +1,133 @@
+{
+  "evidence_id": "a5_live_vllm_heterogeneous_persistent_role_check_20260425",
+  "created_at": "2026-04-25T05:31:58Z",
+  "claim": "Live vLLM delegated queue execution can sustain a heterogeneous role across required families and a dependency-gated project multi-job bundle in one isolated queue.",
+  "provider": {
+    "name": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "host": "http://127.0.0.1:8000"
+  },
+  "queue_root": "/tmp/agentkernel_a5_vllm_persistent_role_clean2_20260425",
+  "patches_validated": [
+    {
+      "file": "agent_kernel/universe_model.py",
+      "change": "Universe governance now allows task-scoped git mutations when operator policy already enables unattended git commands; destructive forbidden patterns remain blocked."
+    },
+    {
+      "file": "datasets/task_bank/default_tasks.json",
+      "change": "project_parallel_release_task worker specs now declare sibling baseline files as preserved paths, removing worker hidden-side-effect false positives."
+    }
+  ],
+  "jobs": [
+    {
+      "task_id": "incident_matrix_task",
+      "budget_group": "family_integration",
+      "job_id": "job:incident_matrix_task:20260425T053140401440Z:0cb1691a",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "llm",
+      "command_steps": 1,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repository_audit_packet_task",
+      "budget_group": "family_repository",
+      "job_id": "job:repository_audit_packet_task:20260425T053140684354Z:78e584cf",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "plan_progress_direct",
+      "command_steps": 2,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "repo_notice_review_task",
+      "budget_group": "family_repo_chore",
+      "job_id": "job:repo_notice_review_task:20260425T053140970013Z:eaf1fcf3",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "plan_progress_direct",
+      "command_steps": 2,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "git_repo_status_review_task",
+      "budget_group": "family_repo_sandbox",
+      "job_id": "job:git_repo_status_review_task:20260425T053141253920Z:d3f76459",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "git_repo_review_direct",
+      "command_steps": 1,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "project_parallel_release_task__worker__worker_api-plan",
+      "budget_group": "family_project",
+      "job_id": "job:project_parallel_release_task__worker__worker_api-plan:20260425T053141549129Z:604548c0",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "plan_progress_direct",
+      "command_steps": 2,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "project_parallel_release_task__worker__worker_ops-cutover",
+      "budget_group": "family_project",
+      "job_id": "job:project_parallel_release_task__worker__worker_ops-cutover:20260425T053141561188Z:468f02f5",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "plan_progress_direct",
+      "command_steps": 2,
+      "hidden_side_effect_risk": false
+    },
+    {
+      "task_id": "project_parallel_release_task",
+      "budget_group": "family_project",
+      "job_id": "job:project_parallel_release_task:20260425T053141583647Z:6b3f96ce",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "last_decision_source": "shared_repo_integrator_segment_direct",
+      "command_steps": 4,
+      "hidden_side_effect_risk": false
+    }
+  ],
+  "queue_final": {
+    "completed_jobs": 7,
+    "safe_stop_jobs": 0,
+    "failed_jobs": 0,
+    "active_leases": 0,
+    "lease_acquired_events": 7,
+    "lease_released_events": 7,
+    "families_covered": [
+      "integration",
+      "project",
+      "repository",
+      "repo_chore",
+      "repo_sandbox"
+    ]
+  },
+  "verification": [
+    {
+      "command": "python -m json.tool datasets/task_bank/default_tasks.json",
+      "result": "passed"
+    },
+    {
+      "command": "pytest -q tests/test_job_queue.py::test_project_parallel_release_task_decomposes_into_project_family_workers tests/test_loop.py::test_kernel_solves_project_parallel_release_task_when_git_policy_enabled tests/test_loop.py::test_universe_model_allows_task_scoped_git_review_when_git_is_operator_allowed",
+      "result": "3 passed"
+    }
+  ],
+  "a5_interpretation": "This is the strongest current A5 substrate proof: a live-provider queue sustained a heterogeneous role across required families, completed a dependency-gated multi-job project bundle, and ended with no hidden side-effect risk or active leases. It still does not prove the custom model_stack live path or long-duration production operation beyond this isolated queue."
+}

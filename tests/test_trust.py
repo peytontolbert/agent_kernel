@@ -200,12 +200,76 @@ def test_build_unattended_trust_ledger_summarizes_recent_reports(tmp_path: Path)
     assert ledger["external_summary"]["total"] == 1
     assert ledger["external_summary"]["distinct_benchmark_families"] == 1
     assert ledger["external_family_summaries"]["external_lab"]["success_count"] == 1
+    assert ledger["overall_summary"]["held_out_frontier_report_count"] == 0
     assert ledger["coverage_summary"]["required_families"] == ["repo_chore", "repo_sandbox"]
     assert ledger["coverage_summary"]["required_families_with_reports"] == ["repo_chore", "repo_sandbox"]
     assert ledger["coverage_summary"]["required_families_with_gated_reports"] == ["repo_chore", "repo_sandbox"]
     assert ledger["coverage_summary"]["missing_required_families"] == []
     assert ledger["coverage_summary"]["missing_required_gated_families"] == []
     assert ledger["coverage_summary"]["distinct_family_gap"] == 0
+
+
+def test_build_unattended_trust_ledger_tracks_held_out_frontier_transfer_reports(tmp_path: Path):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _write_report(
+        reports_dir,
+        "frontier_project_success.json",
+        generated_at="2026-04-26T00:00:01+00:00",
+        benchmark_family="project",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_origin="external_manifest",
+        task_metadata={
+            "held_out_frontier_task": True,
+            "frontier_slice": "environment_novelty",
+        },
+    )
+    _write_report(
+        reports_dir,
+        "frontier_repo_success.json",
+        generated_at="2026-04-26T00:00:02+00:00",
+        benchmark_family="repository",
+        outcome="success",
+        success=True,
+        hidden_side_effect_risk=False,
+        task_origin="external_manifest",
+        task_metadata={
+            "held_out_frontier_task": True,
+            "frontier_slice": "repo_topology_novelty",
+        },
+    )
+    config = KernelConfig(
+        run_reports_dir=reports_dir,
+        use_trust_proposals=False,
+        unattended_trust_recent_report_limit=10,
+        unattended_trust_bootstrap_min_reports=1,
+        unattended_trust_breadth_min_reports=1,
+        unattended_trust_required_benchmark_families=("project", "repository"),
+        unattended_trust_min_distinct_families=1,
+    )
+
+    ledger = build_unattended_trust_ledger(config)
+    overall = ledger["overall_summary"]
+    coverage = ledger["coverage_summary"]
+
+    assert overall["held_out_frontier_report_count"] == 2
+    assert overall["held_out_frontier_success_count"] == 2
+    assert overall["held_out_frontier_clean_success_count"] == 2
+    assert overall["held_out_frontier_success_rate"] == 1.0
+    assert overall["held_out_frontier_clean_success_rate"] == 1.0
+    assert overall["held_out_frontier_benchmark_families"] == ["project", "repository"]
+    assert overall["frontier_slice_counts"] == {
+        "environment_novelty": 1,
+        "repo_topology_novelty": 1,
+    }
+    assert coverage["held_out_frontier_report_count"] == 2
+    assert coverage["held_out_frontier_clean_success_count"] == 2
+    assert coverage["frontier_slice_counts"] == {
+        "environment_novelty": 1,
+        "repo_topology_novelty": 1,
+    }
 
 
 def test_build_unattended_trust_ledger_recursively_counts_nested_reports_but_skips_generated_failure_seed(

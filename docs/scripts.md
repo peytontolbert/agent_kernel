@@ -20,6 +20,26 @@ Useful flags:
 - `--use-retrieval-proposals {0,1}`
 - `--tolbert-cache` can be passed multiple times
 
+[`scripts/run_minimal_asi.py`](/data/agentkernel/scripts/run_minimal_asi.py)
+
+- runs the Qwen + TOLBERT + vLLM reference implementation of the minimal coding-ASI profile
+- uses [`KernelConfig.qwen_tolbert_reference_implementation(...)`](/data/agentkernel/agent_kernel/config.py:655) as the starting configuration
+- supports `--state-root` so an empty directory can be used as a cold-start retained-state root without touching the default trajectories
+
+Useful flags:
+
+- `--task-id`
+- `--state-root`
+- `--use-tolbert-context {0,1}`
+- `--use-graph-memory {0,1}`
+- `--use-world-model {0,1}`
+- `--use-universe-model {0,1}`
+- `--persist-episode-memory {0,1}`
+- `--persist-learning-candidates {0,1}`
+- `--tolbert-cache` can be passed multiple times
+- `--tolbert-source-spans` can be passed multiple times
+- `--print-profile`
+
 [`scripts/run_eval.py`](/data/agentkernel/scripts/run_eval.py)
 
 - runs the local evaluation harness
@@ -202,6 +222,19 @@ Important flags:
 [`scripts/compare_retained_baseline.py`](/data/agentkernel/scripts/compare_retained_baseline.py)
 
 - compares the current artifact against the most recent retained baseline for one subsystem
+
+[`scripts/export_autonomy_evidence.py`](/data/agentkernel/scripts/export_autonomy_evidence.py)
+
+- exports a compact machine-readable autonomy evidence packet from a cycle report
+- currently packages the narrow A4 crossing route from retained `transition_model`
+  reports, including source-report SHA-256, child-native/runtime-managed/natural
+  closeout gates, required-family surface presence, and trace/trajectory
+  non-regression metrics
+- supports `--verify-packet` to fail fast when a tracked packet no longer
+  matches the source report hash or core A4 gates
+- supports `--verify-static-packet` for tracked autonomy packets that are not
+  regenerated from one cycle report, including `A5_substrate` queue/delegation
+  packets
 
 [`scripts/rollback_artifact.py`](/data/agentkernel/scripts/rollback_artifact.py)
 

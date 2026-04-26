@@ -1,0 +1,103 @@
+{
+  "packet_kind": "a5_live_provider_queue_execution_check",
+  "generated_at": "2026-04-25T04:20:00Z",
+  "claim_state": "substrate_evidence_not_full_a5",
+  "provider": "vllm",
+  "model_name": "Qwen/Qwen3.5-9B",
+  "provider_endpoint": "http://127.0.0.1:8000",
+  "provider_health": {
+    "checked": true,
+    "models_endpoint": "/v1/models",
+    "model_visible": true
+  },
+  "isolated_queue_root": "/tmp/agentkernel_a5_vllm_queue_20260425",
+  "queue_paths": {
+    "queue": "/tmp/agentkernel_a5_vllm_queue_20260425/jobs/queue.json",
+    "runtime_state": "/tmp/agentkernel_a5_vllm_queue_20260425/jobs/runtime_state.json",
+    "reports_dir": "/tmp/agentkernel_a5_vllm_queue_20260425/reports",
+    "checkpoints_dir": "/tmp/agentkernel_a5_vllm_queue_20260425/checkpoints",
+    "workspace": "/tmp/agentkernel_a5_vllm_queue_20260425/workspace"
+  },
+  "runtime_posture": {
+    "vllm_autostart": false,
+    "used_existing_provider_process": true,
+    "use_tolbert_context": false,
+    "use_skills": false,
+    "use_graph_memory": false,
+    "use_world_model": false,
+    "use_universe_model": false,
+    "use_planner": false,
+    "use_role_specialization": false,
+    "proposal_layers_disabled": true,
+    "sandbox_command_containment_mode": "disabled"
+  },
+  "queue_summary": {
+    "total_jobs": 2,
+    "completed_jobs": 2,
+    "success_jobs": 2,
+    "active_lease_count_after": 0,
+    "scheduler_selected_total": 2,
+    "blocked_open_jobs": 0,
+    "budget_groups": [
+      "live_vllm"
+    ],
+    "benchmark_families": [
+      "bounded"
+    ],
+    "distinct_task_roots": [
+      "hello_task",
+      "math_task"
+    ],
+    "clean_success_task_roots": [
+      "hello_task",
+      "math_task"
+    ]
+  },
+  "jobs": [
+    {
+      "job_id": "job:hello_task:20260425T041626017327Z:d6d10d77",
+      "task_id": "hello_task",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "report_path": "/tmp/agentkernel_a5_vllm_queue_20260425/reports/job_report_job_hello_task_20260425T041626017327Z_d6d10d77.json",
+      "checkpoint_path": "/tmp/agentkernel_a5_vllm_queue_20260425/checkpoints/job_hello_task_20260425T041626017327Z_d6d10d77.json",
+      "command_steps": 2,
+      "llm_generated_commands": 1,
+      "verified_steps": 1,
+      "hidden_side_effect_risk": false,
+      "notes": "First vLLM command omitted the expected newline and failed verification; plan-progress recovery completed the task on step 2."
+    },
+    {
+      "job_id": "job:math_task:20260425T041843064212Z:0cf9e5eb",
+      "task_id": "math_task",
+      "state": "completed",
+      "outcome": "success",
+      "attempt_count": 1,
+      "scheduler_selected_count": 1,
+      "report_path": "/tmp/agentkernel_a5_vllm_queue_20260425/reports/job_report_job_math_task_20260425T041843064212Z_0cf9e5eb.json",
+      "checkpoint_path": "/tmp/agentkernel_a5_vllm_queue_20260425/checkpoints/job_math_task_20260425T041843064212Z_0cf9e5eb.json",
+      "command_steps": 1,
+      "llm_generated_commands": 1,
+      "verified_steps": 1,
+      "hidden_side_effect_risk": false,
+      "clean_first_shot_llm_success": true,
+      "command": "echo '42' > result.txt"
+    }
+  ],
+  "a5_interpretation": {
+    "closes_gap": "live provider delegated queue execution for bounded tasks",
+    "does_not_close": [
+      "required-family live provider breadth",
+      "live provider hard interruption/recovery",
+      "model_stack live server/model-dir proof",
+      "full A5 persistent role claim"
+    ],
+    "next_shortest_steps": [
+      "Run one required-family task through the same live provider queue posture.",
+      "Repeat the stale-lease recovery proof with provider=vllm or provider=model_stack.",
+      "Start model-stack with a concrete MODEL_DIR/tokenizer path and repeat the bounded queue proof."
+    ]
+  }
+}
