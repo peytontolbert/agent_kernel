@@ -47,6 +47,12 @@ class Verifier:
             _record(needle not in combined_output, f"forbidden output present: {needle}")
 
         reasons.extend(self._semantic_verification_reasons(task, workspace, result=result))
+        success_command_result = self._verify_success_command(task, workspace, skip=bool(reasons))
+        if success_command_result:
+            if not bool(success_command_result.get("passed", False)):
+                reason = str(success_command_result.get("reason", "")).strip()
+                if reason:
+                    reasons.append(reason)
         semantic_failures = max(0, len(reasons) - failed_checks)
         total_checks += semantic_failures
         failed_checks += semantic_failures
@@ -82,8 +88,53 @@ class Verifier:
                     if isinstance(task.metadata.get("semantic_verifier", {}), dict)
                     else "",
                 }
-            ],
+            ]
+            + ([success_command_result] if success_command_result else []),
         )
+
+    def _verify_success_command(
+        self,
+        task: TaskSpec,
+        workspace: Path,
+        *,
+        skip: bool,
+    ) -> dict[str, object]:
+        command = str(task.success_command).strip()
+        if not command or skip:
+            return {}
+        timed_out = False
+        try:
+            completed = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            exit_code = int(completed.returncode)
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            exit_code = 124
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+        passed = (not timed_out) and exit_code == 0
+        reason = ""
+        if timed_out:
+            reason = "success command timed out"
+        elif exit_code != 0:
+            reason = f"success command exited with code {exit_code}"
+        return {
+            "kind": "success_command_result",
+            "command": command,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "passed": passed,
+            "reason": reason,
+            "stdout_preview": str(stdout)[-1000:],
+            "stderr_preview": str(stderr)[-1000:],
+        }
 
     def _semantic_verification_reasons(
         self,
@@ -101,6 +152,8 @@ class Verifier:
             reasons.extend(self._verify_repo_chore_review(workspace, contract))
         elif kind == "git_repo_review":
             reasons.extend(self._verify_git_repo_review(workspace, contract))
+        elif kind == "swe_patch_apply_check":
+            reasons.extend(self._verify_swe_patch_apply_check(workspace, contract))
         reasons.extend(self._verify_behavior_checks(workspace, contract))
         reasons.extend(self._verify_differential_checks(workspace, contract))
         reasons.extend(self._verify_repo_invariants(workspace, contract))
@@ -113,6 +166,131 @@ class Verifier:
             )
         )
         return reasons
+
+    def _verify_swe_patch_apply_check(self, workspace: Path, contract: dict[str, object]) -> list[str]:
+        repo = str(contract.get("repo", "")).strip()
+        base_commit = str(contract.get("base_commit", "")).strip()
+        repo_cache_root = str(contract.get("repo_cache_root", "")).strip()
+        patch_path = str(contract.get("patch_path", "patch.diff")).strip() or "patch.diff"
+        patch_file = (workspace / patch_path).resolve()
+        if not repo:
+            return ["SWE patch verifier missing repo"]
+        if not base_commit:
+            return ["SWE patch verifier missing base_commit"]
+        if not repo_cache_root:
+            return ["SWE patch verifier missing repo_cache_root"]
+        if not patch_file.exists():
+            return [f"SWE patch verifier missing patch file: {patch_path}"]
+        try:
+            patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return [f"SWE patch verifier could not read patch file: {exc}"]
+        placeholder_patterns = (
+            r"# This is a test file\.",
+            r"\bimport os\b",
+            r"\bprocess_data\(",
+            r"\bplaceholder\b",
+            r"\bdummy\b",
+        )
+        for pattern in placeholder_patterns:
+            if re.search(pattern, patch_text, flags=re.IGNORECASE):
+                return ["SWE patch diff contains placeholder/template content"]
+        if not self._patch_has_meaningful_change(patch_text):
+            return ["SWE patch diff has no meaningful content change"]
+        expected_changed_paths = [
+            str(path).strip()
+            for path in contract.get("expected_changed_paths", [])
+            if str(path).strip()
+        ]
+        if expected_changed_paths:
+            changed_paths = self._patch_changed_paths(patch_text)
+            if not changed_paths:
+                return ["SWE patch diff has no changed file paths"]
+            expected_set = set(expected_changed_paths)
+            actual_set = set(changed_paths)
+            unexpected = sorted(actual_set - expected_set)
+            if unexpected:
+                return [f"SWE patch diff includes unexpected path: {path}" for path in unexpected]
+        repo_path = self._swe_repo_cache_path(repo_cache_root, repo)
+        if repo_path is None:
+            return [f"SWE patch verifier missing repo cache: {repo}"]
+        with tempfile.TemporaryDirectory(prefix="swe_patch_verify_") as tmp:
+            worktree = Path(tmp) / "repo"
+            clone = subprocess.run(
+                ["git", "clone", "--shared", "--no-checkout", str(repo_path), str(worktree)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if clone.returncode != 0:
+                return [f"SWE patch verifier clone failed: {clone.stderr.strip()}"]
+            checkout = subprocess.run(
+                ["git", "-C", str(worktree), "checkout", "--detach", base_commit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if checkout.returncode != 0:
+                return [f"SWE patch verifier checkout failed: {checkout.stderr.strip()}"]
+            apply_check = subprocess.run(
+                ["git", "-C", str(worktree), "apply", "--check", str(patch_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if apply_check.returncode != 0:
+                detail = apply_check.stderr.strip()
+                return [f"SWE patch apply check failed: {detail}"]
+        return []
+
+    @staticmethod
+    def _patch_changed_paths(patch_text: str) -> list[str]:
+        paths: list[str] = []
+        for line in patch_text.splitlines():
+            if line.startswith("diff --git "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    path = parts[3]
+                    if path.startswith("b/"):
+                        path = path[2:]
+                    if path and path != "/dev/null" and path not in paths:
+                        paths.append(path)
+                continue
+            if line.startswith("+++ "):
+                path = line[4:].strip()
+                if path.startswith("b/"):
+                    path = path[2:]
+                if path and path != "/dev/null" and path not in paths:
+                    paths.append(path)
+        return paths
+
+    @staticmethod
+    def _patch_has_meaningful_change(patch_text: str) -> bool:
+        removed: list[str] = []
+        added: list[str] = []
+        for line in patch_text.splitlines():
+            if line.startswith("--- ") or line.startswith("+++ "):
+                continue
+            if line.startswith("-"):
+                removed.append(line[1:])
+            elif line.startswith("+"):
+                added.append(line[1:])
+        if not removed and not added:
+            return False
+        return removed != added
+
+    @staticmethod
+    def _swe_repo_cache_path(repo_cache_root: str, repo: str) -> Path | None:
+        root = Path(repo_cache_root)
+        candidates = [
+            root / repo,
+            root / repo.replace("/", "__"),
+            root / repo.split("/")[-1],
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return None
 
     def _verify_repo_chore_review(self, workspace: Path, contract: dict[str, object]) -> list[str]:
         reasons: list[str] = []

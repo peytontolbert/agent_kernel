@@ -754,11 +754,14 @@ def execute_step(
     elif decision.done:
         termination_reason = "policy_terminated"
     elif state.should_stop_for_stuckness():
-        if state.termination_reason == "repeated_failed_action":
+        if _defer_stuckness_for_exact_verifier_repair(state, step_index=step_index):
+            termination_reason = ""
+        elif state.termination_reason == "repeated_failed_action":
             verification["reasons"].append("repeated failed action detected")
         elif state.termination_reason == "no_state_progress":
             verification["reasons"].append("no state progress detected")
-        termination_reason = state.termination_reason
+        if state.termination_reason:
+            termination_reason = state.termination_reason
     elif kernel.config.use_role_specialization:
         state.current_role = kernel._resolve_role_after_step(
             state,
@@ -780,6 +783,42 @@ def execute_step(
 
     should_break = bool(success or decision.done or state.termination_reason)
     return success, termination_reason, should_break
+
+
+def _defer_stuckness_for_exact_verifier_repair(state: AgentState, *, step_index: int) -> bool:
+    termination_reason = str(state.termination_reason).strip()
+    if termination_reason not in {"repeated_failed_action", "no_state_progress"}:
+        return False
+    repair_signature = ""
+    for goal, diagnosis in state.subgoal_diagnoses.items():
+        if not isinstance(diagnosis, dict):
+            continue
+        if int(diagnosis.get("updated_step_index", -1) or -1) != int(step_index):
+            continue
+        path = str(diagnosis.get("path", "")).strip()
+        expected_content = diagnosis.get("expected_content")
+        repair_instruction = str(diagnosis.get("repair_instruction", "")).strip()
+        if not path:
+            continue
+        summary = str(diagnosis.get("summary", "")).lower()
+        exact_content_repair = expected_content is not None and "unexpected file content" in summary
+        swe_patch_repair = path == "patch.diff" and bool(repair_instruction)
+        if not exact_content_repair and not swe_patch_repair:
+            continue
+        repair_signature = f"{termination_reason}|{goal}|{path}"
+        break
+    if not repair_signature:
+        return False
+    deferred_signatures = state.history_archive.get("exact_verifier_repair_stuckness_deferrals", [])
+    if not isinstance(deferred_signatures, list):
+        deferred_signatures = []
+    seen = {str(value).strip() for value in deferred_signatures if str(value).strip()}
+    if repair_signature in seen:
+        return False
+    seen.add(repair_signature)
+    state.history_archive["exact_verifier_repair_stuckness_deferrals"] = sorted(seen)
+    state.termination_reason = ""
+    return True
 
 
 def finalize_episode(

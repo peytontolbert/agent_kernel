@@ -713,6 +713,7 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--use-delegation-proposals", choices=("0", "1"), default=None)
     parser.add_argument("--use-operator-policy-proposals", choices=("0", "1"), default=None)
     parser.add_argument("--use-transition-model-proposals", choices=("0", "1"), default=None)
+    parser.add_argument("--asi-coding-require-live-llm", choices=("0", "1"), default=None)
     parser.add_argument("--allow-git-commands", choices=("0", "1"), default=None)
     parser.add_argument("--allow-http-requests", choices=("0", "1"), default=None)
     parser.add_argument("--allow-generated-path-mutations", choices=("0", "1"), default=None)
@@ -755,6 +756,7 @@ def _runtime_overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
         ("use_delegation_proposals", "use_delegation_proposals"),
         ("use_operator_policy_proposals", "use_operator_policy_proposals"),
         ("use_transition_model_proposals", "use_transition_model_proposals"),
+        ("asi_coding_require_live_llm", "asi_coding_require_live_llm"),
         ("allow_git_commands", "unattended_allow_git_commands"),
         ("allow_http_requests", "unattended_allow_http_requests"),
         ("allow_generated_path_mutations", "unattended_allow_generated_path_mutations"),

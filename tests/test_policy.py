@@ -95,6 +95,108 @@ class CapturingClient:
         }
 
 
+def test_llm_policy_adds_exact_verifier_repair_directive_to_live_prompt():
+    client = CapturingClient()
+    config = KernelConfig(asi_coding_require_live_llm=True)
+    policy = LLMDecisionPolicy(client, config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="exact_verifier_repair_prompt_task",
+            prompt="repair status.txt",
+            workspace_subdir="exact_verifier_repair_prompt_task",
+            expected_files=["status.txt"],
+            expected_file_contents={"status.txt": "ready\n"},
+        )
+    )
+    state.current_role = "critic"
+    state.active_subgoal = "materialize expected artifact status.txt"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "rewrite status.txt to exact expected content \"ready\\n\"",
+            "signals": ["verifier_failure"],
+            "path": "status.txt",
+            "source_role": "verifier",
+            "expected_content": "ready\n",
+            "expected_content_preview": '"ready\\n"',
+        }
+    }
+
+    policy.decide(state)
+
+    assert client.last_payload["exact_verifier_repair_brief"].startswith("rewrite status.txt to exactly")
+    assert '"ready\\n"' in client.last_payload["exact_verifier_repair_brief"]
+    assert "Exact verifier repair directive:" in client.last_decision_prompt
+    assert "do not paraphrase" in client.last_decision_prompt
+
+
+def test_llm_policy_adds_swe_apply_repair_directive_to_live_prompt():
+    client = CapturingClient()
+    config = KernelConfig(asi_coding_require_live_llm=True)
+    policy = LLMDecisionPolicy(client, config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_apply_repair_prompt_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_apply_repair_prompt_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.current_role = "critic"
+    state.active_subgoal = "repair SWE patch.diff until it applies to the base commit"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch apply check failed",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": (
+                "rewrite patch.diff as a real unified diff that applies cleanly to the base commit; "
+                "use exact file paths and context from source excerpts; do not invent files or placeholder hunks"
+            ),
+        }
+    }
+
+    policy.decide(state)
+
+    assert "rewrite patch.diff as a real unified diff" in client.last_payload["exact_verifier_repair_brief"]
+    assert "Exact verifier repair directive:" in client.last_decision_prompt
+    assert "do not invent files" in client.last_decision_prompt
+
+
+def test_llm_policy_adds_swe_missing_patch_synthesis_directive_to_live_prompt():
+    client = CapturingClient()
+    config = KernelConfig(asi_coding_require_live_llm=True)
+    policy = LLMDecisionPolicy(client, config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_prompt_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_prompt_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.current_role = "critic"
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": (
+                "write patch.diff now as a source-grounded unified diff; "
+                "do not repeat source inspection commands, do not run ls/git/find, and do not write template content"
+            ),
+        }
+    }
+
+    policy.decide(state)
+
+    assert "write patch.diff now as a source-grounded unified diff" in client.last_payload["exact_verifier_repair_brief"]
+    assert "do not repeat source inspection commands" in client.last_decision_prompt
+    assert "next command must create or overwrite patch.diff directly" in client.last_decision_prompt
+
+
 class FakeContextProvider:
     def compile(self, state):
         del state

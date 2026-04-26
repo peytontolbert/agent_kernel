@@ -1,0 +1,10 @@
+diff --git a/astropy/__init__.py b/astropy/__init__.py
+index 1234567..abcdefg 100644
+--- a/astropy/__init__.py
++++ b/astropy/__init__.py
+@@ -1,3 +1,4 @@
+ # Astropy
++import os
+ import sys
+ 
+ __version__ = '5.0'

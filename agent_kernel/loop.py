@@ -40,8 +40,11 @@ from .ops.loop_checkpointing import (
 )
 from .ops.loop_progress import emit_progress_callback
 from .ops import loop_diagnostics_support, loop_planning_support, loop_run_support
+from .learning_compiler import persist_episode_learning_candidates
+from .ops.episode_store import episode_storage_metadata
 from .ops.loop_runtime_support import (
     build_default_policy,
+    persist_episode_outputs,
 )
 from .sandbox import Sandbox
 from .schemas import (

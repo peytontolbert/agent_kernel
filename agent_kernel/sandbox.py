@@ -79,15 +79,6 @@ class Sandbox:
         self.urlopen = urlopen or url_request.urlopen
 
     def run(self, command: str, cwd: Path, *, task: TaskSpec | None = None) -> CommandResult:
-        blocked_reason = self._blocked_reason(command)
-        if blocked_reason is not None:
-            return CommandResult(
-                command=command,
-                exit_code=126,
-                stdout="",
-                stderr=blocked_reason,
-            )
-
         try:
             segments = self._parse_segments(command)
         except ValueError as exc:
@@ -97,6 +88,15 @@ class Sandbox:
                 stdout="",
                 stderr=str(exc),
             )
+        if not self._is_literal_cat_heredoc(command):
+            blocked_reason = self._blocked_reason(command)
+            if blocked_reason is not None:
+                return CommandResult(
+                    command=command,
+                    exit_code=126,
+                    stdout="",
+                    stderr=blocked_reason,
+                )
 
         cwd_resolved = cwd.resolve()
         cwd_resolved.mkdir(parents=True, exist_ok=True)
@@ -203,6 +203,9 @@ class Sandbox:
         normalized = command.strip()
         if not normalized:
             raise ValueError("blocked empty command")
+        heredoc_segment = self._parse_simple_cat_heredoc(normalized)
+        if heredoc_segment is not None:
+            return [heredoc_segment]
         if any(marker in normalized for marker in ("`", "$(", "${")):
             raise ValueError(f"blocked unsupported shell expansion: {normalized}")
 
@@ -244,6 +247,45 @@ class Sandbox:
             index += 1
         segments.append(self._build_segment(argv, stdout_path=stdout_path, append_stdout=append_stdout))
         return segments
+
+    def _is_literal_cat_heredoc(self, command: str) -> bool:
+        return self._parse_simple_cat_heredoc(command.strip()) is not None
+
+    def _parse_simple_cat_heredoc(self, normalized: str) -> _ParsedSegment | None:
+        mkdir_match = re.fullmatch(
+            r"mkdir\s+-p\s+(?P<mkdir_path>\S+)\s+&&\s+cat\s+>\s+(?P<path>\S+)\s+"
+            r"<<\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?\n"
+            r"(?P<body>.*)\n(?P=marker)",
+            normalized,
+            flags=re.DOTALL,
+        )
+        if mkdir_match is not None:
+            body = mkdir_match.group("body")
+            lines = body.splitlines()
+            if not lines:
+                lines = [""]
+            return self._build_segment(
+                ["printf", "%s\n", *lines],
+                stdout_path=mkdir_match.group("path"),
+                append_stdout=False,
+            )
+        match = re.fullmatch(
+            r"cat\s+>\s+(?P<path>\S+)\s+<<\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?\n"
+            r"(?P<body>.*)\n(?P=marker)",
+            normalized,
+            flags=re.DOTALL,
+        )
+        if match is None:
+            return None
+        body = match.group("body")
+        lines = body.splitlines()
+        if not lines:
+            lines = [""]
+        return self._build_segment(
+            ["printf", "%s\n", *lines],
+            stdout_path=match.group("path"),
+            append_stdout=False,
+        )
 
     def _build_segment(self, argv: list[str], *, stdout_path: str, append_stdout: bool) -> _ParsedSegment:
         if not argv:

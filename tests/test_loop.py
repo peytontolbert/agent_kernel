@@ -1837,6 +1837,140 @@ def test_kernel_refreshes_planner_subgoals_from_verifier_failures(tmp_path):
     )
 
 
+def test_kernel_verifier_diagnosis_includes_exact_expected_content_for_repair(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="exact_repair_task",
+            prompt="Write the exact release packet.",
+            workspace_subdir="exact_repair_task",
+            expected_files=["reports/status.txt"],
+            expected_file_contents={"reports/status.txt": "STATUS=ready\nchecksum=42\n"},
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=3,
+        verification_reasons=["unexpected file content: reports/status.txt"],
+    )
+
+    diagnosis = state.subgoal_diagnoses["materialize expected artifact reports/status.txt"]
+    assert diagnosis["source_role"] == "verifier"
+    assert diagnosis["path"] == "reports/status.txt"
+    assert diagnosis["expected_content"] == "STATUS=ready\nchecksum=42\n"
+    assert diagnosis["expected_content_preview"] == '"STATUS=ready\\nchecksum=42\\n"'
+    assert "rewrite reports/status.txt to exact expected content" in diagnosis["summary"]
+    assert '"STATUS=ready\\nchecksum=42\\n"' in diagnosis["summary"]
+
+
+def test_kernel_verifier_diagnosis_includes_swe_apply_repair_instruction(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="Write patch.diff.",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_candidate_files": ["astropy/io/ascii/qdp.py", "astropy/io/ascii/tests/test_qdp.py"],
+                "setup_file_contents": {
+                    "source_lines/astropy/io/ascii/qdp.py.lines": "   1: import re\n   2: def _line_type(line):\n"
+                },
+            },
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=2,
+        verification_reasons=["SWE patch apply check failed: error: patch failed: astropy/io/ascii/qdp.py:1"],
+    )
+
+    diagnosis = state.subgoal_diagnoses["repair SWE patch.diff until it applies to the base commit"]
+    assert diagnosis["source_role"] == "verifier"
+    assert diagnosis["path"] == "patch.diff"
+    assert "rewrite patch.diff as a real unified diff" in diagnosis["repair_instruction"]
+    assert "allowed patch paths are astropy/io/ascii/qdp.py, astropy/io/ascii/tests/test_qdp.py" in diagnosis["repair_instruction"]
+    assert "candidate line anchors: astropy/io/ascii/qdp.py: 1: import re" in diagnosis["repair_instruction"]
+    assert "do not invent files" in diagnosis["summary"]
+
+
+def test_kernel_verifier_diagnosis_includes_swe_template_repair_instruction(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="Write patch.diff.",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={"semantic_verifier": {"expected_changed_paths": ["astropy/io/ascii/qdp.py"]}},
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=2,
+        verification_reasons=["SWE patch diff contains placeholder/template content"],
+    )
+
+    diagnosis = state.subgoal_diagnoses["replace template SWE patch.diff with a source-grounded unified diff"]
+    assert diagnosis["source_role"] == "verifier"
+    assert diagnosis["path"] == "patch.diff"
+    assert "source-grounded unified diff" in diagnosis["repair_instruction"]
+    assert "allowed patch paths are astropy/io/ascii/qdp.py" in diagnosis["repair_instruction"]
+    assert "fake imports" in diagnosis["repair_instruction"]
+
+
+def test_kernel_verifier_diagnosis_tells_swe_missing_patch_to_synthesize(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="Write patch.diff.",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=1,
+        verification_reasons=[
+            "missing expected file: patch.diff",
+            "SWE patch verifier missing patch file: patch.diff",
+        ],
+    )
+
+    diagnosis = state.subgoal_diagnoses["materialize expected artifact patch.diff"]
+    assert "write patch.diff now as a source-grounded unified diff" in diagnosis["repair_instruction"]
+    assert "do not repeat" in diagnosis["repair_instruction"]
+
+
 def test_kernel_materializes_planner_recovery_artifact_after_critic_exhaustion(tmp_path):
     config = KernelConfig(
         provider="mock",
@@ -3958,6 +4092,42 @@ class NoProgressPolicy(Policy):
         )
 
 
+class ExactRepairAfterRepeatedFailurePolicy(Policy):
+    def decide(self, state):
+        diagnosis = state.active_subgoal_diagnosis()
+        if state.next_step_index() >= 3 and diagnosis.get("expected_content") == "hello\n":
+            return ActionDecision(
+                thought="use verifier-provided exact content",
+                action="code_execute",
+                content="printf 'hello\\n' > hello.txt",
+                done=False,
+            )
+        return ActionDecision(
+            thought="write the same near miss",
+            action="code_execute",
+            content="printf 'hello world\\n' > hello.txt",
+            done=False,
+        )
+
+
+class SwePatchRepairAfterRepeatedReadPolicy(Policy):
+    def decide(self, state):
+        diagnosis = state.active_subgoal_diagnosis()
+        if state.next_step_index() >= 3 and "write patch.diff now" in str(diagnosis.get("repair_instruction", "")):
+            return ActionDecision(
+                thought="write verifier-directed patch artifact",
+                action="code_execute",
+                content="printf 'diff --git a/pkg/module.py b/pkg/module.py\\n--- a/pkg/module.py\\n+++ b/pkg/module.py\\n' > patch.diff",
+                done=False,
+            )
+        return ActionDecision(
+            thought="inspect source again",
+            action="code_execute",
+            content="cat pkg/module.py",
+            done=False,
+        )
+
+
 class FailingTolbertContextProvider:
     def compile(self, state):
         del state
@@ -3990,6 +4160,56 @@ def test_kernel_stops_repeated_failed_action(tmp_path):
     assert episode.success is False
     assert episode.termination_reason == "repeated_failed_action"
     assert len(episode.steps) == 2
+
+
+def test_kernel_defers_repeated_failed_action_once_for_exact_verifier_repair(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=5,
+    )
+    task = TaskSpec(
+        task_id="repeat_exact_repair",
+        prompt="create hello.txt with exact content",
+        workspace_subdir="repeat_exact_repair",
+        expected_files=["hello.txt"],
+        expected_file_contents={"hello.txt": "hello\n"},
+        max_steps=5,
+    )
+
+    episode = AgentKernel(config=config, policy=ExactRepairAfterRepeatedFailurePolicy()).run_task(task)
+
+    assert episode.success is True
+    assert episode.termination_reason == "success"
+    assert len(episode.steps) == 3
+    assert episode.steps[2].content == "printf 'hello\\n' > hello.txt"
+
+
+def test_kernel_defers_repeated_failed_action_once_for_swe_patch_repair(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=5,
+    )
+    task = TaskSpec(
+        task_id="repeat_swe_patch_repair",
+        prompt="create patch.diff after inspecting source",
+        workspace_subdir="repeat_swe_patch_repair",
+        expected_files=["patch.diff"],
+        metadata={"setup_file_contents": {"pkg/module.py": "def value():\n    return 1\n"}},
+        max_steps=5,
+    )
+
+    episode = AgentKernel(config=config, policy=SwePatchRepairAfterRepeatedReadPolicy()).run_task(task)
+
+    assert episode.success is True
+    assert episode.termination_reason == "success"
+    assert len(episode.steps) == 3
+    assert episode.steps[2].content.startswith("printf 'diff --git")
 
 
 def test_kernel_stops_after_repeated_no_state_progress(tmp_path):
@@ -4748,6 +4968,32 @@ def test_kernel_can_resume_after_setup_phase_interrupt(tmp_path):
     assert (workspace / "seed.txt").read_text(encoding="utf-8") == "seed\n"
     assert (workspace / "prep.txt").read_text(encoding="utf-8") == "prep\n"
     assert (workspace / "done.txt").read_text(encoding="utf-8") == "done\n"
+
+
+def test_kernel_persists_setup_failure_episode_without_runner_exception(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+        max_steps=2,
+    )
+    task = TaskSpec(
+        task_id="setup_failure_task",
+        prompt="setup should fail before model control",
+        workspace_subdir="setup_failure_task",
+        setup_commands=["false"],
+        expected_files=["done.txt"],
+    )
+
+    episode = AgentKernel(config=config).run_task(task)
+
+    assert episode.success is False
+    assert episode.termination_reason == "setup_failed"
+    episode_path = config.trajectories_root / "setup_failure_task.json"
+    assert episode_path.exists()
+    payload = json.loads(episode_path.read_text(encoding="utf-8"))
+    assert payload["termination_reason"] == "setup_failed"
 
 
 def test_kernel_compacts_runtime_history_for_deep_step_tasks(tmp_path):

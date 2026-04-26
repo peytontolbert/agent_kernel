@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -96,13 +97,108 @@ def attach_verifier_subgoal_diagnoses(
             if normalized and normalized not in signals:
                 signals.append(normalized)
         path = str(existing.get("path", "")).strip() or str(entry.get("path", "")).strip() or kernel._subgoal_path(goal)
-        state.subgoal_diagnoses[goal] = {
-            "summary": "; ".join(summary_parts[:2]),
+        expected_content = _expected_content_for_path(state, path)
+        repair_instruction = str(entry.get("repair_instruction", "")).strip()
+        if path == "patch.diff" and repair_instruction:
+            candidate_brief = _swe_candidate_path_repair_brief(state)
+            if candidate_brief and candidate_brief not in repair_instruction:
+                repair_instruction = f"{repair_instruction}; {candidate_brief}"
+        if repair_instruction and repair_instruction not in summary_parts:
+            summary_parts.append(repair_instruction)
+        if expected_content is not None:
+            expected_summary = _expected_content_repair_summary(path, expected_content)
+            if expected_summary and expected_summary not in summary_parts:
+                summary_parts.append(expected_summary)
+        diagnosis: dict[str, object] = {
+            "summary": "; ".join(summary_parts[:3]),
             "signals": signals,
             "path": path,
             "source_role": "verifier",
             "updated_step_index": step_index,
         }
+        if expected_content is not None:
+            diagnosis["expected_content"] = expected_content
+            diagnosis["expected_content_preview"] = _expected_content_preview(expected_content)
+        if repair_instruction:
+            diagnosis["repair_instruction"] = repair_instruction
+        state.subgoal_diagnoses[goal] = {
+            **diagnosis,
+        }
+
+
+def _expected_content_for_path(state, path: str) -> str | None:
+    normalized_path = str(path).strip()
+    if not normalized_path:
+        return None
+    task = getattr(state, "task", None)
+    expected_contents = getattr(task, "expected_file_contents", {}) if task is not None else {}
+    if not isinstance(expected_contents, dict) or normalized_path not in expected_contents:
+        return None
+    return str(expected_contents.get(normalized_path, ""))
+
+
+def _swe_candidate_path_repair_brief(state) -> str:
+    task = getattr(state, "task", None)
+    metadata = getattr(task, "metadata", {}) if task is not None else {}
+    if not isinstance(metadata, dict):
+        return ""
+    candidate_files = [
+        str(path).strip()
+        for path in metadata.get("swe_candidate_files", [])
+        if str(path).strip()
+    ]
+    if not candidate_files:
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        candidate_files = [
+            str(path).strip()
+            for path in verifier.get("expected_changed_paths", [])
+            if str(path).strip()
+        ]
+    if not candidate_files:
+        return ""
+    anchor_preview = _swe_candidate_line_anchor_preview(metadata, candidate_files)
+    brief = (
+        "allowed patch paths are "
+        f"{', '.join(candidate_files)}; inspect source_lines/<path>.lines for exact line anchors "
+        "and write hunks only against those paths"
+    )
+    if anchor_preview:
+        brief = f"{brief}; candidate line anchors: {anchor_preview}"
+    return brief
+
+
+def _swe_candidate_line_anchor_preview(metadata: dict[str, object], candidate_files: list[str]) -> str:
+    setup_files = metadata.get("setup_file_contents", {})
+    if not isinstance(setup_files, dict):
+        return ""
+    chunks: list[str] = []
+    for path in candidate_files[:2]:
+        line_path = f"source_lines/{path}.lines"
+        content = str(setup_files.get(line_path, "")).strip()
+        if not content:
+            continue
+        lines = [line for line in content.splitlines()[:18] if line.strip()]
+        if not lines:
+            continue
+        preview = " | ".join(lines[:12])
+        chunks.append(f"{path}: {preview}")
+    return " || ".join(chunks)
+
+
+def _expected_content_preview(expected_content: str, *, limit: int = 800) -> str:
+    encoded = json.dumps(str(expected_content))
+    if len(encoded) <= limit:
+        return encoded
+    return encoded[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _expected_content_repair_summary(path: str, expected_content: str) -> str:
+    normalized_path = str(path).strip()
+    if not normalized_path:
+        return ""
+    preview = _expected_content_preview(expected_content)
+    return f"rewrite {normalized_path} to exact expected content {preview}"
 
 
 def diagnosis_candidate_subgoals(kernel: Any, state, *, step_active_subgoal: str) -> list[str]:
@@ -206,6 +302,24 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
         elif text.startswith("unexpected file content: "):
             path = text.removeprefix("unexpected file content: ").strip()
             subgoal = f"materialize expected artifact {path}"
+        elif text.startswith("SWE patch apply check failed: "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff until it applies to the base commit"
+        elif text.startswith("SWE patch verifier missing patch file: "):
+            path = text.removeprefix("SWE patch verifier missing patch file: ").strip() or "patch.diff"
+            subgoal = f"materialize expected artifact {path}"
+        elif text.startswith("SWE patch diff includes unexpected path: "):
+            path = "patch.diff"
+            subgoal = "rewrite SWE patch.diff using only listed likely relevant files"
+        elif text == "SWE patch diff contains placeholder/template content":
+            path = "patch.diff"
+            subgoal = "replace template SWE patch.diff with a source-grounded unified diff"
+        elif text == "SWE patch diff has no meaningful content change":
+            path = "patch.diff"
+            subgoal = "replace no-op SWE patch.diff with a behavior-changing unified diff"
+        elif text == "SWE patch diff has no changed file paths":
+            path = "patch.diff"
+            subgoal = "rewrite SWE patch.diff with real changed file paths"
         elif text.startswith("forbidden file present: "):
             path = text.removeprefix("forbidden file present: ").strip()
             subgoal = f"remove forbidden artifact {path}"
@@ -248,7 +362,40 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
                     path = label
                     subgoal = f"run workflow test {label}"
         if subgoal:
-            entries.append({"subgoal": subgoal, "summary": text, "path": path})
+            entry = {"subgoal": subgoal, "summary": text, "path": path}
+            if text.startswith("missing expected file: ") and path == "patch.diff":
+                entry["repair_instruction"] = (
+                    "write patch.diff now as a source-grounded unified diff; "
+                    "do not repeat source inspection commands, do not run ls/git/find, and do not write template content"
+                )
+            elif text.startswith("SWE patch verifier missing patch file: "):
+                entry["repair_instruction"] = (
+                    "write patch.diff now as a source-grounded unified diff using the provided candidate source files; "
+                    "do not repeat cat/ls discovery and do not invent placeholder hunks"
+                )
+            elif text.startswith("SWE patch apply check failed: "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a real unified diff that applies cleanly to the base commit; "
+                    "use exact file paths and context from source excerpts; do not invent files or placeholder hunks"
+                )
+            elif text.startswith("SWE patch diff includes unexpected path: "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff to change only the listed likely relevant files; "
+                    "inspect source_context paths and do not invent alternate repository paths"
+                )
+            elif text.startswith("SWE patch diff has no meaningful content change"):
+                entry["repair_instruction"] = (
+                    "replace patch.diff with a behavior-changing unified diff that addresses the issue; "
+                    "do not remove and re-add identical lines, and use exact context from source_lines"
+                )
+            elif text.startswith("SWE patch diff contains placeholder/template content") or text.startswith(
+                "SWE patch diff has no changed file paths"
+            ):
+                entry["repair_instruction"] = (
+                    "replace patch.diff with a source-grounded unified diff using exact context from source_context; "
+                    "remove template comments, fake imports, placeholder functions, and invented hunks"
+                )
+            entries.append(entry)
     deduped: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for entry in entries:

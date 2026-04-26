@@ -105,6 +105,24 @@ def prepare_task_for_run(
     return deepcopy(task)
 
 
+def _safe_setup_file_path(raw_path: object) -> str:
+    relative_path = str(raw_path).strip().strip("/")
+    if not relative_path or relative_path == "." or relative_path.startswith("../") or "/../" in relative_path:
+        raise ValueError(f"unsafe setup file path: {raw_path!r}")
+    return relative_path
+
+
+def materialize_setup_file_contents(task: TaskSpec, workspace: Path) -> None:
+    setup_files = task.metadata.get("setup_file_contents", {})
+    if not isinstance(setup_files, dict):
+        return
+    for raw_path, raw_content in setup_files.items():
+        relative_path = _safe_setup_file_path(raw_path)
+        path = workspace / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(raw_content), encoding="utf-8")
+
+
 def materialize_workspace_for_new_run(
     task: TaskSpec,
     *,
@@ -137,6 +155,7 @@ def materialize_workspace_for_new_run(
     if clean_workspace and workspace.exists():
         shutil.rmtree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
+    materialize_setup_file_contents(task, workspace)
     return workspace, clean_workspace
 
 
@@ -190,6 +209,7 @@ def maybe_publish_shared_repo_branch(
 
 __all__ = [
     "build_default_policy",
+    "materialize_setup_file_contents",
     "materialize_workspace_for_new_run",
     "maybe_publish_shared_repo_branch",
     "persist_episode_outputs",

@@ -1,4 +1,5 @@
 import importlib.util
+import argparse
 import json
 from pathlib import Path
 from io import StringIO
@@ -125,13 +126,50 @@ def _install_successful_kernel(monkeypatch):
                         "step_stage": "step_complete",
                         "verification_passed": True,
                     }
-                )
+            )
             return episode
 
         def close(self):
             return None
 
     monkeypatch.setattr(job_queue_module, "AgentKernel", SuccessfulKernel)
+
+
+def test_runtime_overrides_parse_asi_coding_live_llm_flag():
+    module = _load_script_module("run_job_queue.py")
+
+    overrides = module._runtime_overrides_from_args(
+        argparse.Namespace(
+            provider=None,
+            model=None,
+            parallel_worker_count=None,
+            shared_repo_id=None,
+            worker_branch=None,
+            target_branch=None,
+            claim_path=None,
+            use_tolbert_context=None,
+            use_skills=None,
+            use_graph_memory=None,
+            use_world_model=None,
+            use_planner=None,
+            use_role_specialization=None,
+            use_prompt_proposals=None,
+            use_curriculum_proposals=None,
+            use_retrieval_proposals=None,
+            use_state_estimation_proposals=None,
+            use_trust_proposals=None,
+            use_recovery_proposals=None,
+            use_delegation_proposals=None,
+            use_operator_policy_proposals=None,
+            use_transition_model_proposals=None,
+            asi_coding_require_live_llm="1",
+            allow_git_commands=None,
+            allow_http_requests=None,
+            allow_generated_path_mutations=None,
+        )
+    )
+
+    assert overrides["asi_coding_require_live_llm"] is True
 
 
 def test_queue_claim_next_respects_deadline_then_priority(tmp_path):
@@ -973,6 +1011,167 @@ def test_a7_unfamiliar_transfer_manifest_loads_as_held_out_external_tasks():
     assert all(task.metadata["task_origin"] == "external_manifest" for task in frontier_tasks)
     assert all(task.metadata["capability"] == "unfamiliar_environment_transfer" for task in frontier_tasks)
     assert all(task.expected_file_contents for task in frontier_tasks)
+
+
+def test_a7_unfamiliar_transfer_rotation_two_is_non_identical_and_loadable():
+    repo_root = Path(__file__).resolve().parents[1]
+    first_manifest = repo_root / "config" / "a7_unfamiliar_transfer_manifest.json"
+    second_manifest = repo_root / "config" / "a7_unfamiliar_transfer_manifest_r2.json"
+    first_bank = TaskBank(external_task_manifests=(str(first_manifest),))
+    second_bank = TaskBank(external_task_manifests=(str(second_manifest),))
+    first_frontier = {
+        task.task_id: task
+        for task in first_bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    }
+    second_frontier = [
+        task
+        for task in second_bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(second_frontier) == 5
+    assert not set(first_frontier).intersection({task.task_id for task in second_frontier})
+    assert {task.metadata["benchmark_family"] for task in second_frontier} == {
+        "project",
+        "repository",
+        "integration",
+        "repo_sandbox",
+        "repo_chore",
+    }
+    assert {task.metadata["frontier_slice"] for task in second_frontier} == {
+        "release_control_novelty",
+        "schema_topology_novelty",
+        "cross_service_recovery_novelty",
+        "patch_queue_novelty",
+        "retention_exception_novelty",
+    }
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer" for task in second_frontier)
+    assert all(task.expected_file_contents for task in second_frontier)
+
+
+def test_a7_unfamiliar_transfer_rotation_three_is_hintless_and_loadable():
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest_path = repo_root / "config" / "a7_unfamiliar_transfer_manifest_r3_hard.json"
+    bank = TaskBank(external_task_manifests=(str(manifest_path),))
+    frontier_tasks = [
+        task
+        for task in bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(frontier_tasks) == 5
+    assert {task.metadata["benchmark_family"] for task in frontier_tasks} == {
+        "project",
+        "repository",
+        "integration",
+        "repo_sandbox",
+        "repo_chore",
+    }
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer_hard" for task in frontier_tasks)
+    assert all(task.metadata["suggested_commands_absent"] is True for task in frontier_tasks)
+    assert all(not task.suggested_commands for task in frontier_tasks)
+    assert all(task.expected_file_contents for task in frontier_tasks)
+    assert {
+        task.metadata["frontier_slice"]
+        for task in frontier_tasks
+    } == {
+        "hintless_delivery_novelty",
+        "hintless_api_migration_novelty",
+        "hintless_failback_novelty",
+        "hintless_sandbox_freeze_novelty",
+        "hintless_legal_hold_novelty",
+    }
+
+
+def test_a7_unfamiliar_transfer_rotation_four_is_larger_hintless_scale():
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest_path = repo_root / "config" / "a7_unfamiliar_transfer_manifest_r4_hard_scale.json"
+    bank = TaskBank(external_task_manifests=(str(manifest_path),))
+    frontier_tasks = [
+        task
+        for task in bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(frontier_tasks) == 10
+    family_counts = {}
+    for task in frontier_tasks:
+        family_counts[task.metadata["benchmark_family"]] = family_counts.get(task.metadata["benchmark_family"], 0) + 1
+    assert family_counts == {
+        "project": 2,
+        "repository": 2,
+        "integration": 2,
+        "repo_sandbox": 2,
+        "repo_chore": 2,
+    }
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer_hard" for task in frontier_tasks)
+    assert all(task.metadata["suggested_commands_absent"] is True for task in frontier_tasks)
+    assert all(not task.suggested_commands for task in frontier_tasks)
+    assert all(task.expected_file_contents for task in frontier_tasks)
+    assert len({task.metadata["frontier_slice"] for task in frontier_tasks}) == 10
+    assert not {
+        "hintless_delivery_novelty",
+        "hintless_api_migration_novelty",
+        "hintless_failback_novelty",
+        "hintless_sandbox_freeze_novelty",
+        "hintless_legal_hold_novelty",
+    }.intersection({task.metadata["frontier_slice"] for task in frontier_tasks})
+
+
+def test_a7_unfamiliar_transfer_rotation_five_is_stateful_repair():
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest_path = repo_root / "config" / "a7_unfamiliar_transfer_manifest_r5_stateful_repair.json"
+    bank = TaskBank(external_task_manifests=(str(manifest_path),))
+    frontier_tasks = [
+        task
+        for task in bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(frontier_tasks) == 5
+    assert {task.metadata["benchmark_family"] for task in frontier_tasks} == {
+        "project",
+        "repository",
+        "integration",
+        "repo_sandbox",
+        "repo_chore",
+    }
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer_stateful_hard" for task in frontier_tasks)
+    assert all(task.metadata["suggested_commands_absent"] is True for task in frontier_tasks)
+    assert all(task.setup_commands for task in frontier_tasks)
+    assert all(not task.suggested_commands for task in frontier_tasks)
+    assert all(task.expected_file_contents for task in frontier_tasks)
+    assert all(task.forbidden_files for task in frontier_tasks)
+    assert len({task.metadata["frontier_slice"] for task in frontier_tasks}) == 5
+
+
+def test_a7_unfamiliar_transfer_rotation_six_is_diagnostic_synthesis():
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest_path = repo_root / "config" / "a7_unfamiliar_transfer_manifest_r6_diagnostic_synthesis.json"
+    bank = TaskBank(external_task_manifests=(str(manifest_path),))
+    frontier_tasks = [
+        task
+        for task in bank.list()
+        if bool(task.metadata.get("held_out_frontier_task", False))
+    ]
+
+    assert len(frontier_tasks) == 5
+    assert {task.metadata["benchmark_family"] for task in frontier_tasks} == {
+        "project",
+        "repository",
+        "integration",
+        "repo_sandbox",
+        "repo_chore",
+    }
+    assert all(task.metadata["capability"] == "unfamiliar_environment_transfer_diagnostic_hard" for task in frontier_tasks)
+    assert all("diagnostic_synthesis" in task.metadata["novelty_axes"] for task in frontier_tasks)
+    assert all(task.metadata["suggested_commands_absent"] is True for task in frontier_tasks)
+    assert all(task.setup_commands for task in frontier_tasks)
+    assert all(not task.suggested_commands for task in frontier_tasks)
+    assert all(task.expected_file_contents for task in frontier_tasks)
+    assert all(task.metadata.get("workflow_guard", {}).get("managed_paths") for task in frontier_tasks)
+    assert len({task.metadata["frontier_slice"] for task in frontier_tasks}) == 5
 
 
 def test_enqueue_with_parallel_worker_decomposition_expands_integrator(tmp_path):

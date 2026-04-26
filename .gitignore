@@ -32,3 +32,8 @@ datasets/task_bank/*
 !config/
 config/*
 !config/a7_unfamiliar_transfer_manifest.json
+!config/a7_unfamiliar_transfer_manifest_r2.json
+!config/a7_unfamiliar_transfer_manifest_r3_hard.json
+!config/a7_unfamiliar_transfer_manifest_r4_hard_scale.json
+!config/a7_unfamiliar_transfer_manifest_r5_stateful_repair.json
+!config/a7_unfamiliar_transfer_manifest_r6_diagnostic_synthesis.json

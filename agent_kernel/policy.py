@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 from pathlib import Path
 from typing import Protocol
 
@@ -379,6 +380,9 @@ class LLMDecisionPolicy(Policy):
         campaign_contract_brief = self._campaign_contract_brief(state)
         if campaign_contract_brief:
             payload["campaign_contract_brief"] = campaign_contract_brief
+        exact_verifier_repair_brief = self._exact_verifier_repair_brief(state)
+        if exact_verifier_repair_brief:
+            payload["exact_verifier_repair_brief"] = exact_verifier_repair_brief
         if state.planner_recovery_artifact:
             payload["planner_recovery_artifact"] = dict(state.planner_recovery_artifact)
         system_prompt = self._role_system_prompt(role)
@@ -400,6 +404,12 @@ class LLMDecisionPolicy(Policy):
                 f"{decision_prompt}\n"
                 "Long-horizon campaign contract: "
                 f"{campaign_contract_brief}"
+            )
+        if exact_verifier_repair_brief:
+            decision_prompt = (
+                f"{decision_prompt}\n"
+                "Exact verifier repair directive: "
+                f"{exact_verifier_repair_brief}"
             )
         self._emit_decision_progress("llm_request")
         raw = self.client.create_decision(
@@ -761,6 +771,48 @@ class LLMDecisionPolicy(Policy):
 
     def _campaign_contract_brief(self, state: AgentState) -> str:
         return self.workflow_adapter.campaign_contract_brief(state)
+
+    @staticmethod
+    def _exact_verifier_repair_brief(state: AgentState) -> str:
+        diagnoses: list[tuple[str, dict[str, object]]] = []
+        active = str(state.active_subgoal).strip()
+        if active:
+            diagnosis = state.diagnosis_for_subgoal(active)
+            if diagnosis:
+                diagnoses.append((active, diagnosis))
+        for goal, diagnosis in state.subgoal_diagnoses.items():
+            normalized = str(goal).strip()
+            if not normalized or normalized == active or not isinstance(diagnosis, dict):
+                continue
+            diagnoses.append((normalized, dict(diagnosis)))
+        repair_items: list[str] = []
+        for goal, diagnosis in diagnoses:
+            path = str(diagnosis.get("path", "")).strip()
+            repair_instruction = str(diagnosis.get("repair_instruction", "")).strip()
+            if repair_instruction:
+                if path == "patch.diff":
+                    repair_instruction = (
+                        f"{repair_instruction}; next command must create or overwrite patch.diff directly "
+                        "with cat > patch.diff or printf > patch.diff; do not run cat, ls, find, git, or source inspection first"
+                    )
+                repair_items.append(repair_instruction)
+                if len(repair_items) >= 3:
+                    break
+                continue
+            if not path or diagnosis.get("expected_content") is None:
+                continue
+            expected = str(diagnosis.get("expected_content", ""))
+            preview = str(diagnosis.get("expected_content_preview", "")).strip()
+            if not preview:
+                preview = json.dumps(expected)
+            repair_items.append(
+                f"rewrite {path} to exactly {preview}; do not paraphrase, pretty-print, add headings, or change spacing"
+            )
+            if len(repair_items) >= 3:
+                break
+        if not repair_items:
+            return ""
+        return " | ".join(repair_items)
 
     def _apply_pre_context_tolbert_route(self, state: AgentState, decision: ActionDecision) -> ActionDecision:
         route = self._tolbert_route_decision(state)
