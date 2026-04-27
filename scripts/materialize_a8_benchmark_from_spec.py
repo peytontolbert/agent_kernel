@@ -65,11 +65,14 @@ def materialize_a8_benchmark_from_spec(
     elif not summary_path.exists():
         raise ValueError(f"adapter.summary_json does not exist: {summary_path}")
 
+    adapter_spec_path = str(adapter.get("adapter_spec_json", "")).strip()
     packet = build_result_for_benchmark(
         _read_json(summary_path),
         benchmark=benchmark,
         source_path=str(summary_path),
         conservative_comparison_report=bool(adapter.get("conservative_comparison_report", False)),
+        adapter_spec=_read_json(Path(adapter_spec_path)) if adapter_spec_path else None,
+        adapter_spec_path=adapter_spec_path,
     )
     packet["source"]["benchmark_run_spec_path"] = spec_path
     failures = verify_a8_benchmark_result_packet(packet)

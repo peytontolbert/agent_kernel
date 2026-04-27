@@ -869,6 +869,65 @@ class AgentKernel:
         return len(guidance.get("evidence", []))
 
     @staticmethod
+    def _research_context_metrics(state: AgentState) -> dict[str, int]:
+        if state.context_packet is None:
+            return {
+                "research_context_chunk_count": 0,
+                "llm_visible_research_context_chunk_count": 0,
+                "research_retrieval_evidence_count": 0,
+                "research_model_asset_count": 0,
+                "research_repository_match_count": 0,
+                "research_algorithm_match_count": 0,
+            }
+        control = state.context_packet.control
+        chunks = [
+            dict(chunk)
+            for chunk in list(control.get("selected_context_chunks", []) or [])
+            if isinstance(chunk, dict)
+        ]
+        budget = control.get("context_chunk_budget", {})
+        budget = dict(budget) if isinstance(budget, dict) else {}
+        try:
+            max_visible_chunks = int(budget.get("max_chunks", 8) or 8)
+        except (TypeError, ValueError):
+            max_visible_chunks = 8
+
+        def is_research_chunk(chunk: dict[str, object]) -> bool:
+            return str(chunk.get("span_id", "")).startswith("research:") or (
+                str(chunk.get("source_id", "")) == "research_library"
+            )
+
+        research_chunks = [chunk for chunk in chunks if is_research_chunk(chunk)]
+        visible_research_chunks = [chunk for chunk in chunks[:max_visible_chunks] if is_research_chunk(chunk)]
+        model_assets = 0
+        repositories = 0
+        algorithms = 0
+        for chunk in research_chunks:
+            metadata = chunk.get("metadata", {})
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            assets = metadata.get("assets", [])
+            repos = metadata.get("repositories", [])
+            algos = metadata.get("algorithms", [])
+            model_assets += len(assets) if isinstance(assets, list) else 0
+            repositories += len(repos) if isinstance(repos, list) else 0
+            algorithms += len(algos) if isinstance(algos, list) else 0
+        guidance = control.get("retrieval_guidance", {})
+        guidance = dict(guidance) if isinstance(guidance, dict) else {}
+        evidence = [
+            str(item)
+            for item in list(guidance.get("evidence", []) or [])
+            if "research_library" in str(item)
+        ]
+        return {
+            "research_context_chunk_count": len(research_chunks),
+            "llm_visible_research_context_chunk_count": len(visible_research_chunks),
+            "research_retrieval_evidence_count": len(evidence),
+            "research_model_asset_count": model_assets,
+            "research_repository_match_count": repositories,
+            "research_algorithm_match_count": algorithms,
+        }
+
+    @staticmethod
     def _retrieval_command_match(state: AgentState, command: str) -> bool:
         if state.context_packet is None or not command.strip():
             return False

@@ -1,0 +1,65 @@
+2026-04-27 17:49:24,885 - INFO - Creating container for sympy__sympy-14711...
+2026-04-27 17:49:25,051 - INFO - Container for sympy__sympy-14711 created: 033922edfe3982d619de1a6b8dfe67f6064d49480aa24ba7aad7498881fdfe41
+2026-04-27 17:49:25,289 - INFO - Container for sympy__sympy-14711 started: 033922edfe3982d619de1a6b8dfe67f6064d49480aa24ba7aad7498881fdfe41
+2026-04-27 17:49:25,290 - INFO - Intermediate patch for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r2_probe/agentkernel/sympy__sympy-14711/patch.diff, now applying to container...
+2026-04-27 17:49:25,428 - INFO - >>>>> Applied Patch:
+Checking patch sympy/physics/vector/vector.py...
+Applied patch sympy/physics/vector/vector.py cleanly.
+
+2026-04-27 17:49:25,749 - INFO - Git diff before:
+diff --git a/sympy/physics/vector/vector.py b/sympy/physics/vector/vector.py
+index a048ee57f..58ae83ff2 100644
+--- a/sympy/physics/vector/vector.py
++++ b/sympy/physics/vector/vector.py
+@@ -57,6 +57,8 @@ def __hash__(self):
+ 
+     def __add__(self, other):
+         """The add operator for Vector. """
++        if other == 0:
++            return self
+         other = _check_vector(other)
+         return Vector(self.args + other.args)
+ 
+@@ -449,7 +451,8 @@ def _det(mat):
+     _sympystr = __str__
+     _sympyrepr = _sympystr
+     __repr__ = __str__
+-    __radd__ = __add__
++    def __radd__(self, other):
++        return self.__add__(other)
+     __rand__ = __and__
+     __rmul__ = __mul__
+2026-04-27 17:49:25,749 - INFO - Eval script for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r2_probe/agentkernel/sympy__sympy-14711/eval.sh; copying to container...
+2026-04-27 17:49:30,383 - INFO - Test runtime: 4.59 seconds
+2026-04-27 17:49:30,384 - INFO - Test output for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r2_probe/agentkernel/sympy__sympy-14711/test_output.txt
+2026-04-27 17:49:30,447 - INFO - Git diff after:
+diff --git a/sympy/physics/vector/vector.py b/sympy/physics/vector/vector.py
+index a048ee57f..58ae83ff2 100644
+--- a/sympy/physics/vector/vector.py
++++ b/sympy/physics/vector/vector.py
+@@ -57,6 +57,8 @@ def __hash__(self):
+ 
+     def __add__(self, other):
+         """The add operator for Vector. """
++        if other == 0:
++            return self
+         other = _check_vector(other)
+         return Vector(self.args + other.args)
+ 
+@@ -449,7 +451,8 @@ def _det(mat):
+     _sympystr = __str__
+     _sympyrepr = _sympystr
+     __repr__ = __str__
+-    __radd__ = __add__
++    def __radd__(self, other):
++        return self.__add__(other)
+     __rand__ = __and__
+     __rmul__ = __mul__
+2026-04-27 17:49:30,447 - INFO - Grading answer for sympy__sympy-14711...
+2026-04-27 17:49:30,447 - INFO - report: {'sympy__sympy-14711': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['test_Vector'], 'failure': []}, 'PASS_TO_PASS': {'success': ['test_Vector_diffs', 'test_vector_var_in_dcm'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for sympy__sympy-14711: resolved: True
+2026-04-27 17:49:30,448 - INFO - Attempting to stop container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r2_probe...
+2026-04-27 17:49:45,637 - INFO - Attempting to remove container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r2_probe...
+2026-04-27 17:49:45,678 - INFO - Container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r2_probe removed.
+2026-04-27 17:49:45,678 - INFO - Attempting to remove image swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest...
+2026-04-27 17:49:47,573 - INFO - Image swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest removed.

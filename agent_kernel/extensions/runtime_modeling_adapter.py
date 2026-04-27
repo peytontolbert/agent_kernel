@@ -6,14 +6,26 @@ from typing import Any
 
 
 def build_context_provider(*, config, repo_root: Path):
-    if not bool(config.use_tolbert_context):
-        return None
-    from .tolbert import MockTolbertContextCompiler, TolbertContextCompiler
+    base_provider = None
+    if bool(config.use_tolbert_context):
+        from .tolbert import MockTolbertContextCompiler, TolbertContextCompiler
 
-    provider = str(config.normalized_provider()).strip()
-    if provider == "mock":
-        return MockTolbertContextCompiler(config=config, repo_root=repo_root)
-    return TolbertContextCompiler(config=config, repo_root=repo_root)
+        provider = str(config.normalized_provider()).strip()
+        if provider == "mock":
+            base_provider = MockTolbertContextCompiler(config=config, repo_root=repo_root)
+        else:
+            base_provider = TolbertContextCompiler(config=config, repo_root=repo_root)
+    if not bool(getattr(config, "use_research_library_context", False)):
+        return base_provider
+    if base_provider is None and not bool(getattr(config, "research_library_standalone_context", False)):
+        return None
+    from ..research_library.context import ResearchLibraryContextProvider
+
+    return ResearchLibraryContextProvider(
+        config=config,
+        repo_root=repo_root,
+        base_provider=base_provider,
+    )
 
 
 def load_model_artifact(path: Path) -> dict[str, object]:

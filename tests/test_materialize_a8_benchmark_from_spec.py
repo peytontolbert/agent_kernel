@@ -26,6 +26,16 @@ def _summary_only_spec(tmp_path: Path) -> dict[str, object]:
         "report_kind": "a8_benchmark_run_spec",
         "benchmark": "codeforces",
         "ready_to_run": False,
+        "prerequisites": [
+            {
+                "blocking": True,
+                "kind": "account",
+                "name": "codeforces_account",
+                "proof_path": str(tmp_path / "codeforces_account.json"),
+                "required_env": ["CODEFORCES_HANDLE"],
+                "satisfied_by": "env_or_proof",
+            }
+        ],
         "runner": {"kind": "summary_only", "summary_source": str(summary_path)},
         "adapter": {
             "script": "scripts/run_a8_benchmark_adapter.py",
@@ -58,6 +68,37 @@ def test_materialize_a8_benchmark_from_spec_rejects_not_ready_by_default(tmp_pat
         assert "spec is not ready_to_run" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_materialize_a8_benchmark_from_spec_uses_adapter_spec_json(tmp_path):
+    module = _load_materializer_module()
+    spec = _summary_only_spec(tmp_path)
+    summary_path = Path(spec["adapter"]["summary_json"])
+    summary_path.write_text(json.dumps({"custom": {"rating": "3007"}}), encoding="utf-8")
+    adapter_spec_path = tmp_path / "codeforces_adapter_spec.json"
+    adapter_spec_path.write_text(
+        json.dumps(
+            {
+                "spec_version": "asi_v1",
+                "report_kind": "a8_benchmark_adapter_spec",
+                "benchmark": "codeforces",
+                "metrics": {
+                    "rating_equivalent": {
+                        "type": "integer",
+                        "aliases": ["custom.rating"],
+                        "required": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec["adapter"]["adapter_spec_json"] = str(adapter_spec_path)
+
+    packet = module.materialize_a8_benchmark_from_spec(spec, spec_path="spec.json", allow_not_ready=True)
+
+    assert packet["metrics"]["rating_equivalent"] == 3007
+    assert packet["source"]["adapter_spec_path"] == str(adapter_spec_path)
 
 
 def test_materialize_a8_benchmark_from_swe_results_json(tmp_path):

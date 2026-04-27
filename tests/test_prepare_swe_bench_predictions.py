@@ -82,6 +82,31 @@ def test_build_swe_predictions_from_manifest_reads_patch_path(tmp_path):
     ]
 
 
+def test_build_swe_predictions_from_nested_prediction_manifest(tmp_path):
+    module = _load_predictions_module()
+    patch_path = tmp_path / "patch.diff"
+    patch_path.write_text(_patch(), encoding="utf-8")
+
+    records = module.build_swe_predictions_from_manifest(
+        {
+            "report_kind": "swe_bench_prediction_task_manifest",
+            "prediction_manifest": {
+                "base_dir": str(tmp_path),
+                "predictions": [
+                    {
+                        "instance_id": "repo__pkg-1",
+                        "model_name_or_path": "agentkernel",
+                        "patch_path": "patch.diff",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert records[0]["instance_id"] == "repo__pkg-1"
+    assert records[0]["model_patch"] == _patch()
+
+
 def test_prepare_swe_bench_predictions_cli_build_and_validate(tmp_path, monkeypatch, capsys):
     module = _load_predictions_module()
     manifest_path = tmp_path / "manifest.json"

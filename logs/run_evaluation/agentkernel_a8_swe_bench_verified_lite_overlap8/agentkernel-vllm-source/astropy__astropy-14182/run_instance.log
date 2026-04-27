@@ -1,0 +1,67 @@
+2026-04-27 12:59:48,066 - INFO - Creating container for astropy__astropy-14182...
+2026-04-27 12:59:48,231 - INFO - Container for astropy__astropy-14182 created: 0f5c5e33f734acbbd37943f25c81fcf28efa21ec83d6c9b32b5dec5e4d8182bb
+2026-04-27 12:59:48,485 - INFO - Container for astropy__astropy-14182 started: 0f5c5e33f734acbbd37943f25c81fcf28efa21ec83d6c9b32b5dec5e4d8182bb
+2026-04-27 12:59:48,486 - INFO - Intermediate patch for astropy__astropy-14182 written to logs/run_evaluation/agentkernel_a8_swe_bench_verified_lite_overlap8/agentkernel-vllm-source/astropy__astropy-14182/patch.diff, now applying to container...
+2026-04-27 12:59:48,605 - INFO - >>>>> Applied Patch:
+Checking patch astropy/io/ascii/rst.py...
+Applied patch astropy/io/ascii/rst.py cleanly.
+
+2026-04-27 12:59:48,995 - INFO - Git diff before:
+diff --git a/astropy/io/ascii/rst.py b/astropy/io/ascii/rst.py
+index abdeba8ef..8e5463b02 100644
+--- a/astropy/io/ascii/rst.py
++++ b/astropy/io/ascii/rst.py
+@@ -57,10 +57,14 @@ class RST(FixedWidth):
+     data_class = SimpleRSTData
+     header_class = SimpleRSTHeader
+ 
+-    def __init__(self):
+-        super().__init__(delimiter_pad=None, bookend=False)
++    def __init__(self, header_rows=None):
++        super().__init__(delimiter_pad=None, bookend=False, header_rows=header_rows)
+ 
+     def write(self, lines):
+         lines = super().write(lines)
+-        lines = [lines[1]] + lines + [lines[1]]
+-        return lines
++        idx = len(self.header.header_rows)
++        return [lines[idx]] + lines + [lines[idx]]
++
++    def read(self, table):
++        self.data.start_line = 2 + len(self.header.header_rows)
++        return super().read(table)
+2026-04-27 12:59:48,996 - INFO - Eval script for astropy__astropy-14182 written to logs/run_evaluation/agentkernel_a8_swe_bench_verified_lite_overlap8/agentkernel-vllm-source/astropy__astropy-14182/eval.sh; copying to container...
+2026-04-27 13:00:43,968 - INFO - Test runtime: 54.92 seconds
+2026-04-27 13:00:43,969 - INFO - Test output for astropy__astropy-14182 written to logs/run_evaluation/agentkernel_a8_swe_bench_verified_lite_overlap8/agentkernel-vllm-source/astropy__astropy-14182/test_output.txt
+2026-04-27 13:00:44,036 - INFO - Git diff after:
+diff --git a/astropy/io/ascii/rst.py b/astropy/io/ascii/rst.py
+index abdeba8ef..8e5463b02 100644
+--- a/astropy/io/ascii/rst.py
++++ b/astropy/io/ascii/rst.py
+@@ -57,10 +57,14 @@ class RST(FixedWidth):
+     data_class = SimpleRSTData
+     header_class = SimpleRSTHeader
+ 
+-    def __init__(self):
+-        super().__init__(delimiter_pad=None, bookend=False)
++    def __init__(self, header_rows=None):
++        super().__init__(delimiter_pad=None, bookend=False, header_rows=header_rows)
+ 
+     def write(self, lines):
+         lines = super().write(lines)
+-        lines = [lines[1]] + lines + [lines[1]]
+-        return lines
++        idx = len(self.header.header_rows)
++        return [lines[idx]] + lines + [lines[idx]]
++
++    def read(self, table):
++        self.data.start_line = 2 + len(self.header.header_rows)
++        return super().read(table)
+2026-04-27 13:00:44,036 - INFO - Grading answer for astropy__astropy-14182...
+2026-04-27 13:00:44,039 - INFO - report: {'astropy__astropy-14182': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['astropy/io/ascii/tests/test_rst.py::test_rst_with_header_rows'], 'failure': []}, 'PASS_TO_PASS': {'success': ['astropy/io/ascii/tests/test_rst.py::test_read_normal', 'astropy/io/ascii/tests/test_rst.py::test_read_normal_names', 'astropy/io/ascii/tests/test_rst.py::test_read_normal_names_include', 'astropy/io/ascii/tests/test_rst.py::test_read_normal_exclude', 'astropy/io/ascii/tests/test_rst.py::test_read_unbounded_right_column', 'astropy/io/ascii/tests/test_rst.py::test_read_unbounded_right_column_header', 'astropy/io/ascii/tests/test_rst.py::test_read_right_indented_table', 'astropy/io/ascii/tests/test_rst.py::test_trailing_spaces_in_row_definition', 'astropy/io/ascii/tests/test_rst.py::test_write_normal'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for astropy__astropy-14182: resolved: True
+2026-04-27 13:00:44,039 - INFO - Attempting to stop container sweb.eval.astropy__astropy-14182.agentkernel_a8_swe_bench_verified_lite_overlap8...
+2026-04-27 13:00:59,319 - INFO - Attempting to remove container sweb.eval.astropy__astropy-14182.agentkernel_a8_swe_bench_verified_lite_overlap8...
+2026-04-27 13:00:59,391 - INFO - Container sweb.eval.astropy__astropy-14182.agentkernel_a8_swe_bench_verified_lite_overlap8 removed.
+2026-04-27 13:00:59,391 - INFO - Attempting to remove image swebench/sweb.eval.x86_64.astropy_1776_astropy-14182:latest...
+2026-04-27 13:01:00,320 - INFO - Image swebench/sweb.eval.x86_64.astropy_1776_astropy-14182:latest removed.

@@ -10,6 +10,7 @@ import argparse
 from agent_kernel.config import KernelConfig
 from evals.harness import (
     compare_abstraction_transfer_modes,
+    compare_research_library_modes,
     compare_skill_modes,
     compare_tolbert_feature_modes,
     compare_tolbert_modes,
@@ -22,6 +23,9 @@ def main() -> None:
     parser.add_argument("--provider", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--use-tolbert-context", choices=("0", "1"), default=None)
+    parser.add_argument("--use-research-library-context", choices=("0", "1"), default=None)
+    parser.add_argument("--research-library-standalone-context", choices=("0", "1"), default=None)
+    parser.add_argument("--require-live-llm-coding-control", choices=("0", "1"), default=None)
     parser.add_argument(
         "--tolbert-mode",
         choices=("full", "path_only", "retrieval_only", "deterministic_command", "skill_ranking"),
@@ -35,6 +39,12 @@ def main() -> None:
     parser.add_argument("--tolbert-cache", action="append", default=None)
     parser.add_argument("--tolbert-label-map", default=None)
     parser.add_argument("--tolbert-device", default=None)
+    parser.add_argument("--task-limit", type=int, default=None)
+    parser.add_argument("--priority-benchmark-family", action="append", default=None)
+    parser.add_argument("--restrict-to-priority-benchmark-families", action="store_true")
+    parser.add_argument("--prefer-retrieval-tasks", action="store_true")
+    parser.add_argument("--prefer-low-cost-tasks", action="store_true")
+    parser.add_argument("--prefer-long-horizon-tasks", action="store_true")
     parser.add_argument("--include-curriculum", action="store_true")
     parser.add_argument("--include-failure-curriculum", action="store_true")
     parser.add_argument("--include-discovered-tasks", action="store_true")
@@ -62,6 +72,7 @@ def main() -> None:
     parser.add_argument("--compare-skills", action="store_true")
     parser.add_argument("--compare-abstractions", action="store_true")
     parser.add_argument("--compare-tolbert", action="store_true")
+    parser.add_argument("--compare-research-library", action="store_true")
     parser.add_argument("--compare-tolbert-features", action="store_true")
     args = parser.parse_args()
 
@@ -72,6 +83,12 @@ def main() -> None:
         config.model_name = args.model
     if args.use_tolbert_context is not None:
         config.use_tolbert_context = args.use_tolbert_context == "1"
+    if args.use_research_library_context is not None:
+        config.use_research_library_context = args.use_research_library_context == "1"
+    if args.research_library_standalone_context is not None:
+        config.research_library_standalone_context = args.research_library_standalone_context == "1"
+    if args.require_live_llm_coding_control is not None:
+        config.asi_coding_require_live_llm = args.require_live_llm_coding_control == "1"
     if args.tolbert_mode:
         config.tolbert_mode = args.tolbert_mode
     if args.use_skills is not None:
@@ -151,6 +168,88 @@ def main() -> None:
             )
         return
 
+    if args.compare_research_library:
+        comparison = compare_research_library_modes(
+            config=config,
+            include_discovered_tasks=args.include_discovered_tasks,
+            include_episode_memory=args.include_episode_memory,
+            include_skill_memory=args.include_skill_memory,
+            include_skill_transfer=args.include_skill_transfer,
+            include_operator_memory=args.include_operator_memory,
+            include_tool_memory=args.include_tool_memory,
+            include_verifier_memory=args.include_verifier_memory,
+            include_benchmark_candidates=args.include_benchmark_candidates,
+            include_verifier_candidates=args.include_verifier_candidates,
+            include_generated=args.include_curriculum,
+            include_failure_generated=args.include_failure_curriculum,
+            task_limit=args.task_limit,
+            priority_benchmark_families=args.priority_benchmark_family,
+            prefer_low_cost_tasks=args.prefer_low_cost_tasks,
+            prefer_long_horizon_tasks=args.prefer_long_horizon_tasks,
+            prefer_retrieval_tasks=args.prefer_retrieval_tasks,
+            restrict_to_priority_benchmark_families=args.restrict_to_priority_benchmark_families,
+            progress_label_prefix="research_library",
+        )
+        print(
+            "research_library_compare "
+            f"pass_rate_delta={comparison.pass_rate_delta:.2f} "
+            f"average_steps_delta={comparison.average_steps_delta:.2f} "
+            f"average_retrieval_evidence_delta={comparison.average_retrieval_evidence_delta:.2f} "
+            f"average_research_context_chunks_delta={comparison.average_research_context_chunks_delta:.2f} "
+            f"average_llm_visible_research_context_chunks_delta="
+            f"{comparison.average_llm_visible_research_context_chunks_delta:.2f} "
+            f"average_research_retrieval_evidence_delta="
+            f"{comparison.average_research_retrieval_evidence_delta:.2f} "
+            f"average_research_model_assets_delta={comparison.average_research_model_assets_delta:.2f} "
+            f"average_research_repository_matches_delta="
+            f"{comparison.average_research_repository_matches_delta:.2f} "
+            f"average_research_algorithm_matches_delta="
+            f"{comparison.average_research_algorithm_matches_delta:.2f} "
+            f"retrieval_influenced_steps_delta={comparison.retrieval_influenced_steps_delta} "
+            f"trusted_retrieval_steps_delta={comparison.trusted_retrieval_steps_delta}"
+        )
+        print(
+            "research_library_with "
+            f"passed={comparison.with_research_library.passed} "
+            f"total={comparison.with_research_library.total} "
+            f"pass_rate={comparison.with_research_library.pass_rate:.2f} "
+            f"average_steps={comparison.with_research_library.average_steps:.2f} "
+            f"average_retrieval_evidence={comparison.with_research_library.average_retrieval_evidence:.2f} "
+            f"average_research_context_chunks="
+            f"{comparison.with_research_library.average_research_context_chunks:.2f} "
+            f"average_llm_visible_research_context_chunks="
+            f"{comparison.with_research_library.average_llm_visible_research_context_chunks:.2f} "
+            f"average_research_retrieval_evidence="
+            f"{comparison.with_research_library.average_research_retrieval_evidence:.2f}"
+        )
+        print(
+            "research_library_without "
+            f"passed={comparison.without_research_library.passed} "
+            f"total={comparison.without_research_library.total} "
+            f"pass_rate={comparison.without_research_library.pass_rate:.2f} "
+            f"average_steps={comparison.without_research_library.average_steps:.2f} "
+            f"average_retrieval_evidence={comparison.without_research_library.average_retrieval_evidence:.2f} "
+            f"average_research_context_chunks="
+            f"{comparison.without_research_library.average_research_context_chunks:.2f} "
+            f"average_llm_visible_research_context_chunks="
+            f"{comparison.without_research_library.average_llm_visible_research_context_chunks:.2f} "
+            f"average_research_retrieval_evidence="
+            f"{comparison.without_research_library.average_research_retrieval_evidence:.2f}"
+        )
+        for capability in sorted(comparison.capability_pass_rate_delta):
+            print(
+                "research_library_compare "
+                f"capability={capability} "
+                f"pass_rate_delta={comparison.capability_pass_rate_delta[capability]:.2f}"
+            )
+        for family in sorted(comparison.benchmark_family_pass_rate_delta):
+            print(
+                "research_library_compare "
+                f"benchmark_family={family} "
+                f"pass_rate_delta={comparison.benchmark_family_pass_rate_delta[family]:.2f}"
+            )
+        return
+
     if args.compare_abstractions:
         comparison = compare_abstraction_transfer_modes(
             config=config,
@@ -161,6 +260,8 @@ def main() -> None:
             include_verifier_candidates=args.include_verifier_candidates,
             include_generated=args.include_curriculum,
             include_failure_generated=args.include_failure_curriculum,
+            task_limit=args.task_limit,
+            progress_label_prefix="abstraction",
         )
         print(
             "abstraction_compare "
@@ -248,6 +349,13 @@ def main() -> None:
         include_verifier_memory=args.include_verifier_memory,
         include_benchmark_candidates=args.include_benchmark_candidates,
         include_verifier_candidates=args.include_verifier_candidates,
+        task_limit=args.task_limit,
+        priority_benchmark_families=args.priority_benchmark_family,
+        prefer_low_cost_tasks=args.prefer_low_cost_tasks,
+        prefer_long_horizon_tasks=args.prefer_long_horizon_tasks,
+        prefer_retrieval_tasks=args.prefer_retrieval_tasks,
+        restrict_to_priority_benchmark_families=args.restrict_to_priority_benchmark_families,
+        progress_label="eval" if args.task_limit else None,
     )
     print(f"passed={metrics.passed} total={metrics.total} pass_rate={metrics.pass_rate:.2f}")
     print(

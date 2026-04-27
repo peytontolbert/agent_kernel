@@ -814,6 +814,7 @@ def _build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--notes", default="")
     enqueue.add_argument("--decompose-workers", choices=("0", "1"), default="0")
     _add_runtime_override_args(enqueue)
+    _add_governance_args(enqueue)
 
     enqueue_manifest = subparsers.add_parser("enqueue-manifest")
     enqueue_manifest.add_argument("--manifest-path", action="append", required=True)
@@ -828,6 +829,7 @@ def _build_parser() -> argparse.ArgumentParser:
     enqueue_manifest.add_argument("--decompose-workers", choices=("0", "1"), default="0")
     enqueue_manifest.add_argument("--json", action="store_true")
     _add_runtime_override_args(enqueue_manifest)
+    _add_governance_args(enqueue_manifest)
 
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--state", action="append", default=None)
@@ -886,6 +888,7 @@ def main() -> None:
     config = KernelConfig()
     config.ensure_directories()
     _apply_retained_delegation_policy(config)
+    _apply_base_config_overrides(config, args)
     queue = DelegatedJobQueue(config.delegated_job_queue_path)
     runtime = DelegatedRuntimeController(config.delegated_job_runtime_state_path)
     try:
@@ -1320,7 +1323,6 @@ def main() -> None:
         print(f"job_id={job.job_id} state={job.state} task_id={job.task_id}")
         return
 
-    _apply_base_config_overrides(config, args)
     runtime = DelegatedRuntimeController(config.delegated_job_runtime_state_path)
 
     if args.command == "status":

@@ -26,6 +26,11 @@ def _dataset() -> list[dict[str, object]]:
             "repo": "astropy/astropy",
             "base_commit": "def456",
         },
+        {
+            "instance_id": "sphinx-doc__sphinx-10323",
+            "repo": "sphinx-doc/sphinx",
+            "base_commit": "fedcba",
+        },
     ]
 
 
@@ -38,8 +43,8 @@ def test_prepare_repo_cache_dry_run_reports_clone_target(tmp_path, capsys):
         dry_run=True,
     )
 
-    assert result["repo_count"] == 1
-    assert result["selected_instance_count"] == 2
+    assert result["repo_count"] == 2
+    assert result["selected_instance_count"] == 3
     repo = result["repositories"][0]
     assert repo["repo"] == "astropy/astropy"
     assert repo["path"].endswith("astropy/astropy")
@@ -60,6 +65,21 @@ def test_prepare_repo_cache_filters_limit_and_instance_ids(tmp_path):
 
     assert result["selected_instance_count"] == 1
     assert result["repositories"][0]["commit_count"] == 1
+
+
+def test_prepare_repo_cache_filters_repositories(tmp_path):
+    module = _load_cache_module()
+
+    result = module.prepare_repo_cache(
+        _dataset(),
+        repo_cache_root=str(tmp_path / "repos"),
+        dry_run=True,
+        repos_filter=["sphinx-doc/sphinx"],
+    )
+
+    assert result["selected_instance_count"] == 1
+    assert result["repo_count"] == 1
+    assert result["repositories"][0]["repo"] == "sphinx-doc/sphinx"
 
 
 def test_prepare_swe_bench_repo_cache_cli_writes_summary(tmp_path, monkeypatch):

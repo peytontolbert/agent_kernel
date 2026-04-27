@@ -991,6 +991,80 @@ def test_run_job_queue_enqueue_manifest_cli_enqueues_external_workstream_json(mo
     assert jobs[0].runtime_overrides["task_payload"]["metadata"]["external_manifest_path"] == str(manifest_path)
 
 
+def test_run_job_queue_enqueue_manifest_cli_honors_max_queued_budget_override(monkeypatch, tmp_path):
+    module = _load_script_module("run_job_queue.py")
+    manifest_path = tmp_path / "workstream.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "external_cli_patch_task_1",
+                        "prompt": "Create one.txt.",
+                        "workspace_subdir": "external_cli_patch_task_1",
+                        "suggested_commands": ["printf 'one\\n' > one.txt"],
+                        "success_command": "test -f one.txt",
+                        "expected_files": ["one.txt"],
+                        "metadata": {"benchmark_family": "patch", "capability": "cli_workstream"},
+                    },
+                    {
+                        "task_id": "external_cli_patch_task_2",
+                        "prompt": "Create two.txt.",
+                        "workspace_subdir": "external_cli_patch_task_2",
+                        "suggested_commands": ["printf 'two\\n' > two.txt"],
+                        "success_command": "test -f two.txt",
+                        "expected_files": ["two.txt"],
+                        "metadata": {"benchmark_family": "patch", "capability": "cli_workstream"},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "KernelConfig",
+        lambda: KernelConfig(
+            provider="mock",
+            use_tolbert_context=False,
+            delegated_job_max_queued_per_budget_group=1,
+            workspace_root=tmp_path / "workspace",
+            trajectories_root=tmp_path / "trajectories" / "episodes",
+            run_reports_dir=tmp_path / "trajectories" / "reports",
+            run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+            delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+            delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_queue.py",
+            "enqueue-manifest",
+            "--manifest-path",
+            str(manifest_path),
+            "--budget-group",
+            "same_patch_budget",
+            "--max-queued-per-budget-group",
+            "2",
+            "--json",
+        ],
+    )
+    stream = StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    module.main()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["enqueued_job_count"] == 2
+    assert [job["budget_group"] for job in payload["enqueued_jobs"]] == [
+        "same_patch_budget",
+        "same_patch_budget",
+    ]
+
+
 def test_a7_unfamiliar_transfer_manifest_loads_as_held_out_external_tasks():
     manifest_path = Path(__file__).resolve().parents[1] / "config" / "a7_unfamiliar_transfer_manifest.json"
     bank = TaskBank(external_task_manifests=(str(manifest_path),))

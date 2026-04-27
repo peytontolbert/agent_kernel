@@ -689,6 +689,7 @@ def execute_step(
             )
     if kernel.config.use_planner:
         kernel._refresh_planner_recovery_artifact(state)
+    research_context_metrics = kernel._research_context_metrics(state)
     step_record = StepRecord(
         index=step_index,
         thought=decision.thought,
@@ -707,6 +708,14 @@ def execute_step(
         path_confidence=kernel._path_confidence(state),
         trust_retrieval=kernel._trust_retrieval(state),
         retrieval_direct_candidate_count=len(state.retrieval_direct_candidates),
+        research_context_chunk_count=int(research_context_metrics["research_context_chunk_count"]),
+        llm_visible_research_context_chunk_count=int(
+            research_context_metrics["llm_visible_research_context_chunk_count"]
+        ),
+        research_retrieval_evidence_count=int(research_context_metrics["research_retrieval_evidence_count"]),
+        research_model_asset_count=int(research_context_metrics["research_model_asset_count"]),
+        research_repository_match_count=int(research_context_metrics["research_repository_match_count"]),
+        research_algorithm_match_count=int(research_context_metrics["research_algorithm_match_count"]),
         active_subgoal=step_active_subgoal,
         subgoal_diagnoses=dict(state.subgoal_diagnoses),
         acting_role=step_role,

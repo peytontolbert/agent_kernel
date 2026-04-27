@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .schemas import CommandResult, TaskSpec, VerificationResult, classify_verification_reason
@@ -195,8 +197,16 @@ class Verifier:
         for pattern in placeholder_patterns:
             if re.search(pattern, patch_text, flags=re.IGNORECASE):
                 return ["SWE patch diff contains placeholder/template content"]
+        for identifier in contract.get("required_patch_identifiers", []):
+            normalized_identifier = str(identifier).strip()
+            if normalized_identifier and not re.search(rf"\b{re.escape(normalized_identifier)}\b", patch_text):
+                return [f"SWE patch does not reference required issue identifier: {normalized_identifier}"]
         if not self._patch_has_meaningful_change(patch_text):
             return ["SWE patch diff has no meaningful content change"]
+        if not self._patch_has_executable_change(patch_text):
+            return ["SWE patch diff changes only comments/docstrings/non-executable text"]
+        if self._patch_double_escapes_raw_regex_whitespace(patch_text):
+            return ["SWE patch suspiciously double-escapes raw regex whitespace"]
         expected_changed_paths = [
             str(path).strip()
             for path in contract.get("expected_changed_paths", [])
@@ -241,6 +251,66 @@ class Verifier:
             if apply_check.returncode != 0:
                 detail = apply_check.stderr.strip()
                 return [f"SWE patch apply check failed: {detail}"]
+            python_paths = [
+                path
+                for path in self._patch_changed_paths(patch_text)
+                if path.endswith(".py") and (worktree / path).exists()
+            ]
+            original_python_sources = {
+                path: (worktree / path).read_text(encoding="utf-8", errors="replace")
+                for path in python_paths
+            }
+            apply_patch = subprocess.run(
+                ["git", "-C", str(worktree), "apply", str(patch_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if apply_patch.returncode != 0:
+                detail = apply_patch.stderr.strip()
+                return [f"SWE patch apply failed after check: {detail}"]
+            if python_paths:
+                compile_check = subprocess.run(
+                    [sys.executable, "-m", "py_compile", *python_paths],
+                    cwd=worktree,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if compile_check.returncode != 0:
+                    detail = compile_check.stderr.strip().splitlines()[-1] if compile_check.stderr.strip() else ""
+                    return [f"SWE patch python syntax check failed: {detail}"]
+                ast_changed = False
+                for path in python_paths:
+                    patched_source = (worktree / path).read_text(encoding="utf-8", errors="replace")
+                    if _python_executable_ast_changed(original_python_sources.get(path, ""), patched_source):
+                        ast_changed = True
+                        break
+                if not ast_changed:
+                    return ["SWE patch python AST unchanged after ignoring docstrings/comments"]
+                for path in python_paths:
+                    if _is_python_test_path(path):
+                        continue
+                    removed_defs = _removed_python_definition_names(
+                        original_python_sources.get(path, ""),
+                        (worktree / path).read_text(encoding="utf-8", errors="replace"),
+                    )
+                    if removed_defs:
+                        preview = ", ".join(removed_defs[:5])
+                        return [f"SWE patch removes existing Python definitions in {path}: {preview}"]
+                    unused_new_params = _unused_new_python_parameters(
+                        original_python_sources.get(path, ""),
+                        (worktree / path).read_text(encoding="utf-8", errors="replace"),
+                    )
+                    if unused_new_params:
+                        preview = ", ".join(unused_new_params[:5])
+                        return [f"SWE patch adds unused production function parameters in {path}: {preview}"]
+                    invalid_init_returns = _python_init_return_value_names(
+                        (worktree / path).read_text(encoding="utf-8", errors="replace")
+                    )
+                    if invalid_init_returns:
+                        preview = ", ".join(invalid_init_returns[:5])
+                        return [f"SWE patch leaves invalid __init__ return values in {path}: {preview}"]
         return []
 
     @staticmethod
@@ -278,6 +348,28 @@ class Verifier:
         if not removed and not added:
             return False
         return removed != added
+
+    @staticmethod
+    def _patch_has_executable_change(patch_text: str) -> bool:
+        changed_lines: list[str] = []
+        for line in patch_text.splitlines():
+            if line.startswith("--- ") or line.startswith("+++ "):
+                continue
+            if line.startswith(("-", "+")):
+                changed_lines.append(line[1:])
+        if not changed_lines:
+            return False
+        return any(not _looks_like_non_executable_patch_line(line) for line in changed_lines)
+
+    @staticmethod
+    def _patch_double_escapes_raw_regex_whitespace(patch_text: str) -> bool:
+        for line in patch_text.splitlines():
+            if not line.startswith("+") or line.startswith("+++ "):
+                continue
+            payload = line[1:]
+            if re.search(r"=\s*rf?[\"']", payload) and r"\\s" in payload:
+                return True
+        return False
 
     @staticmethod
     def _swe_repo_cache_path(repo_cache_root: str, repo: str) -> Path | None:
@@ -1291,6 +1383,222 @@ def _semantic_path_tokens(relative_path: str) -> set[str]:
             tokens.add(stem)
         tokens.update(token for token in re.split(r"[^a-z0-9]+", stem) if token)
     return {token for token in tokens if token}
+
+
+def _looks_like_non_executable_patch_line(line: str) -> bool:
+    stripped = str(line).strip()
+    if not stripped:
+        return True
+    if stripped.startswith("#"):
+        return True
+    if stripped.startswith(('"""', "'''")) or stripped.endswith(('"""', "'''")):
+        return True
+    if stripped.startswith(":"):
+        return True
+    if stripped.lower().startswith("author:"):
+        return True
+    return False
+
+
+def _python_executable_ast_changed(before_source: str, after_source: str) -> bool:
+    try:
+        before_tree = ast.parse(before_source)
+        after_tree = ast.parse(after_source)
+    except SyntaxError:
+        return True
+    _strip_docstrings(before_tree)
+    _strip_docstrings(after_tree)
+    return ast.dump(before_tree, include_attributes=False) != ast.dump(after_tree, include_attributes=False)
+
+
+def _strip_docstrings(node: ast.AST) -> None:
+    for child in ast.walk(node):
+        body = getattr(child, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            body.pop(0)
+
+
+def _is_python_test_path(path: str) -> bool:
+    normalized = str(path).replace("\\", "/")
+    name = Path(normalized).name
+    return "/tests/" in normalized or name.startswith("test_") or name.endswith("_test.py")
+
+
+def _removed_python_definition_names(before_source: str, after_source: str) -> list[str]:
+    before_defs = _python_definition_names(before_source)
+    after_defs = _python_definition_names(after_source)
+    if not before_defs or not after_defs:
+        return []
+    return sorted(before_defs - after_defs)
+
+
+def _python_definition_names(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                names.add(qualified)
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                names.add(qualified)
+                _visit(child, qualified)
+
+    _visit(tree)
+    return names
+
+
+def _unused_new_python_parameters(before_source: str, after_source: str) -> list[str]:
+    before_defs = _python_function_parameters(before_source)
+    after_defs = _python_function_parameters(after_source)
+    if not before_defs or not after_defs:
+        return []
+    first_contexts = _python_function_first_name_contexts(after_source)
+    unused: list[str] = []
+    for name, after_params in sorted(after_defs.items()):
+        before_params = before_defs.get(name, set())
+        new_params = sorted(after_params - before_params)
+        if not new_params:
+            continue
+        used_names = _python_function_used_names(after_source).get(name, set())
+        function_first_contexts = first_contexts.get(name, {})
+        for param in new_params:
+            if param not in used_names or function_first_contexts.get(param) != "load":
+                unused.append(f"{name}.{param}")
+    return unused
+
+
+def _python_init_return_value_names(source: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    invalid: list[str] = []
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                if child.name == "__init__":
+                    for body_item in child.body:
+                        for descendant in ast.walk(body_item):
+                            if (
+                                isinstance(descendant, ast.Return)
+                                and descendant.value is not None
+                                and qualified not in invalid
+                            ):
+                                invalid.append(qualified)
+                _visit(child, qualified)
+
+    _visit(tree)
+    return sorted(invalid)
+
+
+def _python_function_parameters(source: str) -> dict[str, set[str]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    parameters: dict[str, set[str]] = {}
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                args = set()
+                args.update(arg.arg for arg in child.args.posonlyargs)
+                args.update(arg.arg for arg in child.args.args)
+                args.update(arg.arg for arg in child.args.kwonlyargs)
+                if child.args.vararg is not None:
+                    args.add(child.args.vararg.arg)
+                if child.args.kwarg is not None:
+                    args.add(child.args.kwarg.arg)
+                parameters[qualified] = {arg for arg in args if arg not in {"self", "cls"}}
+                _visit(child, qualified)
+
+    _visit(tree)
+    return parameters
+
+
+def _python_function_used_names(source: str) -> dict[str, set[str]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    used: dict[str, set[str]] = {}
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                body_names: set[str] = set()
+                for body_item in child.body:
+                    for descendant in ast.walk(body_item):
+                        if isinstance(descendant, ast.Name) and isinstance(descendant.ctx, ast.Load):
+                            body_names.add(descendant.id)
+                used[qualified] = body_names
+                _visit(child, qualified)
+
+    _visit(tree)
+    return used
+
+
+def _python_function_first_name_contexts(source: str) -> dict[str, dict[str, str]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    contexts: dict[str, dict[str, str]] = {}
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                function_contexts: dict[str, str] = {}
+                for body_item in child.body:
+                    _record_first_body_name_contexts(body_item, function_contexts)
+                contexts[qualified] = function_contexts
+                _visit(child, qualified)
+
+    _visit(tree)
+    return contexts
+
+
+def _record_first_body_name_contexts(node: ast.AST, contexts: dict[str, str]) -> None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return
+    if isinstance(node, ast.Name) and node.id not in contexts:
+        if isinstance(node.ctx, ast.Load):
+            contexts[node.id] = "load"
+        elif isinstance(node.ctx, (ast.Store, ast.Del)):
+            contexts[node.id] = "store"
+    for child in ast.iter_child_nodes(node):
+        _record_first_body_name_contexts(child, contexts)
 
 
 def synthesize_stricter_task(

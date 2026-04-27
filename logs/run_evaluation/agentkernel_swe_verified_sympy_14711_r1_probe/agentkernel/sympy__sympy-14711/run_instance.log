@@ -1,0 +1,51 @@
+2026-04-27 17:43:31,916 - INFO - Creating container for sympy__sympy-14711...
+2026-04-27 17:43:32,066 - INFO - Container for sympy__sympy-14711 created: 1fa270bd3d1319ba5ed70f41da0b3d98f8b9300c8a6e835a08d8e7ab7ef43690
+2026-04-27 17:43:32,327 - INFO - Container for sympy__sympy-14711 started: 1fa270bd3d1319ba5ed70f41da0b3d98f8b9300c8a6e835a08d8e7ab7ef43690
+2026-04-27 17:43:32,327 - INFO - Intermediate patch for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r1_probe/agentkernel/sympy__sympy-14711/patch.diff, now applying to container...
+2026-04-27 17:43:32,450 - INFO - >>>>> Applied Patch:
+Checking patch sympy/physics/vector/vector.py...
+Applied patch sympy/physics/vector/vector.py cleanly.
+
+2026-04-27 17:43:32,770 - INFO - Git diff before:
+diff --git a/sympy/physics/vector/vector.py b/sympy/physics/vector/vector.py
+index a048ee57f..e9f0867d0 100644
+--- a/sympy/physics/vector/vector.py
++++ b/sympy/physics/vector/vector.py
+@@ -449,7 +449,10 @@ def _det(mat):
+     _sympystr = __str__
+     _sympyrepr = _sympystr
+     __repr__ = __str__
+-    __radd__ = __add__
++    def __radd__(self, other):
++        if other == 0:
++            return self
++        return self.__add__(other)
+     __rand__ = __and__
+     __rmul__ = __mul__
+2026-04-27 17:43:32,770 - INFO - Eval script for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r1_probe/agentkernel/sympy__sympy-14711/eval.sh; copying to container...
+2026-04-27 17:43:37,325 - INFO - Test runtime: 4.49 seconds
+2026-04-27 17:43:37,326 - INFO - Test output for sympy__sympy-14711 written to logs/run_evaluation/agentkernel_swe_verified_sympy_14711_r1_probe/agentkernel/sympy__sympy-14711/test_output.txt
+2026-04-27 17:43:37,384 - INFO - Git diff after:
+diff --git a/sympy/physics/vector/vector.py b/sympy/physics/vector/vector.py
+index a048ee57f..e9f0867d0 100644
+--- a/sympy/physics/vector/vector.py
++++ b/sympy/physics/vector/vector.py
+@@ -449,7 +449,10 @@ def _det(mat):
+     _sympystr = __str__
+     _sympyrepr = _sympystr
+     __repr__ = __str__
+-    __radd__ = __add__
++    def __radd__(self, other):
++        if other == 0:
++            return self
++        return self.__add__(other)
+     __rand__ = __and__
+     __rmul__ = __mul__
+2026-04-27 17:43:37,384 - INFO - Grading answer for sympy__sympy-14711...
+2026-04-27 17:43:37,385 - INFO - report: {'sympy__sympy-14711': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['test_Vector']}, 'PASS_TO_PASS': {'success': ['test_Vector_diffs', 'test_vector_var_in_dcm'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for sympy__sympy-14711: resolved: False
+2026-04-27 17:43:37,386 - INFO - Attempting to stop container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r1_probe...
+2026-04-27 17:43:52,576 - INFO - Attempting to remove container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r1_probe...
+2026-04-27 17:43:52,626 - INFO - Container sweb.eval.sympy__sympy-14711.agentkernel_swe_verified_sympy_14711_r1_probe removed.
+2026-04-27 17:43:52,626 - INFO - Attempting to remove image swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest...
+2026-04-27 17:43:54,660 - INFO - Image swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest removed.

@@ -55,6 +55,8 @@ def validate_swe_predictions(records: list[dict[str, Any]]) -> list[str]:
 
 
 def build_swe_predictions_from_manifest(manifest: dict[str, Any] | list[Any]) -> list[dict[str, str]]:
+    if isinstance(manifest, dict) and isinstance(manifest.get("prediction_manifest"), dict):
+        manifest = manifest["prediction_manifest"]
     items = manifest.get("predictions", manifest.get("instances", [])) if isinstance(manifest, dict) else manifest
     if not isinstance(items, list):
         raise ValueError("manifest must be a list or contain predictions/instances list")

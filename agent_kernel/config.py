@@ -183,6 +183,37 @@ class KernelConfig:
     use_prompt_proposals: bool = os.getenv("AGENT_KERNEL_USE_PROMPT_PROPOSALS", "1") == "1"
     use_curriculum_proposals: bool = os.getenv("AGENT_KERNEL_USE_CURRICULUM_PROPOSALS", "1") == "1"
     use_retrieval_proposals: bool = os.getenv("AGENT_KERNEL_USE_RETRIEVAL_PROPOSALS", "1") == "1"
+    use_research_library_context: bool = os.getenv("AGENT_KERNEL_USE_RESEARCH_LIBRARY_CONTEXT", "1") == "1"
+    research_library_standalone_context: bool = (
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_STANDALONE_CONTEXT", "0") == "1"
+    )
+    research_library_config_path: Path = Path(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONFIG_PATH", "config/research_library_sources.json")
+    )
+    research_library_status_path: Path = Path(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_STATUS_PATH", "var/research_library/status.json")
+    )
+    research_library_context_max_chunks: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONTEXT_MAX_CHUNKS", "6")
+    )
+    research_library_context_max_models: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONTEXT_MAX_MODELS", "8")
+    )
+    research_library_context_max_repositories: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONTEXT_MAX_REPOSITORIES", "4")
+    )
+    research_library_context_max_algorithms: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONTEXT_MAX_ALGORITHMS", "4")
+    )
+    research_library_context_max_paper_hits: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_CONTEXT_MAX_PAPER_HITS", "2")
+    )
+    research_library_paper_scan_file_limit: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_PAPER_SCAN_FILE_LIMIT", "1")
+    )
+    research_library_paper_scan_row_limit: int = int(
+        os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_PAPER_SCAN_ROW_LIMIT", "4096")
+    )
     tolbert_tree_version: str = os.getenv("AGENT_KERNEL_TOLBERT_TREE_VERSION", "tol_v1")
     tolbert_branch_results: int = int(os.getenv("AGENT_KERNEL_TOLBERT_BRANCH_RESULTS", "3"))
     tolbert_global_results: int = int(os.getenv("AGENT_KERNEL_TOLBERT_GLOBAL_RESULTS", "2"))
@@ -653,6 +684,7 @@ class KernelConfig:
             "use_universe_model": False,
             "use_planner": False,
             "use_role_specialization": False,
+            "use_research_library_context": False,
             "persist_learning_candidates": False,
         }
         floor_defaults.update(overrides)
@@ -681,6 +713,7 @@ class KernelConfig:
             "use_prompt_proposals": False,
             "use_curriculum_proposals": False,
             "use_retrieval_proposals": False,
+            "use_research_library_context": False,
             "persist_episode_memory": True,
             "persist_learning_candidates": True,
             "asi_coding_require_live_llm": True,
@@ -866,6 +899,7 @@ class KernelConfig:
         self.benchmark_candidates_path.parent.mkdir(parents=True, exist_ok=True)
         self.retrieval_proposals_path.parent.mkdir(parents=True, exist_ok=True)
         self.retrieval_asset_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        self.research_library_status_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_model_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_supervised_datasets_dir.mkdir(parents=True, exist_ok=True)
         self.qwen_adapter_artifact_path.parent.mkdir(parents=True, exist_ok=True)

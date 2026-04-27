@@ -1,0 +1,47 @@
+2026-04-27 15:27:39,922 - INFO - Creating container for pytest-dev__pytest-7205...
+2026-04-27 15:27:40,412 - INFO - Container for pytest-dev__pytest-7205 created: fc2b3f1d7ba7aa6c098ef9013b4db8de4ae02a0d5405f91d9f1eccf11fa3b46f
+2026-04-27 15:27:40,658 - INFO - Container for pytest-dev__pytest-7205 started: fc2b3f1d7ba7aa6c098ef9013b4db8de4ae02a0d5405f91d9f1eccf11fa3b46f
+2026-04-27 15:27:40,658 - INFO - Intermediate patch for pytest-dev__pytest-7205 written to logs/run_evaluation/agentkernel_swe_verified_pytest_7205_r2_probe/agentkernel/pytest-dev__pytest-7205/patch.diff, now applying to container...
+2026-04-27 15:27:40,788 - INFO - >>>>> Applied Patch:
+Checking patch src/_pytest/setuponly.py...
+Applied patch src/_pytest/setuponly.py cleanly.
+
+2026-04-27 15:27:40,893 - INFO - Git diff before:
+diff --git a/src/_pytest/setuponly.py b/src/_pytest/setuponly.py
+index c9cc589ff..53a10732c 100644
+--- a/src/_pytest/setuponly.py
++++ b/src/_pytest/setuponly.py
+@@ -66,7 +66,8 @@ def _show_fixture_action(fixturedef, msg):
+             tw.write(" (fixtures used: {})".format(", ".join(deps)))
+ 
+     if hasattr(fixturedef, "cached_param"):
+-        tw.write("[{}]".format(fixturedef.cached_param))
++        from _pytest._io.saferepr import saferepr
++        tw.write("[{}]".format(saferepr(fixturedef.cached_param, maxsize=42)))
+ 
+     tw.flush()
+2026-04-27 15:27:40,893 - INFO - Eval script for pytest-dev__pytest-7205 written to logs/run_evaluation/agentkernel_swe_verified_pytest_7205_r2_probe/agentkernel/pytest-dev__pytest-7205/eval.sh; copying to container...
+2026-04-27 15:27:46,104 - INFO - Test runtime: 5.16 seconds
+2026-04-27 15:27:46,104 - INFO - Test output for pytest-dev__pytest-7205 written to logs/run_evaluation/agentkernel_swe_verified_pytest_7205_r2_probe/agentkernel/pytest-dev__pytest-7205/test_output.txt
+2026-04-27 15:27:46,160 - INFO - Git diff after:
+diff --git a/src/_pytest/setuponly.py b/src/_pytest/setuponly.py
+index c9cc589ff..53a10732c 100644
+--- a/src/_pytest/setuponly.py
++++ b/src/_pytest/setuponly.py
+@@ -66,7 +66,8 @@ def _show_fixture_action(fixturedef, msg):
+             tw.write(" (fixtures used: {})".format(", ".join(deps)))
+ 
+     if hasattr(fixturedef, "cached_param"):
+-        tw.write("[{}]".format(fixturedef.cached_param))
++        from _pytest._io.saferepr import saferepr
++        tw.write("[{}]".format(saferepr(fixturedef.cached_param, maxsize=42)))
+ 
+     tw.flush()
+2026-04-27 15:27:46,160 - INFO - Grading answer for pytest-dev__pytest-7205...
+2026-04-27 15:27:46,162 - INFO - report: {'pytest-dev__pytest-7205': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['testing/test_setuponly.py::test_show_fixtures_with_parameters[--setup-only]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids[--setup-only]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids_function[--setup-only]', 'testing/test_setuponly.py::test_show_fixtures_with_parameters[--setup-plan]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids[--setup-plan]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids_function[--setup-plan]', 'testing/test_setuponly.py::test_show_fixtures_with_parameters[--setup-show]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids[--setup-show]', 'testing/test_setuponly.py::test_show_fixtures_with_parameter_ids_function[--setup-show]', 'testing/test_setuponly.py::test_show_fixture_action_with_bytes'], 'failure': []}, 'PASS_TO_PASS': {'success': ['testing/test_setuponly.py::test_show_only_active_fixtures[--setup-only]', 'testing/test_setuponly.py::test_show_different_scopes[--setup-only]', 'testing/test_setuponly.py::test_show_nested_fixtures[--setup-only]', 'testing/test_setuponly.py::test_show_fixtures_with_autouse[--setup-only]', 'testing/test_setuponly.py::test_show_only_active_fixtures[--setup-plan]', 'testing/test_setuponly.py::test_show_different_scopes[--setup-plan]', 'testing/test_setuponly.py::test_show_nested_fixtures[--setup-plan]', 'testing/test_setuponly.py::test_show_fixtures_with_autouse[--setup-plan]', 'testing/test_setuponly.py::test_show_only_active_fixtures[--setup-show]', 'testing/test_setuponly.py::test_show_different_scopes[--setup-show]', 'testing/test_setuponly.py::test_show_nested_fixtures[--setup-show]', 'testing/test_setuponly.py::test_show_fixtures_with_autouse[--setup-show]', 'testing/test_setuponly.py::test_dynamic_fixture_request', 'testing/test_setuponly.py::test_capturing', 'testing/test_setuponly.py::test_show_fixtures_and_execute_test', 'testing/test_setuponly.py::test_setup_show_with_KeyboardInterrupt_in_test'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for pytest-dev__pytest-7205: resolved: True
+2026-04-27 15:27:46,163 - INFO - Attempting to stop container sweb.eval.pytest-dev__pytest-7205.agentkernel_swe_verified_pytest_7205_r2_probe...
+2026-04-27 15:28:01,352 - INFO - Attempting to remove container sweb.eval.pytest-dev__pytest-7205.agentkernel_swe_verified_pytest_7205_r2_probe...
+2026-04-27 15:28:01,414 - INFO - Container sweb.eval.pytest-dev__pytest-7205.agentkernel_swe_verified_pytest_7205_r2_probe removed.
+2026-04-27 15:28:01,414 - INFO - Attempting to remove image swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7205:latest...
+2026-04-27 15:28:03,364 - INFO - Image swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7205:latest removed.

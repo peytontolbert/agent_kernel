@@ -343,6 +343,14 @@ class LLMDecisionPolicy(Policy):
             if followup_skill_decision is not None:
                 return self._apply_tolbert_shadow(followup_skill_decision, tolbert_shadow, tolbert_route.mode, state=state)
 
+        swe_suggested_patch = self._swe_suggested_patch_command_direct_decision(state)
+        if swe_suggested_patch is not None:
+            return self._apply_tolbert_shadow(swe_suggested_patch, tolbert_shadow, tolbert_route.mode, state=state)
+
+        swe_patch_repair = self._swe_patch_builder_from_diff_direct_decision(state)
+        if swe_patch_repair is not None:
+            return self._apply_tolbert_shadow(swe_patch_repair, tolbert_shadow, tolbert_route.mode, state=state)
+
         self._emit_decision_progress("plan_candidates")
         transition_preview = self._transition_preview(state)
         self._emit_decision_progress(
@@ -488,6 +496,46 @@ class LLMDecisionPolicy(Policy):
             proposal_metadata=dict(raw_proposal_metadata),
         ), tolbert_shadow, tolbert_route.mode, state=state)
 
+    def _swe_suggested_patch_command_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        task = state.task
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        semantic_verifier = metadata.get("semantic_verifier", {})
+        is_swe_patch_task = bool(metadata.get("swe_bench_prediction_task", False)) or (
+            isinstance(semantic_verifier, dict) and semantic_verifier.get("kind") == "swe_patch_apply_check"
+        )
+        if not is_swe_patch_task:
+            return None
+        commands = metadata.get("swe_suggested_patch_commands", [])
+        if not isinstance(commands, list):
+            return None
+        attempted = {
+            str(step.content).strip()
+            for step in state.history
+            if step.action == CODE_EXECUTE and str(step.content).strip()
+        }
+        for raw_command in commands:
+            command = str(raw_command).strip()
+            if not command or command in attempted:
+                continue
+            if "\n" in command or "\r" in command:
+                continue
+            if not command.startswith("swe_patch_builder --path "):
+                continue
+            if "> patch.diff" not in command:
+                continue
+            return ActionDecision(
+                thought=(
+                    "Execute the source-grounded SWE suggested patch command before asking "
+                    "the model to choose a broader edit window."
+                ),
+                action=CODE_EXECUTE,
+                content=command,
+                done=False,
+                decision_source="swe_suggested_patch_command_direct",
+                proposal_metadata={"swe_suggested_patch_command": True},
+            )
+        return None
+
     def _deterministic_role_decision(
         self,
         state: AgentState,
@@ -510,6 +558,48 @@ class LLMDecisionPolicy(Policy):
             tolbert_mode=tolbert_mode,
             retrieval_has_signal=retrieval_has_signal,
             tolbert_route_mode=tolbert_route_mode,
+        )
+
+    def _swe_patch_builder_from_diff_direct_decision(self, state: AgentState) -> ActionDecision | None:
+        task = state.task
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        semantic_verifier = metadata.get("semantic_verifier", {})
+        is_swe_patch_task = bool(metadata.get("swe_bench_prediction_task", False)) or (
+            isinstance(semantic_verifier, dict) and semantic_verifier.get("kind") == "swe_patch_apply_check"
+        )
+        if not is_swe_patch_task:
+            return None
+        has_patch_repair = any(
+            str(diagnosis.get("path", "")).strip() == "patch.diff"
+            and str(diagnosis.get("repair_instruction", "")).strip()
+            for diagnosis in state.subgoal_diagnoses.values()
+            if isinstance(diagnosis, dict)
+        )
+        if not has_patch_repair:
+            return None
+        workspace = self.config.workspace_root / task.workspace_subdir
+        patch_path = workspace / "patch.diff"
+        if not patch_path.is_file():
+            return None
+        try:
+            patch_text = patch_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not all(marker in patch_text for marker in ("--- ", "+++ ", "@@")):
+            return None
+        command = "swe_patch_builder --from-diff patch.diff > patch.diff"
+        if state.history and state.history[-1].action == CODE_EXECUTE and state.history[-1].content == command:
+            return None
+        return ActionDecision(
+            thought=(
+                "Repair the model-authored SWE patch by preserving its intended changed lines "
+                "and regenerating valid unified diff syntax from the source fixture."
+            ),
+            action=CODE_EXECUTE,
+            content=command,
+            done=False,
+            decision_source="swe_patch_builder_repair_direct",
+            proposal_metadata={"swe_patch_builder_from_diff": True},
         )
 
     def _planner_direct_decision(
@@ -793,7 +883,9 @@ class LLMDecisionPolicy(Policy):
                 if path == "patch.diff":
                     repair_instruction = (
                         f"{repair_instruction}; next command must create or overwrite patch.diff directly "
-                        "with cat > patch.diff or printf > patch.diff; do not run cat, ls, find, git, or source inspection first"
+                        "with one swe_patch_builder command using exact line numbers from source_lines or the high-value "
+                        "edit window; prefer --replace-line/--replace-lines and redirect to patch.diff; do not hand-write "
+                        "unified diff hunk headers with cat/printf; do not run cat, ls, find, git, or source inspection first"
                     )
                 repair_items.append(repair_instruction)
                 if len(repair_items) >= 3:
@@ -1031,6 +1123,8 @@ class LLMDecisionPolicy(Policy):
     def _tolbert_mode(self) -> str:
         mode = str(self.config.tolbert_mode or "full").strip().lower()
         if not self.config.use_tolbert_context:
+            if bool(getattr(self.config, "use_research_library_context", False)):
+                return "deterministic_command"
             return "disabled"
         if mode not in {"full", "path_only", "retrieval_only", "deterministic_command", "skill_ranking", "disabled"}:
             return "full"

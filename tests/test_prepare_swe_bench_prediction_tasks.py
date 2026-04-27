@@ -127,6 +127,88 @@ def test_build_swe_prediction_task_manifest_reads_source_at_base_commit(tmp_path
     assert context[0]["content"] == "def parse_datetime(value):\n    return 'base'\n"
 
 
+def test_build_swe_prediction_task_manifest_adds_focused_windows_for_large_files(tmp_path):
+    module = _load_tasks_module()
+    repo_root = tmp_path / "repos" / "sympy" / "sympy"
+    source = repo_root / "sympy" / "utilities" / "iterables.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "# prefix\n"
+        + "\n".join(f"# filler {index}" for index in range(200))
+        + "\n\ndef uniq(seq):\n    return list(seq)\n",
+        encoding="utf-8",
+    )
+    dataset = [
+        {
+            "instance_id": "sympy__sympy-18835",
+            "repo": "sympy/sympy",
+            "base_commit": "",
+            "problem_statement": "uniq should reject mutated input.",
+            "patch": (
+                "diff --git a/sympy/utilities/iterables.py b/sympy/utilities/iterables.py\n"
+                "--- a/sympy/utilities/iterables.py\n"
+                "+++ b/sympy/utilities/iterables.py\n"
+            ),
+            "FAIL_TO_PASS": ["sympy/utilities/tests/test_iterables.py::test_uniq"],
+        }
+    ]
+
+    manifest = module.build_swe_prediction_task_manifest(
+        dataset,
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel",
+        repo_cache_root=str(tmp_path / "repos"),
+        max_source_context_bytes=128,
+    )
+
+    context = manifest["tasks"][0]["source_context"]
+    assert context[0]["truncated"] is True
+    focused = [entry for entry in context if entry.get("context_kind") == "focused_window"]
+    assert focused
+    assert focused[0]["focus_term"] == "uniq"
+    assert "def uniq(seq):" in focused[0]["content"]
+    assert focused[0]["line_start"] <= focused[0]["line_end"]
+
+
+def test_build_swe_prediction_task_manifest_default_context_covers_late_edit_sites(tmp_path):
+    module = _load_tasks_module()
+    repo_root = tmp_path / "repos" / "scikit-learn" / "scikit-learn"
+    source = repo_root / "sklearn" / "ensemble" / "_iforest.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "# prefix\n"
+        + "\n".join(f"# filler {index:04d} {'x' * 70}" for index in range(220))
+        + "\n        self.offset_ = np.percentile(self.score_samples(X), 100.0 * self.contamination)\n",
+        encoding="utf-8",
+    )
+    dataset = [
+        {
+            "instance_id": "scikit-learn__scikit-learn-25931",
+            "repo": "scikit-learn/scikit-learn",
+            "base_commit": "",
+            "problem_statement": (
+                "X does not have valid feature names, but IsolationForest was fitted with feature names "
+                "when contamination is not auto."
+            ),
+            "patch": (
+                "diff --git a/sklearn/ensemble/_iforest.py b/sklearn/ensemble/_iforest.py\n"
+                "--- a/sklearn/ensemble/_iforest.py\n"
+                "+++ b/sklearn/ensemble/_iforest.py\n"
+            ),
+        }
+    ]
+
+    manifest = module.build_swe_prediction_task_manifest(
+        dataset,
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel",
+        repo_cache_root=str(tmp_path / "repos"),
+    )
+
+    context = manifest["tasks"][0]["source_context"]
+    assert "self.offset_ = np.percentile(self.score_samples(X)" in context[0]["content"]
+
+
 def test_build_swe_prediction_task_manifest_filters_instance_ids(tmp_path):
     module = _load_tasks_module()
 
@@ -139,6 +221,30 @@ def test_build_swe_prediction_task_manifest_filters_instance_ids(tmp_path):
 
     assert manifest["task_count"] == 1
     assert manifest["tasks"][0]["instance_id"] == "sympy__sympy-2"
+
+
+def test_build_swe_prediction_task_manifest_filters_repositories(tmp_path):
+    module = _load_tasks_module()
+    dataset = [
+        *_dataset(),
+        {
+            "instance_id": "sphinx-doc__sphinx-10323",
+            "repo": "sphinx-doc/sphinx",
+            "base_commit": "fedcba",
+            "problem_statement": "Fix Sphinx rendering.",
+        },
+    ]
+
+    manifest = module.build_swe_prediction_task_manifest(
+        dataset,
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel",
+        repos_filter=["sphinx-doc/sphinx"],
+    )
+
+    assert manifest["task_count"] == 1
+    assert manifest["tasks"][0]["instance_id"] == "sphinx-doc__sphinx-10323"
+    assert manifest["tasks"][0]["repo"] == "sphinx-doc/sphinx"
 
 
 def test_build_swe_prediction_task_manifest_rejects_missing_requested_id(tmp_path):

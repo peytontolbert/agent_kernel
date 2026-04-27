@@ -1886,6 +1886,14 @@ def test_kernel_verifier_diagnosis_includes_swe_apply_repair_instruction(tmp_pat
             expected_files=["patch.diff"],
             metadata={
                 "swe_candidate_files": ["astropy/io/ascii/qdp.py", "astropy/io/ascii/tests/test_qdp.py"],
+                "swe_executable_edit_windows": (
+                    "### astropy/io/ascii/qdp.py::_line_type lines 20-72\n"
+                    "  63:     _command_re = r\"READ [TS]ERR(\\s+[0-9]+)+\"\n"
+                    "  71:     _line_type_re = re.compile(_type_re)"
+                ),
+                "swe_suggested_patch_commands": [
+                    "swe_patch_builder --path astropy/io/ascii/qdp.py --replace-line 71 --with '    _line_type_re = re.compile(_type_re, re.IGNORECASE)' > patch.diff"
+                ],
                 "setup_file_contents": {
                     "source_lines/astropy/io/ascii/qdp.py.lines": "   1: import re\n   2: def _line_type(line):\n"
                 },
@@ -1904,8 +1912,69 @@ def test_kernel_verifier_diagnosis_includes_swe_apply_repair_instruction(tmp_pat
     assert diagnosis["path"] == "patch.diff"
     assert "rewrite patch.diff as a real unified diff" in diagnosis["repair_instruction"]
     assert "allowed patch paths are astropy/io/ascii/qdp.py, astropy/io/ascii/tests/test_qdp.py" in diagnosis["repair_instruction"]
+    assert "swe_patch_builder --path <allowed-path> --replace-line <line-number>" in diagnosis["repair_instruction"]
+    assert "not only comments, docstrings, module headers" in diagnosis["repair_instruction"]
+    assert "preserve existing production function and class definitions" in diagnosis["repair_instruction"]
+    assert "mandatory first repair command when it matches the failure behavior" in diagnosis["repair_instruction"]
+    assert "re.compile(_type_re, re.IGNORECASE)" in diagnosis["repair_instruction"]
+    assert "first repair against this high-value issue window" in diagnosis["repair_instruction"]
+    assert "_command_re" in diagnosis["repair_instruction"]
     assert "candidate line anchors: astropy/io/ascii/qdp.py: 1: import re" in diagnosis["repair_instruction"]
     assert "do not invent files" in diagnosis["summary"]
+
+
+def test_kernel_verifier_diagnosis_prefers_swe_executable_anchors(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="Write patch.diff.",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_candidate_files": ["astropy/io/ascii/rst.py"],
+                "setup_file_contents": {
+                    "source_lines/astropy/io/ascii/rst.py.lines": "\n".join(
+                        [
+                            "   1: from astropy.io.ascii.core import (",
+                            "   2:     DefaultSplitter,",
+                            "   3:     FixedWidth,",
+                            "   4:     FixedWidthData,",
+                            "   5:     FixedWidthHeader,",
+                            "   6:     FixedWidthTwoLineDataSplitter,",
+                            "   7: )",
+                            "   8:",
+                            "   9: class SimpleRSTData(FixedWidthData):",
+                            "  10:     def __init__(self):",
+                            "  11:         super().__init__()",
+                            "  12:",
+                            "  13: class RST(FixedWidth):",
+                            "  14:     def write(self, table):",
+                            "  15:         return super().write(table)",
+                        ]
+                    )
+                },
+            },
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=2,
+        verification_reasons=["SWE patch python syntax check failed: SyntaxError: invalid syntax"],
+    )
+
+    diagnosis = state.subgoal_diagnoses["repair SWE patch.diff until changed Python files parse"]
+    assert "candidate line anchors: astropy/io/ascii/rst.py:" in diagnosis["repair_instruction"]
+    assert "13: class RST(FixedWidth):" in diagnosis["repair_instruction"]
+    assert "14:     def write(self, table):" in diagnosis["repair_instruction"]
+    assert "do not insert function definitions inside import lists" in diagnosis["repair_instruction"]
 
 
 def test_kernel_verifier_diagnosis_includes_swe_template_repair_instruction(tmp_path):
@@ -1937,6 +2006,7 @@ def test_kernel_verifier_diagnosis_includes_swe_template_repair_instruction(tmp_
     assert diagnosis["path"] == "patch.diff"
     assert "source-grounded unified diff" in diagnosis["repair_instruction"]
     assert "allowed patch paths are astropy/io/ascii/qdp.py" in diagnosis["repair_instruction"]
+    assert "swe_patch_builder --path <allowed-path>" in diagnosis["repair_instruction"]
     assert "fake imports" in diagnosis["repair_instruction"]
 
 

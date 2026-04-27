@@ -194,7 +194,133 @@ def test_llm_policy_adds_swe_missing_patch_synthesis_directive_to_live_prompt():
 
     assert "write patch.diff now as a source-grounded unified diff" in client.last_payload["exact_verifier_repair_brief"]
     assert "do not repeat source inspection commands" in client.last_decision_prompt
-    assert "next command must create or overwrite patch.diff directly" in client.last_decision_prompt
+    assert "next command must create or overwrite patch.diff directly with one swe_patch_builder command" in client.last_decision_prompt
+    assert "do not hand-write unified diff hunk headers with cat/printf" in client.last_decision_prompt
+
+
+def test_llm_policy_repairs_existing_swe_patch_with_builder_before_more_llm(tmp_path):
+    class ShouldNotRunClient:
+        def create_decision(self, **kwargs):
+            del kwargs
+            raise AssertionError("LLM should not be called when an existing SWE patch can be syntax-repaired")
+
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    (workspace / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-old\n"
+        "+new\n",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        ShouldNotRunClient(),
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.subgoal_diagnoses = {
+        "repair SWE patch.diff until it applies to the base commit": {
+            "path": "patch.diff",
+            "repair_instruction": "rewrite patch.diff as a real unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.content == "swe_patch_builder --from-diff patch.diff > patch.diff"
+    assert decision.decision_source == "swe_patch_builder_repair_direct"
+
+
+def test_llm_policy_executes_swe_suggested_patch_command_before_live_llm(tmp_path):
+    class ShouldNotRunClient:
+        def create_decision(self, **kwargs):
+            del kwargs
+            raise AssertionError("LLM should not be called when a safe suggested SWE command exists")
+
+    suggested = (
+        "swe_patch_builder --path sympy/utilities/iterables.py --replace-line 1 "
+        "--with 'def uniq(seq):' > patch.diff"
+    )
+    policy = LLMDecisionPolicy(
+        ShouldNotRunClient(),
+        config=KernelConfig(workspace_root=tmp_path / "workspace", asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_suggested_patch_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_suggested_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+                "swe_suggested_patch_commands": [suggested],
+            },
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert decision.action == "code_execute"
+    assert decision.content == suggested
+    assert decision.decision_source == "swe_suggested_patch_command_direct"
+    assert decision.proposal_metadata == {"swe_suggested_patch_command": True}
+
+
+def test_llm_policy_does_not_repeat_attempted_swe_suggested_patch_command(tmp_path):
+    client = CapturingClient()
+    suggested = (
+        "swe_patch_builder --path sympy/utilities/iterables.py --replace-line 1 "
+        "--with 'def uniq(seq):' > patch.diff"
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=tmp_path / "workspace", asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_suggested_patch_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_suggested_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+                "swe_suggested_patch_commands": [suggested],
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="try suggested command",
+            action="code_execute",
+            content=suggested,
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source != "swe_suggested_patch_command_direct"
+    assert client.last_payload is not None
 
 
 class FakeContextProvider:

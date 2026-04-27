@@ -44,7 +44,14 @@ from agent_kernel.tasking.task_bank import (
     load_verifier_replay_tasks,
 )
 
-from .metrics import AbstractionComparison, EvalMetrics, SkillComparison, TolbertComparison, TolbertModeComparison
+from .metrics import (
+    AbstractionComparison,
+    EvalMetrics,
+    ResearchLibraryComparison,
+    SkillComparison,
+    TolbertComparison,
+    TolbertModeComparison,
+)
 
 _SCOPED_DIRECTORY_NAMES = {
     "generated_failure",
@@ -55,10 +62,12 @@ _SCOPED_DIRECTORY_NAMES = {
     "tolbert_path_only",
     "tolbert_retrieval_only",
     "tolbert_skill_ranking",
+    "with_research_library",
     "with_operators",
     "with_raw_skill_transfer",
     "with_skills",
     "without_skills",
+    "without_research_library",
     "with_tolbert",
     "without_tolbert",
 }
@@ -3918,6 +3927,12 @@ def run_eval(
     total_retrieval_candidates = 0
     total_retrieval_evidence = 0
     total_retrieval_direct_candidates = 0
+    total_research_context_chunks = 0
+    total_llm_visible_research_context_chunks = 0
+    total_research_retrieval_evidence = 0
+    total_research_model_assets = 0
+    total_research_repository_matches = 0
+    total_research_algorithm_matches = 0
     retrieval_guided_steps = 0
     retrieval_selected_steps = 0
     retrieval_influenced_steps = 0
@@ -4007,6 +4022,14 @@ def run_eval(
         total_retrieval_direct_candidates += sum(
             step.retrieval_direct_candidate_count for step in result.steps
         )
+        total_research_context_chunks += sum(step.research_context_chunk_count for step in result.steps)
+        total_llm_visible_research_context_chunks += sum(
+            step.llm_visible_research_context_chunk_count for step in result.steps
+        )
+        total_research_retrieval_evidence += sum(step.research_retrieval_evidence_count for step in result.steps)
+        total_research_model_assets += sum(step.research_model_asset_count for step in result.steps)
+        total_research_repository_matches += sum(step.research_repository_match_count for step in result.steps)
+        total_research_algorithm_matches += sum(step.research_algorithm_match_count for step in result.steps)
         retrieval_guided_steps += sum(1 for step in result.steps if step.retrieval_command_match)
         retrieval_selected_steps += sum(1 for step in result.steps if step.selected_retrieval_span_id)
         retrieval_influenced_steps += sum(1 for step in result.steps if step.retrieval_influenced)
@@ -4155,6 +4178,14 @@ def run_eval(
                     ),
                     "retrieval_influenced": bool(step.retrieval_influenced),
                     "trust_retrieval": bool(step.trust_retrieval),
+                    "research_context_chunk_count": int(step.research_context_chunk_count),
+                    "llm_visible_research_context_chunk_count": int(
+                        step.llm_visible_research_context_chunk_count
+                    ),
+                    "research_retrieval_evidence_count": int(step.research_retrieval_evidence_count),
+                    "research_model_asset_count": int(step.research_model_asset_count),
+                    "research_repository_match_count": int(step.research_repository_match_count),
+                    "research_algorithm_match_count": int(step.research_algorithm_match_count),
                     "world_feedback": {},
                 }
                 for step in result.steps
@@ -4268,6 +4299,24 @@ def run_eval(
         average_retrieval_direct_candidates=0.0
         if total_step_count == 0
         else total_retrieval_direct_candidates / total_step_count,
+        average_research_context_chunks=0.0
+        if total_step_count == 0
+        else total_research_context_chunks / total_step_count,
+        average_llm_visible_research_context_chunks=0.0
+        if total_step_count == 0
+        else total_llm_visible_research_context_chunks / total_step_count,
+        average_research_retrieval_evidence=0.0
+        if total_step_count == 0
+        else total_research_retrieval_evidence / total_step_count,
+        average_research_model_assets=0.0
+        if total_step_count == 0
+        else total_research_model_assets / total_step_count,
+        average_research_repository_matches=0.0
+        if total_step_count == 0
+        else total_research_repository_matches / total_step_count,
+        average_research_algorithm_matches=0.0
+        if total_step_count == 0
+        else total_research_algorithm_matches / total_step_count,
         retrieval_guided_steps=retrieval_guided_steps,
         retrieval_selected_steps=retrieval_selected_steps,
         retrieval_influenced_steps=retrieval_influenced_steps,
@@ -4488,6 +4537,149 @@ def compare_tolbert_modes(
         benchmark_family_pass_rate_delta={
             family: with_tolbert.benchmark_family_pass_rate(family)
             - without_tolbert.benchmark_family_pass_rate(family)
+            for family in benchmark_families
+        },
+    )
+
+
+def compare_research_library_modes(
+    config: KernelConfig | None = None,
+    *,
+    include_discovered_tasks: bool = False,
+    include_episode_memory: bool = False,
+    include_skill_memory: bool = False,
+    include_skill_transfer: bool = False,
+    include_operator_memory: bool = False,
+    include_tool_memory: bool = False,
+    include_verifier_memory: bool = False,
+    include_benchmark_candidates: bool = False,
+    include_verifier_candidates: bool = False,
+    include_generated: bool = False,
+    include_failure_generated: bool = False,
+    task_limit: int | None = None,
+    priority_benchmark_families: Sequence[str] | None = None,
+    priority_benchmark_family_weights: dict[str, object] | None = None,
+    prefer_low_cost_tasks: bool = False,
+    prefer_long_horizon_tasks: bool = False,
+    prefer_retrieval_tasks: bool = False,
+    restrict_to_priority_benchmark_families: bool = False,
+    progress_label_prefix: str | None = None,
+) -> ResearchLibraryComparison:
+    base_config = config or KernelConfig()
+    standalone_context = bool(
+        getattr(base_config, "research_library_standalone_context", False)
+        or not bool(getattr(base_config, "use_tolbert_context", False))
+    )
+    with_research_config = _scoped_config(
+        base_config,
+        "with_research_library",
+        use_research_library_context=True,
+        research_library_standalone_context=standalone_context,
+    )
+    try:
+        with_research = run_eval(
+            config=with_research_config,
+            include_discovered_tasks=include_discovered_tasks,
+            include_episode_memory=include_episode_memory,
+            include_skill_memory=include_skill_memory,
+            include_skill_transfer=include_skill_transfer,
+            include_operator_memory=include_operator_memory,
+            include_tool_memory=include_tool_memory,
+            include_verifier_memory=include_verifier_memory,
+            include_benchmark_candidates=include_benchmark_candidates,
+            include_verifier_candidates=include_verifier_candidates,
+            include_generated=include_generated,
+            include_failure_generated=include_failure_generated,
+            task_limit=task_limit,
+            priority_benchmark_families=priority_benchmark_families,
+            priority_benchmark_family_weights=priority_benchmark_family_weights,
+            prefer_low_cost_tasks=prefer_low_cost_tasks,
+            prefer_long_horizon_tasks=prefer_long_horizon_tasks,
+            prefer_retrieval_tasks=prefer_retrieval_tasks,
+            restrict_to_priority_benchmark_families=restrict_to_priority_benchmark_families,
+            progress_label=f"{progress_label_prefix}:with" if progress_label_prefix else None,
+        )
+    finally:
+        _cleanup_scoped_runtime_state(with_research_config)
+    without_research_config = _scoped_config(
+        base_config,
+        "without_research_library",
+        use_research_library_context=False,
+        research_library_standalone_context=False,
+    )
+    try:
+        without_research = run_eval(
+            config=without_research_config,
+            include_discovered_tasks=include_discovered_tasks,
+            include_episode_memory=include_episode_memory,
+            include_skill_memory=include_skill_memory,
+            include_skill_transfer=include_skill_transfer,
+            include_operator_memory=include_operator_memory,
+            include_tool_memory=include_tool_memory,
+            include_verifier_memory=include_verifier_memory,
+            include_benchmark_candidates=include_benchmark_candidates,
+            include_verifier_candidates=include_verifier_candidates,
+            include_generated=include_generated,
+            include_failure_generated=include_failure_generated,
+            task_limit=task_limit,
+            priority_benchmark_families=priority_benchmark_families,
+            priority_benchmark_family_weights=priority_benchmark_family_weights,
+            prefer_low_cost_tasks=prefer_low_cost_tasks,
+            prefer_long_horizon_tasks=prefer_long_horizon_tasks,
+            prefer_retrieval_tasks=prefer_retrieval_tasks,
+            restrict_to_priority_benchmark_families=restrict_to_priority_benchmark_families,
+            progress_label=f"{progress_label_prefix}:without" if progress_label_prefix else None,
+        )
+    finally:
+        _cleanup_scoped_runtime_state(without_research_config)
+    capabilities = sorted(
+        set(with_research.total_by_capability) | set(without_research.total_by_capability)
+    )
+    benchmark_families = sorted(
+        set(with_research.total_by_benchmark_family) | set(without_research.total_by_benchmark_family)
+    )
+    return ResearchLibraryComparison(
+        with_research_library=with_research,
+        without_research_library=without_research,
+        pass_rate_delta=with_research.pass_rate - without_research.pass_rate,
+        average_steps_delta=with_research.average_steps - without_research.average_steps,
+        average_retrieval_evidence_delta=(
+            with_research.average_retrieval_evidence - without_research.average_retrieval_evidence
+        ),
+        average_research_context_chunks_delta=(
+            with_research.average_research_context_chunks - without_research.average_research_context_chunks
+        ),
+        average_llm_visible_research_context_chunks_delta=(
+            with_research.average_llm_visible_research_context_chunks
+            - without_research.average_llm_visible_research_context_chunks
+        ),
+        average_research_retrieval_evidence_delta=(
+            with_research.average_research_retrieval_evidence
+            - without_research.average_research_retrieval_evidence
+        ),
+        average_research_model_assets_delta=(
+            with_research.average_research_model_assets - without_research.average_research_model_assets
+        ),
+        average_research_repository_matches_delta=(
+            with_research.average_research_repository_matches
+            - without_research.average_research_repository_matches
+        ),
+        average_research_algorithm_matches_delta=(
+            with_research.average_research_algorithm_matches
+            - without_research.average_research_algorithm_matches
+        ),
+        retrieval_influenced_steps_delta=(
+            with_research.retrieval_influenced_steps - without_research.retrieval_influenced_steps
+        ),
+        trusted_retrieval_steps_delta=with_research.trusted_retrieval_steps - without_research.trusted_retrieval_steps,
+        capability_pass_rate_delta={
+            capability: with_research.capability_pass_rate(capability)
+            - without_research.capability_pass_rate(capability)
+            for capability in capabilities
+        },
+        benchmark_family_pass_rate_delta={
+            family: with_research.benchmark_family_pass_rate(family)
+            - without_research.benchmark_family_pass_rate(family)
             for family in benchmark_families
         },
     )

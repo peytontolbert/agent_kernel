@@ -46,6 +46,74 @@ def test_build_result_for_benchmark_routes_generic_family():
     assert packet["metrics"]["gold_medal_rate"] == 0.24
 
 
+def test_build_result_for_benchmark_uses_declarative_adapter_spec():
+    module = _load_runner_module()
+
+    packet = module.build_result_for_benchmark(
+        {"metrics": {"medal_gold_rate": "0.31"}},
+        benchmark="mle_bench",
+        source_path="summary.json",
+        conservative_comparison_report=True,
+        adapter_spec={
+            "spec_version": "asi_v1",
+            "report_kind": "a8_benchmark_adapter_spec",
+            "benchmark": "mle_bench",
+            "metrics": {
+                "gold_medal_rate": {
+                    "type": "rate",
+                    "aliases": ["metrics.medal_gold_rate"],
+                    "required": True,
+                }
+            },
+        },
+        adapter_spec_path="adapter_spec.json",
+    )
+
+    assert packet["benchmark"] == "mle_bench"
+    assert packet["metrics"]["gold_medal_rate"] == 0.31
+    assert packet["source"]["adapter_spec_path"] == "adapter_spec.json"
+
+
+def test_build_result_for_benchmark_declarative_swe_rate_from_counts():
+    module = _load_runner_module()
+
+    packet = module.build_result_for_benchmark(
+        {"resolved": 8, "total": 10},
+        benchmark="swe_bench_verified",
+        source_path="summary.json",
+        conservative_comparison_report=True,
+        adapter_spec={
+            "spec_version": "asi_v1",
+            "report_kind": "a8_benchmark_adapter_spec",
+            "benchmark": "swe_bench_verified",
+            "metrics": {
+                "resolved_count": {
+                    "type": "integer",
+                    "aliases": ["resolved"],
+                },
+                "task_count": {
+                    "type": "integer",
+                    "aliases": ["total"],
+                    "required": True,
+                },
+                "resolve_rate": {
+                    "type": "rate",
+                    "fallback": {
+                        "op": "divide",
+                        "numerator": "resolved_count",
+                        "denominator": "task_count",
+                    },
+                    "required": True,
+                },
+            },
+        },
+    )
+
+    assert packet["metrics"]["resolved_count"] == 8
+    assert packet["metrics"]["task_count"] == 10
+    assert packet["metrics"]["resolve_rate"] == 0.8
+
+
 def test_run_a8_benchmark_adapter_cli_runs_command_and_writes_verified_packet(
     tmp_path,
     monkeypatch,

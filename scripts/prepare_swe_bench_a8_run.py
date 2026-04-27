@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 from datetime import UTC, datetime
 import json
+import shutil
 import sys
 from typing import Any
 
@@ -24,6 +25,11 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_json(path: Path, payload: dict[str, Any] | list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _safe_label(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value.strip())
+    return safe.strip("_") or "retry"
 
 
 def build_swe_bench_command(
@@ -136,6 +142,877 @@ def summarize_swe_bench_results(results: dict[str, Any], *, source_path: str = "
     }
 
 
+def build_a8_swe_benchmark_run_spec(
+    *,
+    benchmark: str,
+    dataset_name: str,
+    split: str,
+    predictions_path: str,
+    run_id: str,
+    harness_root: str,
+    max_workers: int,
+    timeout: int,
+    cache_level: str,
+    namespace: str,
+    report_dir: str,
+    results_json: str,
+    summary_json: str,
+    output_packet_json: str,
+    ready_to_run: bool | None = None,
+    instance_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    if benchmark not in DEFAULT_DATASETS:
+        raise ValueError("benchmark must be one of " + ",".join(DEFAULT_DATASETS))
+    resolved_dataset = str(dataset_name or DEFAULT_DATASETS[benchmark]).strip()
+    if not resolved_dataset:
+        raise ValueError("dataset_name is required")
+    path = Path(predictions_path)
+    computed_ready = path.exists() and path.is_file() if ready_to_run is None else bool(ready_to_run)
+    open_limits = [
+        "This spec is execution readiness only; it is not A8 evidence until the official SWE harness runs.",
+        "Do not claim SWE-bench Verified from local apply-check or sparse pytest smoke tests.",
+    ]
+    if not computed_ready:
+        open_limits.insert(0, "ready_to_run remains false until predictions_path exists and is intentionally selected.")
+    runner = {
+        "kind": "swebench_harness",
+        "harness_root": harness_root,
+        "dataset_name": resolved_dataset,
+        "split": split,
+        "predictions_path": predictions_path,
+        "run_id": run_id,
+        "max_workers": max_workers,
+        "timeout": timeout,
+        "cache_level": cache_level,
+        "namespace": namespace,
+        "report_dir": report_dir,
+        "results_json": results_json,
+    }
+    selected_ids = [value.strip() for value in (instance_ids or []) if value.strip()]
+    if selected_ids:
+        runner["instance_ids"] = selected_ids
+    return {
+        "spec_version": "asi_v1",
+        "report_kind": "a8_benchmark_run_spec",
+        "benchmark": benchmark,
+        "ready_to_run": computed_ready,
+        "runner": runner,
+        "adapter": {
+            "script": "scripts/run_a8_benchmark_adapter.py",
+            "summary_json": summary_json,
+            "output_packet_json": output_packet_json,
+            "conservative_comparison_report": True,
+        },
+        "open_limits": open_limits,
+    }
+
+
+def _phase(
+    name: str,
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    preflight_argv: list[str] | None = None,
+    required_inputs: list[str] | None = None,
+    expected_outputs: list[str] | None = None,
+    gate: str = "",
+) -> dict[str, Any]:
+    phase: dict[str, Any] = {
+        "name": name,
+        "kind": "command",
+        "argv": argv,
+    }
+    if env:
+        phase["env"] = env
+    if preflight_argv:
+        phase["preflight_argv"] = preflight_argv
+    if required_inputs:
+        phase["required_inputs"] = required_inputs
+    if expected_outputs:
+        phase["expected_outputs"] = expected_outputs
+    if gate:
+        phase["gate"] = gate
+    return phase
+
+
+def _queue_env(queue_root: str) -> dict[str, str]:
+    root = Path(queue_root)
+    return {
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": str(root / "queue.json"),
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": str(root / "runtime_state.json"),
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": str(root / "agentkernel.sqlite3"),
+        "AGENT_KERNEL_RUN_REPORTS_DIR": str(root / "reports"),
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": str(root / "checkpoints"),
+    }
+
+
+def _queue_max_queued_budget(*, selected_ids: list[str], limit: int, drain_limit: int) -> int:
+    """Return a queue budget that can admit the intended harness slice."""
+    if not selected_ids and limit <= 0:
+        return 0
+    intended_jobs = len(selected_ids) if selected_ids else max(0, limit)
+    return max(1, intended_jobs, max(0, drain_limit))
+
+
+def build_swe_autonomous_harness_spec(
+    *,
+    benchmark: str,
+    dataset_json: str,
+    dataset_name: str,
+    split: str,
+    repo_cache_root: str,
+    prediction_task_manifest: str,
+    patch_dir: str,
+    queue_manifest: str,
+    queue_root: str,
+    workspace_root: str,
+    workspace_prefix: str,
+    predictions_jsonl: str,
+    apply_check_json: str,
+    run_spec_json: str,
+    run_id: str,
+    harness_root: str,
+    max_workers: int,
+    timeout: int,
+    cache_level: str,
+    namespace: str,
+    report_dir: str,
+    results_json: str,
+    summary_json: str,
+    output_packet_json: str,
+    python_bin: str,
+    model_name_or_path: str,
+    provider: str,
+    drain_limit: int,
+    max_source_context_bytes: int,
+    instance_ids: list[str] | None = None,
+    limit: int = 0,
+) -> dict[str, Any]:
+    if benchmark not in DEFAULT_DATASETS:
+        raise ValueError("benchmark must be one of " + ",".join(DEFAULT_DATASETS))
+    resolved_dataset = str(dataset_name or DEFAULT_DATASETS[benchmark]).strip()
+    if not resolved_dataset:
+        raise ValueError("dataset_name is required")
+    selected_ids = [value.strip() for value in (instance_ids or []) if value.strip()]
+    if selected_ids:
+        selection_mode = "operator_selected_instance_ids"
+    elif limit > 0:
+        selection_mode = "dataset_limit"
+    else:
+        selection_mode = "full_split"
+
+    prepare_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_prediction_tasks.py",
+        "--dataset-json",
+        dataset_json,
+        "--output-manifest-json",
+        prediction_task_manifest,
+        "--output-patch-dir",
+        patch_dir,
+        "--model-name-or-path",
+        model_name_or_path,
+        "--repo-cache-root",
+        repo_cache_root,
+        "--max-source-context-bytes",
+        str(max_source_context_bytes),
+    ]
+    if selected_ids:
+        prepare_args.extend(["--instance-ids", *selected_ids])
+    if limit > 0:
+        prepare_args.extend(["--limit", str(limit)])
+
+    queue_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_queue_manifest.py",
+        "--prediction-task-manifest",
+        prediction_task_manifest,
+        "--output-manifest-json",
+        queue_manifest,
+        "--workspace-prefix",
+        workspace_prefix,
+    ]
+    queue_env = _queue_env(queue_root)
+    queue_env["AGENT_KERNEL_WORKSPACE_ROOT"] = workspace_root
+    patch_jobs_verification_json = str(Path(queue_root) / "patch_jobs_verification.json")
+    queue_max_queued_per_budget_group = _queue_max_queued_budget(
+        selected_ids=selected_ids,
+        limit=limit,
+        drain_limit=drain_limit,
+    )
+    enqueue_args = [
+        python_bin,
+        "scripts/run_job_queue.py",
+        "enqueue-manifest",
+        "--manifest-path",
+        queue_manifest,
+        "--limit",
+        str(limit if limit > 0 else 0),
+        "--priority-start",
+        "100",
+        "--budget-group",
+        f"{benchmark}_{run_id}",
+        "--max-queued-per-budget-group",
+        str(queue_max_queued_per_budget_group),
+        "--json",
+    ]
+    drain_args = [
+        python_bin,
+        "scripts/run_job_queue.py",
+        "drain",
+        "--limit",
+        str(drain_limit),
+        "--provider",
+        provider,
+        "--model",
+        model_name_or_path,
+        "--enforce-preflight",
+        "0",
+        "--use-tolbert-context",
+        "0",
+        "--use-graph-memory",
+        "0",
+        "--use-world-model",
+        "0",
+        "--use-retrieval-proposals",
+        "0",
+        "--use-trust-proposals",
+        "0",
+        "--asi-coding-require-live-llm",
+        "1",
+    ]
+    verify_patch_jobs_args = [
+        python_bin,
+        "scripts/verify_swe_bench_patch_jobs.py",
+        "--queue-json",
+        queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"],
+        "--queue-manifest",
+        queue_manifest,
+        "--workspace-root",
+        workspace_root,
+        "--output-json",
+        patch_jobs_verification_json,
+    ]
+    collect_args = [
+        python_bin,
+        "scripts/collect_swe_bench_predictions.py",
+        "--prediction-task-manifest",
+        prediction_task_manifest,
+        "--queue-manifest",
+        queue_manifest,
+        "--workspace-root",
+        workspace_root,
+        "--output-jsonl",
+        predictions_jsonl,
+    ]
+    apply_check_args = [
+        python_bin,
+        "scripts/validate_swe_bench_predictions_against_repo_cache.py",
+        "--dataset-json",
+        dataset_json,
+        "--predictions-jsonl",
+        predictions_jsonl,
+        "--repo-cache-root",
+        repo_cache_root,
+        "--output-json",
+        apply_check_json,
+    ]
+    if selected_ids:
+        apply_check_args.extend(["--instance-ids", *selected_ids])
+    run_spec_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "spec",
+        "--benchmark",
+        benchmark,
+        "--dataset-name",
+        resolved_dataset,
+        "--split",
+        split,
+        "--predictions-path",
+        predictions_jsonl,
+        "--run-id",
+        run_id,
+        "--max-workers",
+        str(max_workers),
+        "--timeout",
+        str(timeout),
+        "--cache-level",
+        cache_level,
+        "--namespace",
+        namespace,
+        "--report-dir",
+        report_dir,
+        "--results-json",
+        results_json,
+        "--summary-json",
+        summary_json,
+        "--output-packet-json",
+        output_packet_json,
+        "--swe-bench-root",
+        harness_root,
+        "--ready-to-run",
+        "auto",
+        "--output-spec-json",
+        run_spec_json,
+    ]
+    if selected_ids:
+        run_spec_args.extend(["--instance-ids", *selected_ids])
+    official_args = build_swe_bench_command(
+        python_bin=python_bin,
+        dataset_name=resolved_dataset,
+        split=split,
+        predictions_path=predictions_jsonl,
+        run_id=run_id,
+        max_workers=max_workers,
+        timeout=timeout,
+        cache_level=cache_level,
+        namespace=namespace,
+        report_dir=report_dir,
+        instance_ids=selected_ids or None,
+    )
+    materialize_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "materialize-results",
+        "--run-id",
+        run_id,
+        "--namespace",
+        namespace,
+        "--report-dir",
+        report_dir,
+        "--output-results-json",
+        results_json,
+    ]
+    summarize_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "summarize",
+        "--results-json",
+        results_json,
+        "--output-summary-json",
+        summary_json,
+    ]
+    adapt_args = [
+        python_bin,
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        benchmark,
+        "--summary-json",
+        summary_json,
+        "--output-json",
+        output_packet_json,
+        "--conservative-comparison-report",
+    ]
+    open_limits = [
+        "The harness is A8 evidence only after the official SWE harness completes and the adapter packet verifies.",
+        "Repo-cache apply-check and patch-generation success are not benchmark scores.",
+        "Do not add per-instance queue hooks or manually edit predictions after this harness starts.",
+    ]
+    if selection_mode != "full_split":
+        open_limits.insert(0, "This is selected-slice or limited-run evidence, not full benchmark evidence.")
+    return {
+        "spec_version": "asi_v1",
+        "report_kind": "autonomous_benchmark_harness_spec",
+        "benchmark": benchmark,
+        "created_at": datetime.now(UTC).isoformat(),
+        "autonomy_contract": {
+            "operator_role": "launch_and_monitor_only",
+            "selection_mode": selection_mode,
+            "kernel_owned_phases": [
+                "enqueue_patch_jobs",
+                "drain_patch_jobs",
+                "verify_patch_jobs",
+                "collect_predictions",
+                "repo_cache_apply_check",
+                "official_harness",
+                "summarize_results",
+                "adapt_a8_packet",
+            ],
+            "prohibited_manual_interventions": [
+                "manual per-instance patch authoring",
+                "manual prediction JSONL editing",
+                "new per-instance queue hook edits during the run",
+                "claiming local apply-checks as official benchmark results",
+            ],
+            "countable_evidence": [
+                "official SWE harness resolved_instances/resolved_ids",
+                "verified a8_benchmark_result packet",
+            ],
+        },
+        "inputs": {
+            "dataset_json": dataset_json,
+            "dataset_name": resolved_dataset,
+            "split": split,
+            "repo_cache_root": repo_cache_root,
+            "instance_ids": selected_ids,
+            "limit": limit,
+            "max_source_context_bytes": max_source_context_bytes,
+        },
+        "run_config": {
+            "run_id": run_id,
+            "harness_root": harness_root,
+            "max_workers": max_workers,
+            "timeout": timeout,
+            "cache_level": cache_level,
+            "namespace": namespace,
+            "python_bin": python_bin,
+            "model_name_or_path": model_name_or_path,
+            "provider": provider,
+            "drain_limit": drain_limit,
+            "queue_max_queued_per_budget_group": queue_max_queued_per_budget_group,
+        },
+        "artifacts": {
+            "prediction_task_manifest": prediction_task_manifest,
+            "patch_dir": patch_dir,
+            "queue_manifest": queue_manifest,
+            "queue_root": queue_root,
+            "patch_jobs_verification_json": patch_jobs_verification_json,
+            "workspace_root": workspace_root,
+            "workspace_prefix": workspace_prefix,
+            "predictions_jsonl": predictions_jsonl,
+            "apply_check_json": apply_check_json,
+            "run_spec_json": run_spec_json,
+            "report_dir": report_dir,
+            "results_json": results_json,
+            "summary_json": summary_json,
+            "output_packet_json": output_packet_json,
+        },
+        "phases": [
+            _phase(
+                "prepare_prediction_tasks",
+                prepare_args,
+                required_inputs=[dataset_json, repo_cache_root],
+                expected_outputs=[prediction_task_manifest],
+            ),
+            _phase(
+                "prepare_queue_manifest",
+                queue_args,
+                required_inputs=[prediction_task_manifest],
+                expected_outputs=[queue_manifest],
+            ),
+            _phase(
+                "enqueue_patch_jobs",
+                enqueue_args,
+                env=queue_env,
+                required_inputs=[queue_manifest],
+                expected_outputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
+            ),
+            _phase(
+                "drain_patch_jobs",
+                drain_args,
+                env=queue_env,
+                required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
+            ),
+            _phase(
+                "verify_patch_jobs",
+                verify_patch_jobs_args,
+                required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"], queue_manifest],
+                expected_outputs=[patch_jobs_verification_json],
+                gate="all patch jobs must complete successfully and produce patch.diff",
+            ),
+            _phase(
+                "collect_predictions",
+                collect_args,
+                required_inputs=[prediction_task_manifest, queue_manifest],
+                expected_outputs=[predictions_jsonl],
+            ),
+            _phase(
+                "repo_cache_apply_check",
+                apply_check_args,
+                required_inputs=[dataset_json, predictions_jsonl, repo_cache_root],
+                expected_outputs=[apply_check_json],
+                gate="all_apply_check_passed must be true",
+            ),
+            _phase("build_run_spec", run_spec_args, required_inputs=[predictions_jsonl], expected_outputs=[run_spec_json]),
+            _phase(
+                "official_harness",
+                official_args,
+                required_inputs=[predictions_jsonl],
+                gate="official SWE-bench harness must complete",
+            ),
+            _phase("materialize_results", materialize_args, expected_outputs=[results_json]),
+            _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
+            _phase(
+                "adapt_a8_packet",
+                adapt_args,
+                preflight_argv=adapt_args + ["--validate-only"],
+                required_inputs=[summary_json],
+                expected_outputs=[output_packet_json],
+                gate="adapter verifies a8_benchmark_result packet",
+            ),
+        ],
+        "open_limits": open_limits,
+    }
+
+
+def build_swe_retry_harness_spec(
+    *,
+    source_harness: dict[str, Any],
+    patch_job_verification: dict[str, Any],
+    retry_label: str,
+    artifact_dir: Path,
+    output_harness_json: str,
+    run_id: str = "",
+) -> dict[str, Any]:
+    if source_harness.get("report_kind") != "autonomous_benchmark_harness_spec":
+        raise ValueError("source harness report_kind must be autonomous_benchmark_harness_spec")
+    retry_instance_ids = [
+        str(value).strip()
+        for value in patch_job_verification.get("retry_instance_ids", [])
+        if str(value).strip()
+    ]
+    if not retry_instance_ids:
+        raise ValueError("patch job verification does not contain retry_instance_ids")
+    inputs = source_harness.get("inputs") if isinstance(source_harness.get("inputs"), dict) else {}
+    run_config = source_harness.get("run_config") if isinstance(source_harness.get("run_config"), dict) else {}
+    artifacts = source_harness.get("artifacts") if isinstance(source_harness.get("artifacts"), dict) else {}
+    label = _safe_label(retry_label)
+    benchmark = str(source_harness.get("benchmark", "")).strip()
+    if benchmark not in DEFAULT_DATASETS:
+        raise ValueError("source harness benchmark must be one of " + ",".join(DEFAULT_DATASETS))
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    workspace_prefix = str(artifacts.get("workspace_prefix", "swe_bench_retry")).strip().strip("/") or "swe_bench_retry"
+    resolved_run_id = str(run_id).strip() or f"{str(run_config.get('run_id', 'swe_retry')).strip() or 'swe_retry'}_{label}"
+    spec = build_swe_autonomous_harness_spec(
+        benchmark=benchmark,
+        dataset_json=str(inputs.get("dataset_json", "")).strip(),
+        dataset_name=str(inputs.get("dataset_name", DEFAULT_DATASETS[benchmark])).strip(),
+        split=str(inputs.get("split", "test")).strip() or "test",
+        repo_cache_root=str(inputs.get("repo_cache_root", "")).strip(),
+        prediction_task_manifest=str(artifact_dir / f"prediction_tasks_{label}.json"),
+        patch_dir=str(artifact_dir / f"patches_{label}"),
+        queue_manifest=str(artifact_dir / f"queue_manifest_{label}.json"),
+        queue_root=str(artifact_dir / f"queue_{label}"),
+        workspace_root=str(artifacts.get("workspace_root", "workspace")).strip() or "workspace",
+        workspace_prefix=f"{workspace_prefix}_{label}",
+        predictions_jsonl=str(artifact_dir / f"predictions_{label}.jsonl"),
+        apply_check_json=str(artifact_dir / f"predictions_{label}_apply_check.json"),
+        run_spec_json=str(artifact_dir / f"a8_run_spec_{label}.json"),
+        run_id=resolved_run_id,
+        harness_root=str(run_config.get("harness_root", "/data/agiattempt/agi_dw/third_party/swe-bench")).strip()
+        or "/data/agiattempt/agi_dw/third_party/swe-bench",
+        max_workers=int(run_config.get("max_workers", 1) or 1),
+        timeout=int(run_config.get("timeout", 1800) or 1800),
+        cache_level=str(run_config.get("cache_level", "env")).strip() or "env",
+        namespace=str(run_config.get("namespace", "swebench")).strip() or "swebench",
+        report_dir=str(artifact_dir / f"evaluation_results_{label}"),
+        results_json=str(artifact_dir / f"evaluation_results_{label}" / "results.json"),
+        summary_json=str(artifact_dir / f"evaluation_results_{label}" / "summary.json"),
+        output_packet_json=str(artifact_dir / f"evaluation_results_{label}" / "a8_benchmark_result.json"),
+        python_bin=str(run_config.get("python_bin", sys.executable)).strip() or sys.executable,
+        model_name_or_path=str(run_config.get("model_name_or_path", "agentkernel")).strip() or "agentkernel",
+        provider=str(run_config.get("provider", "vllm")).strip() or "vllm",
+        drain_limit=len(retry_instance_ids),
+        max_source_context_bytes=int(inputs.get("max_source_context_bytes", 30000) or 30000),
+        instance_ids=retry_instance_ids,
+        limit=0,
+    )
+    spec["source_retry"] = {
+        "source_harness_json": str(source_harness.get("source_harness_json", "")),
+        "patch_job_verification_json": str(patch_job_verification.get("patch_job_verification_json", "")),
+        "retry_label": label,
+        "retry_instance_ids": retry_instance_ids,
+        "output_harness_json": output_harness_json,
+    }
+    spec["open_limits"].insert(0, "This retry harness was generated from failed SWE patch-job verifier output; it retries only retry_instance_ids.")
+    return spec
+
+
+def build_swe_success_continuation_harness_spec(
+    *,
+    source_harness: dict[str, Any],
+    patch_job_verification: dict[str, Any],
+    success_label: str,
+    artifact_dir: Path,
+    output_harness_json: str,
+    run_id: str = "",
+) -> dict[str, Any]:
+    if source_harness.get("report_kind") != "autonomous_benchmark_harness_spec":
+        raise ValueError("source harness report_kind must be autonomous_benchmark_harness_spec")
+    successful_instance_ids = [
+        str(value).strip()
+        for value in patch_job_verification.get("successful_instance_ids", [])
+        if str(value).strip()
+    ]
+    if not successful_instance_ids:
+        raise ValueError("patch job verification does not contain successful_instance_ids")
+    inputs = source_harness.get("inputs") if isinstance(source_harness.get("inputs"), dict) else {}
+    run_config = source_harness.get("run_config") if isinstance(source_harness.get("run_config"), dict) else {}
+    source_artifacts = source_harness.get("artifacts") if isinstance(source_harness.get("artifacts"), dict) else {}
+    label = _safe_label(success_label)
+    benchmark = str(source_harness.get("benchmark", "")).strip()
+    if benchmark not in DEFAULT_DATASETS:
+        raise ValueError("source harness benchmark must be one of " + ",".join(DEFAULT_DATASETS))
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    resolved_dataset = str(inputs.get("dataset_name", DEFAULT_DATASETS[benchmark])).strip()
+    resolved_run_id = str(run_id).strip() or f"{str(run_config.get('run_id', 'swe_success')).strip() or 'swe_success'}_{label}"
+    python_bin = str(run_config.get("python_bin", sys.executable)).strip() or sys.executable
+    namespace = str(run_config.get("namespace", "swebench")).strip() or "swebench"
+    timeout = int(run_config.get("timeout", 1800) or 1800)
+    max_workers = int(run_config.get("max_workers", 1) or 1)
+    cache_level = str(run_config.get("cache_level", "env")).strip() or "env"
+    harness_root = str(run_config.get("harness_root", "/data/agiattempt/agi_dw/third_party/swe-bench")).strip()
+    if not harness_root:
+        harness_root = "/data/agiattempt/agi_dw/third_party/swe-bench"
+
+    predictions_jsonl = str(artifact_dir / f"predictions_{label}.jsonl")
+    apply_check_json = str(artifact_dir / f"predictions_{label}_apply_check.json")
+    run_spec_json = str(artifact_dir / f"a8_run_spec_{label}.json")
+    report_dir = str(artifact_dir / f"evaluation_results_{label}")
+    results_json = str(artifact_dir / f"evaluation_results_{label}" / "results.json")
+    summary_json = str(artifact_dir / f"evaluation_results_{label}" / "summary.json")
+    output_packet_json = str(artifact_dir / f"evaluation_results_{label}" / "a8_benchmark_result.json")
+    verification_json = str(patch_job_verification.get("patch_job_verification_json", "")).strip()
+    if not verification_json:
+        raise ValueError("patch_job_verification_json is required for success continuation harness")
+
+    collect_args = [
+        python_bin,
+        "scripts/collect_swe_bench_predictions.py",
+        "--prediction-task-manifest",
+        str(source_artifacts.get("prediction_task_manifest", "")).strip(),
+        "--queue-manifest",
+        str(source_artifacts.get("queue_manifest", "")).strip(),
+        "--workspace-root",
+        str(source_artifacts.get("workspace_root", "workspace")).strip() or "workspace",
+        "--output-jsonl",
+        predictions_jsonl,
+        "--patch-job-verification-json",
+        verification_json,
+    ]
+    apply_check_args = [
+        python_bin,
+        "scripts/validate_swe_bench_predictions_against_repo_cache.py",
+        "--dataset-json",
+        str(inputs.get("dataset_json", "")).strip(),
+        "--predictions-jsonl",
+        predictions_jsonl,
+        "--repo-cache-root",
+        str(inputs.get("repo_cache_root", "")).strip(),
+        "--output-json",
+        apply_check_json,
+        "--instance-ids",
+        *successful_instance_ids,
+    ]
+    run_spec_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "spec",
+        "--benchmark",
+        benchmark,
+        "--dataset-name",
+        resolved_dataset,
+        "--split",
+        str(inputs.get("split", "test")).strip() or "test",
+        "--predictions-path",
+        predictions_jsonl,
+        "--run-id",
+        resolved_run_id,
+        "--max-workers",
+        str(max_workers),
+        "--timeout",
+        str(timeout),
+        "--cache-level",
+        cache_level,
+        "--namespace",
+        namespace,
+        "--report-dir",
+        report_dir,
+        "--results-json",
+        results_json,
+        "--summary-json",
+        summary_json,
+        "--output-packet-json",
+        output_packet_json,
+        "--swe-bench-root",
+        harness_root,
+        "--ready-to-run",
+        "auto",
+        "--output-spec-json",
+        run_spec_json,
+        "--instance-ids",
+        *successful_instance_ids,
+    ]
+    official_args = build_swe_bench_command(
+        python_bin=python_bin,
+        dataset_name=resolved_dataset,
+        split=str(inputs.get("split", "test")).strip() or "test",
+        predictions_path=predictions_jsonl,
+        run_id=resolved_run_id,
+        max_workers=max_workers,
+        timeout=timeout,
+        cache_level=cache_level,
+        namespace=namespace,
+        report_dir=report_dir,
+        instance_ids=successful_instance_ids,
+    )
+    materialize_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "materialize-results",
+        "--run-id",
+        resolved_run_id,
+        "--namespace",
+        namespace,
+        "--report-dir",
+        report_dir,
+        "--output-results-json",
+        results_json,
+    ]
+    summarize_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_a8_run.py",
+        "summarize",
+        "--results-json",
+        results_json,
+        "--output-summary-json",
+        summary_json,
+    ]
+    adapt_args = [
+        python_bin,
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        benchmark,
+        "--summary-json",
+        summary_json,
+        "--output-json",
+        output_packet_json,
+        "--conservative-comparison-report",
+    ]
+    return {
+        "spec_version": "asi_v1",
+        "report_kind": "autonomous_benchmark_harness_spec",
+        "benchmark": benchmark,
+        "created_at": datetime.now(UTC).isoformat(),
+        "autonomy_contract": {
+            "operator_role": "launch_and_monitor_only",
+            "selection_mode": "verified_patch_success_continuation",
+            "kernel_owned_phases": [
+                "collect_predictions",
+                "repo_cache_apply_check",
+                "official_harness",
+                "summarize_results",
+                "adapt_a8_packet",
+            ],
+            "prohibited_manual_interventions": [
+                "manual per-instance patch authoring",
+                "manual prediction JSONL editing",
+                "claiming local apply-checks as official benchmark results",
+            ],
+            "countable_evidence": [
+                "official SWE harness resolved_instances/resolved_ids",
+                "verified a8_benchmark_result packet",
+            ],
+        },
+        "inputs": {
+            "dataset_json": str(inputs.get("dataset_json", "")).strip(),
+            "dataset_name": resolved_dataset,
+            "split": str(inputs.get("split", "test")).strip() or "test",
+            "repo_cache_root": str(inputs.get("repo_cache_root", "")).strip(),
+            "instance_ids": successful_instance_ids,
+            "source_harness_json": str(source_harness.get("source_harness_json", "")),
+            "patch_job_verification_json": verification_json,
+        },
+        "run_config": {
+            "run_id": resolved_run_id,
+            "harness_root": harness_root,
+            "max_workers": max_workers,
+            "timeout": timeout,
+            "cache_level": cache_level,
+            "namespace": namespace,
+            "python_bin": python_bin,
+        },
+        "artifacts": {
+            "source_prediction_task_manifest": str(source_artifacts.get("prediction_task_manifest", "")).strip(),
+            "source_queue_manifest": str(source_artifacts.get("queue_manifest", "")).strip(),
+            "source_workspace_root": str(source_artifacts.get("workspace_root", "workspace")).strip() or "workspace",
+            "predictions_jsonl": predictions_jsonl,
+            "apply_check_json": apply_check_json,
+            "run_spec_json": run_spec_json,
+            "report_dir": report_dir,
+            "results_json": results_json,
+            "summary_json": summary_json,
+            "output_packet_json": output_packet_json,
+        },
+        "phases": [
+            _phase(
+                "collect_predictions",
+                collect_args,
+                required_inputs=[
+                    str(source_artifacts.get("prediction_task_manifest", "")).strip(),
+                    str(source_artifacts.get("queue_manifest", "")).strip(),
+                    verification_json,
+                ],
+                expected_outputs=[predictions_jsonl],
+                gate="collect only verifier-successful patch jobs",
+            ),
+            _phase(
+                "repo_cache_apply_check",
+                apply_check_args,
+                required_inputs=[str(inputs.get("dataset_json", "")).strip(), predictions_jsonl, str(inputs.get("repo_cache_root", "")).strip()],
+                expected_outputs=[apply_check_json],
+                gate="all_apply_check_passed must be true",
+            ),
+            _phase("build_run_spec", run_spec_args, required_inputs=[predictions_jsonl], expected_outputs=[run_spec_json]),
+            _phase(
+                "official_harness",
+                official_args,
+                required_inputs=[predictions_jsonl],
+                gate="official SWE-bench harness must complete",
+            ),
+            _phase("materialize_results", materialize_args, expected_outputs=[results_json]),
+            _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
+            _phase(
+                "adapt_a8_packet",
+                adapt_args,
+                preflight_argv=adapt_args + ["--validate-only"],
+                required_inputs=[summary_json],
+                expected_outputs=[output_packet_json],
+                gate="adapter verifies a8_benchmark_result packet",
+            ),
+        ],
+        "open_limits": [
+            "This continuation harness evaluates only patch jobs already verified successful by a prior harness verifier.",
+            "This is selected-slice evidence, not full benchmark evidence.",
+            "Do not claim patch verification or repo-cache apply-check as official benchmark success.",
+        ],
+        "source_success_continuation": {
+            "source_harness_json": str(source_harness.get("source_harness_json", "")),
+            "patch_job_verification_json": verification_json,
+            "success_label": label,
+            "successful_instance_ids": successful_instance_ids,
+            "output_harness_json": output_harness_json,
+        },
+    }
+
+
+def materialize_swe_bench_results(
+    *,
+    run_id: str,
+    namespace: str,
+    report_dir: str,
+    output_results_json: str,
+    search_root: str = ".",
+) -> Path:
+    filename = f"{namespace}.{run_id}.json"
+    candidates = [
+        Path(report_dir) / filename,
+        Path(search_root) / filename,
+    ]
+    for root in (Path(report_dir), Path(search_root)):
+        if root.exists():
+            candidates.extend(sorted(root.glob(f"*.{run_id}.json")))
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            output_path = Path(output_results_json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if candidate.resolve() != output_path.resolve():
+                shutil.copyfile(candidate, output_path)
+            return output_path
+    raise FileNotFoundError("could not locate official SWE-bench report at " + ", ".join(str(path) for path in candidates))
+
+
 def _command_mode(args: argparse.Namespace) -> None:
     dataset_name = str(args.dataset_name or DEFAULT_DATASETS[args.benchmark]).strip()
     if not dataset_name:
@@ -175,6 +1052,37 @@ def _command_mode(args: argparse.Namespace) -> None:
     print(f"benchmark={args.benchmark} command_json={args.output_command_json}")
 
 
+def _spec_mode(args: argparse.Namespace) -> None:
+    dataset_name = str(args.dataset_name or DEFAULT_DATASETS[args.benchmark]).strip()
+    if not dataset_name:
+        raise SystemExit("--dataset-name is required for this benchmark")
+    ready_to_run: bool | None = None if args.ready_to_run == "auto" else args.ready_to_run == "true"
+    spec = build_a8_swe_benchmark_run_spec(
+        benchmark=args.benchmark,
+        dataset_name=dataset_name,
+        split=args.split,
+        predictions_path=args.predictions_path,
+        run_id=args.run_id,
+        harness_root=args.swe_bench_root,
+        max_workers=int(args.max_workers),
+        timeout=int(args.timeout),
+        cache_level=args.cache_level,
+        namespace=args.namespace,
+        report_dir=args.report_dir,
+        results_json=args.results_json,
+        summary_json=args.summary_json,
+        output_packet_json=args.output_packet_json,
+        ready_to_run=ready_to_run,
+        instance_ids=args.instance_ids,
+    )
+    _write_json(Path(args.output_spec_json), spec)
+    print(
+        f"benchmark={args.benchmark} "
+        f"ready_to_run={str(spec['ready_to_run']).lower()} "
+        f"spec_json={args.output_spec_json}"
+    )
+
+
 def _summarize_mode(args: argparse.Namespace) -> None:
     results_path = Path(args.results_json)
     summary = summarize_swe_bench_results(_read_json(results_path), source_path=str(results_path))
@@ -184,6 +1092,101 @@ def _summarize_mode(args: argparse.Namespace) -> None:
         f"task_count={summary['task_count']} "
         f"resolve_rate={summary['resolve_rate']} "
         f"summary_json={args.output_summary_json}"
+    )
+
+
+def _materialize_results_mode(args: argparse.Namespace) -> None:
+    output_path = materialize_swe_bench_results(
+        run_id=args.run_id,
+        namespace=args.namespace,
+        report_dir=args.report_dir,
+        output_results_json=args.output_results_json,
+        search_root=args.search_root,
+    )
+    print(f"results_json={output_path}")
+
+
+def _harness_mode(args: argparse.Namespace) -> None:
+    spec = build_swe_autonomous_harness_spec(
+        benchmark=args.benchmark,
+        dataset_json=args.dataset_json,
+        dataset_name=args.dataset_name,
+        split=args.split,
+        repo_cache_root=args.repo_cache_root,
+        prediction_task_manifest=args.prediction_task_manifest,
+        patch_dir=args.patch_dir,
+        queue_manifest=args.queue_manifest,
+        queue_root=args.queue_root,
+        workspace_root=args.workspace_root,
+        workspace_prefix=args.workspace_prefix,
+        predictions_jsonl=args.predictions_jsonl,
+        apply_check_json=args.apply_check_json,
+        run_spec_json=args.run_spec_json,
+        run_id=args.run_id,
+        harness_root=args.swe_bench_root,
+        max_workers=int(args.max_workers),
+        timeout=int(args.timeout),
+        cache_level=args.cache_level,
+        namespace=args.namespace,
+        report_dir=args.report_dir,
+        results_json=args.results_json,
+        summary_json=args.summary_json,
+        output_packet_json=args.output_packet_json,
+        python_bin=args.python_bin,
+        model_name_or_path=args.model_name_or_path,
+        provider=args.provider,
+        drain_limit=int(args.drain_limit),
+        max_source_context_bytes=int(args.max_source_context_bytes),
+        instance_ids=args.instance_ids,
+        limit=int(args.limit),
+    )
+    _write_json(Path(args.output_harness_json), spec)
+    print(
+        f"benchmark={args.benchmark} "
+        f"selection_mode={spec['autonomy_contract']['selection_mode']} "
+        f"harness_json={args.output_harness_json}"
+    )
+
+
+def _retry_harness_mode(args: argparse.Namespace) -> None:
+    source_harness = _read_json(Path(args.source_harness_json))
+    source_harness["source_harness_json"] = args.source_harness_json
+    patch_job_verification = _read_json(Path(args.patch_job_verification_json))
+    patch_job_verification["patch_job_verification_json"] = args.patch_job_verification_json
+    spec = build_swe_retry_harness_spec(
+        source_harness=source_harness,
+        patch_job_verification=patch_job_verification,
+        retry_label=args.retry_label,
+        artifact_dir=Path(args.artifact_dir),
+        output_harness_json=args.output_harness_json,
+        run_id=args.run_id,
+    )
+    _write_json(Path(args.output_harness_json), spec)
+    print(
+        f"benchmark={spec['benchmark']} "
+        f"retry_count={len(spec['source_retry']['retry_instance_ids'])} "
+        f"harness_json={args.output_harness_json}"
+    )
+
+
+def _success_continuation_harness_mode(args: argparse.Namespace) -> None:
+    source_harness = _read_json(Path(args.source_harness_json))
+    source_harness["source_harness_json"] = args.source_harness_json
+    patch_job_verification = _read_json(Path(args.patch_job_verification_json))
+    patch_job_verification["patch_job_verification_json"] = args.patch_job_verification_json
+    spec = build_swe_success_continuation_harness_spec(
+        source_harness=source_harness,
+        patch_job_verification=patch_job_verification,
+        success_label=args.success_label,
+        artifact_dir=Path(args.artifact_dir),
+        output_harness_json=args.output_harness_json,
+        run_id=args.run_id,
+    )
+    _write_json(Path(args.output_harness_json), spec)
+    print(
+        f"benchmark={spec['benchmark']} "
+        f"success_count={len(spec['source_success_continuation']['successful_instance_ids'])} "
+        f"harness_json={args.output_harness_json}"
     )
 
 
@@ -211,10 +1214,91 @@ def main() -> None:
     command_parser.add_argument("--instance-ids", nargs="*")
     command_parser.set_defaults(func=_command_mode)
 
+    spec_parser = subparsers.add_parser("spec")
+    spec_parser.add_argument("--benchmark", choices=tuple(DEFAULT_DATASETS), required=True)
+    spec_parser.add_argument("--dataset-name", default="")
+    spec_parser.add_argument("--split", default="test")
+    spec_parser.add_argument("--predictions-path", required=True)
+    spec_parser.add_argument("--run-id", required=True)
+    spec_parser.add_argument("--max-workers", type=int, default=4)
+    spec_parser.add_argument("--timeout", type=int, default=1800)
+    spec_parser.add_argument("--cache-level", default="env")
+    spec_parser.add_argument("--namespace", default="swebench")
+    spec_parser.add_argument("--report-dir", required=True)
+    spec_parser.add_argument("--results-json", required=True)
+    spec_parser.add_argument("--summary-json", required=True)
+    spec_parser.add_argument("--output-packet-json", required=True)
+    spec_parser.add_argument("--swe-bench-root", default="/data/agiattempt/agi_dw/third_party/swe-bench")
+    spec_parser.add_argument("--ready-to-run", choices=("auto", "true", "false"), default="auto")
+    spec_parser.add_argument("--instance-ids", nargs="*")
+    spec_parser.add_argument("--output-spec-json", required=True)
+    spec_parser.set_defaults(func=_spec_mode)
+
     summarize_parser = subparsers.add_parser("summarize")
     summarize_parser.add_argument("--results-json", required=True)
     summarize_parser.add_argument("--output-summary-json", required=True)
     summarize_parser.set_defaults(func=_summarize_mode)
+
+    materialize_parser = subparsers.add_parser("materialize-results")
+    materialize_parser.add_argument("--run-id", required=True)
+    materialize_parser.add_argument("--namespace", default="swebench")
+    materialize_parser.add_argument("--report-dir", required=True)
+    materialize_parser.add_argument("--output-results-json", required=True)
+    materialize_parser.add_argument("--search-root", default=".")
+    materialize_parser.set_defaults(func=_materialize_results_mode)
+
+    harness_parser = subparsers.add_parser("harness")
+    harness_parser.add_argument("--benchmark", choices=tuple(DEFAULT_DATASETS), required=True)
+    harness_parser.add_argument("--dataset-json", required=True)
+    harness_parser.add_argument("--dataset-name", default="")
+    harness_parser.add_argument("--split", default="test")
+    harness_parser.add_argument("--repo-cache-root", required=True)
+    harness_parser.add_argument("--prediction-task-manifest", required=True)
+    harness_parser.add_argument("--patch-dir", required=True)
+    harness_parser.add_argument("--queue-manifest", required=True)
+    harness_parser.add_argument("--queue-root", required=True)
+    harness_parser.add_argument("--workspace-root", default="workspace")
+    harness_parser.add_argument("--workspace-prefix", required=True)
+    harness_parser.add_argument("--predictions-jsonl", required=True)
+    harness_parser.add_argument("--apply-check-json", required=True)
+    harness_parser.add_argument("--run-spec-json", required=True)
+    harness_parser.add_argument("--run-id", required=True)
+    harness_parser.add_argument("--max-workers", type=int, default=1)
+    harness_parser.add_argument("--timeout", type=int, default=1800)
+    harness_parser.add_argument("--cache-level", default="env")
+    harness_parser.add_argument("--namespace", default="swebench")
+    harness_parser.add_argument("--report-dir", required=True)
+    harness_parser.add_argument("--results-json", required=True)
+    harness_parser.add_argument("--summary-json", required=True)
+    harness_parser.add_argument("--output-packet-json", required=True)
+    harness_parser.add_argument("--swe-bench-root", default="/data/agiattempt/agi_dw/third_party/swe-bench")
+    harness_parser.add_argument("--python-bin", default=sys.executable)
+    harness_parser.add_argument("--model-name-or-path", default="agentkernel")
+    harness_parser.add_argument("--provider", default="vllm")
+    harness_parser.add_argument("--drain-limit", type=int, default=0)
+    harness_parser.add_argument("--max-source-context-bytes", type=int, default=30000)
+    harness_parser.add_argument("--limit", type=int, default=0)
+    harness_parser.add_argument("--instance-ids", nargs="*")
+    harness_parser.add_argument("--output-harness-json", required=True)
+    harness_parser.set_defaults(func=_harness_mode)
+
+    retry_harness_parser = subparsers.add_parser("retry-harness")
+    retry_harness_parser.add_argument("--source-harness-json", required=True)
+    retry_harness_parser.add_argument("--patch-job-verification-json", required=True)
+    retry_harness_parser.add_argument("--retry-label", default="retry")
+    retry_harness_parser.add_argument("--artifact-dir", required=True)
+    retry_harness_parser.add_argument("--run-id", default="")
+    retry_harness_parser.add_argument("--output-harness-json", required=True)
+    retry_harness_parser.set_defaults(func=_retry_harness_mode)
+
+    success_harness_parser = subparsers.add_parser("success-continuation-harness")
+    success_harness_parser.add_argument("--source-harness-json", required=True)
+    success_harness_parser.add_argument("--patch-job-verification-json", required=True)
+    success_harness_parser.add_argument("--success-label", default="success")
+    success_harness_parser.add_argument("--artifact-dir", required=True)
+    success_harness_parser.add_argument("--run-id", default="")
+    success_harness_parser.add_argument("--output-harness-json", required=True)
+    success_harness_parser.set_defaults(func=_success_continuation_harness_mode)
 
     args = parser.parse_args()
     args.func(args)

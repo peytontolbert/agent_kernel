@@ -75,8 +75,10 @@ def prepare_repo_cache(
     dry_run: bool = False,
     limit: int = 0,
     instance_ids: list[str] | None = None,
+    repos_filter: list[str] | None = None,
 ) -> dict[str, Any]:
     selected_ids = {value.strip() for value in (instance_ids or []) if value.strip()}
+    selected_repos = {value.strip() for value in (repos_filter or []) if value.strip()}
     repos: dict[str, set[str]] = {}
     selected_count = 0
     for item in _dataset_items(dataset):
@@ -85,6 +87,8 @@ def prepare_repo_cache(
             continue
         repo = _repo(item)
         if not repo:
+            continue
+        if selected_repos and repo not in selected_repos:
             continue
         selected_count += 1
         repos.setdefault(repo, set())
@@ -139,6 +143,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--instance-ids", nargs="*")
+    parser.add_argument("--repos", nargs="*")
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()
 
@@ -149,6 +154,7 @@ def main() -> None:
         dry_run=bool(args.dry_run),
         limit=int(args.limit),
         instance_ids=args.instance_ids,
+        repos_filter=args.repos,
     )
     if args.output_json:
         output_path = Path(args.output_json)

@@ -200,8 +200,21 @@ class ContextBudgeter:
             plan=plan,
             active_subgoal=active_subgoal,
         )
-        budget = max(256, self.config.tolbert_context_char_budget)
-        max_chunks = max(1, self.config.tolbert_context_max_chunks)
+        packet_budget = {}
+        if llm_context_packet is not None:
+            control = llm_context_packet.get("control", {})
+            if isinstance(control, dict):
+                raw_budget = control.get("context_chunk_budget", {})
+                if isinstance(raw_budget, dict):
+                    packet_budget = raw_budget
+        budget = max(
+            256,
+            _safe_int(packet_budget.get("char_budget"), self.config.tolbert_context_char_budget),
+        )
+        max_chunks = max(
+            1,
+            _safe_int(packet_budget.get("max_chunks"), self.config.tolbert_context_max_chunks),
+        )
         selected: list[_BudgetChunk] = []
         used_chars = 0
         for chunk in sorted(chunks, key=lambda item: (-item.score, item.source, item.key, item.text)):
@@ -237,13 +250,19 @@ class ContextBudgeter:
                 text = str(item.get("text", "")).strip()
                 if text:
                     score = 9
+                    span_id = str(item.get("span_id", ""))
+                    span_type = str(item.get("span_type", ""))
+                    if span_id == "research:applied_guidance" or span_type == "research_library:applied_guidance":
+                        score += 8
+                    elif span_id == "research:paper_hits" or span_type == "research_library:paper_hits":
+                        score += 3
                     score += self._token_overlap_bonus(text, subgoal_tokens, expected, forbidden)
                     if role == "executor":
                         score += 2
                     chunks.append(
                         _BudgetChunk(
                             source="retrieval",
-                            key=str(item.get("span_id", "")),
+                            key=span_id,
                             text=text,
                             score=score,
                             payload=item,

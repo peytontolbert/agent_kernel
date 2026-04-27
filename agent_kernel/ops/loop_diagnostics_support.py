@@ -157,15 +157,52 @@ def _swe_candidate_path_repair_brief(state) -> str:
         ]
     if not candidate_files:
         return ""
+    high_value_windows = _swe_high_value_window_repair_preview(metadata)
+    suggested_command = _swe_first_suggested_patch_command(metadata)
     anchor_preview = _swe_candidate_line_anchor_preview(metadata, candidate_files)
     brief = (
         "allowed patch paths are "
         f"{', '.join(candidate_files)}; inspect source_lines/<path>.lines for exact line anchors "
-        "and write hunks only against those paths"
+        "and write hunks only against those paths; prefer deterministic patch construction with "
+        "swe_patch_builder --path <allowed-path> --replace-line <line-number> "
+        "--with '<full replacement source line>' > patch.diff; for multi-line replacements use "
+        "swe_patch_builder --path <allowed-path> --replace-lines <start> <end> followed by one "
+        "--with argument per replacement line and redirect to patch.diff; the patch must change executable "
+        "Python behavior, not only comments, docstrings, module headers, or triple-quoted text; preserve "
+        "existing production function and class definitions"
     )
+    if suggested_command:
+        brief = (
+            f"{brief}; mandatory first repair command when it matches the failure behavior: "
+            f"{suggested_command}; run that exact command before trying alternate edits"
+        )
+    if high_value_windows:
+        brief = f"{brief}; first repair against this high-value issue window: {high_value_windows}"
     if anchor_preview:
         brief = f"{brief}; candidate line anchors: {anchor_preview}"
     return brief
+
+
+def _swe_first_suggested_patch_command(metadata: dict[str, object]) -> str:
+    commands = metadata.get("swe_suggested_patch_commands", [])
+    if not isinstance(commands, list):
+        return ""
+    for command in commands:
+        normalized = str(command).strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _swe_high_value_window_repair_preview(metadata: dict[str, object]) -> str:
+    windows = str(metadata.get("swe_executable_edit_windows", "")).strip()
+    if not windows:
+        return ""
+    first_window = windows.split("\n\n", 1)[0].strip()
+    if not first_window:
+        return ""
+    normalized = " | ".join(line.strip() for line in first_window.splitlines() if line.strip())
+    return normalized[:1200]
 
 
 def _swe_candidate_line_anchor_preview(metadata: dict[str, object], candidate_files: list[str]) -> str:
@@ -178,12 +215,42 @@ def _swe_candidate_line_anchor_preview(metadata: dict[str, object], candidate_fi
         content = str(setup_files.get(line_path, "")).strip()
         if not content:
             continue
-        lines = [line for line in content.splitlines()[:18] if line.strip()]
+        lines = _swe_candidate_anchor_lines(content)
         if not lines:
             continue
-        preview = " | ".join(lines[:12])
+        preview = " | ".join(lines[:16])
         chunks.append(f"{path}: {preview}")
     return " || ".join(chunks)
+
+
+def _swe_candidate_anchor_lines(content: str) -> list[str]:
+    source_lines = [line for line in content.splitlines() if line.strip()]
+    if not source_lines:
+        return []
+    selected: list[str] = []
+
+    def _append(line: str) -> None:
+        normalized = str(line).strip()
+        if normalized and normalized not in selected:
+            selected.append(normalized)
+
+    for line in source_lines[:8]:
+        _append(line)
+    anchor_patterns = (
+        r":\s*class\s+",
+        r":\s*def\s+",
+        r"\b__init__\s*\(",
+        r"\bread\s*\(",
+        r"\bwrite\s*\(",
+        r"\bparse\s*\(",
+        r"\bformat\s*\(",
+    )
+    for line in source_lines:
+        if any(re.search(pattern, line) for pattern in anchor_patterns):
+            _append(line)
+        if len(selected) >= 16:
+            break
+    return selected
 
 
 def _expected_content_preview(expected_content: str, *, limit: int = 800) -> str:
@@ -305,6 +372,18 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
         elif text.startswith("SWE patch apply check failed: "):
             path = "patch.diff"
             subgoal = "repair SWE patch.diff until it applies to the base commit"
+        elif text.startswith("SWE patch python syntax check failed: "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff until changed Python files parse"
+        elif text == "SWE patch python AST unchanged after ignoring docstrings/comments":
+            path = "patch.diff"
+            subgoal = "replace docstring-only SWE patch.diff with executable behavior change"
+        elif text.startswith("SWE patch removes existing Python definitions in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without deleting existing source definitions"
+        elif text.startswith("SWE patch adds unused production function parameters in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without unused signature-only parameters"
         elif text.startswith("SWE patch verifier missing patch file: "):
             path = text.removeprefix("SWE patch verifier missing patch file: ").strip() or "patch.diff"
             subgoal = f"materialize expected artifact {path}"
@@ -314,9 +393,15 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
         elif text == "SWE patch diff contains placeholder/template content":
             path = "patch.diff"
             subgoal = "replace template SWE patch.diff with a source-grounded unified diff"
+        elif text.startswith("SWE patch does not reference required issue identifier: "):
+            path = "patch.diff"
+            subgoal = "rewrite SWE patch.diff to address the named issue identifier"
         elif text == "SWE patch diff has no meaningful content change":
             path = "patch.diff"
             subgoal = "replace no-op SWE patch.diff with a behavior-changing unified diff"
+        elif text == "SWE patch diff changes only comments/docstrings/non-executable text":
+            path = "patch.diff"
+            subgoal = "replace nonfunctional SWE patch.diff with executable behavior change"
         elif text == "SWE patch diff has no changed file paths":
             path = "patch.diff"
             subgoal = "rewrite SWE patch.diff with real changed file paths"
@@ -378,15 +463,48 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
                     "rewrite patch.diff as a real unified diff that applies cleanly to the base commit; "
                     "use exact file paths and context from source excerpts; do not invent files or placeholder hunks"
                 )
+            elif text.startswith("SWE patch python syntax check failed: "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as an executable Python code change that still parses after application; "
+                    "do not insert function definitions inside import lists, argument lists, or other invalid blocks; "
+                    "anchor edits near real class/function bodies from source_lines"
+                )
+            elif text == "SWE patch python AST unchanged after ignoring docstrings/comments":
+                entry["repair_instruction"] = (
+                    "replace patch.diff with a change that modifies executable Python AST, not only docstrings, comments, "
+                    "headers, or text inside triple-quoted strings; anchor the edit in a real function body"
+                )
+            elif text.startswith("SWE patch removes existing Python definitions in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a minimal behavior fix that preserves existing production function and class "
+                    "definitions; do not rename, delete, or replace method/function definition lines unless the issue "
+                    "explicitly requires a signature-preserving edit"
+                )
+            elif text.startswith("SWE patch adds unused production function parameters in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a real behavior change inside the relevant function body; do not add unused "
+                    "parameters or signature-only changes that are never referenced by executable code"
+                )
             elif text.startswith("SWE patch diff includes unexpected path: "):
                 entry["repair_instruction"] = (
                     "rewrite patch.diff to change only the listed likely relevant files; "
                     "inspect source_context paths and do not invent alternate repository paths"
                 )
+            elif text.startswith("SWE patch does not reference required issue identifier: "):
+                identifier = text.rsplit(": ", 1)[-1].strip()
+                entry["repair_instruction"] = (
+                    f"rewrite patch.diff so the executable source change directly handles `{identifier}`; "
+                    "do not use generic **kwargs/signature-only changes that ignore the named failing keyword"
+                )
             elif text.startswith("SWE patch diff has no meaningful content change"):
                 entry["repair_instruction"] = (
                     "replace patch.diff with a behavior-changing unified diff that addresses the issue; "
                     "do not remove and re-add identical lines, and use exact context from source_lines"
+                )
+            elif text.startswith("SWE patch diff changes only comments/docstrings/non-executable text"):
+                entry["repair_instruction"] = (
+                    "replace patch.diff with an executable code change that addresses the failing behavior; "
+                    "do not edit only comments, module headers, or docstrings"
                 )
             elif text.startswith("SWE patch diff contains placeholder/template content") or text.startswith(
                 "SWE patch diff has no changed file paths"

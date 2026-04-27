@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Benchmark Browser</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Benchmark Browser</h1>
+        <p id="generatedAt">Loading benchmark index...</p>
+      </div>
+      <div class="search">
+        <input id="searchInput" type="search" placeholder="Search tasks, repos, files" />
+      </div>
+    </header>
+
+    <main>
+      <section class="metrics" id="metrics"></section>
+
+      <section class="layout">
+        <aside class="sidebar">
+          <nav class="tabs" aria-label="Benchmark sections">
+            <button class="tab active" data-panel="overview">Overview</button>
+            <button class="tab" data-panel="datasets">Datasets</button>
+            <button class="tab" data-panel="results">Results</button>
+            <button class="tab" data-panel="predictions">Predictions</button>
+            <button class="tab" data-panel="sources">Sources</button>
+            <button class="tab" data-panel="specs">Run Specs</button>
+          </nav>
+          <div class="filters">
+            <label>
+              Repository
+              <select id="repoFilter">
+                <option value="">All repositories</option>
+              </select>
+            </label>
+            <label>
+              Dataset
+              <select id="datasetFilter">
+                <option value="">All datasets</option>
+              </select>
+            </label>
+          </div>
+        </aside>
+
+        <section class="content">
+          <div id="overview" class="panel active"></div>
+          <div id="datasets" class="panel"></div>
+          <div id="results" class="panel"></div>
+          <div id="predictions" class="panel"></div>
+          <div id="sources" class="panel"></div>
+          <div id="specs" class="panel"></div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="detailDialog">
+      <div class="dialogHead">
+        <div>
+          <h2 id="detailTitle"></h2>
+          <p id="detailMeta"></p>
+        </div>
+        <button id="closeDetail" class="iconButton" aria-label="Close">×</button>
+      </div>
+      <div id="detailBody" class="detailBody"></div>
+    </dialog>
+
+    <script src="app.js"></script>
+  </body>
+</html>

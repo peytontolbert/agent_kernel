@@ -29,6 +29,8 @@ def collect_swe_predictions(
     *,
     workspace_root: str,
     output_jsonl: str,
+    instance_ids: list[str] | None = None,
+    patch_job_verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prediction_manifest = prediction_task_manifest.get("prediction_manifest")
     if not isinstance(prediction_manifest, dict):
@@ -47,10 +49,28 @@ def collect_swe_predictions(
     copied: list[dict[str, str]] = []
     workspace_base = Path(workspace_root)
     base_dir = Path(str(prediction_manifest.get("base_dir", "")))
+    requested_ids = {str(value).strip() for value in (instance_ids or []) if str(value).strip()}
+    if patch_job_verification is not None:
+        successful_ids = {
+            str(value).strip()
+            for value in patch_job_verification.get("successful_instance_ids", [])
+            if str(value).strip()
+        }
+        if not successful_ids:
+            raise ValueError("patch job verification has no successful_instance_ids")
+        if requested_ids:
+            missing = sorted(requested_ids - successful_ids)
+            if missing:
+                raise ValueError("requested instance_ids are not verified successful: " + ",".join(missing))
+        else:
+            requested_ids = successful_ids
+    selected_predictions: list[dict[str, Any]] = []
     for prediction in prediction_manifest.get("predictions", []):
         if not isinstance(prediction, dict):
             raise ValueError("prediction_manifest predictions must be objects")
         instance_id = str(prediction.get("instance_id", "")).strip()
+        if requested_ids and instance_id not in requested_ids:
+            continue
         queue_task = queue_by_instance.get(instance_id)
         if not queue_task:
             raise ValueError(f"missing queue task for instance_id={instance_id}")
@@ -66,13 +86,19 @@ def collect_swe_predictions(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(patch_text, encoding="utf-8")
         copied.append({"instance_id": instance_id, "source": str(source), "target": str(target)})
-    records = build_swe_predictions_from_manifest(prediction_manifest)
+        selected_predictions.append(dict(prediction))
+    if not selected_predictions:
+        raise ValueError("no predictions selected for collection")
+    selected_prediction_manifest = dict(prediction_manifest)
+    selected_prediction_manifest["predictions"] = selected_predictions
+    records = build_swe_predictions_from_manifest(selected_prediction_manifest)
     _write_jsonl(Path(output_jsonl), records)
     return {
         "copied_patch_count": len(copied),
         "prediction_count": len(records),
         "copied_patches": copied,
         "output_jsonl": output_jsonl,
+        "selected_instance_ids": [record["instance_id"] for record in records],
     }
 
 
@@ -82,13 +108,20 @@ def main() -> None:
     parser.add_argument("--queue-manifest", required=True)
     parser.add_argument("--workspace-root", required=True)
     parser.add_argument("--output-jsonl", required=True)
+    parser.add_argument("--instance-ids", nargs="*", default=None)
+    parser.add_argument("--patch-job-verification-json", default="")
     args = parser.parse_args()
 
+    patch_job_verification = (
+        _read_json(Path(args.patch_job_verification_json)) if str(args.patch_job_verification_json).strip() else None
+    )
     result = collect_swe_predictions(
         _read_json(Path(args.prediction_task_manifest)),
         _read_json(Path(args.queue_manifest)),
         workspace_root=args.workspace_root,
         output_jsonl=args.output_jsonl,
+        instance_ids=args.instance_ids,
+        patch_job_verification=patch_job_verification,
     )
     print(
         f"copied_patch_count={result['copied_patch_count']} "

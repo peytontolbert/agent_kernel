@@ -1,0 +1,45 @@
+2026-04-27 21:14:50,279 - INFO - Creating container for scikit-learn__scikit-learn-14141...
+2026-04-27 21:14:51,393 - INFO - Container for scikit-learn__scikit-learn-14141 created: 7e44fe800db90265cc7ec230541498a86c634ecf3010231bc6a79cb9e849fbb4
+2026-04-27 21:14:51,641 - INFO - Container for scikit-learn__scikit-learn-14141 started: 7e44fe800db90265cc7ec230541498a86c634ecf3010231bc6a79cb9e849fbb4
+2026-04-27 21:14:51,641 - INFO - Intermediate patch for scikit-learn__scikit-learn-14141 written to logs/run_evaluation/agentkernel_swe_verified_high_conf_next10_r3_success9_r1/agentkernel/scikit-learn__scikit-learn-14141/patch.diff, now applying to container...
+2026-04-27 21:14:51,767 - INFO - >>>>> Applied Patch:
+Checking patch sklearn/utils/_show_versions.py...
+Applied patch sklearn/utils/_show_versions.py cleanly.
+
+2026-04-27 21:14:52,035 - INFO - Git diff before:
+diff --git a/sklearn/utils/_show_versions.py b/sklearn/utils/_show_versions.py
+index e5d3141bf..d13f28b00 100644
+--- a/sklearn/utils/_show_versions.py
++++ b/sklearn/utils/_show_versions.py
+@@ -46,6 +46,7 @@ def _get_deps_info():
+         "numpy",
+         "scipy",
+         "Cython",
++        "joblib",
+         "pandas",
+         "matplotlib",
+     ]
+2026-04-27 21:14:52,035 - INFO - Eval script for scikit-learn__scikit-learn-14141 written to logs/run_evaluation/agentkernel_swe_verified_high_conf_next10_r3_success9_r1/agentkernel/scikit-learn__scikit-learn-14141/eval.sh; copying to container...
+2026-04-27 21:14:55,737 - INFO - Test runtime: 3.65 seconds
+2026-04-27 21:14:55,738 - INFO - Test output for scikit-learn__scikit-learn-14141 written to logs/run_evaluation/agentkernel_swe_verified_high_conf_next10_r3_success9_r1/agentkernel/scikit-learn__scikit-learn-14141/test_output.txt
+2026-04-27 21:14:55,812 - INFO - Git diff after:
+diff --git a/sklearn/utils/_show_versions.py b/sklearn/utils/_show_versions.py
+index e5d3141bf..d13f28b00 100644
+--- a/sklearn/utils/_show_versions.py
++++ b/sklearn/utils/_show_versions.py
+@@ -46,6 +46,7 @@ def _get_deps_info():
+         "numpy",
+         "scipy",
+         "Cython",
++        "joblib",
+         "pandas",
+         "matplotlib",
+     ]
+2026-04-27 21:14:55,812 - INFO - Grading answer for scikit-learn__scikit-learn-14141...
+2026-04-27 21:14:55,814 - INFO - report: {'scikit-learn__scikit-learn-14141': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['sklearn/utils/tests/test_show_versions.py::test_get_deps_info'], 'failure': []}, 'PASS_TO_PASS': {'success': ['sklearn/utils/tests/test_show_versions.py::test_get_sys_info', 'sklearn/utils/tests/test_show_versions.py::test_show_versions_with_blas'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for scikit-learn__scikit-learn-14141: resolved: True
+2026-04-27 21:14:55,814 - INFO - Attempting to stop container sweb.eval.scikit-learn__scikit-learn-14141.agentkernel_swe_verified_high_conf_next10_r3_success9_r1...
+2026-04-27 21:15:10,995 - INFO - Attempting to remove container sweb.eval.scikit-learn__scikit-learn-14141.agentkernel_swe_verified_high_conf_next10_r3_success9_r1...
+2026-04-27 21:15:11,025 - INFO - Container sweb.eval.scikit-learn__scikit-learn-14141.agentkernel_swe_verified_high_conf_next10_r3_success9_r1 removed.
+2026-04-27 21:15:11,025 - INFO - Attempting to remove image swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14141:latest...
+2026-04-27 21:15:13,890 - INFO - Image swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14141:latest removed.

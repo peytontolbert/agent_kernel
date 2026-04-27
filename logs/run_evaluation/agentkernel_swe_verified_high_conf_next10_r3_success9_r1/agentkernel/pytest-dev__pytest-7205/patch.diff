@@ -1,0 +1,12 @@
+--- a/src/_pytest/setuponly.py
++++ b/src/_pytest/setuponly.py
+@@ -66,7 +66,8 @@
+             tw.write(" (fixtures used: {})".format(", ".join(deps)))
+ 
+     if hasattr(fixturedef, "cached_param"):
+-        tw.write("[{}]".format(fixturedef.cached_param))
++        from _pytest._io.saferepr import saferepr
++        tw.write("[{}]".format(saferepr(fixturedef.cached_param, maxsize=42)))
+ 
+     tw.flush()
+ 

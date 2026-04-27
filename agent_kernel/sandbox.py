@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import difflib
 import os
 from pathlib import Path
 import re
@@ -48,6 +49,7 @@ class Sandbox:
             "sed",
             "sleep",
             "sort",
+            "swe_patch_builder",
             "tail",
             "test",
             "touch",
@@ -116,7 +118,7 @@ class Sandbox:
                     stderr=f"{combined_stderr}{path_error}",
                 )
             try:
-                segment_result = self._run_segment(segment, cwd_resolved, env=env)
+                segment_result = self._run_segment(segment, cwd_resolved, env=env, task=task)
             except subprocess.TimeoutExpired as exc:
                 return CommandResult(
                     command=command,
@@ -157,10 +159,17 @@ class Sandbox:
         cwd: Path,
         *,
         env: dict[str, str],
+        task: TaskSpec | None = None,
     ) -> CommandResult:
         command_name = Path(segment.argv[0]).name
         if command_name == "http_request":
             result = self._run_http_request_segment(segment, cwd)
+            stdout = result.stdout
+            stderr = result.stderr
+            exit_code = result.exit_code
+            timed_out = result.timed_out
+        elif command_name == "swe_patch_builder":
+            result = self._run_swe_patch_builder_segment(segment, cwd, task=task)
             stdout = result.stdout
             stderr = result.stderr
             exit_code = result.exit_code
@@ -355,7 +364,262 @@ class Sandbox:
             return self._test_path_operands(args)
         if command_name == "http_request":
             return self._http_request_path_operands(args)
+        if command_name == "swe_patch_builder":
+            return self._swe_patch_builder_path_operands(args)
         return [arg for arg in args if self._looks_like_path(arg)]
+
+    def _run_swe_patch_builder_segment(
+        self,
+        segment: _ParsedSegment,
+        cwd: Path,
+        *,
+        task: TaskSpec | None,
+    ) -> CommandResult:
+        try:
+            patch = self._build_swe_patch(segment.argv[1:], cwd, task=task)
+        except ValueError as exc:
+            return CommandResult(
+                command=" ".join(segment.argv),
+                exit_code=2,
+                stdout="",
+                stderr=f"{exc}\n",
+            )
+        return CommandResult(
+            command=" ".join(segment.argv),
+            exit_code=0,
+            stdout=patch,
+            stderr="",
+        )
+
+    def _build_swe_patch(self, args: list[str], cwd: Path, *, task: TaskSpec | None) -> str:
+        from_diff = ""
+        path = ""
+        operations: list[tuple[int, int, list[str]]] = []
+        current_start_line = 0
+        current_end_line = 0
+        current_replacement_lines: list[str] = []
+
+        def flush_operation() -> None:
+            nonlocal current_start_line, current_end_line, current_replacement_lines
+            if current_start_line:
+                operations.append((current_start_line, current_end_line, list(current_replacement_lines)))
+                current_start_line = 0
+                current_end_line = 0
+                current_replacement_lines = []
+
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token == "--from-diff" and index + 1 < len(args):
+                flush_operation()
+                from_diff = args[index + 1].strip()
+                index += 2
+                continue
+            if token == "--path" and index + 1 < len(args):
+                path = args[index + 1].strip()
+                index += 2
+                continue
+            if token == "--replace-line" and index + 1 < len(args):
+                flush_operation()
+                current_start_line = int(args[index + 1])
+                current_end_line = current_start_line
+                index += 2
+                continue
+            if token == "--replace-lines" and index + 2 < len(args):
+                flush_operation()
+                current_start_line = int(args[index + 1])
+                current_end_line = int(args[index + 2])
+                index += 3
+                continue
+            if token == "--with" and index + 1 < len(args):
+                if not current_start_line:
+                    raise ValueError("swe_patch_builder --with requires a preceding replacement range")
+                current_replacement_lines.append(args[index + 1])
+                index += 2
+                continue
+            raise ValueError(f"unsupported swe_patch_builder argument: {token}")
+        flush_operation()
+        if from_diff:
+            if path or operations:
+                raise ValueError("swe_patch_builder --from-diff cannot be combined with line replacement arguments")
+            diff_path = self._resolve_workspace_path(from_diff, cwd)
+            if not diff_path.is_file():
+                raise ValueError(f"swe_patch_builder input diff missing: {from_diff}")
+            return self._build_swe_patch_from_diff(diff_path.read_text(encoding="utf-8"), cwd, task=task)
+        if not path:
+            raise ValueError("swe_patch_builder requires --path")
+        if not operations:
+            raise ValueError("swe_patch_builder requires --replace-line or --replace-lines")
+        normalized_path = path.strip().strip("/")
+        if not normalized_path or normalized_path.startswith("../") or "/../" in normalized_path:
+            raise ValueError(f"swe_patch_builder received unsafe path: {path}")
+        if task is not None:
+            allowed_paths = self._swe_candidate_paths(task)
+            if allowed_paths and normalized_path not in allowed_paths:
+                raise ValueError(f"swe_patch_builder path is not in task candidate files: {normalized_path}")
+        source_path = self._resolve_workspace_path(normalized_path, cwd)
+        if not source_path.is_file():
+            raise ValueError(f"swe_patch_builder source file missing: {normalized_path}")
+        original_lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        normalized_operations = sorted(operations, key=lambda item: item[0])
+        previous_end_line = 0
+        for start_line, end_line, replacement_lines in normalized_operations:
+            if start_line < 1 or end_line < start_line:
+                raise ValueError("swe_patch_builder received invalid replacement line range")
+            if start_line <= previous_end_line:
+                raise ValueError("swe_patch_builder received overlapping replacement ranges")
+            if not replacement_lines:
+                raise ValueError("swe_patch_builder requires at least one --with replacement line")
+            if end_line > len(original_lines):
+                raise ValueError(
+                    f"swe_patch_builder replacement range {start_line}-{end_line} exceeds {normalized_path} line count {len(original_lines)}"
+                )
+            previous_end_line = end_line
+        updated_lines = list(original_lines)
+        for start_line, end_line, replacement_lines in reversed(normalized_operations):
+            formatted_replacements = self._format_swe_replacement_lines(
+                original_lines,
+                start_line=start_line,
+                replacement_lines=replacement_lines,
+            )
+            updated_lines[start_line - 1 : end_line] = formatted_replacements
+        if updated_lines == original_lines:
+            raise ValueError("swe_patch_builder replacement produced no meaningful change")
+        return "".join(
+            difflib.unified_diff(
+                original_lines,
+                updated_lines,
+                fromfile=f"a/{normalized_path}",
+                tofile=f"b/{normalized_path}",
+            )
+        )
+
+    def _build_swe_patch_from_diff(self, diff_text: str, cwd: Path, *, task: TaskSpec | None) -> str:
+        path, replacements = self._extract_swe_diff_replacements(diff_text)
+        if not path:
+            raise ValueError("swe_patch_builder could not find a changed path in input diff")
+        normalized_path = path.strip().strip("/")
+        if task is not None:
+            allowed_paths = self._swe_candidate_paths(task)
+            if allowed_paths and normalized_path not in allowed_paths:
+                raise ValueError(f"swe_patch_builder path is not in task candidate files: {normalized_path}")
+        source_path = self._resolve_workspace_path(normalized_path, cwd)
+        if not source_path.is_file():
+            raise ValueError(f"swe_patch_builder source file missing: {normalized_path}")
+        original_lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        updated_lines = list(original_lines)
+        for start_line, end_line, replacement_lines in sorted(replacements, reverse=True):
+            if start_line < 1 or end_line < start_line or end_line > len(updated_lines):
+                raise ValueError(f"swe_patch_builder input diff contains invalid range {start_line}-{end_line}")
+            formatted_replacements = self._format_swe_replacement_lines(
+                updated_lines,
+                start_line=start_line,
+                replacement_lines=replacement_lines,
+            )
+            updated_lines[start_line - 1 : end_line] = formatted_replacements
+        if updated_lines == original_lines:
+            raise ValueError("swe_patch_builder input diff produced no meaningful change")
+        return "".join(
+            difflib.unified_diff(
+                original_lines,
+                updated_lines,
+                fromfile=f"a/{normalized_path}",
+                tofile=f"b/{normalized_path}",
+            )
+        )
+
+    @staticmethod
+    def _format_swe_replacement_lines(
+        source_lines: list[str],
+        *,
+        start_line: int,
+        replacement_lines: list[str],
+    ) -> list[str]:
+        formatted: list[str] = []
+        for offset, replacement in enumerate(replacement_lines):
+            line = replacement if replacement.endswith("\n") else f"{replacement}\n"
+            original_index = start_line - 1 + offset
+            if (
+                original_index < len(source_lines)
+                and line.strip()
+                and not line[:1].isspace()
+            ):
+                original_indent = re.match(r"^\s*", source_lines[original_index]).group(0)
+                if original_indent:
+                    line = f"{original_indent}{line}"
+            formatted.append(line)
+        return formatted
+
+    @staticmethod
+    def _extract_swe_diff_replacements(diff_text: str) -> tuple[str, list[tuple[int, int, list[str]]]]:
+        lines = diff_text.splitlines()
+        path = ""
+        for line in lines:
+            if line.startswith("+++ b/"):
+                path = line.removeprefix("+++ b/").strip()
+                break
+        if not path:
+            for line in lines:
+                if line.startswith("diff --git "):
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3].startswith("b/"):
+                        path = parts[3].removeprefix("b/").strip()
+                        break
+        replacements: list[tuple[int, int, list[str]]] = []
+        hunk_header = re.compile(r"^@@\s+-(?P<start>\d+)(?:,(?P<count>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))?\s+@@")
+        index = 0
+        while index < len(lines):
+            match = hunk_header.match(lines[index])
+            if match is None:
+                index += 1
+                continue
+            old_cursor = int(match.group("start"))
+            change_start = 0
+            change_end = 0
+            replacement: list[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].startswith("@@ ") and not lines[index].startswith("diff --git "):
+                line = lines[index]
+                if not line:
+                    index += 1
+                    continue
+                prefix = line[0]
+                payload = line[1:]
+                if prefix == " ":
+                    if change_start:
+                        break
+                    old_cursor += 1
+                elif prefix == "-":
+                    if not change_start:
+                        change_start = old_cursor
+                    old_cursor += 1
+                    change_end = old_cursor - 1
+                elif prefix == "+":
+                    if not change_start:
+                        change_start = old_cursor
+                        change_end = old_cursor
+                    replacement.append(payload)
+                elif line.startswith("\\ No newline"):
+                    pass
+                else:
+                    break
+                index += 1
+            if change_start and change_end >= change_start and replacement:
+                replacements.append((change_start, change_end, replacement))
+            continue
+        if not replacements:
+            raise ValueError("swe_patch_builder could not extract a replacement from input diff")
+        return path, replacements
+
+    @staticmethod
+    def _swe_candidate_paths(task: TaskSpec) -> set[str]:
+        candidates = task.metadata.get("swe_candidate_files", [])
+        verifier = task.metadata.get("semantic_verifier", {})
+        if not candidates and isinstance(verifier, dict):
+            candidates = verifier.get("expected_changed_paths", [])
+        if not isinstance(candidates, list):
+            return set()
+        return {str(path).strip().strip("/") for path in candidates if str(path).strip()}
 
     def _workflow_policy_violation(
         self,
@@ -451,6 +715,23 @@ class Sandbox:
                 index += 2
                 continue
             if token == "--output" and index + 1 < len(args):
+                operands.append(args[index + 1])
+                index += 2
+                continue
+            index += 1
+        return operands
+
+    @staticmethod
+    def _swe_patch_builder_path_operands(args: list[str]) -> list[str]:
+        operands: list[str] = []
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token == "--from-diff" and index + 1 < len(args):
+                operands.append(args[index + 1])
+                index += 2
+                continue
+            if token == "--path" and index + 1 < len(args):
                 operands.append(args[index + 1])
                 index += 2
                 continue

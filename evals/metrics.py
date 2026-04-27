@@ -41,6 +41,12 @@ class EvalMetrics:
     low_confidence_steps: int = 0
     first_step_successes: int = 0
     average_retrieval_direct_candidates: float = 0.0
+    average_research_context_chunks: float = 0.0
+    average_llm_visible_research_context_chunks: float = 0.0
+    average_research_retrieval_evidence: float = 0.0
+    average_research_model_assets: float = 0.0
+    average_research_repository_matches: float = 0.0
+    average_research_algorithm_matches: float = 0.0
     average_first_step_path_confidence: float = 0.0
     success_first_step_path_confidence: float = 0.0
     failed_first_step_path_confidence: float = 0.0
@@ -165,6 +171,25 @@ class TolbertComparison:
     without_tolbert: EvalMetrics
     pass_rate_delta: float
     average_steps_delta: float
+    capability_pass_rate_delta: dict[str, float] = field(default_factory=dict)
+    benchmark_family_pass_rate_delta: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ResearchLibraryComparison:
+    with_research_library: EvalMetrics
+    without_research_library: EvalMetrics
+    pass_rate_delta: float
+    average_steps_delta: float
+    average_retrieval_evidence_delta: float
+    average_research_context_chunks_delta: float
+    average_llm_visible_research_context_chunks_delta: float
+    average_research_retrieval_evidence_delta: float
+    average_research_model_assets_delta: float
+    average_research_repository_matches_delta: float
+    average_research_algorithm_matches_delta: float
+    retrieval_influenced_steps_delta: int
+    trusted_retrieval_steps_delta: int
     capability_pass_rate_delta: dict[str, float] = field(default_factory=dict)
     benchmark_family_pass_rate_delta: dict[str, float] = field(default_factory=dict)
 

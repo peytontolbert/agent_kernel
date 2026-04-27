@@ -215,6 +215,12 @@ class StepRecord:
     path_confidence: float = 0.0
     trust_retrieval: bool = False
     retrieval_direct_candidate_count: int = 0
+    research_context_chunk_count: int = 0
+    llm_visible_research_context_chunk_count: int = 0
+    research_retrieval_evidence_count: int = 0
+    research_model_asset_count: int = 0
+    research_repository_match_count: int = 0
+    research_algorithm_match_count: int = 0
     active_subgoal: str = ""
     subgoal_diagnoses: dict[str, Any] = field(default_factory=dict)
     acting_role: str = "executor"

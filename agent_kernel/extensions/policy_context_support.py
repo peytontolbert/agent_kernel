@@ -239,6 +239,7 @@ def llm_context_packet(state: AgentState) -> dict[str, object] | None:
         "context_chunk_budget": control.get("context_chunk_budget", {}),
         "selected_context_chunks": control.get("selected_context_chunks", [])[:max_chunks],
         "retrieval_guidance": control.get("retrieval_guidance", {}),
+        "research_library": control.get("research_library", {}),
     }
     compact_retrieval = {
         bucket: [

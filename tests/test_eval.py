@@ -16,6 +16,7 @@ from agent_kernel.extensions.trust import build_unattended_trust_ledger
 from evals.harness import (
     _limit_tasks_for_compare,
     compare_abstraction_transfer_modes,
+    compare_research_library_modes,
     compare_skill_modes,
     compare_tolbert_feature_modes,
     compare_tolbert_modes,
@@ -3144,6 +3145,80 @@ def test_compare_tolbert_modes_reports_deltas(tmp_path):
     assert comparison.with_tolbert.total == comparison.without_tolbert.total
     assert "file_write" in comparison.capability_pass_rate_delta
     assert "workflow" in comparison.benchmark_family_pass_rate_delta
+
+
+def test_compare_research_library_modes_reports_deltas_and_forwards_controls(tmp_path, monkeypatch):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    seen_calls = []
+
+    def fake_run_eval(*, config, **kwargs):
+        seen_calls.append((config, kwargs))
+        if config.use_research_library_context:
+            return EvalMetrics(
+                total=2,
+                passed=2,
+                average_steps=1.0,
+                average_retrieval_evidence=3.0,
+                average_research_context_chunks=4.0,
+                average_llm_visible_research_context_chunks=4.0,
+                average_research_retrieval_evidence=2.0,
+                average_research_model_assets=8.0,
+                average_research_repository_matches=1.0,
+                average_research_algorithm_matches=1.0,
+                retrieval_influenced_steps=2,
+                trusted_retrieval_steps=2,
+                total_by_capability={"file_write": 2},
+                passed_by_capability={"file_write": 2},
+                total_by_benchmark_family={"workflow": 2},
+                passed_by_benchmark_family={"workflow": 2},
+            )
+        return EvalMetrics(
+            total=2,
+            passed=1,
+            average_steps=2.0,
+            average_retrieval_evidence=0.5,
+            total_by_capability={"file_write": 2},
+            passed_by_capability={"file_write": 1},
+            total_by_benchmark_family={"workflow": 2},
+            passed_by_benchmark_family={"workflow": 1},
+        )
+
+    monkeypatch.setattr(harness_module, "run_eval", fake_run_eval)
+
+    comparison = compare_research_library_modes(
+        config=config,
+        task_limit=5,
+        priority_benchmark_families=["workflow"],
+        prefer_retrieval_tasks=True,
+        restrict_to_priority_benchmark_families=True,
+    )
+
+    assert comparison.pass_rate_delta == 0.5
+    assert comparison.average_steps_delta == -1.0
+    assert comparison.average_retrieval_evidence_delta == 2.5
+    assert comparison.average_research_context_chunks_delta == 4.0
+    assert comparison.average_llm_visible_research_context_chunks_delta == 4.0
+    assert comparison.average_research_retrieval_evidence_delta == 2.0
+    assert comparison.average_research_model_assets_delta == 8.0
+    assert comparison.average_research_repository_matches_delta == 1.0
+    assert comparison.average_research_algorithm_matches_delta == 1.0
+    assert comparison.retrieval_influenced_steps_delta == 2
+    assert comparison.trusted_retrieval_steps_delta == 2
+    assert comparison.capability_pass_rate_delta["file_write"] == 0.5
+    assert comparison.benchmark_family_pass_rate_delta["workflow"] == 0.5
+    assert seen_calls[0][0].use_research_library_context is True
+    assert seen_calls[0][0].research_library_standalone_context is True
+    assert seen_calls[1][0].use_research_library_context is False
+    assert seen_calls[1][0].research_library_standalone_context is False
+    assert all(call[1]["task_limit"] == 5 for call in seen_calls)
+    assert all(call[1]["priority_benchmark_families"] == ["workflow"] for call in seen_calls)
+    assert all(call[1]["prefer_retrieval_tasks"] is True for call in seen_calls)
+    assert all(call[1]["restrict_to_priority_benchmark_families"] is True for call in seen_calls)
 
 
 def test_compare_tolbert_feature_modes_reports_all_modes(tmp_path):

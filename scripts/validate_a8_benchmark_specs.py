@@ -3,8 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import json
+import os
+import sys
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_swe_bench_predictions import _read_jsonl, validate_swe_predictions
 
 
@@ -48,13 +51,39 @@ def validate_a8_benchmark_spec(spec: dict[str, Any], *, spec_path: str = "") -> 
     if not isinstance(ready_to_run, bool):
         failures.append("ready_to_run must be boolean")
         ready_to_run = False
+    prerequisites = spec.get("prerequisites", [])
+    if prerequisites is not None and not isinstance(prerequisites, list):
+        failures.append("prerequisites must be a list when provided")
+        prerequisites = []
+    if benchmark == "codeforces":
+        account_prerequisites = [
+            item for item in prerequisites if isinstance(item, dict) and item.get("kind") == "account"
+        ]
+        if not account_prerequisites:
+            failures.append("codeforces specs must declare an account prerequisite")
+        for item in account_prerequisites:
+            required_env = item.get("required_env", [])
+            proof_path = str(item.get("proof_path", "")).strip()
+            if not isinstance(required_env, list) or any(not isinstance(value, str) or not value for value in required_env):
+                failures.append("codeforces account prerequisite required_env must be a string list")
+                required_env = []
+            if not required_env and not proof_path:
+                failures.append("codeforces account prerequisite must declare required_env or proof_path")
+            if ready_to_run:
+                env_ok = bool(required_env) and all(str(os.environ.get(value, "")).strip() for value in required_env)
+                proof_ok = bool(proof_path) and Path(proof_path).exists()
+                if not env_ok and not proof_ok:
+                    failures.append("codeforces ready_to_run requires CODEFORCES_HANDLE or account proof_path")
 
     runner = spec.get("runner") if isinstance(spec.get("runner"), dict) else {}
     if benchmark in {"swe_bench_verified", "swe_rebench"}:
         if str(runner.get("kind", "")).strip() != "swebench_harness":
             failures.append("runner.kind must be swebench_harness for SWE benchmark specs")
-        if not str(runner.get("dataset_name", "")).strip():
+        dataset_name = str(runner.get("dataset_name", "")).strip()
+        if not dataset_name and (ready_to_run or benchmark != "swe_rebench"):
             failures.append("runner.dataset_name is required for SWE benchmark specs")
+        if benchmark == "swe_rebench" and dataset_name.lower() in {"swe-rebench", "swe_rebench", "template"}:
+            failures.append("runner.dataset_name must be the confirmed official SWE-ReBench dataset identifier")
         harness_root = str(runner.get("harness_root", "")).strip()
         if not harness_root:
             failures.append("runner.harness_root is required for SWE benchmark specs")
