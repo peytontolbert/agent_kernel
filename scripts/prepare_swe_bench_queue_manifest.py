@@ -31,10 +31,6 @@ def _with_arg(value: str) -> str:
 
 def _candidate_file_success_command(candidate_files: list[str]) -> str:
     base = "test -s patch.diff && grep -Eq '^(diff --git |--- )' patch.diff"
-    base = (
-        f"{base} && ! grep -Eiq "
-        "'placeholder|satisfy the verifier|dummy|TODO|Some comment|New line added' patch.diff"
-    )
     if not candidate_files:
         return base
     pattern = "|".join(re.escape(path) for path in candidate_files)

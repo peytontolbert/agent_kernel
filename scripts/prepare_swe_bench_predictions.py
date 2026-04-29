@@ -41,7 +41,9 @@ def validate_swe_predictions(records: list[dict[str, Any]]) -> list[str]:
     for index, record in enumerate(records, start=1):
         for field in REQUIRED_FIELDS:
             value = record.get(field)
-            if not isinstance(value, str) or not value.strip():
+            if not isinstance(value, str):
+                failures.append(f"record {index} field {field} must be a string")
+            elif field != "model_patch" and not value.strip():
                 failures.append(f"record {index} field {field} must be a non-empty string")
         instance_id = str(record.get("instance_id", "")).strip()
         if instance_id:

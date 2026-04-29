@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import re
 import subprocess
+import sys
 from typing import Any
 
 
@@ -122,7 +123,9 @@ def _candidate_files(item: dict[str, Any]) -> list[str]:
             if path not in seen:
                 seen.add(path)
                 paths.append(path)
-    for field in ("FAIL_TO_PASS", "fail_to_pass", "PASS_TO_PASS", "pass_to_pass"):
+    # PASS_TO_PASS can contain broad regression suites; keep it as verifier
+    # metadata, not source-context expansion input.
+    for field in ("FAIL_TO_PASS", "fail_to_pass"):
         values = item.get(field, [])
         if isinstance(values, str):
             try:
@@ -354,6 +357,40 @@ def _source_context(
     return contexts
 
 
+def _write_progress(progress_path: Path | None, payload: dict[str, Any]) -> None:
+    if progress_path is None:
+        return
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = progress_path.with_name(progress_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(progress_path)
+
+
+def _progress_payload(
+    *,
+    status: str,
+    processed_items: int,
+    total_items: int,
+    selected_tasks: int,
+    current_instance_id: str = "",
+    current_repo: str = "",
+    output_manifest_json: str = "",
+) -> dict[str, Any]:
+    return {
+        "spec_version": "asi_v1",
+        "report_kind": "swe_bench_prediction_task_progress",
+        "status": status,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "processed_items": processed_items,
+        "total_items": total_items,
+        "selected_tasks": selected_tasks,
+        "progress_rate": (processed_items / total_items) if total_items else 0.0,
+        "current_instance_id": current_instance_id,
+        "current_repo": current_repo,
+        "output_manifest_json": output_manifest_json,
+    }
+
+
 def build_swe_prediction_task_manifest(
     dataset: dict[str, Any] | list[Any],
     *,
@@ -364,19 +401,38 @@ def build_swe_prediction_task_manifest(
     repos_filter: list[str] | None = None,
     repo_cache_root: str = "",
     max_source_context_bytes: int = DEFAULT_SOURCE_CONTEXT_BYTES,
+    progress_json: str = "",
+    progress_every: int = 25,
+    output_manifest_json: str = "",
 ) -> dict[str, Any]:
     selected_ids = {value.strip() for value in (instance_ids or []) if value.strip()}
     selected_repos = {value.strip() for value in (repos_filter or []) if value.strip()}
+    items = _dataset_items(dataset)
+    total_items = len(items)
+    progress_path = Path(progress_json) if str(progress_json).strip() else None
+    progress_stride = max(1, int(progress_every))
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in _dataset_items(dataset):
+    duplicate_instance_ids: list[str] = []
+    _write_progress(
+        progress_path,
+        _progress_payload(
+            status="running",
+            processed_items=0,
+            total_items=total_items,
+            selected_tasks=0,
+            output_manifest_json=output_manifest_json,
+        ),
+    )
+    for processed_items, item in enumerate(items, start=1):
         instance_id = _instance_id(item)
         if not instance_id:
             continue
         if selected_ids and instance_id not in selected_ids:
             continue
         if instance_id in seen:
-            raise ValueError(f"duplicate instance_id in dataset: {instance_id}")
+            duplicate_instance_ids.append(instance_id)
+            continue
         problem_statement = _problem_statement(item)
         if not problem_statement:
             raise ValueError(f"missing problem statement for instance_id={instance_id}")
@@ -414,6 +470,27 @@ def build_swe_prediction_task_manifest(
             ),
         }
         tasks.append(task)
+        if progress_path is not None and (len(tasks) == 1 or len(tasks) % progress_stride == 0):
+            _write_progress(
+                progress_path,
+                _progress_payload(
+                    status="running",
+                    processed_items=processed_items,
+                    total_items=total_items,
+                    selected_tasks=len(tasks),
+                    current_instance_id=instance_id,
+                    current_repo=repo,
+                    output_manifest_json=output_manifest_json,
+                ),
+            )
+            print(
+                "prepare_progress "
+                f"processed={processed_items}/{total_items} "
+                f"selected={len(tasks)} "
+                f"instance_id={instance_id}",
+                file=sys.stderr,
+                flush=True,
+            )
         if limit > 0 and len(tasks) >= limit:
             break
     if selected_ids:
@@ -423,13 +500,15 @@ def build_swe_prediction_task_manifest(
             raise ValueError("requested instance_ids not found: " + ",".join(missing))
     if not tasks:
         raise ValueError("no SWE prediction tasks selected")
-    return {
+    manifest = {
         "spec_version": "asi_v1",
         "report_kind": "swe_bench_prediction_task_manifest",
         "created_at": datetime.now(UTC).isoformat(),
         "model_name_or_path": model_name_or_path,
         "output_patch_dir": output_patch_dir,
         "task_count": len(tasks),
+        "deduplicated_instance_count": len(duplicate_instance_ids),
+        "duplicate_instance_ids": sorted(set(duplicate_instance_ids)),
         "tasks": tasks,
         "prediction_manifest": {
             "base_dir": output_patch_dir,
@@ -447,6 +526,19 @@ def build_swe_prediction_task_manifest(
             "Run scripts/prepare_swe_bench_predictions.py build after patches exist to create benchmark JSONL.",
         ],
     }
+    _write_progress(
+        progress_path,
+        _progress_payload(
+            status="complete",
+            processed_items=min(total_items, processed_items if "processed_items" in locals() else 0),
+            total_items=total_items,
+            selected_tasks=len(tasks),
+            current_instance_id=tasks[-1]["instance_id"] if tasks else "",
+            current_repo=tasks[-1]["repo"] if tasks else "",
+            output_manifest_json=output_manifest_json,
+        ),
+    )
+    return manifest
 
 
 def main() -> None:
@@ -460,8 +552,11 @@ def main() -> None:
     parser.add_argument("--repos", nargs="*")
     parser.add_argument("--repo-cache-root", default="")
     parser.add_argument("--max-source-context-bytes", type=int, default=DEFAULT_SOURCE_CONTEXT_BYTES)
+    parser.add_argument("--progress-json", default="")
+    parser.add_argument("--progress-every", type=int, default=25)
     args = parser.parse_args()
 
+    output_path = Path(args.output_manifest_json)
     manifest = build_swe_prediction_task_manifest(
         _read_json_or_jsonl(Path(args.dataset_json)),
         output_patch_dir=args.output_patch_dir,
@@ -471,8 +566,10 @@ def main() -> None:
         repos_filter=args.repos,
         repo_cache_root=args.repo_cache_root,
         max_source_context_bytes=int(args.max_source_context_bytes),
+        progress_json=args.progress_json,
+        progress_every=int(args.progress_every),
+        output_manifest_json=str(output_path),
     )
-    output_path = Path(args.output_manifest_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"task_count={manifest['task_count']} output_manifest_json={output_path}")

@@ -131,6 +131,9 @@ DEFAULT_ADAPTER_SPECS: dict[str, dict[str, Any]] = {
     "swe_rebench": {
         "inherits": "swe_bench_verified",
     },
+    "swe_bench_live": {
+        "inherits": "swe_bench_verified",
+    },
     "sustained_coding_window": {
         "metrics": {
             "window_count": {

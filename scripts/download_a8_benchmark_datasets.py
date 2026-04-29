@@ -29,6 +29,11 @@ def _jsonable(value: Any) -> Any:
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_jsonable(item) for item in value]
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # noqa: BLE001 - best-effort JSON conversion for dataset scalar types.
+            pass
     if hasattr(value, "tolist"):
         return _jsonable(value.tolist())
     if hasattr(value, "item"):
@@ -160,6 +165,7 @@ def _status_for_source(source: dict[str, Any], root: Path) -> dict[str, Any]:
         "benchmark": source.get("benchmark", ""),
         "label": source.get("label", ""),
         "kind": source.get("kind", ""),
+        "benchmark_role": source.get("benchmark_role", ""),
         "required_for_a8": bool(source.get("required_for_a8", False)),
         "requires_credentials": bool(source.get("requires_credentials", False)),
         "large": bool(source.get("large", False)),

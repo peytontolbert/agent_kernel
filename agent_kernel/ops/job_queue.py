@@ -40,7 +40,7 @@ from ..schemas import (
 )
 from ..tasking.task_bank import TaskBank
 from ..extensions.trust import write_unattended_trust_ledger
-from ..verifier import Verifier
+from ..verifier import Verifier, structured_artifact_verifier_covers_success_command
 from .workspace_recovery import (
     annotate_task_report_recovery,
     recovery_annotation,
@@ -55,6 +55,9 @@ from .workspace_recovery import (
 TERMINAL_JOB_STATES = {"cancelled", "completed", "expired", "failed", "safe_stop"}
 _CHECKPOINT_OUTPUT_TAIL_MAX_CHARS = 4000
 _CHECKPOINT_OUTPUT_TAIL_MAX_LINES = 40
+_ARTIFACT_GUARD_BACKOFF_EVENT = "artifact_guard_backoff_requeued"
+_ARTIFACT_GUARD_BACKOFF_LIMIT = 3
+_ARTIFACT_GUARD_BACKOFF_PRIORITY_DELTA = 100
 
 
 def _utcnow() -> str:
@@ -948,6 +951,57 @@ class DelegatedJobQueue:
             jobs.append(job)
             return job
 
+    def enqueue_many(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        max_queued_jobs_for_budget_group: int = 0,
+        task_bank: TaskBank | None = None,
+    ) -> list[DelegatedJob]:
+        enqueued: list[DelegatedJob] = []
+        if not entries:
+            return enqueued
+        with self._locked_jobs() as jobs:
+            queued_by_group: dict[str, int] = {}
+            if max_queued_jobs_for_budget_group > 0:
+                for existing in jobs:
+                    if existing.state in TERMINAL_JOB_STATES:
+                        continue
+                    queued_by_group[existing.budget_group] = queued_by_group.get(existing.budget_group, 0) + 1
+            for entry in entries:
+                task_id = str(entry.get("task_id", "")).strip()
+                if not task_id:
+                    raise ValueError("batch enqueue entry task_id is required")
+                runtime_overrides = dict(entry.get("runtime_overrides") or {})
+                normalized_budget_group = _inferred_budget_group(
+                    task_id=task_id,
+                    budget_group=str(entry.get("budget_group", "default")),
+                    runtime_overrides=runtime_overrides,
+                    task_bank=task_bank,
+                )
+                if max_queued_jobs_for_budget_group > 0:
+                    queued_in_group = queued_by_group.get(normalized_budget_group, 0)
+                    if queued_in_group >= max_queued_jobs_for_budget_group:
+                        raise ValueError(
+                            f"queue_budget_exceeded:{normalized_budget_group}:{max_queued_jobs_for_budget_group}"
+                        )
+                    queued_by_group[normalized_budget_group] = queued_in_group + 1
+                job = DelegatedJob(
+                    job_id=_job_id(task_id),
+                    task_id=task_id,
+                    priority=int(entry.get("priority", 0)),
+                    budget_group=normalized_budget_group,
+                    deadline_at=str(entry.get("deadline_at", "")).strip(),
+                    notes=str(entry.get("notes", "")).strip(),
+                    runtime_overrides=runtime_overrides,
+                    checkpoint_path=str(entry.get("checkpoint_path", "")).strip(),
+                    report_path=str(entry.get("report_path", "")).strip(),
+                )
+                self._append_history(job, event="queued", detail="job added to delegated queue")
+                jobs.append(job)
+                enqueued.append(job)
+        return enqueued
+
     def cancel(self, job_id: str, *, reason: str = "cancelled by operator") -> DelegatedJob:
         with self._locked_jobs() as jobs:
             for index, job in enumerate(jobs):
@@ -1013,11 +1067,13 @@ class DelegatedJobQueue:
                     self._append_history(job, event="expired", detail="job deadline elapsed before execution")
                     jobs[index] = job
                     continue
-                if job.state == "queued" or (
-                    allow_in_progress and self._resumable_in_progress(job)
-                ):
+                claim_time = _utcnow()
+                fresh_queued_claim = job.state == "queued"
+                if fresh_queued_claim or (allow_in_progress and self._resumable_in_progress(job)):
                     job.state = "in_progress"
-                    job.started_at = job.started_at or _utcnow()
+                    job.started_at = claim_time if fresh_queued_claim else job.started_at or claim_time
+                    if fresh_queued_claim:
+                        job.finished_at = ""
                     job.attempt_count += 1
                     self._append_history(
                         job,
@@ -1051,11 +1107,13 @@ class DelegatedJobQueue:
                     self._append_history(job, event="expired", detail="job deadline elapsed before execution")
                     jobs[index] = job
                     return None
-                if job.state == "queued" or (
-                    allow_in_progress and self._resumable_in_progress(job)
-                ):
+                claim_time = _utcnow()
+                fresh_queued_claim = job.state == "queued"
+                if fresh_queued_claim or (allow_in_progress and self._resumable_in_progress(job)):
                     job.state = "in_progress"
-                    job.started_at = job.started_at or _utcnow()
+                    job.started_at = claim_time if fresh_queued_claim else job.started_at or claim_time
+                    if fresh_queued_claim:
+                        job.finished_at = ""
                     job.attempt_count += 1
                     self._append_history(job, event="claimed", detail=f"runner claimed job attempt={job.attempt_count}")
                     jobs[index] = job
@@ -1152,6 +1210,42 @@ class DelegatedJobQueue:
         self._persist_job(job)
         return job
 
+    def requeue_artifact_guard_backoff(
+        self,
+        job_id: str,
+        *,
+        checkpoint_path: Path,
+        report_path: Path,
+        reason: str,
+        priority_delta: int = _ARTIFACT_GUARD_BACKOFF_PRIORITY_DELTA,
+    ) -> DelegatedJob:
+        with self._locked_jobs() as jobs:
+            for index, job in enumerate(jobs):
+                if job.job_id != job_id:
+                    continue
+                updated = replace(
+                    job,
+                    state="queued",
+                    priority=int(job.priority) - max(1, int(priority_delta)),
+                    finished_at="",
+                    cancel_requested_at="",
+                    checkpoint_path=str(checkpoint_path),
+                    report_path=str(report_path),
+                    outcome="",
+                    outcome_reasons=[],
+                    last_error="",
+                    scheduler_blocked_open=False,
+                    history=[dict(entry) for entry in job.history],
+                )
+                self._append_history(
+                    updated,
+                    event=_ARTIFACT_GUARD_BACKOFF_EVENT,
+                    detail=reason.strip() or "artifact guard terminal backoff requeue",
+                )
+                jobs[index] = updated
+                return updated
+        raise ValueError(f"unknown job_id: {job_id}")
+
     def fail(
         self,
         job_id: str,
@@ -1179,6 +1273,90 @@ class DelegatedJobQueue:
         self._append_history(job, event="promoted", detail=job.promotion_detail)
         self._persist_job(job)
         return job
+
+    def retry_terminal(
+        self,
+        *,
+        states: set[str] | None = None,
+        job_ids: set[str] | None = None,
+        reason: str = "retry terminal job",
+        priority: int | None = None,
+        limit: int = 0,
+    ) -> list[DelegatedJob]:
+        target_states = set(states or {"safe_stop", "failed"})
+        if "completed" in target_states:
+            raise ValueError("retry_terminal_refuses_completed_jobs")
+        invalid_states = target_states - TERMINAL_JOB_STATES
+        if invalid_states:
+            raise ValueError(f"retry_terminal_invalid_states:{','.join(sorted(invalid_states))}")
+        target_job_ids = {job_id.strip() for job_id in (job_ids or set()) if job_id.strip()}
+        retry_reason = reason.strip() or "retry terminal job"
+        retried: list[DelegatedJob] = []
+        with self._locked_jobs() as jobs:
+            ordered_indices = sorted(range(len(jobs)), key=lambda index: self._claim_sort_key(jobs[index]))
+            for index in ordered_indices:
+                if limit > 0 and len(retried) >= limit:
+                    break
+                job = jobs[index]
+                if target_job_ids and job.job_id not in target_job_ids:
+                    continue
+                if job.state not in target_states:
+                    continue
+                updated = replace(
+                    job,
+                    state="queued",
+                    priority=job.priority if priority is None else int(priority),
+                    finished_at="",
+                    cancel_requested_at="",
+                    outcome="",
+                    outcome_reasons=[],
+                    last_error="",
+                    scheduler_blocked_open=False,
+                    history=[dict(entry) for entry in job.history],
+                )
+                self._append_history(updated, event="retry_queued", detail=retry_reason)
+                jobs[index] = updated
+                retried.append(updated)
+        return retried
+
+    def requeue_stale_in_progress(
+        self,
+        *,
+        active_job_ids: set[str] | None = None,
+        reason: str = "requeue stale in-progress job without active runner",
+        priority: int | None = None,
+        limit: int = 0,
+    ) -> list[DelegatedJob]:
+        active = {job_id.strip() for job_id in (active_job_ids or set()) if job_id.strip()}
+        detail = reason.strip() or "requeue stale in-progress job without active runner"
+        requeued: list[DelegatedJob] = []
+        with self._locked_jobs() as jobs:
+            ordered_indices = sorted(range(len(jobs)), key=lambda index: self._claim_sort_key(jobs[index]))
+            for index in ordered_indices:
+                if limit > 0 and len(requeued) >= limit:
+                    break
+                job = jobs[index]
+                if job.state != "in_progress" or job.job_id in active:
+                    continue
+                if self._resumable_in_progress(job):
+                    continue
+                updated = replace(
+                    job,
+                    state="queued",
+                    priority=job.priority if priority is None else int(priority),
+                    started_at="",
+                    finished_at="",
+                    cancel_requested_at="",
+                    outcome="",
+                    outcome_reasons=[],
+                    last_error="",
+                    scheduler_blocked_open=False,
+                    history=[dict(entry) for entry in job.history],
+                )
+                self._append_history(updated, event="stale_in_progress_requeued", detail=detail)
+                jobs[index] = updated
+                requeued.append(updated)
+        return requeued
 
     def _claim_sort_key(self, job: DelegatedJob) -> tuple[int, float, int, float, str]:
         state_rank = 0 if job.state == "in_progress" else 1
@@ -1268,7 +1446,7 @@ class DelegatedJobQueue:
             )
             if not storage_config.storage_write_job_state_exports:
                 return
-        self.queue_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_json(self.queue_path, payload, config=storage_config, govern_storage=False)
 
     @contextmanager
     def _locked_jobs(self) -> Any:
@@ -1276,19 +1454,32 @@ class DelegatedJobQueue:
         storage_config = _storage_config_for_path(self.queue_path)
         with self.queue_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            if storage_config is not None and storage_config.uses_sqlite_storage():
-                raw_jobs = storage_config.sqlite_store().load_job_queue(queue_path=self.queue_path)
-            else:
-                handle.seek(0)
-                raw = handle.read().strip()
-                payload = json.loads(raw) if raw else {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                raw_jobs = payload.get("jobs", [])
-            jobs = [DelegatedJob.from_dict(job) for job in raw_jobs if isinstance(job, dict)] if isinstance(raw_jobs, list) else []
             try:
+                if storage_config is not None and storage_config.uses_sqlite_storage():
+                    raw_jobs = storage_config.sqlite_store().load_job_queue(queue_path=self.queue_path)
+                    if not raw_jobs:
+                        handle.seek(0)
+                        raw = handle.read().strip()
+                        payload = json.loads(raw) if raw else {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        raw_jobs = payload.get("jobs", [])
+                else:
+                    handle.seek(0)
+                    raw = handle.read().strip()
+                    payload = json.loads(raw) if raw else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    raw_jobs = payload.get("jobs", [])
+                jobs = (
+                    [DelegatedJob.from_dict(job) for job in raw_jobs if isinstance(job, dict)]
+                    if isinstance(raw_jobs, list)
+                    else []
+                )
                 yield jobs
-            finally:
+            except BaseException:
+                raise
+            else:
                 _prune_terminal_jobs(jobs, storage_config)
                 persisted = {
                     "spec_version": "asi_v1",
@@ -1301,12 +1492,7 @@ class DelegatedJobQueue:
                         jobs=list(persisted["jobs"]),
                     )
                     if storage_config.storage_write_job_state_exports:
-                        handle.seek(0)
-                        handle.truncate()
-                        handle.write(json.dumps(persisted, indent=2))
-                        handle.write("\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                        atomic_write_json(self.queue_path, persisted, config=storage_config, govern_storage=False)
                 else:
                     handle.seek(0)
                     handle.truncate()
@@ -1314,6 +1500,7 @@ class DelegatedJobQueue:
                     handle.write("\n")
                     handle.flush()
                     os.fsync(handle.fileno())
+            finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -1335,6 +1522,35 @@ def delegated_job_paths(config: KernelConfig, job: DelegatedJob) -> tuple[Path, 
 def delegated_job_progress_path(config: KernelConfig, job: DelegatedJob) -> Path:
     checkpoint_path, _ = delegated_job_paths(config, job)
     return checkpoint_path.with_name(f"{checkpoint_path.stem}.progress.json")
+
+
+def _stale_retry_archive_path(path: Path, *, attempt_count: int) -> Path:
+    base = path.with_name(f"{path.name}.stale_before_attempt{max(1, attempt_count)}")
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.name}.stale_before_attempt{max(1, attempt_count)}.{index}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}.stale_before_attempt{max(1, attempt_count)}.{uuid4().hex}")
+
+
+def _archive_nonresumable_retry_artifacts(
+    *,
+    checkpoint_path: Path,
+    report_path: Path,
+    progress_path: Path,
+    attempt_count: int,
+) -> list[Path]:
+    archived: list[Path] = []
+    for path in (checkpoint_path, report_path, progress_path):
+        if not path.exists() or not path.is_file():
+            continue
+        archive_path = _stale_retry_archive_path(path, attempt_count=attempt_count)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(archive_path)
+        archived.append(archive_path)
+    return archived
 
 
 def _write_delegated_job_progress(
@@ -1584,6 +1800,17 @@ def _worker_command_verification_result(
     success_command_payload: dict[str, object] = {}
     if not verification.passed or not task.success_command:
         return verification, success_command_payload
+    if structured_artifact_verifier_covers_success_command(task):
+        return (
+            verification,
+            {
+                "kind": "success_command_result",
+                "command": task.success_command,
+                "passed": True,
+                "skipped": True,
+                "skip_reason": "structured_artifact_verifier_covers_success_command",
+            },
+        )
     success_timed_out = False
     try:
         success_check = subprocess.run(
@@ -1804,6 +2031,66 @@ def _task_is_synthetic(task: Any, *, bank: TaskBank) -> bool:
     return False
 
 
+def _artifact_guard_backoff_count(job: DelegatedJob) -> int:
+    return sum(
+        1
+        for entry in job.history
+        if isinstance(entry, dict) and str(entry.get("event", "")).strip() == _ARTIFACT_GUARD_BACKOFF_EVENT
+    )
+
+
+def _artifact_guard_terminal_backoff_reason(report_path: Path, job: DelegatedJob) -> str:
+    if _artifact_guard_backoff_count(job) >= _ARTIFACT_GUARD_BACKOFF_LIMIT:
+        return ""
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    failure = payload.get("artifact_contract_failure", {})
+    if not isinstance(failure, dict):
+        return ""
+    mode = str(failure.get("mode", "")).strip()
+    last_source = str(failure.get("last_decision_source", "")).strip()
+    repairable = bool(failure.get("repairable"))
+    materialization_guard = (
+        mode == "artifact_materialization_guard_terminal"
+        or last_source in {"artifact_materialization_guard", "swe_patch_materialization_guard"}
+    )
+    repairable_artifact_contract = (
+        repairable
+        and mode.startswith("artifact_")
+        and mode not in {"artifact_contract_success", "artifact_contract_unknown"}
+    )
+    if not materialization_guard and not repairable_artifact_contract:
+        return ""
+    evidence = [
+        str(value).strip()
+        for value in failure.get("evidence", [])
+        if str(value).strip()
+    ]
+    reason = (
+        "artifact guard terminal backoff requeue"
+        if materialization_guard
+        else "repairable artifact contract backoff requeue"
+    )
+    if mode:
+        reason += f": mode={mode}"
+    if last_source:
+        reason += f" source={last_source}"
+    if evidence:
+        reason += f" evidence={'; '.join(evidence[-3:])[:500]}"
+    return reason
+
+
+def _job_was_artifact_guard_backoff_requeued(job: DelegatedJob) -> bool:
+    if not job.history:
+        return False
+    last = job.history[-1]
+    return isinstance(last, dict) and str(last.get("event", "")).strip() == _ARTIFACT_GUARD_BACKOFF_EVENT
+
+
 def run_next_delegated_job(
     queue: DelegatedJobQueue,
     *,
@@ -1836,6 +2123,7 @@ def run_next_delegated_job(
         raw_candidates = queue.list_jobs(states={"queued", "in_progress", "cancel_requested"})
         prepared_candidates: list[tuple[DelegatedJob, KernelConfig, Any, Any, bool, bool]] = []
         repo = repo_root or Path(__file__).resolve().parents[1]
+        stale_in_progress_requeued = False
         for candidate in raw_candidates:
             if candidate.job_id in attempted_budget_blocked | attempted_dependency_blocked | attempted_preflight_blocked:
                 continue
@@ -1844,6 +2132,23 @@ def run_next_delegated_job(
                 and candidate.job_id not in active_lease_job_ids
                 and DelegatedJobQueue._resumable_in_progress(candidate)
             )
+            if (
+                candidate.state == "in_progress"
+                and candidate.job_id not in active_lease_job_ids
+                and not resumable
+            ):
+                requeued = queue.requeue_stale_in_progress(
+                    active_job_ids=active_lease_job_ids,
+                    reason="stale in-progress job had no active lease and no resume artifact",
+                    limit=1,
+                )
+                if requeued:
+                    attempted_budget_blocked.discard(candidate.job_id)
+                    attempted_dependency_blocked.discard(candidate.job_id)
+                    attempted_preflight_blocked.discard(candidate.job_id)
+                    stale_in_progress_requeued = True
+                    break
+                continue
             if candidate.state == "in_progress" and not resumable:
                 continue
             candidate_config = _config_for_job(resolved_config, candidate)
@@ -1868,6 +2173,8 @@ def run_next_delegated_job(
                     resumable,
                 )
             )
+        if stale_in_progress_requeued:
+            continue
         prepared_candidates.sort(
             key=lambda item: _scheduler_candidate_sort_key(item[0], worker_job=item[4])
         )
@@ -2009,6 +2316,22 @@ def run_next_delegated_job(
         job = claimed_job
         checkpoint_path, report_path = delegated_job_paths(config, job)
         progress_path = delegated_job_progress_path(config, job)
+        if not resumable and job.attempt_count > 1:
+            archived_retry_artifacts = _archive_nonresumable_retry_artifacts(
+                checkpoint_path=checkpoint_path,
+                report_path=report_path,
+                progress_path=progress_path,
+                attempt_count=job.attempt_count,
+            )
+            if archived_retry_artifacts:
+                queue.record_scheduler_decision(
+                    job.job_id,
+                    decision="retry:fresh_start",
+                    detail=(
+                        f"attempt={job.attempt_count} "
+                        f"archived_artifacts={len(archived_retry_artifacts)}"
+                    ),
+                )
         queue.set_paths(job.job_id, checkpoint_path=checkpoint_path, report_path=report_path)
         controller = runtime_controller or DelegatedRuntimeController(config.delegated_job_runtime_state_path)
         lease, denied_reason = controller.acquire(
@@ -2194,6 +2517,7 @@ def run_next_delegated_job(
                 workspace_path=workspace_path,
                 checkpoint_path=checkpoint_path,
                 report_path=report,
+                expected_files=list(getattr(runtime_task, "expected_files", [])),
             )
             terminal_state = "completed" if outcome == "success" else "safe_stop" if outcome == "safe_stop" else "failed"
             last_error = ""
@@ -2226,6 +2550,33 @@ def run_next_delegated_job(
             )
             if report.exists():
                 write_unattended_trust_ledger(config)
+            artifact_guard_backoff_reason = (
+                _artifact_guard_terminal_backoff_reason(report, job)
+                if terminal_state == "safe_stop"
+                else ""
+            )
+            if artifact_guard_backoff_reason:
+                release_state = "queued"
+                release_detail = artifact_guard_backoff_reason
+                final_job = queue.requeue_artifact_guard_backoff(
+                    job.job_id,
+                    checkpoint_path=checkpoint_path,
+                    report_path=report,
+                    reason=artifact_guard_backoff_reason,
+                )
+                _write_delegated_job_progress(
+                    progress_path,
+                    config=config,
+                    job_id=job.job_id,
+                    task_id=runtime_task.task_id,
+                    payload={
+                        "event": "delegated_job_deferred",
+                        "terminal_state": "queued",
+                        "outcome": "artifact_guard_backoff_requeued",
+                        "outcome_reasons": list(outcome_reasons),
+                    },
+                )
+                return final_job
             release_state = terminal_state
             release_detail = last_error or f"outcome={outcome}"
             final_job = queue.finalize(
@@ -2280,13 +2631,24 @@ def drain_delegated_jobs(
         if job is None:
             break
         completed.append(job)
+        if job.state == "queued" and _job_was_artifact_guard_backoff_requeued(job):
+            continue
         if job.state in {"in_progress", "queued"}:
             break
     return completed
 
 
-def _artifact_bytes(*, workspace_path: Path, checkpoint_path: Path, report_path: Path) -> int:
-    return _path_bytes(workspace_path) + _path_bytes(checkpoint_path) + _path_bytes(report_path)
+def _artifact_bytes(
+    *,
+    workspace_path: Path,
+    checkpoint_path: Path,
+    report_path: Path,
+    expected_files: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    expected_artifacts = [str(path).strip().strip("/") for path in expected_files or [] if str(path).strip()]
+    if expected_artifacts:
+        return sum(_path_bytes(workspace_path / relative_path) for relative_path in expected_artifacts)
+    return _path_bytes(workspace_path)
 
 
 def _path_bytes(path: Path) -> int:

@@ -262,6 +262,104 @@ def test_verifier_swe_patch_apply_check_rejects_template_patch(tmp_path):
     assert "SWE patch diff contains placeholder/template content" in verification.reasons
 
 
+def test_verifier_swe_patch_apply_check_allows_placeholder_tokens_in_context_lines(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    source = repo_root / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    source.write_text("import os\n\n\ndef value():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "workspace" / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,5 +1,5 @@\n"
+        " import os\n"
+        " \n"
+        " \n"
+        " def value():\n"
+        "-    return 1\n"
+        "+    return 2\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="swe",
+        prompt="verify swe patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            }
+        },
+    )
+
+    verification = Verifier().verify(
+        task,
+        tmp_path / "workspace",
+        CommandResult(command="write", exit_code=0, stdout="", stderr=""),
+    )
+
+    assert "SWE patch diff contains placeholder/template content" not in verification.reasons
+
+
+def test_verifier_swe_patch_apply_check_skips_brittle_success_command(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    source = repo_root / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    source.write_text("def value():\n    if name == 'dummy':\n        return 1\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    source.write_text("def value():\n    if name == 'dummy':\n        return 1\n    return 2\n", encoding="utf-8")
+    patch = subprocess.check_output(["git", "diff"], cwd=repo_root, text=True)
+    subprocess.run(["git", "checkout", "--", "pkg/module.py"], cwd=repo_root, check=True)
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "workspace" / "patch.diff").write_text(patch, encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe",
+        prompt="verify swe patch",
+        workspace_subdir="workspace",
+        success_command="test -s patch.diff && ! grep -Eiq 'dummy' patch.diff",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            }
+        },
+    )
+
+    verification = Verifier().verify(
+        task,
+        tmp_path / "workspace",
+        CommandResult(command="write", exit_code=0, stdout="", stderr=""),
+    )
+
+    assert verification.passed is True
+    assert any(
+        evidence.get("skip_reason") == "structured_artifact_verifier_covers_success_command"
+        for evidence in verification.evidence
+    )
+
+
 def test_verifier_swe_patch_apply_check_rejects_missing_required_issue_identifier(tmp_path):
     repo_root = tmp_path / "repos" / "owner" / "repo"
     source = repo_root / "pkg" / "module.py"
@@ -825,6 +923,196 @@ def test_verifier_swe_patch_apply_check_rejects_init_return_value(tmp_path):
     assert "SWE patch leaves invalid __init__ return values in pkg/module.py: Reader.__init__" in verification.reasons
 
 
+def test_verifier_swe_patch_apply_check_rejects_init_generator(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    source = repo_root / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    source.write_text(
+        "class Reader:\n"
+        "    def __init__(self, rule):\n"
+        "        self.rule = rule\n"
+        "\n"
+        "    def values(self):\n"
+        "        return []\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "workspace" / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,6 +1,6 @@\n"
+        " class Reader:\n"
+        "     def __init__(self, rule):\n"
+        "-        self.rule = rule\n"
+        "+        yield from rule.values()\n"
+        " \n"
+        "     def values(self):\n"
+        "         return []\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="swe",
+        prompt="verify swe patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            }
+        },
+    )
+
+    verification = Verifier().verify(
+        task,
+        tmp_path / "workspace",
+        CommandResult(command="write", exit_code=0, stdout="", stderr=""),
+    )
+
+    assert verification.passed is False
+    assert "SWE patch leaves invalid __init__ generators in pkg/module.py: Reader.__init__" in verification.reasons
+
+
+def test_verifier_swe_patch_apply_check_rejects_local_use_before_assignment(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    source = repo_root / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    source.write_text(
+        "def raw_strict(value):\n"
+        "    return bool(value)\n"
+        "\n"
+        "def raw_normal(value):\n"
+        "    return True\n"
+        "\n"
+        "def choose(strict, values):\n"
+        "    if strict:\n"
+        "        raw_type_fn = raw_strict\n"
+        "    else:\n"
+        "        raw_type_fn = raw_normal\n"
+        "    return all(raw_type_fn(value) for value in values)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "workspace" / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -5,7 +5,7 @@\n"
+        " def raw_normal(value):\n"
+        "     return True\n"
+        " \n"
+        " def choose(strict, values):\n"
+        "-    if strict:\n"
+        "+    if not any(raw_type_fn(value) for value in values):\n"
+        "         raw_type_fn = raw_strict\n"
+        "     else:\n"
+        "         raw_type_fn = raw_normal\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="swe",
+        prompt="verify swe patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            }
+        },
+    )
+
+    verification = Verifier().verify(
+        task,
+        tmp_path / "workspace",
+        CommandResult(command="write", exit_code=0, stdout="", stderr=""),
+    )
+
+    assert verification.passed is False
+    assert "SWE patch introduces local use before assignment in pkg/module.py: choose.raw_type_fn" in verification.reasons
+
+
+def test_verifier_swe_patch_apply_check_allows_preexisting_init_return_value(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    source = repo_root / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    source.write_text(
+        "class Reader:\n"
+        "    def __init__(self, rows=None):\n"
+        "        if rows is not None:\n"
+        "            return rows\n"
+        "        self.rows = []\n"
+        "\n"
+        "    def write(self, lines):\n"
+        "        return list(lines)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "workspace" / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -5,4 +5,4 @@\n"
+        "         self.rows = []\n"
+        " \n"
+        "     def write(self, lines):\n"
+        "-        return list(lines)\n"
+        "+        return tuple(lines)\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="swe",
+        prompt="verify swe patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            }
+        },
+    )
+
+    verification = Verifier().verify(
+        task,
+        tmp_path / "workspace",
+        CommandResult(command="write", exit_code=0, stdout="", stderr=""),
+    )
+
+    assert verification.passed is True
+
+
 def test_verifier_applies_behavior_check_regex_output_rules(tmp_path):
     task = TaskSpec(
         task_id="regex_behavior",
@@ -1069,6 +1357,52 @@ def test_sandbox_swe_patch_builder_creates_applyable_candidate_diff(tmp_path):
     assert verification.passed is True
 
 
+def test_sandbox_patch_builder_alias_creates_applyable_candidate_diff(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    workspace = tmp_path / "workspace"
+    workspace_source = workspace / "pkg" / "module.py"
+    workspace_source.parent.mkdir(parents=True)
+    workspace_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="patch_builder_alias",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+        workspace,
+        task=task,
+    )
+    verification = Verifier().verify(task, workspace, result)
+
+    assert result.exit_code == 0
+    assert "--- a/pkg/module.py" in (workspace / "patch.diff").read_text(encoding="utf-8")
+    assert "+    return 2" in (workspace / "patch.diff").read_text(encoding="utf-8")
+    assert verification.passed is True
+
+
 def test_sandbox_swe_patch_builder_creates_multi_replacement_diff(tmp_path):
     repo_root = tmp_path / "repos" / "owner" / "repo"
     repo_source = repo_root / "pkg" / "module.py"
@@ -1118,6 +1452,53 @@ def test_sandbox_swe_patch_builder_creates_multi_replacement_diff(tmp_path):
     assert verification.passed is True
 
 
+def test_sandbox_swe_patch_builder_splits_embedded_newline_replacement(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    workspace = tmp_path / "workspace"
+    workspace_source = workspace / "pkg" / "module.py"
+    workspace_source.parent.mkdir(parents=True)
+    workspace_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-lines 1 2 "
+        "--with 'def value():\n    return 2' > patch.diff",
+        workspace,
+        task=task,
+    )
+    patch = (workspace / "patch.diff").read_text(encoding="utf-8")
+    verification = Verifier().verify(task, workspace, result)
+
+    assert result.exit_code == 0
+    assert "+    return 2" in patch
+    assert verification.passed is True
+
+
 def test_sandbox_swe_patch_builder_preserves_original_indent_for_bare_replacement(tmp_path):
     repo_root = tmp_path / "repos" / "owner" / "repo"
     repo_source = repo_root / "pkg" / "module.py"
@@ -1164,6 +1545,245 @@ def test_sandbox_swe_patch_builder_preserves_original_indent_for_bare_replacemen
     assert verification.passed is True
 
 
+def test_sandbox_swe_patch_builder_normalizes_single_space_indent_hint(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    workspace = tmp_path / "workspace"
+    workspace_source = workspace / "pkg" / "module.py"
+    workspace_source.parent.mkdir(parents=True)
+    workspace_source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 2 --with ' return 2' > patch.diff",
+        workspace,
+        task=task,
+    )
+    patch_text = (workspace / "patch.diff").read_text(encoding="utf-8")
+    verification = Verifier().verify(task, workspace, result)
+
+    assert result.exit_code == 0
+    assert "+    return 2" in patch_text
+    assert "+ return 2" not in patch_text
+    assert verification.passed is True
+
+
+def test_sandbox_swe_patch_builder_rejects_invalid_python_replacement(tmp_path):
+    workspace = tmp_path / "workspace"
+    source = workspace / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder_invalid_python",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 2 --with '    if (' > patch.diff",
+        workspace,
+        task=task,
+    )
+
+    assert result.exit_code == 2
+    assert "swe_patch_builder replacement would produce invalid Python" in result.stderr
+    assert (workspace / "patch.diff").read_text(encoding="utf-8") == ""
+
+
+def test_sandbox_swe_patch_builder_allows_unparseable_baseline_excerpt(tmp_path):
+    workspace = tmp_path / "workspace"
+    source = workspace / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def value():\n    return 1\n\ndef truncated():\n    call(\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder_unparseable_baseline_excerpt",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+        workspace,
+        task=task,
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert "+    return 2" in (workspace / "patch.diff").read_text(encoding="utf-8")
+
+
+def test_sandbox_swe_patch_builder_validates_unparseable_excerpt_against_base_source(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    return 1\n\ndef other():\n    return 3\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    workspace = tmp_path / "workspace"
+    source = workspace / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def value():\n    return 1\n\ndef truncated():\n    call(\n", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder_unparseable_excerpt_with_base",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 2 --with '    if (' > patch.diff",
+        workspace,
+        task=task,
+    )
+
+    assert result.exit_code == 2
+    assert "swe_patch_builder replacement would produce invalid Python" in result.stderr
+    assert (workspace / "patch.diff").read_text(encoding="utf-8") == ""
+
+
+def test_sandbox_swe_patch_builder_generates_diff_from_base_source_when_workspace_excerpt_truncated(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    total = 1\n    return total\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    workspace = tmp_path / "workspace"
+    source = workspace / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def value():\n    total = 1\n    ret", encoding="utf-8")
+    task = TaskSpec(
+        task_id="swe_builder_truncated_excerpt_with_base",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 3 --with '    return total + 1' > patch.diff",
+        workspace,
+        task=task,
+    )
+    patch_text = (workspace / "patch.diff").read_text(encoding="utf-8")
+    verification = Verifier().verify(task, workspace, result)
+
+    assert result.exit_code == 0
+    assert "-    return total" in patch_text
+    assert "+    return total + 1" in patch_text
+    assert "-    ret+" not in patch_text
+    assert verification.passed is True
+
+
+def test_sandbox_swe_patch_builder_rejects_compile_only_python_errors(tmp_path):
+    workspace = tmp_path / "workspace"
+    source = workspace / "pkg" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "def value(obj):\n"
+        "    return must_be(\n"
+        "        \"x\", option=\"option\", obj=obj, id=\"test.E001\"\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    task = TaskSpec(
+        task_id="swe_builder_compile_only_error",
+        prompt="build a patch",
+        workspace_subdir="workspace",
+        expected_files=["patch.diff"],
+        metadata={
+            "swe_candidate_files": ["pkg/module.py"],
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "patch_path": "patch.diff",
+                "expected_changed_paths": ["pkg/module.py"],
+            },
+        },
+    )
+
+    result = Sandbox(timeout_seconds=1).run(
+        "swe_patch_builder --path pkg/module.py --replace-line 4 "
+        "--with \"'x', option='option', obj=obj)\" > patch.diff",
+        workspace,
+        task=task,
+    )
+
+    assert result.exit_code == 2
+    assert "keyword argument repeated" in result.stderr
+    assert (workspace / "patch.diff").read_text(encoding="utf-8") == ""
+
+
 def test_sandbox_swe_patch_builder_rejects_non_candidate_path(tmp_path):
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "module.py").write_text("def value():\n    return 1\n", encoding="utf-8")
@@ -1186,7 +1806,7 @@ def test_sandbox_swe_patch_builder_rejects_non_candidate_path(tmp_path):
     assert (tmp_path / "patch.diff").read_text(encoding="utf-8") == ""
 
 
-def test_sandbox_swe_patch_builder_repairs_intended_change_from_corrupt_diff(tmp_path):
+def test_sandbox_swe_patch_builder_rejects_from_diff_for_swe_patch_tasks(tmp_path):
     repo_root = tmp_path / "repos" / "owner" / "repo"
     repo_source = repo_root / "pkg" / "module.py"
     repo_source.parent.mkdir(parents=True)
@@ -1230,11 +1850,10 @@ def test_sandbox_swe_patch_builder_repairs_intended_change_from_corrupt_diff(tmp
     )
 
     result = Sandbox(timeout_seconds=1).run("swe_patch_builder --from-diff patch.diff > patch.diff", workspace, task=task)
-    verification = Verifier().verify(task, workspace, result)
 
-    assert result.exit_code == 0
-    assert "+    return 2" in (workspace / "patch.diff").read_text(encoding="utf-8")
-    assert verification.passed is True
+    assert result.exit_code == 2
+    assert "swe_patch_builder --from-diff is disabled for SWE patch tasks" in result.stderr
+    assert (workspace / "patch.diff").read_text(encoding="utf-8") == ""
 
 
 def test_sandbox_allows_in_place_sed_workspace_edit(tmp_path):

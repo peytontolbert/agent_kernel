@@ -49,7 +49,7 @@ def test_validate_a8_benchmark_spec_checks_ready_swe_prediction_format(tmp_path)
             {
                 "instance_id": "repo__pkg-1",
                 "model_name_or_path": "agentkernel",
-                "model_patch": "",
+                "model_patch": "not a unified diff",
             }
         )
         + "\n",
@@ -94,6 +94,37 @@ def test_validate_a8_benchmark_spec_rejects_placeholder_swe_rebench_dataset(tmp_
     failures = module.validate_a8_benchmark_spec(payload)
 
     assert "runner.dataset_name must be the confirmed official SWE-ReBench dataset identifier" in failures
+
+
+def test_validate_a8_benchmark_spec_accepts_swe_bench_live_autonomous_template(tmp_path):
+    module = _load_validator_module()
+    payload = {
+        "spec_version": "asi_v1",
+        "report_kind": "a8_benchmark_run_spec",
+        "benchmark": "swe_bench_live",
+        "ready_to_run": False,
+        "runner": {
+            "kind": "swebench_live_autonomous_queue",
+            "harness_root": str(tmp_path / "SWE-bench-Live"),
+            "dataset_json": str(tmp_path / "dataset.json"),
+            "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+            "split": "verified",
+            "submission_subset": "verified",
+            "platform": "linux",
+            "repo_cache_root": str(tmp_path / "repo_cache"),
+            "predictions_path": str(tmp_path / "predictions.jsonl"),
+            "run_id": "fixture",
+        },
+        "adapter": {
+            "script": "scripts/run_a8_benchmark_adapter.py",
+            "summary_json": str(tmp_path / "summary.json"),
+            "output_packet_json": str(tmp_path / "packet.json"),
+            "conservative_comparison_report": True,
+        },
+        "open_limits": ["Fixture template spec."],
+    }
+
+    assert module.validate_a8_benchmark_spec(payload) == []
 
 
 def test_validate_a8_benchmark_spec_rejects_non_conservative_adapter():

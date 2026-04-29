@@ -38,7 +38,12 @@ config/*
 !config/a7_unfamiliar_transfer_manifest_r5_stateful_repair.json
 !config/a7_unfamiliar_transfer_manifest_r6_diagnostic_synthesis.json
 !config/research_library_sources.json
+!config/a8_benchmark_dataset_sources.json
 !config/a8_benchmark_run_specs/
 !config/a8_benchmark_run_specs/*.json
+!config/standalone_benchmark_run_specs/
+!config/standalone_benchmark_run_specs/*.json
+!config/a8_benchmark_adapter_specs/
+!config/a8_benchmark_adapter_specs/*.json
 !config/autonomous_benchmark_harnesses/
 !config/autonomous_benchmark_harnesses/*.json

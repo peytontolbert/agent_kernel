@@ -99,6 +99,26 @@ def test_validate_predictions_against_repo_cache_rejects_bad_patch(tmp_path):
     assert result["results"][0]["reason"] == "apply_check_failed"
 
 
+def test_validate_predictions_against_repo_cache_accepts_empty_patch_noop(tmp_path):
+    module = _load_validator_module()
+    repo_cache_root, commit = _make_repo(tmp_path)
+    predictions_path = tmp_path / "predictions.jsonl"
+    predictions_path.write_text(
+        json.dumps({"instance_id": "owner__repo-1", "model_name_or_path": "m", "model_patch": ""}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = module.validate_predictions_against_repo_cache(
+        [{"instance_id": "owner__repo-1", "repo": "owner/repo", "base_commit": commit}],
+        predictions_jsonl=str(predictions_path),
+        repo_cache_root=str(repo_cache_root),
+    )
+
+    assert result["all_apply_check_passed"] is True
+    assert result["apply_check_passed_count"] == 1
+    assert result["results"][0]["reason"] == "empty_patch_noop"
+
+
 def test_validate_predictions_against_repo_cache_can_run_declared_pytest_tests(tmp_path):
     module = _load_validator_module()
     repo_cache_root, commit = _make_repo_with_pytest(tmp_path)

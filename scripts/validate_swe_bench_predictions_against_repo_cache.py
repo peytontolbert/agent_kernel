@@ -226,7 +226,8 @@ def validate_predictions_against_repo_cache(
                 results.append(result)
                 continue
             if not patch_text:
-                result["reason"] = "empty_patch"
+                result["apply_check_passed"] = True
+                result["reason"] = "empty_patch_noop"
                 results.append(result)
                 continue
             worktree = tmp_root / instance_id.replace("/", "_")

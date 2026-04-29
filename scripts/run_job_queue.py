@@ -116,6 +116,7 @@ def _job_readiness(
     config: KernelConfig,
     repo_root: Path,
     bank: TaskBank,
+    enforce_preflight: bool = True,
 ) -> dict[str, object]:
     acceptance = _acceptance_summary(_load_report_payload(getattr(job, "report_path", "")))
     task = resolve_job_task(bank, job)
@@ -165,15 +166,16 @@ def _job_readiness(
         if not dependencies_ready:
             blockers.append("dependency")
             blocker_details.append(dependency_reason)
-        preflight = run_unattended_preflight(config, runtime_task, repo_root=repo_root)
-        for check in [item for item in preflight.checks if not item.passed]:
-            if check.name == "trust_posture":
-                blockers.append("trust")
-            elif check.name == "operator_policy":
-                blockers.append("scope")
-            else:
-                blockers.append("preflight")
-            blocker_details.append(f"{check.name}:{check.detail}")
+        if enforce_preflight:
+            preflight = run_unattended_preflight(config, runtime_task, repo_root=repo_root)
+            for check in [item for item in preflight.checks if not item.passed]:
+                if check.name == "trust_posture":
+                    blockers.append("trust")
+                elif check.name == "operator_policy":
+                    blockers.append("scope")
+                else:
+                    blockers.append("preflight")
+                blocker_details.append(f"{check.name}:{check.detail}")
     elif acceptance and acceptance.get("verifier_passed", 0) != 1:
         blockers.append("acceptance")
         blocker_details.append("acceptance_verifier_failed")
@@ -827,6 +829,7 @@ def _build_parser() -> argparse.ArgumentParser:
     enqueue_manifest.add_argument("--deadline", default="")
     enqueue_manifest.add_argument("--notes", default="")
     enqueue_manifest.add_argument("--decompose-workers", choices=("0", "1"), default="0")
+    enqueue_manifest.add_argument("--skip-existing-task-ids", action="store_true")
     enqueue_manifest.add_argument("--json", action="store_true")
     _add_runtime_override_args(enqueue_manifest)
     _add_governance_args(enqueue_manifest)
@@ -836,17 +839,20 @@ def _build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--show-blockers", choices=("0", "1"), default="0")
     list_parser.add_argument("--blocked-only", choices=("0", "1"), default="0")
     list_parser.add_argument("--ready-to-accept-only", choices=("0", "1"), default="0")
+    list_parser.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
     list_parser.add_argument("--json", action="store_true")
 
     promotable = subparsers.add_parser("promotable")
     promotable.add_argument("--state", action="append", default=None)
     promotable.add_argument("--show-blockers", choices=("0", "1"), default="0")
+    promotable.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
     promotable.add_argument("--json", action="store_true")
 
     acceptance_review = subparsers.add_parser("acceptance-review")
     acceptance_review.add_argument("--state", action="append", default=None)
     acceptance_review.add_argument("--show-blockers", choices=("0", "1"), default="0")
     acceptance_review.add_argument("--include-promoted", choices=("0", "1"), default="0")
+    acceptance_review.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
     acceptance_review.add_argument("--json", action="store_true")
 
     inspect = subparsers.add_parser("inspect")
@@ -857,8 +863,17 @@ def _build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--job-id", required=True)
     promote.add_argument("--detail", default="accepted for delivery")
 
+    retry_terminal = subparsers.add_parser("retry-terminal")
+    retry_terminal.add_argument("--state", action="append", default=None)
+    retry_terminal.add_argument("--job-id", action="append", default=None)
+    retry_terminal.add_argument("--reason", default="retrying terminal jobs after kernel hardening")
+    retry_terminal.add_argument("--priority", type=int, default=None)
+    retry_terminal.add_argument("--limit", type=int, default=0)
+    retry_terminal.add_argument("--json", action="store_true")
+
     next_runnable = subparsers.add_parser("next-runnable")
     next_runnable.add_argument("--show-blockers", choices=("0", "1"), default="0")
+    next_runnable.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
     next_runnable.add_argument("--json", action="store_true")
 
     cancel = subparsers.add_parser("cancel")
@@ -866,6 +881,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status")
     _add_governance_args(status)
+    status.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
     status.add_argument("--json", action="store_true")
 
     run_next = subparsers.add_parser("run-next")
@@ -946,54 +962,98 @@ def main() -> None:
         limit = max(0, int(args.limit))
         if limit:
             manifest_tasks = manifest_tasks[:limit]
+        skipped_existing_task_ids: list[str] = []
+        if getattr(args, "skip_existing_task_ids", False):
+            existing_task_ids = {str(job.task_id).strip() for job in queue.list_jobs() if str(job.task_id).strip()}
+            retained_tasks = []
+            for task in manifest_tasks:
+                if task.task_id in existing_task_ids:
+                    skipped_existing_task_ids.append(task.task_id)
+                    continue
+                retained_tasks.append(task)
+            manifest_tasks = retained_tasks
         if not manifest_tasks:
+            if skipped_existing_task_ids:
+                if getattr(args, "json", False):
+                    print(
+                        json.dumps(
+                            {
+                                "manifest_paths": list(manifest_paths),
+                                "selected_task_count": 0,
+                                "enqueued_job_count": 0,
+                                "enqueued_jobs": [],
+                                "skipped_existing_task_count": len(skipped_existing_task_ids),
+                                "skipped_existing_task_ids": skipped_existing_task_ids,
+                            },
+                            indent=2,
+                        )
+                    )
+                    return
+                print("enqueue_manifest all_matching_tasks_already_queued=1", file=sys.stderr)
+                return
             print("enqueue_manifest no_matching_tasks=1", file=sys.stderr)
             raise SystemExit(1)
         records: list[dict[str, object]] = []
-        priority = int(args.priority_start)
-        for task in manifest_tasks:
-            runtime_overrides = _runtime_overrides_from_args(args)
-            runtime_overrides["task_payload"] = task.to_dict()
-            jobs = enqueue_with_parallel_worker_decomposition(
-                queue,
-                bank=manifest_bank,
-                task_id=task.task_id,
-                priority=priority,
-                budget_group=args.budget_group,
-                deadline_at=str(args.deadline).strip(),
-                notes=str(args.notes).strip(),
-                runtime_overrides=runtime_overrides,
-                max_queued_jobs_for_budget_group=max(0, int(config.delegated_job_max_queued_per_budget_group)),
-            ) if args.decompose_workers == "1" else [
-                queue.enqueue(
+        max_queued_for_group = max(0, int(config.delegated_job_max_queued_per_budget_group))
+        if args.decompose_workers == "1":
+            priority = int(args.priority_start)
+            task_job_pairs = []
+            for task in manifest_tasks:
+                runtime_overrides = _runtime_overrides_from_args(args)
+                runtime_overrides["task_payload"] = task.to_dict()
+                jobs = enqueue_with_parallel_worker_decomposition(
+                    queue,
+                    bank=manifest_bank,
                     task_id=task.task_id,
                     priority=priority,
                     budget_group=args.budget_group,
                     deadline_at=str(args.deadline).strip(),
                     notes=str(args.notes).strip(),
                     runtime_overrides=runtime_overrides,
-                    max_queued_jobs_for_budget_group=max(0, int(config.delegated_job_max_queued_per_budget_group)),
-                    task_bank=manifest_bank,
+                    max_queued_jobs_for_budget_group=max_queued_for_group,
                 )
-            ]
-            for job in jobs:
-                record = {
-                    "job_id": job.job_id,
-                    "state": job.state,
-                    "task_id": job.task_id,
-                    "priority": job.priority,
-                    "budget_group": job.budget_group,
-                    "benchmark_family": str(task.metadata.get("benchmark_family", "")).strip(),
-                    "external_manifest_path": str(task.metadata.get("external_manifest_path", "")).strip(),
-                }
-                records.append(record)
-                if not getattr(args, "json", False):
-                    print(
-                        f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
-                        f"priority={job.priority} budget_group={job.budget_group} "
-                        f"benchmark_family={record['benchmark_family']}"
-                    )
-            priority += int(args.priority_step)
+                task_job_pairs.extend((task, job) for job in jobs)
+                priority += int(args.priority_step)
+        else:
+            entries: list[dict[str, object]] = []
+            priority = int(args.priority_start)
+            for task in manifest_tasks:
+                runtime_overrides = _runtime_overrides_from_args(args)
+                runtime_overrides["task_payload"] = task.to_dict()
+                entries.append(
+                    {
+                        "task_id": task.task_id,
+                        "priority": priority,
+                        "budget_group": args.budget_group,
+                        "deadline_at": str(args.deadline).strip(),
+                        "notes": str(args.notes).strip(),
+                        "runtime_overrides": runtime_overrides,
+                    }
+                )
+                priority += int(args.priority_step)
+            enqueued_jobs = queue.enqueue_many(
+                entries,
+                max_queued_jobs_for_budget_group=max_queued_for_group,
+                task_bank=manifest_bank,
+            )
+            task_job_pairs = list(zip(manifest_tasks, enqueued_jobs))
+        for task, job in task_job_pairs:
+            record = {
+                "job_id": job.job_id,
+                "state": job.state,
+                "task_id": job.task_id,
+                "priority": job.priority,
+                "budget_group": job.budget_group,
+                "benchmark_family": str(task.metadata.get("benchmark_family", "")).strip(),
+                "external_manifest_path": str(task.metadata.get("external_manifest_path", "")).strip(),
+            }
+            records.append(record)
+            if not getattr(args, "json", False):
+                print(
+                    f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
+                    f"priority={job.priority} budget_group={job.budget_group} "
+                    f"benchmark_family={record['benchmark_family']}"
+                )
         if getattr(args, "json", False):
             print(
                 json.dumps(
@@ -1002,9 +1062,38 @@ def main() -> None:
                         "selected_task_count": len(manifest_tasks),
                         "enqueued_job_count": len(records),
                         "enqueued_jobs": records,
+                        "skipped_existing_task_count": len(skipped_existing_task_ids),
+                        "skipped_existing_task_ids": skipped_existing_task_ids,
                     },
                     indent=2,
                 )
+            )
+        return
+
+    if args.command == "retry-terminal":
+        retried = queue.retry_terminal(
+            states=set(getattr(args, "state", None) or ["safe_stop"]),
+            job_ids=set(getattr(args, "job_id", None) or []),
+            reason=str(getattr(args, "reason", "")).strip() or "retrying terminal jobs",
+            priority=getattr(args, "priority", None),
+            limit=max(0, int(getattr(args, "limit", 0) or 0)),
+        )
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "retried_count": len(retried),
+                        "jobs": [job.to_dict() for job in retried],
+                    },
+                    indent=2,
+                )
+            )
+            return
+        print(f"retried={len(retried)}")
+        for job in retried:
+            print(
+                f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
+                f"priority={job.priority} attempts={job.attempt_count}"
             )
         return
 
@@ -1025,8 +1114,19 @@ def main() -> None:
             if acceptance_review_only
             else False
         )
+        enforce_readiness_preflight = getattr(args, "enforce_preflight", "1") == "1"
         jobs_with_readiness = [
-            (job, _job_readiness(queue, job, config=config, repo_root=repo_root, bank=runtime_bank))
+            (
+                job,
+                _job_readiness(
+                    queue,
+                    job,
+                    config=config,
+                    repo_root=repo_root,
+                    bank=runtime_bank,
+                    enforce_preflight=enforce_readiness_preflight,
+                ),
+            )
             for job in queue.list_jobs(states=states or None)
         ]
         jobs_with_readiness.sort(key=lambda item: _job_display_sort_key(item[0], item[1]))
@@ -1333,8 +1433,19 @@ def main() -> None:
         operator_policy = operator_policy_snapshot(config)
         capability_policy = capability_registry_snapshot(config)
         repo_root = Path(__file__).resolve().parents[1]
+        enforce_readiness_preflight = getattr(args, "enforce_preflight", "1") == "1"
         jobs_with_readiness = [
-            (job, _job_readiness(queue, job, config=config, repo_root=repo_root, bank=runtime_bank))
+            (
+                job,
+                _job_readiness(
+                    queue,
+                    job,
+                    config=config,
+                    repo_root=repo_root,
+                    bank=runtime_bank,
+                    enforce_preflight=enforce_readiness_preflight,
+                ),
+            )
             for job in queue.list_jobs()
         ]
         jobs_with_readiness.sort(key=lambda item: _job_display_sort_key(item[0], item[1]))

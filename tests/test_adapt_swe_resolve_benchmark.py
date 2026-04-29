@@ -52,6 +52,18 @@ def test_build_swe_resolve_benchmark_result_from_nested_metrics_and_lower_bound(
     assert packet["metrics"]["resolve_rate_lower_bound"] == 0.52
 
 
+def test_build_swe_resolve_benchmark_result_accepts_swe_bench_live():
+    module = _load_adapter_module()
+
+    packet = module.build_swe_resolve_benchmark_result(
+        {"resolved": 9, "total": 10},
+        benchmark="swe_bench_live",
+    )
+
+    assert packet["benchmark"] == "swe_bench_live"
+    assert packet["metrics"]["resolve_rate"] == 0.9
+
+
 def test_build_swe_resolve_benchmark_result_rejects_impossible_counts():
     module = _load_adapter_module()
 

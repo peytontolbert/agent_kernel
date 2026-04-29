@@ -50,20 +50,28 @@ def collect_swe_predictions(
     workspace_base = Path(workspace_root)
     base_dir = Path(str(prediction_manifest.get("base_dir", "")))
     requested_ids = {str(value).strip() for value in (instance_ids or []) if str(value).strip()}
+    abstained_ids: set[str] = set()
+    inferred_abstained_ids: set[str] = set()
     if patch_job_verification is not None:
         successful_ids = {
             str(value).strip()
             for value in patch_job_verification.get("successful_instance_ids", [])
             if str(value).strip()
         }
-        if not successful_ids:
-            raise ValueError("patch job verification has no successful_instance_ids")
+        abstained_ids = {
+            str(value).strip()
+            for value in patch_job_verification.get("abstained_instance_ids", [])
+            if str(value).strip()
+        }
+        selectable_ids = successful_ids | abstained_ids
+        if not selectable_ids:
+            raise ValueError("patch job verification has no successful or abstained instance ids")
         if requested_ids:
-            missing = sorted(requested_ids - successful_ids)
+            missing = sorted(requested_ids - selectable_ids)
             if missing:
-                raise ValueError("requested instance_ids are not verified successful: " + ",".join(missing))
+                raise ValueError("requested instance_ids are not verified successful or abstained: " + ",".join(missing))
         else:
-            requested_ids = successful_ids
+            requested_ids = selectable_ids
     selected_predictions: list[dict[str, Any]] = []
     for prediction in prediction_manifest.get("predictions", []):
         if not isinstance(prediction, dict):
@@ -75,8 +83,21 @@ def collect_swe_predictions(
         if not queue_task:
             raise ValueError(f"missing queue task for instance_id={instance_id}")
         source = workspace_base / str(queue_task.get("workspace_subdir", "")).strip() / "patch.diff"
+        if instance_id in abstained_ids:
+            selected_prediction = dict(prediction)
+            selected_prediction.pop("patch_path", None)
+            selected_prediction["model_patch"] = ""
+            selected_prediction["abstained"] = True
+            selected_predictions.append(selected_prediction)
+            continue
         if not source.exists() or source.stat().st_size <= 0:
-            raise ValueError(f"missing generated patch for instance_id={instance_id}: {source}")
+            inferred_abstained_ids.add(instance_id)
+            selected_prediction = dict(prediction)
+            selected_prediction.pop("patch_path", None)
+            selected_prediction["model_patch"] = ""
+            selected_prediction["abstained"] = True
+            selected_predictions.append(selected_prediction)
+            continue
         patch_text = source.read_text(encoding="utf-8")
         if "diff --git " not in patch_text and "--- " not in patch_text:
             raise ValueError(f"generated patch does not look like a unified diff: {source}")
@@ -95,6 +116,7 @@ def collect_swe_predictions(
     _write_jsonl(Path(output_jsonl), records)
     return {
         "copied_patch_count": len(copied),
+        "abstained_prediction_count": len((abstained_ids | inferred_abstained_ids) & set(record["instance_id"] for record in records)),
         "prediction_count": len(records),
         "copied_patches": copied,
         "output_jsonl": output_jsonl,

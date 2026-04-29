@@ -247,6 +247,43 @@ def test_build_swe_prediction_task_manifest_filters_repositories(tmp_path):
     assert manifest["tasks"][0]["repo"] == "sphinx-doc/sphinx"
 
 
+def test_build_swe_prediction_task_manifest_writes_progress_json(tmp_path):
+    module = _load_tasks_module()
+    progress_path = tmp_path / "progress.json"
+
+    manifest = module.build_swe_prediction_task_manifest(
+        _dataset(),
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel",
+        progress_json=str(progress_path),
+        progress_every=1,
+    )
+
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert manifest["task_count"] == 2
+    assert progress["report_kind"] == "swe_bench_prediction_task_progress"
+    assert progress["status"] == "complete"
+    assert progress["processed_items"] == 2
+    assert progress["total_items"] == 2
+    assert progress["selected_tasks"] == 2
+    assert progress["current_instance_id"] == "sympy__sympy-2"
+
+
+def test_build_swe_prediction_task_manifest_deduplicates_instance_ids(tmp_path):
+    module = _load_tasks_module()
+    dataset = [*_dataset(), _dataset()[0]]
+
+    manifest = module.build_swe_prediction_task_manifest(
+        dataset,
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel",
+    )
+
+    assert manifest["task_count"] == 2
+    assert manifest["deduplicated_instance_count"] == 1
+    assert manifest["duplicate_instance_ids"] == ["django__django-1"]
+
+
 def test_build_swe_prediction_task_manifest_rejects_missing_requested_id(tmp_path):
     module = _load_tasks_module()
 
@@ -300,7 +337,12 @@ def test_read_arrow_dataset_when_datasets_package_available(tmp_path):
     except ImportError:
         return
     dataset_dir = tmp_path / "dataset"
-    Dataset.from_list(_dataset()).save_to_disk(str(dataset_dir))
+    try:
+        Dataset.from_list(_dataset()).save_to_disk(str(dataset_dir))
+    except AttributeError as exc:
+        if "torch" in str(exc):
+            return
+        raise
     arrow_path = next(dataset_dir.glob("*.arrow"))
 
     records = module._read_json_or_jsonl(arrow_path)

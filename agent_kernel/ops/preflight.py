@@ -20,6 +20,7 @@ from ..extensions.capabilities import (
     effective_http_allowed_hosts,
 )
 from ..config import KernelConfig
+from ..extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
 from ..extensions.operator_policy import operator_policy_snapshot
 from .runtime_supervision import atomic_write_json
 from ..schemas import EpisodeRecord, StepRecord, TaskSpec
@@ -211,6 +212,23 @@ def build_unattended_task_report(
         outcome_reasons=outcome_reasons,
     )
     last_decision_source = _report_last_decision_source(episode_steps)
+    policy_trace = _report_policy_trace(episode_steps)
+    termination_reason = (
+        termination_reason_override.strip()
+        if termination_reason_override
+        else episode.termination_reason if episode is not None else "preflight_failed"
+    )
+    task_metadata = dict(task.metadata)
+    artifact_contract_failure = classify_artifact_contract_failure_report(
+        {
+            "outcome": outcome,
+            "outcome_reasons": outcome_reasons,
+            "termination_reason": termination_reason,
+            "last_decision_source": last_decision_source,
+            "policy_trace": policy_trace,
+            "task_metadata": task_metadata,
+        }
+    )
     return {
         "report_kind": "unattended_task_report",
         "generated_at": datetime.now(UTC).isoformat(),
@@ -221,19 +239,16 @@ def build_unattended_task_report(
         "outcome": outcome,
         "outcome_reasons": outcome_reasons,
         "success": bool(episode.success) if episode is not None else False,
-        "termination_reason": (
-            termination_reason_override.strip()
-            if termination_reason_override
-            else episode.termination_reason if episode is not None else "preflight_failed"
-        ),
+        "termination_reason": termination_reason,
         "failure_origin": failure_origin,
         "failure_reason": failure_reason,
+        "artifact_contract_failure": artifact_contract_failure,
         "last_decision_source": last_decision_source,
         "trusted_retrieval_steps": retrieval_trace["trusted_retrieval_steps"],
         "selected_retrieval_span_ids": retrieval_trace["selected_retrieval_span_ids"],
         "retrieval_influenced_steps": retrieval_trace["retrieval_influenced_steps"],
-        "policy_trace": _report_policy_trace(episode_steps),
-        "task_metadata": dict(task.metadata),
+        "policy_trace": policy_trace,
+        "task_metadata": task_metadata,
         "task_contract": task_contract,
         "trust_scope": trust_scope,
         "supervision": supervision,
@@ -1543,24 +1558,99 @@ def _report_policy_trace(steps: list[StepRecord]) -> list[dict[str, Any]]:
     trace: list[dict[str, Any]] = []
     for step in steps[-5:]:
         verification = step.verification if isinstance(step.verification, dict) else {}
-        trace.append(
-            {
-                "index": int(step.index),
-                "action": str(step.action).strip(),
-                "decision_source": str(step.decision_source).strip(),
-                "verification_passed": bool(verification.get("passed", False)),
-                "verification_reasons": [
-                    str(value).strip()
-                    for value in list(verification.get("reasons", []) or [])
-                    if str(value).strip()
-                ],
-                "failure_origin": str(step.failure_origin).strip() or None,
-                "selected_retrieval_span_id": str(step.selected_retrieval_span_id or "").strip() or None,
-                "retrieval_influenced": bool(step.retrieval_influenced),
-                "trust_retrieval": bool(step.trust_retrieval),
-            }
-        )
+        item = {
+            "index": int(step.index),
+            "action": str(step.action).strip(),
+            "decision_source": str(step.decision_source).strip(),
+            "verification_passed": bool(verification.get("passed", False)),
+            "verification_reasons": [
+                str(value).strip()
+                for value in list(verification.get("reasons", []) or [])
+                if str(value).strip()
+            ],
+            "failure_origin": str(step.failure_origin).strip() or None,
+            "selected_retrieval_span_id": str(step.selected_retrieval_span_id or "").strip() or None,
+            "retrieval_influenced": bool(step.retrieval_influenced),
+            "trust_retrieval": bool(step.trust_retrieval),
+        }
+        proposal_metadata = _report_artifact_proposal_metadata(step)
+        if proposal_metadata:
+            item["proposal_metadata"] = proposal_metadata
+        trace.append(item)
     return trace
+
+
+def _report_artifact_proposal_metadata(step: StepRecord) -> dict[str, Any]:
+    decision_source = str(step.decision_source).strip()
+    metadata = step.proposal_metadata if isinstance(step.proposal_metadata, dict) else {}
+    if not metadata:
+        return {}
+    if not (
+        decision_source.startswith("artifact_")
+        or decision_source.startswith("llm_artifact_")
+        or decision_source.startswith("swe_patch_")
+        or decision_source.startswith("llm_swe_patch_")
+        or any(str(key).startswith(("artifact_", "retry_")) for key in metadata.keys())
+    ):
+        return {}
+    allowed_keys = {
+        "artifact_materialization_retry",
+        "artifact_materialization_retry_attempt",
+        "artifact_materialization_retry_attempts",
+        "artifact_repair_context",
+        "artifact_repair_continue_retry",
+        "artifact_repair_continue_attempt",
+        "artifact_repair_continue_attempts",
+        "artifact_semantic_repair_retry",
+        "artifact_semantic_repair_retry_attempt",
+        "artifact_semantic_repair_retry_attempts",
+        "artifact_source_lines_followup",
+        "artifact_inference_failure_fallback",
+        "artifact_anchor_replacement_retry",
+        "artifact_anchor_replacement_attempt",
+        "artifact_broad_builder_last_resort_direct",
+        "artifact_guard_rejection_operations",
+        "invalid_python_replacement_operations",
+        "rejected_reason",
+        "rejected_command",
+        "rejected_response",
+        "retry_command",
+        "retry_rejected_reason",
+        "source_identical_noop_operations",
+        "fallback_path",
+        "source_path",
+        "source_lines_path",
+    }
+    compact: dict[str, Any] = {}
+    for key in allowed_keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        compact[key] = _compact_artifact_proposal_metadata_value(value)
+    return compact
+
+
+def _compact_artifact_proposal_metadata_value(value: Any, *, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if depth >= 3:
+        return str(value)[:1000]
+    if isinstance(value, list):
+        return [
+            _compact_artifact_proposal_metadata_value(item, depth=depth + 1)
+            for item in value[:6]
+        ]
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:16]:
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            compact[key[:120]] = _compact_artifact_proposal_metadata_value(raw_value, depth=depth + 1)
+        return compact
+    return str(value)[:1000]
 
 
 def _execution_source_summary(command_steps: list[StepRecord]) -> dict[str, int]:

@@ -12,7 +12,7 @@ from validate_a8_benchmark_specs import validate_a8_benchmark_spec
 from export_autonomy_evidence import verify_a8_benchmark_result_packet
 
 
-SWE_BENCHMARKS = {"swe_bench_verified", "swe_rebench"}
+SWE_BENCHMARKS = {"swe_bench_verified", "swe_rebench", "swe_bench_live"}
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -348,6 +348,12 @@ def classify_verification_reason(reason: str) -> str:
         return "success_command_failed"
     if "semantic verifier contract malformed" in lowered:
         return "semantic_verifier_contract_malformed"
+    if "swe patch leaves invalid __init__ return values" in lowered:
+        return "invalid_init_return_value"
+    if "swe patch leaves invalid __init__ generators" in lowered:
+        return "invalid_init_generator"
+    if "swe patch introduces local use before assignment" in lowered:
+        return "local_use_before_assignment"
     if "policy terminated" in lowered:
         return "policy_terminated"
     if "governance rejected command" in lowered:

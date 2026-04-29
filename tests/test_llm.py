@@ -14,6 +14,8 @@ from agent_kernel.llm import (
     VLLMClient,
     OllamaClient,
     _extract_json_object,
+    _compact_state_payload,
+    _minimal_state_payload,
     _post_json,
     coerce_action_decision,
 )
@@ -52,6 +54,52 @@ def test_coerce_action_decision_forces_respond_to_done():
 
     assert parsed["action"] == "respond"
     assert parsed["done"] is True
+
+
+def test_compact_state_payload_preserves_recent_source_output_and_artifact_guard():
+    payload = {
+        "task": {"task_id": "artifact_task", "expected_files": ["patch.diff"]},
+        "history": [
+            {
+                "index": 1,
+                "action": "code_execute",
+                "content": "cat source_lines/pkg/module.py.lines",
+                "decision_source": "artifact_source_lines_followup_direct",
+                "verification": {"passed": False, "reasons": ["missing expected file: patch.diff"]},
+                "command_result": {
+                    "exit_code": 0,
+                    "stdout": "   10: def value():\n   11:     return 1\n",
+                    "stderr": "",
+                    "timed_out": False,
+                },
+            }
+        ],
+        "artifact_materialization_guard": {
+            "attempt": 1,
+            "rejected_reason": "source_inspection",
+        },
+        "artifact_repair_context": {
+            "artifact_path": "patch.diff",
+            "required_command_shape": "patch_builder --path <allowed-path> --replace-line <line> --with '<replacement>' > patch.diff",
+            "source_lines_path": "source_lines/pkg/module.py.lines",
+            "source_lines_excerpt": "   10: def value():\n   11:     return 1\n",
+            "edit_windows": "### pkg/module.py::value lines 10-11",
+        },
+    }
+
+    compact = _compact_state_payload(payload)
+
+    step = compact["history"][0]
+    assert step["decision_source"] == "artifact_source_lines_followup_direct"
+    assert "10: def value()" in step["command_result"]["stdout_preview"]
+    assert compact["artifact_materialization_guard"]["rejected_reason"] == "source_inspection"
+    assert "10: def value()" in compact["artifact_repair_context"]["source_lines_excerpt"]
+
+    minimal = _minimal_state_payload(payload)
+    assert "command_result" not in minimal["history"][0]
+    assert minimal["artifact_repair_context"]["source_lines_path"] == "source_lines/pkg/module.py.lines"
+    assert "source_lines_excerpt" not in minimal["artifact_repair_context"]
+    assert "edit_windows" not in minimal["artifact_repair_context"]
 
 
 def test_ollama_client_retries_then_succeeds(monkeypatch):
@@ -261,6 +309,97 @@ def test_vllm_client_reduces_completion_budget_after_context_limit_error(monkeyp
 
     assert decision["action"] == "respond"
     assert calls["max_tokens"][:3] == [384, 384, 256]
+
+
+def test_vllm_client_uses_ultra_lean_recovery_after_context_limit_errors(monkeypatch):
+    calls = {"count": 0, "recovery_prompt_seen": False}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "thought": "recover",
+                                        "action": "code_execute",
+                                        "content": (
+                                            "patch_builder --path pkg/module.py --replace-line 2 "
+                                            "--with '    return 2' > patch.diff"
+                                        ),
+                                        "done": False,
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        calls["count"] += 1
+        payload = json.loads(req.data.decode("utf-8"))
+        prompt = payload["messages"][1]["content"]
+        if "Provider recovery mode" in prompt:
+            calls["recovery_prompt_seen"] = True
+            return _Response()
+        raise error.HTTPError(
+            req.full_url,
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"maximum input length exceeded: input tokens too large"}}'),
+        )
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision" * 2000,
+        state_payload={
+            "task": {
+                "task_id": "artifact_task",
+                "prompt": "write patch.diff",
+                "workspace_subdir": "artifact_task",
+                "expected_files": ["patch.diff"],
+            },
+            "history": [
+                {
+                    "action": "code_execute",
+                    "content": "cat source_lines/pkg/module.py.lines",
+                    "decision_source": "artifact_source_lines_followup_direct",
+                    "verification": {"reasons": ["missing expected file: patch.diff"]},
+                    "command_result": {"exit_code": 0, "stdout": "  2:     return 1\n"},
+                }
+            ],
+            "artifact_repair_context": {
+                "artifact_path": "patch.diff",
+                "source_lines_path": "source_lines/pkg/module.py.lines",
+                "required_command_shape": "patch_builder --path <allowed-path> --replace-line <line> --with '<replacement>' > patch.diff",
+            },
+        },
+    )
+
+    assert calls["recovery_prompt_seen"] is True
+    assert calls["count"] > 1
+    assert decision["action"] == "code_execute"
+    assert "patch_builder --path pkg/module.py" in decision["content"]
 
 
 def test_model_stack_client_uses_token_generation_endpoint(monkeypatch):

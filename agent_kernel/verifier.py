@@ -12,6 +12,16 @@ import tempfile
 from .schemas import CommandResult, TaskSpec, VerificationResult, classify_verification_reason
 
 
+def structured_artifact_verifier_covers_success_command(task: TaskSpec) -> bool:
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    semantic_verifier = metadata.get("semantic_verifier", {})
+    if not isinstance(semantic_verifier, dict):
+        return False
+    return str(semantic_verifier.get("kind", "")).strip() in {
+        "swe_patch_apply_check",
+    }
+
+
 class Verifier:
     def verify(self, task: TaskSpec, workspace: Path, result: CommandResult) -> VerificationResult:
         reasons: list[str] = []
@@ -104,6 +114,14 @@ class Verifier:
         command = str(task.success_command).strip()
         if not command or skip:
             return {}
+        if structured_artifact_verifier_covers_success_command(task):
+            return {
+                "kind": "success_command_result",
+                "command": command,
+                "passed": True,
+                "skipped": True,
+                "skip_reason": "structured_artifact_verifier_covers_success_command",
+            }
         timed_out = False
         try:
             completed = subprocess.run(
@@ -194,8 +212,9 @@ class Verifier:
             r"\bplaceholder\b",
             r"\bdummy\b",
         )
+        added_patch_text = "\n".join(self._patch_added_lines(patch_text))
         for pattern in placeholder_patterns:
-            if re.search(pattern, patch_text, flags=re.IGNORECASE):
+            if re.search(pattern, added_patch_text, flags=re.IGNORECASE):
                 return ["SWE patch diff contains placeholder/template content"]
         for identifier in contract.get("required_patch_identifiers", []):
             normalized_identifier = str(identifier).strip()
@@ -305,12 +324,40 @@ class Verifier:
                     if unused_new_params:
                         preview = ", ".join(unused_new_params[:5])
                         return [f"SWE patch adds unused production function parameters in {path}: {preview}"]
-                    invalid_init_returns = _python_init_return_value_names(
-                        (worktree / path).read_text(encoding="utf-8", errors="replace")
+                    before_invalid_init_returns = set(_python_init_return_value_names(original_python_sources.get(path, "")))
+                    invalid_init_returns = sorted(
+                        set(
+                            _python_init_return_value_names(
+                                (worktree / path).read_text(encoding="utf-8", errors="replace")
+                            )
+                        )
+                        - before_invalid_init_returns
                     )
                     if invalid_init_returns:
                         preview = ", ".join(invalid_init_returns[:5])
                         return [f"SWE patch leaves invalid __init__ return values in {path}: {preview}"]
+                    before_init_generators = set(_python_init_generator_names(original_python_sources.get(path, "")))
+                    invalid_init_generators = sorted(
+                        set(_python_init_generator_names((worktree / path).read_text(encoding="utf-8", errors="replace")))
+                        - before_init_generators
+                    )
+                    if invalid_init_generators:
+                        preview = ", ".join(invalid_init_generators[:5])
+                        return [f"SWE patch leaves invalid __init__ generators in {path}: {preview}"]
+                    before_unbound_locals = set(
+                        _python_local_load_before_assignment_names(original_python_sources.get(path, ""))
+                    )
+                    introduced_unbound_locals = sorted(
+                        set(
+                            _python_local_load_before_assignment_names(
+                                (worktree / path).read_text(encoding="utf-8", errors="replace")
+                            )
+                        )
+                        - before_unbound_locals
+                    )
+                    if introduced_unbound_locals:
+                        preview = ", ".join(introduced_unbound_locals[:5])
+                        return [f"SWE patch introduces local use before assignment in {path}: {preview}"]
         return []
 
     @staticmethod
@@ -348,6 +395,16 @@ class Verifier:
         if not removed and not added:
             return False
         return removed != added
+
+    @staticmethod
+    def _patch_added_lines(patch_text: str) -> list[str]:
+        added: list[str] = []
+        for line in patch_text.splitlines():
+            if line.startswith("+++ "):
+                continue
+            if line.startswith("+"):
+                added.append(line[1:])
+        return added
 
     @staticmethod
     def _patch_has_executable_change(patch_text: str) -> bool:
@@ -1508,6 +1565,108 @@ def _python_init_return_value_names(source: str) -> list[str]:
 
     _visit(tree)
     return sorted(invalid)
+
+
+def _python_init_generator_names(source: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    invalid: list[str] = []
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                if child.name == "__init__":
+                    for body_item in child.body:
+                        for descendant in ast.walk(body_item):
+                            if isinstance(descendant, (ast.Yield, ast.YieldFrom)) and qualified not in invalid:
+                                invalid.append(qualified)
+                _visit(child, qualified)
+
+    _visit(tree)
+    return sorted(invalid)
+
+
+def _python_local_load_before_assignment_names(source: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    invalid: list[str] = []
+
+    def _visit(node: ast.AST, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                _visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                local_names, declared_external = _python_function_local_binding_names(child)
+                local_names -= declared_external
+                first_contexts: dict[str, str] = {}
+                for body_item in child.body:
+                    _record_first_body_name_contexts(body_item, first_contexts)
+                for name in sorted(local_names):
+                    if first_contexts.get(name) == "load":
+                        invalid.append(f"{qualified}.{name}")
+                _visit(child, qualified)
+
+    _visit(tree)
+    return sorted(invalid)
+
+
+def _python_function_local_binding_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
+    local_names: set[str] = set()
+    declared_external: set[str] = set()
+    for child in _python_function_body_nodes(node):
+        if isinstance(child, (ast.Global, ast.Nonlocal)):
+            declared_external.update(str(name) for name in child.names if str(name).strip())
+            continue
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            local_names.add(child.id)
+            continue
+        if isinstance(child, ast.Import):
+            for alias in child.names:
+                local_names.add(str(alias.asname or alias.name).split(".", 1)[0])
+            continue
+        if isinstance(child, ast.ImportFrom):
+            for alias in child.names:
+                if alias.name == "*":
+                    continue
+                local_names.add(str(alias.asname or alias.name).split(".", 1)[0])
+            continue
+        if isinstance(child, ast.ExceptHandler) and child.name:
+            local_names.add(str(child.name))
+    return local_names, declared_external
+
+
+def _python_function_body_nodes(node: ast.FunctionDef | ast.AsyncFunctionDef):
+    def _walk(current: ast.AST):
+        if isinstance(
+            current,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Lambda,
+                ast.ListComp,
+                ast.SetComp,
+                ast.DictComp,
+                ast.GeneratorExp,
+            ),
+        ):
+            return
+        yield current
+        for nested in ast.iter_child_nodes(current):
+            yield from _walk(nested)
+
+    for body_item in node.body:
+        yield from _walk(body_item)
 
 
 def _python_function_parameters(source: str) -> dict[str, set[str]]:

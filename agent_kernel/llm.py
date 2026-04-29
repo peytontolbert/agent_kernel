@@ -153,6 +153,10 @@ class VLLMClient:
                 decision_prompt=decision_prompt,
                 state_payload=_lean_state_payload(state_payload),
             ),
+            _render_prompt(
+                decision_prompt=_ultra_lean_decision_prompt(decision_prompt),
+                state_payload=_ultra_lean_state_payload(state_payload),
+            ),
         ]
         last_data: dict[str, Any] | None = None
         last_error: Exception | None = None
@@ -701,19 +705,22 @@ def _compact_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
     }
     compact_history = []
     for step in state_payload.get("history", [])[-2:]:
-        compact_history.append(
-            {
-                "index": step.get("index"),
-                "action": step.get("action"),
-                "content": _truncate_text_value(step.get("content"), limit=200),
-                "verification": _compact_json_value(
-                    step.get("verification", {}),
-                    max_depth=1,
-                    max_items=4,
-                    text_limit=80,
-                ),
-            }
-        )
+        compact_step = {
+            "index": step.get("index"),
+            "action": step.get("action"),
+            "content": _truncate_text_value(step.get("content"), limit=200),
+            "decision_source": _truncate_text_value(step.get("decision_source", ""), limit=80),
+            "verification": _compact_json_value(
+                step.get("verification", {}),
+                max_depth=1,
+                max_items=4,
+                text_limit=80,
+            ),
+        }
+        command_result = _compact_command_result(step)
+        if command_result:
+            compact_step["command_result"] = command_result
+        compact_history.append(compact_step)
 
     compact_context = None
     context_packet = state_payload.get("context_packet")
@@ -755,7 +762,7 @@ def _compact_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
-    return {
+    compact_payload = {
         "task": compact_task,
         "history": compact_history,
         "recent_workspace_summary": _truncate_text_value(
@@ -841,10 +848,26 @@ def _compact_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
             text_limit=100,
         ),
     }
+    for key in (
+        "artifact_repair_context",
+        "artifact_materialization_guard",
+        "artifact_repair_continue_guard",
+        "artifact_required_identifier_guard",
+        "artifact_semantic_repair_guard",
+    ):
+        if state_payload.get(key) is not None:
+            compact_payload[key] = _compact_json_value(
+                state_payload.get(key),
+                max_depth=2,
+                max_items=8,
+                text_limit=500,
+            )
+    return compact_payload
 
 
 def _minimal_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
     compact = _compact_state_payload(state_payload)
+    compact["history"] = [_minimal_history_step(step) for step in compact.get("history", [])[-2:]]
     compact["context_packet"] = (
         {
             "control": {
@@ -879,6 +902,8 @@ def _minimal_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
     compact["active_subgoal_diagnosis"] = None
     compact["state_context_chunks"] = None
     compact["planner_recovery_artifact"] = None
+    if isinstance(compact.get("artifact_repair_context"), dict):
+        compact["artifact_repair_context"] = _minimal_artifact_repair_context(compact["artifact_repair_context"])
     return compact
 
 
@@ -916,6 +941,51 @@ def _lean_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
     return lean
 
 
+def _ultra_lean_decision_prompt(decision_prompt: str) -> str:
+    return (
+        _truncate_block_value(decision_prompt, limit=700)
+        + "\nProvider recovery mode: return only a valid minified JSON decision. "
+        "Use action code_execute when an expected artifact is still missing; do not include prose outside JSON."
+    )
+
+
+def _ultra_lean_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
+    task = state_payload.get("task", {}) if isinstance(state_payload.get("task"), dict) else {}
+    history = state_payload.get("history", [])
+    history_steps = history if isinstance(history, list) else []
+    last_step = history_steps[-1] if history_steps and isinstance(history_steps[-1], dict) else {}
+    verification = last_step.get("verification", {}) if isinstance(last_step.get("verification"), dict) else {}
+    payload: dict[str, Any] = {
+        "task": {
+            "task_id": task.get("task_id"),
+            "prompt": _truncate_text_value(task.get("prompt", ""), limit=180),
+            "expected_files": _compact_string_list(task.get("expected_files", []), max_items=3, text_limit=80),
+            "workspace_subdir": _truncate_text_value(task.get("workspace_subdir", ""), limit=100),
+        },
+        "latest_step": {
+            "action": last_step.get("action"),
+            "content": _truncate_text_value(last_step.get("content", ""), limit=180),
+            "decision_source": _truncate_text_value(last_step.get("decision_source", ""), limit=80),
+            "verification_reasons": _compact_string_list(
+                list(verification.get("reasons", []) or []),
+                max_items=3,
+                text_limit=100,
+            ),
+        },
+        "active_subgoal": _truncate_text_value(state_payload.get("active_subgoal", ""), limit=140),
+        "allowed_actions": ["code_execute", "respond"],
+    }
+    for key in (
+        "artifact_repair_context",
+        "artifact_materialization_guard",
+        "artifact_repair_continue_guard",
+    ):
+        value = state_payload.get(key)
+        if isinstance(value, dict):
+            payload[key] = _minimal_artifact_repair_context(value)
+    return payload
+
+
 def _compact_retrieved_span(span: dict[str, Any]) -> dict[str, Any]:
     return {
         "span_id": span.get("span_id"),
@@ -925,6 +995,80 @@ def _compact_retrieved_span(span: dict[str, Any]) -> dict[str, Any]:
         "node_path": _compact_string_list(span.get("node_path", []), max_items=4, text_limit=80),
         "text": _truncate_text_value(span.get("text", ""), limit=120),
     }
+
+
+def _minimal_history_step(step: object) -> dict[str, Any]:
+    if not isinstance(step, dict):
+        return {}
+    return {
+        "index": step.get("index"),
+        "action": step.get("action"),
+        "content": _truncate_text_value(step.get("content"), limit=160),
+        "decision_source": _truncate_text_value(step.get("decision_source", ""), limit=80),
+        "verification": _compact_json_value(
+            step.get("verification", {}),
+            max_depth=1,
+            max_items=3,
+            text_limit=70,
+        ),
+    }
+
+
+def _minimal_artifact_repair_context(context: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "artifact_path",
+        "builder_command",
+        "required_command_shape",
+        "last_source_path",
+        "source_lines_path",
+    ):
+        value = context.get(key)
+        if value:
+            compact[key] = _truncate_text_value(value, limit=180)
+    allowed_source_paths = context.get("allowed_source_paths", [])
+    if isinstance(allowed_source_paths, list):
+        compact["allowed_source_paths"] = _compact_string_list(
+            allowed_source_paths,
+            max_items=4,
+            text_limit=120,
+        )
+    return compact
+
+
+def _compact_command_result(step: dict[str, Any]) -> dict[str, Any]:
+    result = step.get("command_result")
+    if not isinstance(result, dict):
+        return {}
+    compact: dict[str, Any] = {
+        "exit_code": result.get("exit_code"),
+        "timed_out": bool(result.get("timed_out", False)),
+    }
+    content = str(step.get("content", "") or "")
+    stdout_limit = 1200 if _command_reads_source_context(content) else 600
+    stderr_limit = 600
+    stdout = str(result.get("stdout", "") or "")
+    stderr = str(result.get("stderr", "") or "")
+    if stdout:
+        compact["stdout_preview"] = _truncate_block_value(stdout, limit=stdout_limit)
+    if stderr:
+        compact["stderr_preview"] = _truncate_block_value(stderr, limit=stderr_limit)
+    return compact
+
+
+def _command_reads_source_context(command: str) -> bool:
+    normalized = str(command or "")
+    return "source_lines/" in normalized or "source_context/" in normalized
+
+
+def _truncate_block_value(value: object, *, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    if limit <= 32:
+        return text[:limit]
+    keep = max(8, (limit - 24) // 2)
+    return f"{text[:keep].rstrip()}\n...<truncated>...\n{text[-keep:].lstrip()}"
 
 
 def _truncate_text_value(value: object, *, limit: int) -> str:

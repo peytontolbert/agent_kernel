@@ -41,7 +41,7 @@ def test_validate_swe_predictions_accepts_complete_records():
     assert failures == []
 
 
-def test_validate_swe_predictions_rejects_duplicate_and_empty_patch():
+def test_validate_swe_predictions_accepts_empty_patch_as_noop_but_rejects_duplicate():
     module = _load_predictions_module()
 
     failures = module.validate_swe_predictions(
@@ -52,7 +52,7 @@ def test_validate_swe_predictions_rejects_duplicate_and_empty_patch():
     )
 
     assert "duplicate instance_id: repo__pkg-1" in failures
-    assert "record 2 field model_patch must be a non-empty string" in failures
+    assert "record 2 field model_patch must be a non-empty string" not in failures
 
 
 def test_build_swe_predictions_from_manifest_reads_patch_path(tmp_path):

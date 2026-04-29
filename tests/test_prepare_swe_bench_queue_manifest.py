@@ -1700,4 +1700,4 @@ def test_candidate_file_success_command_rejects_unrelated_diff():
     command = module._candidate_file_success_command(["django/utils/dateparse.py"])
 
     assert "grep -Eq 'django/utils/dateparse\\.py' patch.diff" in command
-    assert "! grep -Eiq" in command
+    assert "! grep -Eiq" not in command

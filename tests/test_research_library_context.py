@@ -156,6 +156,13 @@ def _research_status(tmp_path):
     }
 
 
+def test_research_library_context_is_detached_by_default(tmp_path):
+    config = KernelConfig(provider="mock", use_tolbert_context=False)
+
+    assert config.use_research_library_context is False
+    assert build_context_provider(config=config, repo_root=tmp_path) is None
+
+
 def test_research_library_context_provider_adds_capability_chunks(tmp_path):
     status_path = tmp_path / "var/research_library/status.json"
     _write_json(status_path, _research_status(tmp_path))
@@ -195,6 +202,72 @@ def test_research_library_context_provider_adds_capability_chunks(tmp_path):
     assert "notes=Shortest path algorithm for non-negative edges." in algorithm_chunk["text"]
     assert any(span["span_id"] == "research:inventory" for span in packet.retrieval["global"])
     assert any("prefer existing trained adapters" in item for item in packet.control["retrieval_guidance"]["evidence"])
+
+
+def test_research_library_context_adds_repository_code_hits(tmp_path):
+    status = _research_status(tmp_path)
+    repo_exports = tmp_path / "data/repository_library/exports"
+    manifest_path = repo_exports / "_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["repos"]["AgentLab"]["extensions"]["repo_skills_miner"]["paths"] = {
+        "skills": "AgentLab/structured/repo_skills_miner.skills.jsonl"
+    }
+    _write_json(manifest_path, manifest)
+    _write_text(
+        repo_exports / "AgentLab/structured/repo_skills_miner.skills.jsonl",
+        json.dumps(
+            {
+                "repo_id": "AgentLab",
+                "kind": "function",
+                "module": "agentlab.magic",
+                "qualname": "parse_magic_flag",
+                "signature": "(value)",
+                "file_path": "agentlab/magic.py",
+                "line_start": 10,
+                "line_end": 14,
+                "snippet": "def parse_magic_flag(value):\n    return value.strip().lower() in {'enabled', 'sentinel'}\n",
+            }
+        )
+        + "\n",
+    )
+    status_path = tmp_path / "var/research_library/status.json"
+    _write_json(status_path, status)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        use_research_library_context=True,
+        research_library_standalone_context=True,
+        research_library_status_path=status_path,
+        research_library_context_max_chunks=7,
+    )
+    provider = build_context_provider(config=config, repo_root=tmp_path)
+    assert provider is not None
+    state = AgentState(
+        task=TaskSpec(
+            task_id="repo_code_probe",
+            prompt="Implement AgentLab parse_magic_flag behavior for enabled and sentinel values.",
+            workspace_subdir="work",
+            metadata={
+                "benchmark_family": "research_library_repo_code_probe",
+                "repo": "AgentLab",
+                "code_symbol": "parse_magic_flag",
+            },
+        )
+    )
+
+    packet = provider.compile(state)
+
+    code_chunk = next(
+        chunk for chunk in packet.control["selected_context_chunks"] if chunk["span_id"] == "research:repository_code"
+    )
+    assert "parse_magic_flag" in code_chunk["text"]
+    assert "sentinel" in code_chunk["text"]
+    assert code_chunk["metadata"]["repository_code_hits"][0]["file_path"] == "agentlab/magic.py"
+    assert any(
+        "research_library: repository_code_hit repo=AgentLab" in item
+        for item in packet.control["retrieval_guidance"]["evidence"]
+    )
+    assert packet.control["retrieval_guidance"]["recommended_commands"] == []
 
 
 def test_research_library_context_adds_paper_content_hits(tmp_path):
@@ -348,6 +421,88 @@ def test_research_library_context_promotes_content_derived_applied_guidance(tmp_
         "research_library: applied_guidance replacement_start(alpha, p): start = p - len(alpha)" in item
         for item in packet.control["retrieval_guidance"]["evidence"]
     )
+
+
+def test_research_library_context_builds_structured_fact_command(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    chunks_dir = tmp_path / "paper_chunks"
+    chunks_dir.mkdir(parents=True)
+    paper_text = (
+        "Table 3. Comparison between the measurement with the new traceability chain, and the maintained "
+        "capacitance national standard. Source of uncertainty Type ur Note. "
+        "10 pF maintained group value at 1592 Hz B 400. "
+        "Capacitance bridge, 10 pF to 100 pF step-up B 40. "
+        "Capacitance bridge, 100 pF to 1000 pF step-up B 100. "
+        "New traceability chain, (C1 C2)1/2 B 64. RSS 419."
+    )
+    table = pa.Table.from_pylist(
+        [
+            {
+                "id": "farad:0:0",
+                "paper_id": "farad",
+                "title": "Farad Traceability",
+                "categories": "physics.ins-det",
+                "year": 2010,
+                "chunk_index": 0,
+                "text": paper_text,
+            }
+        ]
+    )
+    pq.write_table(table, chunks_dir / "train-00000.parquet")
+    status = _research_status(tmp_path)
+    for source in status["sources"]:
+        if source["id"] == "paper_chunks_p1":
+            source["path"] = str(chunks_dir)
+    status_path = tmp_path / "var/research_library/status.json"
+    _write_json(status_path, status)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        use_research_library_context=True,
+        research_library_standalone_context=True,
+        research_library_status_path=status_path,
+        research_library_context_max_chunks=6,
+        research_library_context_max_paper_hits=1,
+        research_library_paper_scan_file_limit=1,
+        research_library_paper_scan_row_limit=8,
+    )
+    provider = build_context_provider(config=config, repo_root=tmp_path)
+    assert provider is not None
+    state = AgentState(
+        task=TaskSpec(
+            task_id="farad_table_probe",
+            prompt=(
+                "Create answer.txt with ten_pf_group=..., ten_to_100_pf_stepup=..., "
+                "hundred_to_1000_pf_stepup=..., new_traceability_chain=..., and rss=...."
+            ),
+            workspace_subdir="work",
+            expected_files=["answer.txt"],
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "research_topic": (
+                    "farad traceability comparison uncertainty table maintained capacitance national standard "
+                    "10 pF 100 pF 1000 pF step-up RSS new traceability chain"
+                ),
+            },
+        )
+    )
+
+    packet = provider.compile(state)
+
+    assert [chunk["span_id"] for chunk in packet.control["selected_context_chunks"]] == [
+        "research:applied_guidance",
+        "research:paper_hits",
+    ]
+    command = packet.control["retrieval_guidance"]["recommended_commands"][0]
+    assert command == (
+        "printf '%s\\n' ten_pf_group=400 ten_to_100_pf_stepup=40 "
+        "hundred_to_1000_pf_stepup=100 new_traceability_chain=64 rss=419 > answer.txt"
+    )
+    guidance_text = packet.control["selected_context_chunks"][0]["text"]
+    assert "Adapter-derived command candidate" in guidance_text
+    assert "new_traceability_chain=64" in guidance_text
 
 
 def test_research_library_context_expands_visible_chunk_budget(tmp_path):

@@ -51,6 +51,34 @@ def test_build_swe_bench_command_uses_harness_module_and_safe_argv():
     assert "repo__pkg-2" in command
 
 
+def test_build_swe_bench_live_command_uses_official_evaluation_module():
+    module = _load_prepare_module()
+
+    command = module.build_swe_bench_live_command(
+        python_bin="/env/bin/python",
+        dataset_name="SWE-bench-Live/SWE-bench-Live",
+        split="verified",
+        predictions_json="preds.json",
+        platform="linux",
+        output_dir="logs/test",
+        workers=2,
+        overwrite=0,
+        instance_ids=["repo__pkg-1"],
+        start_month="2026-01",
+        end_month="2026-02",
+    )
+
+    assert command[:3] == ["/env/bin/python", "-m", "evaluation.evaluation"]
+    assert "--dataset" in command
+    assert "SWE-bench-Live/SWE-bench-Live" in command
+    assert "--patch_dir" in command
+    assert "preds.json" in command
+    assert "--platform" in command
+    assert "linux" in command
+    assert "--instance_ids" in command
+    assert "repo__pkg-1" in command
+
+
 def test_summarize_swe_bench_results_from_counts():
     module = _load_prepare_module()
 
@@ -80,6 +108,23 @@ def test_summarize_swe_bench_results_from_id_lists():
     assert summary["resolved_count"] == 2
     assert summary["task_count"] == 4
     assert summary["resolve_rate"] == 0.5
+
+
+def test_summarize_swe_bench_results_from_live_success_shape():
+    module = _load_prepare_module()
+
+    summary = module.summarize_swe_bench_results(
+        {
+            "submitted": 5,
+            "success_ids": ["a", "b"],
+            "failure_ids": ["c", "d"],
+            "error_ids": ["e"],
+        }
+    )
+
+    assert summary["resolved_count"] == 2
+    assert summary["task_count"] == 5
+    assert summary["resolve_rate"] == 0.4
 
 
 def test_prepare_swe_bench_command_cli_writes_command_and_spec(tmp_path, monkeypatch, capsys):
@@ -304,10 +349,15 @@ def test_build_swe_autonomous_harness_spec_defines_end_to_end_phases(tmp_path):
         "adapt_a8_packet",
     ]
     assert spec["phases"][0]["required_inputs"] == ["dataset.json", "repo_cache"]
+    assert spec["phases"][0]["expected_outputs"] == ["tasks.json", "prediction_task_progress_autonomous-run.json"]
     assert spec["phases"][1]["required_inputs"] == ["tasks.json"]
     assert spec["phases"][4]["required_inputs"][1] == "queue_manifest.json"
     assert spec["phases"][4]["expected_outputs"][0].endswith("patch_jobs_verification.json")
-    assert spec["phases"][5]["required_inputs"] == ["tasks.json", "queue_manifest.json"]
+    assert spec["phases"][5]["required_inputs"] == [
+        "tasks.json",
+        "queue_manifest.json",
+        str(tmp_path / "queue" / "patch_jobs_verification.json"),
+    ]
     assert spec["phases"][6]["required_inputs"] == ["dataset.json", "predictions.jsonl", "repo_cache"]
     assert spec["phases"][8]["required_inputs"] == ["predictions.jsonl"]
     assert spec["phases"][10]["required_inputs"] == ["results/results.json"]
@@ -316,9 +366,69 @@ def test_build_swe_autonomous_harness_spec_defines_end_to_end_phases(tmp_path):
     assert spec["phases"][2]["env"]["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"].endswith("queue.json")
     enqueue_argv = spec["phases"][2]["argv"]
     assert enqueue_argv[enqueue_argv.index("--max-queued-per-budget-group") + 1] == "2"
+    assert "--skip-existing-task-ids" in enqueue_argv
     assert spec["phases"][3]["env"]["AGENT_KERNEL_WORKSPACE_ROOT"] == "workspace"
+    assert spec["phases"][3]["env"]["AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS"] == "1000"
+    assert spec["phases"][3]["env"]["AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS"] == "0"
     assert spec["artifacts"]["patch_jobs_verification_json"].endswith("patch_jobs_verification.json")
+    assert spec["artifacts"]["prediction_task_progress_json"] == "prediction_task_progress_autonomous-run.json"
     assert any("not full benchmark evidence" in limit for limit in spec["open_limits"])
+
+
+def test_build_swe_autonomous_harness_spec_can_target_swe_bench_live(tmp_path):
+    module = _load_prepare_module()
+
+    spec = module.build_swe_autonomous_harness_spec(
+        benchmark="swe_bench_live",
+        dataset_json="dataset.json",
+        dataset_name="SWE-bench-Live/SWE-bench-Live",
+        split="verified",
+        repo_cache_root="repo_cache",
+        prediction_task_manifest="tasks.json",
+        patch_dir="patches",
+        queue_manifest="queue_manifest.json",
+        queue_root=str(tmp_path / "queue"),
+        workspace_root="workspace",
+        workspace_prefix="swe_live_probe",
+        predictions_jsonl="predictions.jsonl",
+        apply_check_json="apply_check.json",
+        run_spec_json="run_spec.json",
+        run_id="live-run",
+        harness_root=str(tmp_path),
+        max_workers=1,
+        timeout=1800,
+        cache_level="env",
+        namespace="swebench_live",
+        report_dir="results",
+        results_json="results/results.json",
+        summary_json="results/summary.json",
+        output_packet_json="results/a8_benchmark_result.json",
+        python_bin=sys.executable,
+        model_name_or_path="agentkernel",
+        provider="vllm",
+        drain_limit=0,
+        max_source_context_bytes=30000,
+        limit=2,
+        prepare_repo_cache=True,
+        repo_cache_manifest_json="repo_cache.json",
+        official_harness_kind="swebench_live",
+        live_predictions_json="preds.json",
+        live_submission_dir="submission/verified/agentkernel",
+        live_submission_subset="verified",
+    )
+
+    phase_names = [phase["name"] for phase in spec["phases"]]
+    assert phase_names[0] == "prepare_repo_cache"
+    assert "build_live_predictions_json" in phase_names
+    assert "materialize_results" not in phase_names
+    official_phase = next(phase for phase in spec["phases"] if phase["name"] == "official_harness")
+    assert official_phase["required_inputs"] == ["preds.json"]
+    assert official_phase["expected_outputs"] == ["results/results.json"]
+    assert official_phase["cwd"] == str(tmp_path)
+    assert spec["artifacts"]["live_predictions_json"] == "preds.json"
+    assert spec["artifacts"]["repo_cache_manifest_json"] == "repo_cache.json"
+    assert spec["artifacts"]["leaderboard_submission_dir"] == "submission/verified/agentkernel"
+    assert "SWE-bench Live leaderboard submission package" in spec["autonomy_contract"]["countable_evidence"]
 
 
 def test_swe_autonomous_harness_queue_budget_scales_with_selected_slice(tmp_path):

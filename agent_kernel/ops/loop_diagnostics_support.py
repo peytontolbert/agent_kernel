@@ -167,7 +167,8 @@ def _swe_candidate_path_repair_brief(state) -> str:
         "swe_patch_builder --path <allowed-path> --replace-line <line-number> "
         "--with '<full replacement source line>' > patch.diff; for multi-line replacements use "
         "swe_patch_builder --path <allowed-path> --replace-lines <start> <end> followed by one "
-        "--with argument per replacement line and redirect to patch.diff; the patch must change executable "
+        "--with argument per replacement line and redirect to patch.diff; do not replace a whole high-value "
+        "window, class, or function unless every existing definition line is preserved; the patch must change executable "
         "Python behavior, not only comments, docstrings, module headers, or triple-quoted text; preserve "
         "existing production function and class definitions"
     )
@@ -384,6 +385,15 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
         elif text.startswith("SWE patch adds unused production function parameters in "):
             path = "patch.diff"
             subgoal = "repair SWE patch.diff without unused signature-only parameters"
+        elif text.startswith("SWE patch leaves invalid __init__ return values in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without invalid __init__ return values"
+        elif text.startswith("SWE patch leaves invalid __init__ generators in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without generator __init__ methods"
+        elif text.startswith("SWE patch introduces local use before assignment in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without unbound local reads"
         elif text.startswith("SWE patch verifier missing patch file: "):
             path = text.removeprefix("SWE patch verifier missing patch file: ").strip() or "patch.diff"
             subgoal = f"materialize expected artifact {path}"
@@ -467,7 +477,9 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
                 entry["repair_instruction"] = (
                     "rewrite patch.diff as an executable Python code change that still parses after application; "
                     "do not insert function definitions inside import lists, argument lists, or other invalid blocks; "
-                    "anchor edits near real class/function bodies from source_lines"
+                    "do not run swe_patch_builder --from-diff on the current patch because that preserves the same "
+                    "invalid Python; anchor edits near real class/function bodies from source_lines and keep the "
+                    "replacement at the same indentation level as the source line"
                 )
             elif text == "SWE patch python AST unchanged after ignoring docstrings/comments":
                 entry["repair_instruction"] = (
@@ -478,12 +490,32 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
                 entry["repair_instruction"] = (
                     "rewrite patch.diff as a minimal behavior fix that preserves existing production function and class "
                     "definitions; do not rename, delete, or replace method/function definition lines unless the issue "
-                    "explicitly requires a signature-preserving edit"
+                    "explicitly requires a signature-preserving edit; do not run swe_patch_builder --from-diff on the "
+                    "current patch because that preserves the invalid deletion; use a smaller --replace-line or narrow "
+                    "--replace-lines hunk anchored inside the relevant existing function body"
                 )
             elif text.startswith("SWE patch adds unused production function parameters in "):
                 entry["repair_instruction"] = (
                     "rewrite patch.diff as a real behavior change inside the relevant function body; do not add unused "
                     "parameters or signature-only changes that are never referenced by executable code"
+                )
+            elif text.startswith("SWE patch leaves invalid __init__ return values in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a real behavior change that preserves valid Python object construction; "
+                    "never add or keep a value-returning return statement inside __init__; use a smallest-scope "
+                    "assignment/body edit or a bare return only if early exit is required"
+                )
+            elif text.startswith("SWE patch leaves invalid __init__ generators in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a real behavior change that preserves normal Python object construction; "
+                    "never add yield or yield from inside __init__; put iterable behavior in a normal method/helper or "
+                    "assign state inside __init__ instead"
+                )
+            elif text.startswith("SWE patch introduces local use before assignment in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so every local variable is assigned before its first read; do not move calls "
+                    "above the assignment they depend on, and prefer a narrow statement-level edit that preserves the "
+                    "existing initialization order"
                 )
             elif text.startswith("SWE patch diff includes unexpected path: "):
                 entry["repair_instruction"] = (

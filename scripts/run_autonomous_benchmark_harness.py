@@ -103,6 +103,9 @@ def validate_harness_spec(spec: dict[str, Any]) -> list[str]:
             not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items())
         ):
             failures.append(f"phase {name or index} env must be a string map")
+        phase_cwd = phase.get("cwd", "")
+        if phase_cwd is not None and not isinstance(phase_cwd, str):
+            failures.append(f"phase {name or index} cwd must be a string")
         outputs = phase.get("expected_outputs", [])
         if outputs is not None and (
             not isinstance(outputs, list) or any(not isinstance(value, str) or not value for value in outputs)
@@ -171,9 +174,12 @@ def check_phase_preflight(
             continue
         phase_env = base_env.copy()
         phase_env.update({str(k): str(v) for k, v in dict(phase.get("env", {})).items()})
+        phase_cwd = Path(str(phase.get("cwd") or cwd))
+        if not phase_cwd.is_absolute():
+            phase_cwd = cwd / phase_cwd
         completed = subprocess.run(
             [str(part) for part in preflight_argv],
-            cwd=str(cwd),
+            cwd=str(phase_cwd),
             env=phase_env,
             text=True,
             capture_output=True,
@@ -313,9 +319,13 @@ def run_harness_spec(
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in dict(phase.get("env", {})).items()})
         argv = [str(part) for part in phase["argv"]]
+        phase_cwd = Path(str(phase.get("cwd") or cwd))
+        if not phase_cwd.is_absolute():
+            phase_cwd = cwd / phase_cwd
         started_monotonic = time.monotonic()
         log["active_phase"] = {
             "argv": argv,
+            "cwd": str(phase_cwd),
             "elapsed_seconds": 0.0,
             "heartbeat_at": started_at,
             "name": phase_name,
@@ -325,7 +335,7 @@ def run_harness_spec(
         _write_run_log(log_json, log)
         process = subprocess.Popen(
             argv,
-            cwd=str(cwd),
+            cwd=str(phase_cwd),
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -355,6 +365,7 @@ def run_harness_spec(
             "returncode": int(process.returncode or 0),
             "stdout": stdout.strip(),
             "stderr": stderr.strip(),
+            "cwd": str(phase_cwd),
             "missing_outputs": missing_outputs,
         }
         log["phase_results"].append(phase_result)

@@ -205,8 +205,8 @@ def build_autonomous_harness_from_run_spec(
     spec_path: str = "",
     python_bin: str = sys.executable,
 ) -> dict[str, Any]:
-    if spec.get("report_kind") != "a8_benchmark_run_spec":
-        raise ValueError("run spec report_kind must be a8_benchmark_run_spec")
+    if spec.get("report_kind") not in {"a8_benchmark_run_spec", "standalone_benchmark_run_spec"}:
+        raise ValueError("run spec report_kind must be a8_benchmark_run_spec or standalone_benchmark_run_spec")
     benchmark = str(spec.get("benchmark", "")).strip()
     if not benchmark:
         raise ValueError("run spec benchmark is required")
@@ -344,17 +344,17 @@ def build_autonomous_harness_from_run_spec(
             }
         )
         open_limits.insert(0, "This generic SWE harness assumes predictions already exist; use the SWE patch-generation harness to create them autonomously.")
-    elif runner_kind == "swebench_autonomous_queue":
+    elif runner_kind in {"swebench_autonomous_queue", "swebench_live_autonomous_queue"}:
         artifact_root = _runner_text(runner, "artifact_root")
         run_id = _runner_text(runner, "run_id")
         if not run_id:
-            raise ValueError("runner.run_id is required for swebench_autonomous_queue")
+            raise ValueError(f"runner.run_id is required for {runner_kind}")
         dataset_json = _runner_text(runner, "dataset_json")
         repo_cache_root = _runner_text(runner, "repo_cache_root")
         if not dataset_json:
-            raise ValueError("runner.dataset_json is required for swebench_autonomous_queue")
+            raise ValueError(f"runner.dataset_json is required for {runner_kind}")
         if not repo_cache_root:
-            raise ValueError("runner.repo_cache_root is required for swebench_autonomous_queue")
+            raise ValueError(f"runner.repo_cache_root is required for {runner_kind}")
         prediction_task_manifest = _swe_autonomous_path(
             runner,
             "prediction_task_manifest",
@@ -380,9 +380,15 @@ def build_autonomous_harness_from_run_spec(
         summary_json = str(adapter.get("summary_json", "")).strip()
         output_packet_json = str(adapter.get("output_packet_json", "")).strip()
         if not summary_json:
-            raise ValueError("adapter.summary_json is required for swebench_autonomous_queue")
+            raise ValueError(f"adapter.summary_json is required for {runner_kind}")
         if not output_packet_json:
-            raise ValueError("adapter.output_packet_json is required for swebench_autonomous_queue")
+            raise ValueError(f"adapter.output_packet_json is required for {runner_kind}")
+        live_predictions_json = _swe_autonomous_path(
+            runner,
+            "predictions_patch_json",
+            artifact_root,
+            f"preds_{run_id}.json",
+        ) if runner_kind == "swebench_live_autonomous_queue" else ""
         swe_harness = build_swe_autonomous_harness_spec(
             benchmark=benchmark,
             dataset_json=dataset_json,
@@ -415,6 +421,20 @@ def build_autonomous_harness_from_run_spec(
             max_source_context_bytes=_runner_int(runner, "max_source_context_bytes", 30000),
             instance_ids=list(runner.get("instance_ids", [])) if isinstance(runner.get("instance_ids"), list) else None,
             limit=_runner_int(runner, "limit", 0),
+            prepare_repo_cache=bool(runner.get("prepare_repo_cache", False)),
+            repo_cache_manifest_json=_runner_text(runner, "repo_cache_manifest_json"),
+            fetch_repo_cache=bool(runner.get("fetch_repo_cache", False)),
+            official_harness_kind=(
+                "swebench_live" if runner_kind == "swebench_live_autonomous_queue" else "swebench"
+            ),
+            live_predictions_json=live_predictions_json,
+            live_platform=_runner_text(runner, "platform", "linux"),
+            live_overwrite=_runner_int(runner, "overwrite", 0),
+            live_start_month=_runner_text(runner, "start_month"),
+            live_end_month=_runner_text(runner, "end_month"),
+            live_submission_dir=_runner_text(runner, "submission_dir"),
+            live_submission_subset=_runner_text(runner, "submission_subset", _runner_text(runner, "split", "verified")),
+            live_system_name=_runner_text(runner, "system_name", "Agent Kernel"),
         )
         _attach_adapter_spec_to_swe_autonomous_harness(
             swe_harness,
@@ -457,8 +477,8 @@ def build_autonomous_harness_from_run_spec(
 
 
 def adapter_spec_from_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    if spec.get("report_kind") != "a8_benchmark_run_spec":
-        raise ValueError("run spec report_kind must be a8_benchmark_run_spec")
+    if spec.get("report_kind") not in {"a8_benchmark_run_spec", "standalone_benchmark_run_spec"}:
+        raise ValueError("run spec report_kind must be a8_benchmark_run_spec or standalone_benchmark_run_spec")
     benchmark = str(spec.get("benchmark", "")).strip()
     if not benchmark:
         raise ValueError("run spec benchmark is required")

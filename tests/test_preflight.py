@@ -1989,6 +1989,93 @@ def test_build_unattended_task_report_preserves_policy_termination_trace_without
     ]
 
 
+def test_build_unattended_task_report_exposes_artifact_guard_metadata(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    task = TaskSpec(
+        task_id="artifact_guard_task",
+        prompt="write patch.diff",
+        workspace_subdir="artifact_guard_task",
+        expected_files=["patch.diff"],
+        metadata={
+            "artifact_repair_contract": {
+                "artifact_path": "patch.diff",
+                "builder_commands": ["patch_builder"],
+            }
+        },
+    )
+    episode = EpisodeRecord(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        workspace=str(config.workspace_root / task.workspace_subdir),
+        success=False,
+        termination_reason="policy_terminated",
+        steps=[
+            StepRecord(
+                index=1,
+                thought="guard rejected invalid Python",
+                action="respond",
+                content="Stopping because the model did not produce a materialization command.",
+                selected_skill_id=None,
+                command_result=None,
+                verification={"passed": False, "reasons": ["policy terminated"]},
+                decision_source="artifact_materialization_guard",
+                proposal_metadata={
+                    "artifact_materialization_retry": True,
+                    "artifact_materialization_retry_attempts": 3,
+                    "rejected_command": "patch_builder --path pkg/module.py --replace-line 4 --with 'if (' > patch.diff",
+                    "retry_rejected_reason": "invalid_python_replacement",
+                    "invalid_python_replacement_operations": [
+                        {
+                            "path": "pkg/module.py",
+                            "attempted_start_line": 4,
+                            "attempted_existing_source": "    value = call(",
+                            "replacement_syntax_kind_mismatch": {
+                                "existing_line": "value = call(",
+                                "replacement_first_line": "def bad():",
+                            },
+                        }
+                    ],
+                    "source_identical_noop_operations": [
+                        {
+                            "path": "pkg/module.py",
+                            "start_line": 5,
+                            "existing_source": "    return value",
+                            "suggested_statement_range": {"start_line": 5, "end_line": 5},
+                        }
+                    ],
+                    "artifact_repair_context": {
+                        "artifact_path": "patch.diff",
+                        "allowed_source_paths": ["pkg/module.py"],
+                    },
+                },
+            )
+        ],
+    )
+
+    payload = build_unattended_task_report(
+        task=task,
+        config=config,
+        episode=episode,
+        preflight=None,
+        before_workspace_snapshot={},
+    )
+
+    metadata = payload["policy_trace"][0]["proposal_metadata"]
+    assert metadata["artifact_materialization_retry_attempts"] == 3
+    assert metadata["retry_rejected_reason"] == "invalid_python_replacement"
+    assert "patch_builder --path pkg/module.py" in metadata["rejected_command"]
+    assert metadata["invalid_python_replacement_operations"][0]["path"] == "pkg/module.py"
+    assert metadata["invalid_python_replacement_operations"][0]["replacement_syntax_kind_mismatch"][
+        "replacement_first_line"
+    ] == "def bad():"
+    assert metadata["source_identical_noop_operations"][0]["suggested_statement_range"]["start_line"] == 5
+    assert metadata["artifact_repair_context"]["allowed_source_paths"] == ["pkg/module.py"]
+
+
 def test_build_unattended_task_report_marks_nonacting_retrieval_companion_as_coverage_only(tmp_path):
     config = KernelConfig(
         provider="mock",

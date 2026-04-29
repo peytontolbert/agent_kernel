@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import difflib
 import os
@@ -43,6 +44,7 @@ class Sandbox:
             "ls",
             "mkdir",
             "mv",
+            "patch_builder",
             "printf",
             "pwd",
             "rm",
@@ -168,7 +170,7 @@ class Sandbox:
             stderr = result.stderr
             exit_code = result.exit_code
             timed_out = result.timed_out
-        elif command_name == "swe_patch_builder":
+        elif command_name in {"swe_patch_builder", "patch_builder"}:
             result = self._run_swe_patch_builder_segment(segment, cwd, task=task)
             stdout = result.stdout
             stderr = result.stderr
@@ -364,7 +366,7 @@ class Sandbox:
             return self._test_path_operands(args)
         if command_name == "http_request":
             return self._http_request_path_operands(args)
-        if command_name == "swe_patch_builder":
+        if command_name in {"swe_patch_builder", "patch_builder"}:
             return self._swe_patch_builder_path_operands(args)
         return [arg for arg in args if self._looks_like_path(arg)]
 
@@ -434,7 +436,8 @@ class Sandbox:
             if token == "--with" and index + 1 < len(args):
                 if not current_start_line:
                     raise ValueError("swe_patch_builder --with requires a preceding replacement range")
-                current_replacement_lines.append(args[index + 1])
+                replacement = args[index + 1]
+                current_replacement_lines.extend(replacement.split("\n"))
                 index += 2
                 continue
             raise ValueError(f"unsupported swe_patch_builder argument: {token}")
@@ -442,6 +445,16 @@ class Sandbox:
         if from_diff:
             if path or operations:
                 raise ValueError("swe_patch_builder --from-diff cannot be combined with line replacement arguments")
+            metadata = task.metadata if task is not None and isinstance(task.metadata, dict) else {}
+            semantic_verifier = metadata.get("semantic_verifier", {})
+            is_swe_patch_task = bool(metadata.get("swe_bench_prediction_task", False)) or (
+                isinstance(semantic_verifier, dict) and semantic_verifier.get("kind") == "swe_patch_apply_check"
+            )
+            if is_swe_patch_task:
+                raise ValueError(
+                    "swe_patch_builder --from-diff is disabled for SWE patch tasks; "
+                    "use swe_patch_builder --path with exact source_lines anchors"
+                )
             diff_path = self._resolve_workspace_path(from_diff, cwd)
             if not diff_path.is_file():
                 raise ValueError(f"swe_patch_builder input diff missing: {from_diff}")
@@ -461,6 +474,8 @@ class Sandbox:
         if not source_path.is_file():
             raise ValueError(f"swe_patch_builder source file missing: {normalized_path}")
         original_lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        base_source = self._swe_base_source_text(task, normalized_path) if task is not None else ""
+        diff_original_lines = base_source.splitlines(keepends=True) if base_source else original_lines
         normalized_operations = sorted(operations, key=lambda item: item[0])
         previous_end_line = 0
         for start_line, end_line, replacement_lines in normalized_operations:
@@ -470,24 +485,50 @@ class Sandbox:
                 raise ValueError("swe_patch_builder received overlapping replacement ranges")
             if not replacement_lines:
                 raise ValueError("swe_patch_builder requires at least one --with replacement line")
-            if end_line > len(original_lines):
+            if end_line > len(diff_original_lines):
                 raise ValueError(
-                    f"swe_patch_builder replacement range {start_line}-{end_line} exceeds {normalized_path} line count {len(original_lines)}"
+                    f"swe_patch_builder replacement range {start_line}-{end_line} exceeds {normalized_path} line count {len(diff_original_lines)}"
                 )
             previous_end_line = end_line
-        updated_lines = list(original_lines)
+        updated_lines = list(diff_original_lines)
         for start_line, end_line, replacement_lines in reversed(normalized_operations):
             formatted_replacements = self._format_swe_replacement_lines(
-                original_lines,
+                diff_original_lines,
                 start_line=start_line,
                 replacement_lines=replacement_lines,
             )
             updated_lines[start_line - 1 : end_line] = formatted_replacements
-        if updated_lines == original_lines:
+        if updated_lines == diff_original_lines:
             raise ValueError("swe_patch_builder replacement produced no meaningful change")
+        if normalized_path.endswith(".py"):
+            syntax_original_lines = diff_original_lines
+            original_source = "".join(syntax_original_lines)
+            original_compile_error = self._python_compile_error(original_source, normalized_path)
+            if original_compile_error:
+                # Some autonomous benchmark workspaces contain source excerpts
+                # rather than parseable full modules. In that case the builder
+                # cannot reliably assign syntax blame to the proposed edit; the
+                # downstream artifact verifier remains responsible for quality.
+                pass
+            else:
+                syntax_updated_lines = list(syntax_original_lines)
+                for start_line, end_line, replacement_lines in reversed(normalized_operations):
+                    formatted_replacements = self._format_swe_replacement_lines(
+                        syntax_original_lines,
+                        start_line=start_line,
+                        replacement_lines=replacement_lines,
+                    )
+                    syntax_updated_lines[start_line - 1 : end_line] = formatted_replacements
+                updated_source = "".join(syntax_updated_lines)
+                updated_compile_error = self._python_compile_error(updated_source, normalized_path)
+                if updated_compile_error:
+                    raise ValueError(
+                        f"swe_patch_builder replacement would produce invalid Python in {normalized_path}: "
+                        f"{updated_compile_error}"
+                    )
         return "".join(
             difflib.unified_diff(
-                original_lines,
+                diff_original_lines,
                 updated_lines,
                 fromfile=f"a/{normalized_path}",
                 tofile=f"b/{normalized_path}",
@@ -529,6 +570,17 @@ class Sandbox:
         )
 
     @staticmethod
+    def _python_compile_error(source_text: str, filename: str) -> str:
+        try:
+            compile(source_text, filename or "<swe_patch_builder>", "exec")
+        except SyntaxError as exc:
+            detail = f"{exc.__class__.__name__}: {exc.msg}"
+            if exc.lineno:
+                detail = f"{detail} at line {exc.lineno}"
+            return detail
+        return ""
+
+    @staticmethod
     def _format_swe_replacement_lines(
         source_lines: list[str],
         *,
@@ -547,6 +599,10 @@ class Sandbox:
                 original_indent = re.match(r"^\s*", source_lines[original_index]).group(0)
                 if original_indent:
                     line = f"{original_indent}{line}"
+            elif original_index < len(source_lines) and line.strip() and line.startswith(" ") and not line.startswith("  "):
+                original_indent = re.match(r"^\s*", source_lines[original_index]).group(0)
+                if len(original_indent) >= 2:
+                    line = f"{original_indent}{line.lstrip()}"
             formatted.append(line)
         return formatted
 
@@ -620,6 +676,45 @@ class Sandbox:
         if not isinstance(candidates, list):
             return set()
         return {str(path).strip().strip("/") for path in candidates if str(path).strip()}
+
+    @staticmethod
+    def _swe_repo_cache_path(repo_cache_root: str, repo: str) -> Path | None:
+        root = Path(repo_cache_root)
+        candidates = [
+            root / repo,
+            root / repo.replace("/", "__"),
+            root / repo.split("/")[-1],
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return None
+
+    @classmethod
+    def _swe_base_source_text(cls, task: TaskSpec, normalized_path: str) -> str:
+        verifier = task.metadata.get("semantic_verifier", {})
+        if not isinstance(verifier, dict):
+            return ""
+        if verifier.get("kind") != "swe_patch_apply_check":
+            return ""
+        repo = str(verifier.get("repo", "")).strip()
+        base_commit = str(verifier.get("base_commit", "")).strip()
+        repo_cache_root = str(verifier.get("repo_cache_root", "")).strip()
+        if not repo or not base_commit or not repo_cache_root:
+            return ""
+        repo_path = cls._swe_repo_cache_path(repo_cache_root, repo)
+        if repo_path is None:
+            return ""
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "show", f"{base_commit}:{normalized_path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout
 
     def _workflow_policy_violation(
         self,

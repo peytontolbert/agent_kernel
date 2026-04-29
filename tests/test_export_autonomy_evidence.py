@@ -918,6 +918,24 @@ def test_verify_a8_benchmark_result_packet_accepts_required_metrics():
         assert module.verify_a8_benchmark_result_packet(packet) == []
 
 
+def test_verify_a8_benchmark_result_packet_accepts_swe_bench_live():
+    module = _load_export_module()
+
+    failures = module.verify_a8_benchmark_result_packet(
+        {
+            "spec_version": "asi_v1",
+            "report_kind": "a8_benchmark_result",
+            "benchmark": "swe_bench_live",
+            "metrics": {
+                "resolve_rate": 0.82,
+                "conservative_comparison_report": True,
+            },
+        }
+    )
+
+    assert failures == []
+
+
 def test_verify_a8_benchmark_result_packet_rejects_missing_metric():
     module = _load_export_module()
     packet = {

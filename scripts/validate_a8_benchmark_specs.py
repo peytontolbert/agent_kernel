@@ -16,6 +16,7 @@ SUPPORTED_BENCHMARKS = {
     "mle_bench",
     "swe_bench_verified",
     "swe_rebench",
+    "swe_bench_live",
     "re_bench",
     "sustained_coding_window",
     "recursive_compounding",
@@ -76,9 +77,17 @@ def validate_a8_benchmark_spec(spec: dict[str, Any], *, spec_path: str = "") -> 
                     failures.append("codeforces ready_to_run requires CODEFORCES_HANDLE or account proof_path")
 
     runner = spec.get("runner") if isinstance(spec.get("runner"), dict) else {}
-    if benchmark in {"swe_bench_verified", "swe_rebench"}:
-        if str(runner.get("kind", "")).strip() != "swebench_harness":
-            failures.append("runner.kind must be swebench_harness for SWE benchmark specs")
+    if benchmark in {"swe_bench_verified", "swe_rebench", "swe_bench_live"}:
+        runner_kind = str(runner.get("kind", "")).strip()
+        allowed_runner_kinds = {"swebench_harness", "swebench_autonomous_queue"}
+        if benchmark == "swe_bench_live":
+            allowed_runner_kinds = {"swebench_live_autonomous_queue"}
+        if runner_kind not in allowed_runner_kinds:
+            failures.append(
+                "runner.kind must be one of "
+                + ",".join(sorted(allowed_runner_kinds))
+                + " for SWE benchmark specs"
+            )
         dataset_name = str(runner.get("dataset_name", "")).strip()
         if not dataset_name and (ready_to_run or benchmark != "swe_rebench"):
             failures.append("runner.dataset_name is required for SWE benchmark specs")
@@ -87,8 +96,20 @@ def validate_a8_benchmark_spec(spec: dict[str, Any], *, spec_path: str = "") -> 
         harness_root = str(runner.get("harness_root", "")).strip()
         if not harness_root:
             failures.append("runner.harness_root is required for SWE benchmark specs")
-        elif not Path(harness_root).exists():
+        elif ready_to_run and not Path(harness_root).exists():
             failures.append(f"runner.harness_root does not exist: {harness_root}")
+        if runner_kind in {"swebench_autonomous_queue", "swebench_live_autonomous_queue"}:
+            if not str(runner.get("dataset_json", "")).strip():
+                failures.append("runner.dataset_json is required for autonomous SWE benchmark specs")
+            if not str(runner.get("repo_cache_root", "")).strip():
+                failures.append("runner.repo_cache_root is required for autonomous SWE benchmark specs")
+        if runner_kind == "swebench_live_autonomous_queue":
+            platform = str(runner.get("platform", "linux")).strip() or "linux"
+            if platform not in {"linux", "windows"}:
+                failures.append("runner.platform must be linux or windows for SWE-bench Live specs")
+            subset = str(runner.get("submission_subset", runner.get("split", ""))).strip()
+            if not subset:
+                failures.append("runner.submission_subset or runner.split is required for SWE-bench Live specs")
         predictions_path = str(runner.get("predictions_path", "")).strip()
         if not predictions_path:
             failures.append("runner.predictions_path is required for SWE benchmark specs")

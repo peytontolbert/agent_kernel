@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 
-SUPPORTED_BENCHMARKS = ("swe_bench_verified", "swe_rebench")
+SUPPORTED_BENCHMARKS = ("swe_bench_verified", "swe_rebench", "swe_bench_live")
 
 
 def _read_json(path: Path) -> dict[str, Any]:

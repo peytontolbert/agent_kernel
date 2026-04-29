@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 from datetime import UTC, datetime
 import json
+import shlex
 import shutil
 import sys
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 DEFAULT_DATASETS = {
     "swe_bench_verified": "princeton-nlp/SWE-bench_Verified",
     "swe_rebench": "",
+    "swe_bench_live": "SWE-bench-Live/SWE-bench-Live",
 }
 
 
@@ -80,6 +82,54 @@ def build_swe_bench_command(
     return command
 
 
+def build_swe_bench_live_command(
+    *,
+    python_bin: str,
+    dataset_name: str,
+    split: str,
+    predictions_json: str,
+    platform: str,
+    output_dir: str,
+    workers: int,
+    overwrite: int,
+    instance_ids: list[str] | None = None,
+    start_month: str = "",
+    end_month: str = "",
+) -> list[str]:
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    if platform not in {"linux", "windows"}:
+        raise ValueError("platform must be linux or windows")
+    if overwrite not in {0, 1}:
+        raise ValueError("overwrite must be 0 or 1")
+    command = [
+        python_bin,
+        "-m",
+        "evaluation.evaluation",
+        "--dataset",
+        dataset_name,
+        "--split",
+        split,
+        "--platform",
+        platform,
+        "--patch_dir",
+        predictions_json,
+        "--output_dir",
+        output_dir,
+        "--workers",
+        str(workers),
+        "--overwrite",
+        str(overwrite),
+    ]
+    if start_month:
+        command.extend(["--start-month", start_month])
+    if end_month:
+        command.extend(["--end-month", end_month])
+    if instance_ids:
+        command.extend(["--instance_ids", *instance_ids])
+    return command
+
+
 def _count_from_keys(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     for key in keys:
         value = payload.get(key)
@@ -107,6 +157,8 @@ def summarize_swe_bench_results(results: dict[str, Any], *, source_path: str = "
             "resolved",
             "resolved_ids",
             "resolved_instances",
+            "success",
+            "success_ids",
         ),
     )
     total = _count_from_keys(
@@ -118,6 +170,7 @@ def summarize_swe_bench_results(results: dict[str, Any], *, source_path: str = "
             "instances_submitted",
             "submitted_instances",
             "submitted_ids",
+            "submitted",
             "all_instances",
         ),
     )
@@ -211,6 +264,7 @@ def _phase(
     name: str,
     argv: list[str],
     *,
+    cwd: str = "",
     env: dict[str, str] | None = None,
     preflight_argv: list[str] | None = None,
     required_inputs: list[str] | None = None,
@@ -222,6 +276,8 @@ def _phase(
         "kind": "command",
         "argv": argv,
     }
+    if cwd:
+        phase["cwd"] = cwd
     if env:
         phase["env"] = env
     if preflight_argv:
@@ -287,12 +343,27 @@ def build_swe_autonomous_harness_spec(
     max_source_context_bytes: int,
     instance_ids: list[str] | None = None,
     limit: int = 0,
+    prepare_repo_cache: bool = False,
+    repo_cache_manifest_json: str = "",
+    fetch_repo_cache: bool = False,
+    official_harness_kind: str = "swebench",
+    live_predictions_json: str = "",
+    live_platform: str = "linux",
+    live_overwrite: int = 0,
+    live_start_month: str = "",
+    live_end_month: str = "",
+    live_submission_dir: str = "",
+    live_submission_subset: str = "",
+    live_system_name: str = "Agent Kernel",
 ) -> dict[str, Any]:
     if benchmark not in DEFAULT_DATASETS:
         raise ValueError("benchmark must be one of " + ",".join(DEFAULT_DATASETS))
+    if official_harness_kind not in {"swebench", "swebench_live"}:
+        raise ValueError("official_harness_kind must be swebench or swebench_live")
     resolved_dataset = str(dataset_name or DEFAULT_DATASETS[benchmark]).strip()
     if not resolved_dataset:
         raise ValueError("dataset_name is required")
+    is_live = official_harness_kind == "swebench_live"
     selected_ids = [value.strip() for value in (instance_ids or []) if value.strip()]
     if selected_ids:
         selection_mode = "operator_selected_instance_ids"
@@ -300,6 +371,9 @@ def build_swe_autonomous_harness_spec(
         selection_mode = "dataset_limit"
     else:
         selection_mode = "full_split"
+    prediction_task_progress_json = str(
+        Path(prediction_task_manifest).with_name(f"prediction_task_progress_{run_id}.json")
+    )
 
     prepare_args = [
         python_bin,
@@ -316,11 +390,32 @@ def build_swe_autonomous_harness_spec(
         repo_cache_root,
         "--max-source-context-bytes",
         str(max_source_context_bytes),
+        "--progress-json",
+        prediction_task_progress_json,
     ]
     if selected_ids:
         prepare_args.extend(["--instance-ids", *selected_ids])
     if limit > 0:
         prepare_args.extend(["--limit", str(limit)])
+    repo_cache_manifest_json = str(repo_cache_manifest_json).strip()
+    if prepare_repo_cache and not repo_cache_manifest_json:
+        repo_cache_manifest_json = str(Path(prediction_task_manifest).with_name(f"repo_cache_{run_id}.json"))
+    repo_cache_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_repo_cache.py",
+        "--dataset-json",
+        dataset_json,
+        "--repo-cache-root",
+        repo_cache_root,
+        "--output-json",
+        repo_cache_manifest_json,
+    ]
+    if fetch_repo_cache:
+        repo_cache_args.append("--fetch")
+    if selected_ids:
+        repo_cache_args.extend(["--instance-ids", *selected_ids])
+    if limit > 0:
+        repo_cache_args.extend(["--limit", str(limit)])
 
     queue_args = [
         python_bin,
@@ -334,6 +429,11 @@ def build_swe_autonomous_harness_spec(
     ]
     queue_env = _queue_env(queue_root)
     queue_env["AGENT_KERNEL_WORKSPACE_ROOT"] = workspace_root
+    # Benchmark queues must retain every terminal task until prediction
+    # collection; the default delegated-queue terminal pruning is too small
+    # for full SWE-Bench Verified.
+    queue_env["AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS"] = "1000"
+    queue_env["AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS"] = "0"
     patch_jobs_verification_json = str(Path(queue_root) / "patch_jobs_verification.json")
     queue_max_queued_per_budget_group = _queue_max_queued_budget(
         selected_ids=selected_ids,
@@ -354,6 +454,7 @@ def build_swe_autonomous_harness_spec(
         f"{benchmark}_{run_id}",
         "--max-queued-per-budget-group",
         str(queue_max_queued_per_budget_group),
+        "--skip-existing-task-ids",
         "--json",
     ]
     drain_args = [
@@ -404,6 +505,8 @@ def build_swe_autonomous_harness_spec(
         workspace_root,
         "--output-jsonl",
         predictions_jsonl,
+        "--patch-job-verification-json",
+        patch_jobs_verification_json,
     ]
     apply_check_args = [
         python_bin,
@@ -458,32 +561,51 @@ def build_swe_autonomous_harness_spec(
     ]
     if selected_ids:
         run_spec_args.extend(["--instance-ids", *selected_ids])
-    official_args = build_swe_bench_command(
-        python_bin=python_bin,
-        dataset_name=resolved_dataset,
-        split=split,
-        predictions_path=predictions_jsonl,
-        run_id=run_id,
-        max_workers=max_workers,
-        timeout=timeout,
-        cache_level=cache_level,
-        namespace=namespace,
-        report_dir=report_dir,
-        instance_ids=selected_ids or None,
-    )
-    materialize_args = [
-        python_bin,
-        "scripts/prepare_swe_bench_a8_run.py",
-        "materialize-results",
-        "--run-id",
-        run_id,
-        "--namespace",
-        namespace,
-        "--report-dir",
-        report_dir,
-        "--output-results-json",
-        results_json,
-    ]
+    live_predictions_json = str(live_predictions_json).strip()
+    if is_live and not live_predictions_json:
+        live_predictions_json = str(Path(predictions_jsonl).with_suffix(".live_preds.json"))
+    if is_live:
+        official_args = build_swe_bench_live_command(
+            python_bin=python_bin,
+            dataset_name=resolved_dataset,
+            split=split,
+            predictions_json=live_predictions_json,
+            platform=live_platform,
+            output_dir=report_dir,
+            workers=max_workers,
+            overwrite=live_overwrite,
+            instance_ids=selected_ids or None,
+            start_month=live_start_month,
+            end_month=live_end_month,
+        )
+        materialize_args: list[str] = []
+    else:
+        official_args = build_swe_bench_command(
+            python_bin=python_bin,
+            dataset_name=resolved_dataset,
+            split=split,
+            predictions_path=predictions_jsonl,
+            run_id=run_id,
+            max_workers=max_workers,
+            timeout=timeout,
+            cache_level=cache_level,
+            namespace=namespace,
+            report_dir=report_dir,
+            instance_ids=selected_ids or None,
+        )
+        materialize_args = [
+            python_bin,
+            "scripts/prepare_swe_bench_a8_run.py",
+            "materialize-results",
+            "--run-id",
+            run_id,
+            "--namespace",
+            namespace,
+            "--report-dir",
+            report_dir,
+            "--output-results-json",
+            results_json,
+        ]
     summarize_args = [
         python_bin,
         "scripts/prepare_swe_bench_a8_run.py",
@@ -504,6 +626,37 @@ def build_swe_autonomous_harness_spec(
         output_packet_json,
         "--conservative-comparison-report",
     ]
+    live_prediction_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_live_submission.py",
+        "preds",
+        "--predictions-jsonl",
+        predictions_jsonl,
+        "--output-json",
+        live_predictions_json,
+    ]
+    live_submission_subset = str(live_submission_subset).strip() or split
+    if is_live and not live_submission_dir:
+        live_submission_dir = str(Path(report_dir).parent / "submission" / live_submission_subset / "agentkernel")
+    live_submission_args = [
+        python_bin,
+        "scripts/prepare_swe_bench_live_submission.py",
+        "package",
+        "--predictions-jsonl",
+        predictions_jsonl,
+        "--results-json",
+        results_json,
+        "--output-dir",
+        live_submission_dir,
+        "--model-name",
+        model_name_or_path,
+        "--system-name",
+        live_system_name,
+        "--subset",
+        live_submission_subset,
+        "--run-command",
+        " ".join(shlex.quote(part) for part in official_args),
+    ]
     open_limits = [
         "The harness is A8 evidence only after the official SWE harness completes and the adapter packet verifies.",
         "Repo-cache apply-check and patch-generation success are not benchmark scores.",
@@ -511,6 +664,154 @@ def build_swe_autonomous_harness_spec(
     ]
     if selection_mode != "full_split":
         open_limits.insert(0, "This is selected-slice or limited-run evidence, not full benchmark evidence.")
+    if is_live:
+        open_limits.append(
+            "SWE-bench Live leaderboard ranking requires packaging preds.json/results.json/README.md and submitting them through the official PR flow."
+        )
+    artifacts = {
+        "prediction_task_manifest": prediction_task_manifest,
+        "prediction_task_progress_json": prediction_task_progress_json,
+        "patch_dir": patch_dir,
+        "queue_manifest": queue_manifest,
+        "queue_root": queue_root,
+        "patch_jobs_verification_json": patch_jobs_verification_json,
+        "workspace_root": workspace_root,
+        "workspace_prefix": workspace_prefix,
+        "predictions_jsonl": predictions_jsonl,
+        "apply_check_json": apply_check_json,
+        "run_spec_json": run_spec_json,
+        "report_dir": report_dir,
+        "results_json": results_json,
+        "summary_json": summary_json,
+        "output_packet_json": output_packet_json,
+    }
+    phases = [
+        *(
+            [
+                _phase(
+                    "prepare_repo_cache",
+                    repo_cache_args,
+                    required_inputs=[dataset_json],
+                    expected_outputs=[repo_cache_manifest_json],
+                    gate="repository cache must contain the dataset repositories before prediction tasks are built",
+                )
+            ]
+            if prepare_repo_cache
+            else []
+        ),
+        _phase(
+            "prepare_prediction_tasks",
+            prepare_args,
+            required_inputs=[dataset_json, repo_cache_root],
+            expected_outputs=[prediction_task_manifest, prediction_task_progress_json],
+        ),
+        _phase(
+            "prepare_queue_manifest",
+            queue_args,
+            required_inputs=[prediction_task_manifest],
+            expected_outputs=[queue_manifest],
+        ),
+        _phase(
+            "enqueue_patch_jobs",
+            enqueue_args,
+            env=queue_env,
+            required_inputs=[queue_manifest],
+            expected_outputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
+        ),
+        _phase(
+            "drain_patch_jobs",
+            drain_args,
+            env=queue_env,
+            required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
+        ),
+        _phase(
+            "verify_patch_jobs",
+            verify_patch_jobs_args,
+            required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"], queue_manifest],
+            expected_outputs=[patch_jobs_verification_json],
+            gate="nonterminal patch jobs must finish; terminal abstentions become no-op predictions",
+        ),
+        _phase(
+            "collect_predictions",
+            collect_args,
+            required_inputs=[prediction_task_manifest, queue_manifest, patch_jobs_verification_json],
+            expected_outputs=[predictions_jsonl],
+        ),
+        _phase(
+            "repo_cache_apply_check",
+            apply_check_args,
+            required_inputs=[dataset_json, predictions_jsonl, repo_cache_root],
+            expected_outputs=[apply_check_json],
+            gate="all non-empty patches must apply; empty no-op predictions are valid abstentions",
+        ),
+    ]
+    if is_live:
+        artifacts["live_predictions_json"] = live_predictions_json
+        artifacts["leaderboard_submission_dir"] = live_submission_dir
+    if prepare_repo_cache:
+        artifacts["repo_cache_manifest_json"] = repo_cache_manifest_json
+    if is_live:
+        phases.extend(
+            [
+                _phase(
+                    "build_live_predictions_json",
+                    live_prediction_args,
+                    required_inputs=[predictions_jsonl],
+                    expected_outputs=[live_predictions_json],
+                    gate="SWE-bench Live predictions must use the official instance-id keyed object format",
+                ),
+                _phase(
+                    "official_harness",
+                    official_args,
+                    cwd=harness_root,
+                    required_inputs=[live_predictions_json],
+                    expected_outputs=[results_json],
+                    gate="official SWE-bench Live evaluator must complete",
+                ),
+                _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
+                _phase(
+                    "adapt_a8_packet",
+                    adapt_args,
+                    preflight_argv=adapt_args + ["--validate-only"],
+                    required_inputs=[summary_json],
+                    expected_outputs=[output_packet_json],
+                    gate="adapter verifies a8_benchmark_result packet",
+                ),
+                _phase(
+                    "package_live_leaderboard_submission",
+                    live_submission_args,
+                    required_inputs=[predictions_jsonl, results_json],
+                    expected_outputs=[
+                        str(Path(live_submission_dir) / "preds.json"),
+                        str(Path(live_submission_dir) / "results.json"),
+                        str(Path(live_submission_dir) / "README.md"),
+                    ],
+                    gate="leaderboard submission package must include predictions, results, and system README",
+                ),
+            ]
+        )
+    else:
+        phases.extend(
+            [
+                _phase("build_run_spec", run_spec_args, required_inputs=[predictions_jsonl], expected_outputs=[run_spec_json]),
+                _phase(
+                    "official_harness",
+                    official_args,
+                    required_inputs=[predictions_jsonl],
+                    gate="official SWE-bench harness must complete",
+                ),
+                _phase("materialize_results", materialize_args, expected_outputs=[results_json]),
+                _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
+                _phase(
+                    "adapt_a8_packet",
+                    adapt_args,
+                    preflight_argv=adapt_args + ["--validate-only"],
+                    required_inputs=[summary_json],
+                    expected_outputs=[output_packet_json],
+                    gate="adapter verifies a8_benchmark_result packet",
+                ),
+            ]
+        )
     return {
         "spec_version": "asi_v1",
         "report_kind": "autonomous_benchmark_harness_spec",
@@ -519,16 +820,7 @@ def build_swe_autonomous_harness_spec(
         "autonomy_contract": {
             "operator_role": "launch_and_monitor_only",
             "selection_mode": selection_mode,
-            "kernel_owned_phases": [
-                "enqueue_patch_jobs",
-                "drain_patch_jobs",
-                "verify_patch_jobs",
-                "collect_predictions",
-                "repo_cache_apply_check",
-                "official_harness",
-                "summarize_results",
-                "adapt_a8_packet",
-            ],
+            "kernel_owned_phases": [phase["name"] for phase in phases],
             "prohibited_manual_interventions": [
                 "manual per-instance patch authoring",
                 "manual prediction JSONL editing",
@@ -538,6 +830,11 @@ def build_swe_autonomous_harness_spec(
             "countable_evidence": [
                 "official SWE harness resolved_instances/resolved_ids",
                 "verified a8_benchmark_result packet",
+                *(
+                    ["SWE-bench Live leaderboard submission package"]
+                    if is_live
+                    else []
+                ),
             ],
         },
         "inputs": {
@@ -561,87 +858,15 @@ def build_swe_autonomous_harness_spec(
             "provider": provider,
             "drain_limit": drain_limit,
             "queue_max_queued_per_budget_group": queue_max_queued_per_budget_group,
+            "official_harness_kind": official_harness_kind,
+            "live_platform": live_platform,
+            "live_overwrite": live_overwrite,
+            "live_start_month": live_start_month,
+            "live_end_month": live_end_month,
+            "live_submission_subset": live_submission_subset,
         },
-        "artifacts": {
-            "prediction_task_manifest": prediction_task_manifest,
-            "patch_dir": patch_dir,
-            "queue_manifest": queue_manifest,
-            "queue_root": queue_root,
-            "patch_jobs_verification_json": patch_jobs_verification_json,
-            "workspace_root": workspace_root,
-            "workspace_prefix": workspace_prefix,
-            "predictions_jsonl": predictions_jsonl,
-            "apply_check_json": apply_check_json,
-            "run_spec_json": run_spec_json,
-            "report_dir": report_dir,
-            "results_json": results_json,
-            "summary_json": summary_json,
-            "output_packet_json": output_packet_json,
-        },
-        "phases": [
-            _phase(
-                "prepare_prediction_tasks",
-                prepare_args,
-                required_inputs=[dataset_json, repo_cache_root],
-                expected_outputs=[prediction_task_manifest],
-            ),
-            _phase(
-                "prepare_queue_manifest",
-                queue_args,
-                required_inputs=[prediction_task_manifest],
-                expected_outputs=[queue_manifest],
-            ),
-            _phase(
-                "enqueue_patch_jobs",
-                enqueue_args,
-                env=queue_env,
-                required_inputs=[queue_manifest],
-                expected_outputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
-            ),
-            _phase(
-                "drain_patch_jobs",
-                drain_args,
-                env=queue_env,
-                required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
-            ),
-            _phase(
-                "verify_patch_jobs",
-                verify_patch_jobs_args,
-                required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"], queue_manifest],
-                expected_outputs=[patch_jobs_verification_json],
-                gate="all patch jobs must complete successfully and produce patch.diff",
-            ),
-            _phase(
-                "collect_predictions",
-                collect_args,
-                required_inputs=[prediction_task_manifest, queue_manifest],
-                expected_outputs=[predictions_jsonl],
-            ),
-            _phase(
-                "repo_cache_apply_check",
-                apply_check_args,
-                required_inputs=[dataset_json, predictions_jsonl, repo_cache_root],
-                expected_outputs=[apply_check_json],
-                gate="all_apply_check_passed must be true",
-            ),
-            _phase("build_run_spec", run_spec_args, required_inputs=[predictions_jsonl], expected_outputs=[run_spec_json]),
-            _phase(
-                "official_harness",
-                official_args,
-                required_inputs=[predictions_jsonl],
-                gate="official SWE-bench harness must complete",
-            ),
-            _phase("materialize_results", materialize_args, expected_outputs=[results_json]),
-            _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
-            _phase(
-                "adapt_a8_packet",
-                adapt_args,
-                preflight_argv=adapt_args + ["--validate-only"],
-                required_inputs=[summary_json],
-                expected_outputs=[output_packet_json],
-                gate="adapter verifies a8_benchmark_result packet",
-            ),
-        ],
+        "artifacts": artifacts,
+        "phases": phases,
         "open_limits": open_limits,
     }
 
@@ -945,14 +1170,14 @@ def build_swe_success_continuation_harness_spec(
                     verification_json,
                 ],
                 expected_outputs=[predictions_jsonl],
-                gate="collect only verifier-successful patch jobs",
+                gate="collect verifier-successful patches and no-op abstentions",
             ),
             _phase(
                 "repo_cache_apply_check",
                 apply_check_args,
                 required_inputs=[str(inputs.get("dataset_json", "")).strip(), predictions_jsonl, str(inputs.get("repo_cache_root", "")).strip()],
                 expected_outputs=[apply_check_json],
-                gate="all_apply_check_passed must be true",
+                gate="all non-empty patches must apply; empty no-op predictions are valid abstentions",
             ),
             _phase("build_run_spec", run_spec_args, required_inputs=[predictions_jsonl], expected_outputs=[run_spec_json]),
             _phase(
@@ -1139,6 +1364,18 @@ def _harness_mode(args: argparse.Namespace) -> None:
         max_source_context_bytes=int(args.max_source_context_bytes),
         instance_ids=args.instance_ids,
         limit=int(args.limit),
+        prepare_repo_cache=bool(args.prepare_repo_cache),
+        repo_cache_manifest_json=args.repo_cache_manifest_json,
+        fetch_repo_cache=bool(args.fetch_repo_cache),
+        official_harness_kind=args.official_harness_kind,
+        live_predictions_json=args.live_predictions_json,
+        live_platform=args.live_platform,
+        live_overwrite=int(args.live_overwrite),
+        live_start_month=args.live_start_month,
+        live_end_month=args.live_end_month,
+        live_submission_dir=args.live_submission_dir,
+        live_submission_subset=args.live_submission_subset,
+        live_system_name=args.live_system_name,
     )
     _write_json(Path(args.output_harness_json), spec)
     print(
@@ -1279,6 +1516,18 @@ def main() -> None:
     harness_parser.add_argument("--max-source-context-bytes", type=int, default=30000)
     harness_parser.add_argument("--limit", type=int, default=0)
     harness_parser.add_argument("--instance-ids", nargs="*")
+    harness_parser.add_argument("--prepare-repo-cache", action="store_true")
+    harness_parser.add_argument("--repo-cache-manifest-json", default="")
+    harness_parser.add_argument("--fetch-repo-cache", action="store_true")
+    harness_parser.add_argument("--official-harness-kind", choices=("swebench", "swebench_live"), default="swebench")
+    harness_parser.add_argument("--live-predictions-json", default="")
+    harness_parser.add_argument("--live-platform", choices=("linux", "windows"), default="linux")
+    harness_parser.add_argument("--live-overwrite", type=int, choices=(0, 1), default=0)
+    harness_parser.add_argument("--live-start-month", default="")
+    harness_parser.add_argument("--live-end-month", default="")
+    harness_parser.add_argument("--live-submission-dir", default="")
+    harness_parser.add_argument("--live-submission-subset", default="")
+    harness_parser.add_argument("--live-system-name", default="Agent Kernel")
     harness_parser.add_argument("--output-harness-json", required=True)
     harness_parser.set_defaults(func=_harness_mode)
 

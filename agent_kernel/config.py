@@ -183,7 +183,7 @@ class KernelConfig:
     use_prompt_proposals: bool = os.getenv("AGENT_KERNEL_USE_PROMPT_PROPOSALS", "1") == "1"
     use_curriculum_proposals: bool = os.getenv("AGENT_KERNEL_USE_CURRICULUM_PROPOSALS", "1") == "1"
     use_retrieval_proposals: bool = os.getenv("AGENT_KERNEL_USE_RETRIEVAL_PROPOSALS", "1") == "1"
-    use_research_library_context: bool = os.getenv("AGENT_KERNEL_USE_RESEARCH_LIBRARY_CONTEXT", "1") == "1"
+    use_research_library_context: bool = os.getenv("AGENT_KERNEL_USE_RESEARCH_LIBRARY_CONTEXT", "0") == "1"
     research_library_standalone_context: bool = (
         os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_STANDALONE_CONTEXT", "0") == "1"
     )

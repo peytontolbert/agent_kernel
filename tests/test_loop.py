@@ -1914,6 +1914,7 @@ def test_kernel_verifier_diagnosis_includes_swe_apply_repair_instruction(tmp_pat
     assert "allowed patch paths are astropy/io/ascii/qdp.py, astropy/io/ascii/tests/test_qdp.py" in diagnosis["repair_instruction"]
     assert "swe_patch_builder --path <allowed-path> --replace-line <line-number>" in diagnosis["repair_instruction"]
     assert "not only comments, docstrings, module headers" in diagnosis["repair_instruction"]
+    assert "do not replace a whole high-value window" in diagnosis["repair_instruction"]
     assert "preserve existing production function and class definitions" in diagnosis["repair_instruction"]
     assert "mandatory first repair command when it matches the failure behavior" in diagnosis["repair_instruction"]
     assert "re.compile(_type_re, re.IGNORECASE)" in diagnosis["repair_instruction"]
@@ -1921,6 +1922,45 @@ def test_kernel_verifier_diagnosis_includes_swe_apply_repair_instruction(tmp_pat
     assert "_command_re" in diagnosis["repair_instruction"]
     assert "candidate line anchors: astropy/io/ascii/qdp.py: 1: import re" in diagnosis["repair_instruction"]
     assert "do not invent files" in diagnosis["summary"]
+
+
+def test_kernel_verifier_diagnosis_for_swe_definition_removal_blocks_from_diff_replay(tmp_path):
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    kernel = AgentKernel(config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="Write patch.diff.",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_candidate_files": ["django/db/models/fields/__init__.py"],
+                "swe_executable_edit_windows": (
+                    "### django/db/models/fields/__init__.py::deconstruct lines 411-507\n"
+                    "  413:     def deconstruct(self):\n"
+                    "  500:         return (self.name, path, [], keywords)"
+                ),
+            },
+        )
+    )
+
+    kernel._attach_verifier_subgoal_diagnoses(
+        state,
+        step_index=3,
+        verification_reasons=[
+            "SWE patch removes existing Python definitions in django/db/models/fields/__init__.py: Field.clone"
+        ],
+    )
+
+    diagnosis = state.subgoal_diagnoses["repair SWE patch.diff without deleting existing source definitions"]
+    assert "do not run swe_patch_builder --from-diff" in diagnosis["repair_instruction"]
+    assert "smaller --replace-line or narrow --replace-lines hunk" in diagnosis["repair_instruction"]
+    assert "do not replace a whole high-value window" in diagnosis["repair_instruction"]
 
 
 def test_kernel_verifier_diagnosis_prefers_swe_executable_anchors(tmp_path):
@@ -1975,6 +2015,8 @@ def test_kernel_verifier_diagnosis_prefers_swe_executable_anchors(tmp_path):
     assert "13: class RST(FixedWidth):" in diagnosis["repair_instruction"]
     assert "14:     def write(self, table):" in diagnosis["repair_instruction"]
     assert "do not insert function definitions inside import lists" in diagnosis["repair_instruction"]
+    assert "do not run swe_patch_builder --from-diff" in diagnosis["repair_instruction"]
+    assert "same indentation level" in diagnosis["repair_instruction"]
 
 
 def test_kernel_verifier_diagnosis_includes_swe_template_repair_instruction(tmp_path):

@@ -92,6 +92,7 @@ A8_BENCHMARK_REQUIRED_METRICS = {
     "mle_bench": ("gold_medal_rate",),
     "swe_bench_verified": ("resolve_rate",),
     "swe_rebench": ("resolve_rate",),
+    "swe_bench_live": ("resolve_rate",),
     "re_bench": ("human_expert_win_rate",),
     "sustained_coding_window": (
         "window_count",
@@ -105,6 +106,16 @@ A8_BENCHMARK_REQUIRED_METRICS = {
     ),
     "recursive_compounding": ("retained_gain_runs", "window_count"),
 }
+
+A8_COMPOSITE_REQUIRED_BENCHMARKS = (
+    "codeforces",
+    "mle_bench",
+    "swe_bench_verified",
+    "swe_rebench",
+    "re_bench",
+    "sustained_coding_window",
+    "recursive_compounding",
+)
 
 
 def _max_metric(results: list[dict[str, Any]], benchmark: str, metric: str, default: float = 0.0) -> float:
@@ -134,7 +145,7 @@ def _any_metric_true(results: list[dict[str, Any]], benchmark: str, metric: str)
 
 
 def _all_benchmark_results_mark_conservative(results: list[dict[str, Any]]) -> bool:
-    required = set(A8_BENCHMARK_REQUIRED_METRICS)
+    required = set(A8_COMPOSITE_REQUIRED_BENCHMARKS)
     present = {str(result.get("benchmark", "")).strip() for result in results}
     if not required.issubset(present):
         return False

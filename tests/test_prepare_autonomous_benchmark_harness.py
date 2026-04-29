@@ -176,6 +176,76 @@ def test_swebench_autonomous_queue_generates_prediction_and_official_phases():
     assert harness["autonomy_contract"]["operator_role"] == "launch_and_monitor_only"
 
 
+def test_swebench_live_autonomous_queue_packages_leaderboard_submission():
+    module = _load_prepare_module()
+    spec = {
+        "spec_version": "asi_v1",
+        "report_kind": "a8_benchmark_run_spec",
+        "benchmark": "swe_bench_live",
+        "ready_to_run": False,
+        "runner": {
+            "kind": "swebench_live_autonomous_queue",
+            "harness_root": "/tmp/SWE-bench-Live",
+            "dataset_json": "benchmarks/swe_bench_live/dataset.json",
+            "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+            "split": "verified",
+            "submission_subset": "verified",
+            "platform": "linux",
+            "repo_cache_root": "benchmarks/repo_cache",
+            "prepare_repo_cache": True,
+            "repo_cache_manifest_json": "benchmarks/swe_bench_live/autonomous/verified/repo_cache.json",
+            "artifact_root": "benchmarks/swe_bench_live/autonomous/verified",
+            "provider": "vllm",
+            "model_name_or_path": "agentkernel-model",
+            "run_id": "live-verified",
+            "limit": 2,
+            "drain_limit": 2,
+            "predictions_patch_json": "benchmarks/predictions/swe_bench_live_preds.json",
+            "submission_dir": "benchmarks/swe_bench_live/submissions/verified/agentkernel",
+        },
+        "adapter": {
+            "script": "scripts/run_a8_benchmark_adapter.py",
+            "summary_json": "benchmarks/swe_bench_live/summary.json",
+            "output_packet_json": "benchmarks/swe_bench_live/a8_benchmark_result.json",
+            "adapter_spec_json": "config/a8_benchmark_adapter_specs/swe_bench_live_adapter_spec.json",
+            "conservative_comparison_report": True,
+        },
+        "open_limits": ["template"],
+    }
+
+    harness = module.build_autonomous_harness_from_run_spec(spec, spec_path="swe_live.json")
+
+    phase_names = [phase["name"] for phase in harness["phases"]]
+    assert phase_names == [
+        "validate_adapter_spec",
+        "prepare_repo_cache",
+        "prepare_prediction_tasks",
+        "prepare_queue_manifest",
+        "enqueue_patch_jobs",
+        "drain_patch_jobs",
+        "verify_patch_jobs",
+        "collect_predictions",
+        "repo_cache_apply_check",
+        "build_live_predictions_json",
+        "official_harness",
+        "summarize_results",
+        "adapt_a8_packet",
+        "package_live_leaderboard_submission",
+    ]
+    official_phase = next(phase for phase in harness["phases"] if phase["name"] == "official_harness")
+    assert official_phase["argv"][:3] == [sys.executable, "-m", "evaluation.evaluation"]
+    assert official_phase["cwd"] == "/tmp/SWE-bench-Live"
+    assert "--patch_dir" in official_phase["argv"]
+    assert "benchmarks/predictions/swe_bench_live_preds.json" in official_phase["argv"]
+    package_phase = harness["phases"][-1]
+    assert package_phase["name"] == "package_live_leaderboard_submission"
+    repo_cache_phase = next(phase for phase in harness["phases"] if phase["name"] == "prepare_repo_cache")
+    assert repo_cache_phase["expected_outputs"] == ["benchmarks/swe_bench_live/autonomous/verified/repo_cache.json"]
+    assert "benchmarks/swe_bench_live/submissions/verified/agentkernel/README.md" in package_phase["expected_outputs"]
+    assert harness["artifacts"]["leaderboard_submission_dir"] == "benchmarks/swe_bench_live/submissions/verified/agentkernel"
+    assert harness["run_config"]["official_harness_kind"] == "swebench_live"
+
+
 def test_adapter_spec_from_run_spec_builds_default_metric_adapter():
     module = _load_prepare_module()
 

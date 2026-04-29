@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 
 from agent_kernel.llm import MockLLMClient
 from agent_kernel.config import KernelConfig
@@ -75,6 +76,33 @@ def test_llm_policy_returns_allowed_action():
 
     assert decision.action == "code_execute"
     assert "hello.txt" in decision.content
+
+
+def test_llm_policy_retries_transient_json_decision_failure():
+    class FlakyDecisionClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("LLM response did not return a parseable JSON decision")
+            return {
+                "thought": "write expected file",
+                "action": "code_execute",
+                "content": "printf 'hello agent kernel\\n' > hello.txt",
+                "done": False,
+            }
+
+    client = FlakyDecisionClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+
+    decision = policy.decide(AgentState(task=TaskBank().get("hello_task")))
+
+    assert client.calls == 2
+    assert decision.action == "code_execute"
+    assert decision.content == "printf 'hello agent kernel\\n' > hello.txt"
 
 
 class CapturingClient:
@@ -163,6 +191,139 @@ def test_llm_policy_adds_swe_apply_repair_directive_to_live_prompt():
     assert "do not invent files" in client.last_decision_prompt
 
 
+def test_llm_policy_adds_swe_definition_preservation_repair_directive_to_live_prompt():
+    client = CapturingClient()
+    config = KernelConfig(asi_coding_require_live_llm=True)
+    policy = LLMDecisionPolicy(client, config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_definition_repair_prompt_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_definition_repair_prompt_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.current_role = "critic"
+    state.active_subgoal = "repair SWE patch.diff without deleting existing source definitions"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch removes existing Python definitions in pkg/module.py: Field.clone",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": (
+                "rewrite patch.diff as a minimal behavior fix that preserves existing production "
+                "function and class definitions"
+            ),
+        }
+    }
+
+    policy.decide(state)
+
+    assert "do not run patch_builder --from-diff" in client.last_decision_prompt
+    assert "do not use broad --replace-lines" in client.last_decision_prompt
+    assert "preserves every existing def/class line" in client.last_decision_prompt
+
+
+def test_llm_policy_adds_swe_invalid_init_return_repair_directive_to_live_prompt():
+    client = CapturingClient()
+    config = KernelConfig(asi_coding_require_live_llm=True)
+    policy = LLMDecisionPolicy(client, config=config)
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_invalid_init_return_repair_prompt_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_invalid_init_return_repair_prompt_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.current_role = "critic"
+    state.active_subgoal = "repair SWE patch.diff until __init__ methods remain valid"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch leaves invalid __init__ return values in pkg/module.py: Reader.__init__",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": (
+                "rewrite patch.diff as a minimal behavior fix that keeps Python object construction valid"
+            ),
+        }
+    }
+
+    policy.decide(state)
+
+    assert "do not run patch_builder --from-diff" in client.last_decision_prompt
+    assert "never add or keep a value-returning return statement inside __init__" in client.last_decision_prompt
+    assert "smallest behavior-changing assignment/body edit" in client.last_decision_prompt
+
+
+def test_invalid_init_return_verifier_feedback_creates_structural_repair_entry():
+    from agent_kernel.ops.loop_diagnostics_support import verifier_failure_entries
+    from agent_kernel.schemas import classify_verification_reason
+
+    entries = verifier_failure_entries(
+        [
+            "SWE patch leaves invalid __init__ return values in pkg/module.py: Reader.__init__",
+        ]
+    )
+
+    assert entries == [
+        {
+            "subgoal": "repair SWE patch.diff without invalid __init__ return values",
+            "summary": "SWE patch leaves invalid __init__ return values in pkg/module.py: Reader.__init__",
+            "path": "patch.diff",
+            "repair_instruction": (
+                "rewrite patch.diff as a real behavior change that preserves valid Python object construction; "
+                "never add or keep a value-returning return statement inside __init__; use a smallest-scope "
+                "assignment/body edit or a bare return only if early exit is required"
+            ),
+        }
+    ]
+    assert (
+        classify_verification_reason(
+            "SWE patch leaves invalid __init__ return values in pkg/module.py: Reader.__init__"
+        )
+        == "invalid_init_return_value"
+    )
+    assert (
+        classify_verification_reason(
+            "SWE patch leaves invalid __init__ generators in pkg/module.py: Reader.__init__"
+        )
+        == "invalid_init_generator"
+    )
+    assert (
+        classify_verification_reason(
+            "SWE patch introduces local use before assignment in pkg/module.py: choose.raw_type_fn"
+        )
+        == "local_use_before_assignment"
+    )
+
+
+def test_python_static_verifier_feedback_creates_structural_repair_entries():
+    from agent_kernel.ops.loop_diagnostics_support import verifier_failure_entries
+
+    entries = verifier_failure_entries(
+        [
+            "SWE patch leaves invalid __init__ generators in pkg/module.py: Reader.__init__",
+            "SWE patch introduces local use before assignment in pkg/module.py: choose.raw_type_fn",
+        ]
+    )
+
+    assert entries[0]["subgoal"] == "repair SWE patch.diff without generator __init__ methods"
+    assert "never add yield or yield from inside __init__" in entries[0]["repair_instruction"]
+    assert entries[1]["subgoal"] == "repair SWE patch.diff without unbound local reads"
+    assert "assigned before its first read" in entries[1]["repair_instruction"]
+
+
 def test_llm_policy_adds_swe_missing_patch_synthesis_directive_to_live_prompt():
     client = CapturingClient()
     config = KernelConfig(asi_coding_require_live_llm=True)
@@ -194,30 +355,4320 @@ def test_llm_policy_adds_swe_missing_patch_synthesis_directive_to_live_prompt():
 
     assert "write patch.diff now as a source-grounded unified diff" in client.last_payload["exact_verifier_repair_brief"]
     assert "do not repeat source inspection commands" in client.last_decision_prompt
-    assert "next command must create or overwrite patch.diff directly with one swe_patch_builder command" in client.last_decision_prompt
+    assert "next command must create or overwrite patch.diff directly with one patch_builder command" in client.last_decision_prompt
     assert "do not hand-write unified diff hunk headers with cat/printf" in client.last_decision_prompt
 
 
-def test_llm_policy_repairs_existing_swe_patch_with_builder_before_more_llm(tmp_path):
-    class ShouldNotRunClient:
+def test_llm_policy_reasks_swe_missing_patch_after_repeated_source_inspection():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect the same source again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize patch",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                    "--with 'VALUE = 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_reask_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_reask_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+        "--with 'VALUE = 2' > patch.diff"
+    )
+    assert decision.decision_source == "llm_artifact_materialization_retry"
+    assert decision.proposal_metadata["artifact_materialization_retry"] is True
+    assert "Artifact materialization guard" in client.prompts[1]
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_command"] == "cat pkg/module.py"
+
+
+def test_artifact_materialization_retry_uses_compact_no_inspection_control_prompt():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source lines again",
+                    "action": "code_execute",
+                    "content": "grep -n 'return' source_lines/pkg/module.py.lines",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize artifact",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_compact_artifact_retry_prompt_task",
+            prompt="Change value() so it returns 2.",
+            workspace_subdir="generic_compact_artifact_retry_prompt_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read numbered source",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "inspect source_lines/pkg/module.py.lines before writing patch.diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.prompts[1].startswith("Artifact materialization guard")
+    assert "Source context is already available" in client.prompts[1]
+    assert "inspect source_lines/pkg/module.py.lines before writing patch.diff" not in client.prompts[1]
+    compact_diagnosis = client.payloads[1]["subgoal_diagnoses"][state.active_subgoal]
+    assert "do not inspect files" in compact_diagnosis["repair_instruction"]
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    )
+
+
+def test_llm_policy_allows_line_numbered_source_followup_after_initial_inspection():
+    class CapturingSourceLinesClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            return {
+                "thought": "read exact line anchors",
+                "action": "code_execute",
+                "content": "cat source_lines/pkg/module.py.lines",
+                "done": False,
+            }
+
+    client = CapturingSourceLinesClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_line_numbered_followup_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_line_numbered_followup_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded artifact",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 0
+    assert decision.content == "cat source_lines/pkg/module.py.lines"
+    assert decision.decision_source == "artifact_source_lines_followup_direct"
+
+
+def test_llm_policy_materialization_guard_accepts_line_numbered_followup_once():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "read line-numbered anchors",
+                "action": "code_execute",
+                "content": "cat source_lines/pkg/module.py.lines",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_line_numbered_guard_followup_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_line_numbered_guard_followup_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded artifact",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_reason"] == "source_inspection"
+    assert decision.content == "cat source_lines/pkg/module.py.lines"
+    assert decision.decision_source == "llm_artifact_source_inspection_followup"
+    assert decision.proposal_metadata["artifact_source_inspection_followup"] is True
+
+
+def test_llm_policy_reads_line_numbered_source_after_noop_artifact_repair():
+    class FailingClient:
         def create_decision(self, **kwargs):
             del kwargs
-            raise AssertionError("LLM should not be called when an existing SWE patch can be syntax-repaired")
+            raise AssertionError("direct source-lines follow-up should run before the LLM")
 
+    policy = LLMDecisionPolicy(FailingClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_noop_source_lines_followup_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_noop_source_lines_followup_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=2,
+            thought="try builder",
+            action="code_execute",
+            content="patch_builder --path pkg/module.py --replace-line 2 --with '    return 1' > patch.diff",
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["Artifact AST unchanged after ignoring docstrings/comments"],
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "Artifact AST unchanged after ignoring docstrings/comments",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write a behavior-changing artifact",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.content == "cat source_lines/pkg/module.py.lines"
+    assert decision.decision_source == "artifact_source_lines_followup_direct"
+    assert decision.proposal_metadata["artifact_source_lines_followup"] is True
+
+
+def test_llm_policy_reasks_invalid_python_builder_before_execution():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "bad indentation",
+                    "action": "code_execute",
+                    "content": (
+                        "patch_builder --path pkg/module.py --replace-lines 2 3 "
+                        "--with ' for item in items:' --with '  total += item' > patch.diff"
+                    ),
+                    "done": False,
+                }
+            return {
+                "thought": "valid narrow edit",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path pkg/module.py --replace-line 3 "
+                    "--with '        total += item + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_python_builder_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_python_builder_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value(items):\n"
+                        "    for item in items:\n"
+                        "        total += item\n"
+                        "    return total\n"
+                    ),
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded artifact",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_reason"] == "invalid_python_replacement"
+    invalid_ops = client.payloads[1]["artifact_materialization_guard"]["invalid_python_replacement_operations"]
+    assert invalid_ops[0]["path"] == "pkg/module.py"
+    assert invalid_ops[0]["attempted_start_line"] == 2
+    assert invalid_ops[0]["attempted_end_line"] == 3
+    assert invalid_ops[0]["suggested_statement_range"] == {
+        "start_line": 2,
+        "end_line": 3,
+        "node_type": "For",
+    }
+    assert "for item in items:" in invalid_ops[0]["suggested_existing_source"]
+    assert "replace the whole syntactic statement" in client.prompts[1]
+    assert "invalid_python_replacement_operations" in client.prompts[1]
+    assert "same syntactic kind" in client.prompts[1]
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '        total += item + 1' > patch.diff"
+    )
+
+
+def test_llm_policy_reasks_early_response_from_artifact_diagnosis():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "answer instead of writing artifact",
+                    "action": "respond",
+                    "content": "Cannot finish without more context.",
+                    "done": True,
+                }
+            return {
+                "thought": "write the missing artifact",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_missing_artifact_continue_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_missing_artifact_continue_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="try command",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_repair_continue_guard"]["rejected_reason"] == (
+        "respond_before_artifact_materialized"
+    )
+    assert decision.decision_source == "llm_artifact_repair_continue"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+
+def test_llm_policy_reasks_early_response_after_source_inspection_without_artifact():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "source is inspected enough",
+                    "action": "respond",
+                    "content": "The fix is clear.",
+                    "done": True,
+                }
+            return {
+                "thought": "write the artifact after inspection",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_inspection_then_response_artifact_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_inspection_then_response_artifact_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "1: def value():\n2:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": True, "reasons": []},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_repair_continue_guard"]["rejected_reason"] == (
+        "respond_before_artifact_materialized"
+    )
+    assert "do not stop or respond" in client.prompts[1]
+    assert decision.decision_source == "llm_artifact_repair_continue"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+
+def test_llm_policy_anchor_salvages_continue_guard_artifact_path_source_retry():
+    class ThreeStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "answer instead of writing artifact",
+                    "action": "respond",
+                    "content": "Cannot finish without more context.",
+                    "done": True,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "bad artifact self-source",
+                    "action": "code_execute",
+                    "content": "patch_builder --path patch.diff --replace-line 2 --with '    return 2' > patch.diff",
+                    "done": False,
+                }
+            return {
+                "thought": "anchor on source line",
+                "action": "code_execute",
+                "content": "2||    return 2",
+                "done": False,
+            }
+
+    client = ThreeStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_continue_anchor_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_continue_anchor_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="try command",
+            action="code_execute",
+            content="true",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_repair_continue_guard"]["rejected_reason"] == (
+        "respond_before_artifact_materialized"
+    )
+    assert decision.decision_source == "artifact_builder_source_path_remap_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_repair_continue_retry"] is True
+    assert decision.proposal_metadata["artifact_builder_source_path_remap_direct"] is True
+
+
+def test_llm_policy_anchor_salvages_exhausted_source_inspection_retry():
+    class ThreeStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py | head -n 100",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "still inspecting",
+                    "action": "code_execute",
+                    "content": "sed -n '1,40p' pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "anchor from existing source context",
+                "action": "code_execute",
+                "content": "11||    return 2",
+                "done": False,
+            }
+
+    client = ThreeStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_source_inspection_anchor_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_source_inspection_anchor_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": "### pkg/module.py::value lines 10-12\n  10: def value():\n  11:     return 1",
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "  10: def value():\n  11:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read line anchors",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "  10: def value():\n  11:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 3
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_reason"] == "source_inspection"
+    assert client.payloads[2]["artifact_anchor_repair_guard"]["rejected_reason"] == "source_inspection"
+    assert client.payloads[2]["artifact_anchor_repair_guard"]["fixed_path"] == "pkg/module.py"
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 11 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_retry"] is True
+
+
+def test_llm_policy_anchor_salvages_repeated_invalid_python_retry():
+    class ThreeStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "invalid statement header in expression context",
+                    "action": "code_execute",
+                    "content": "patch_builder --path pkg/module.py --replace-line 2 --with ' def value(self):' > patch.diff",
+                    "done": False,
+                }
+            return {
+                "thought": "anchor valid source line",
+                "action": "code_execute",
+                "content": "2||    return 2",
+                "done": False,
+            }
+
+    client = ThreeStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_python_anchor_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_python_anchor_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read source anchors",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "1: def value():\n2:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 3
+    assert client.prompts[2].startswith("Constrained artifact anchor repair")
+    assert "do not inspect files" in client.prompts[2]
+    assert client.payloads[2]["artifact_anchor_repair_guard"]["rejected_reason"] == "invalid_python_replacement"
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_retry"] is True
+
+
+def test_llm_policy_remaps_line_out_rejected_builder_without_extra_llm():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, state_payload
+            self.prompts.append(decision_prompt)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "used issue number as line number",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 9999 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_line_out_remap_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_line_out_remap_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": "### pkg/module.py::value lines 1-2\n1: def value():\n2:     return 1\n",
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read source anchors",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "1: def value():\n2:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_attempt"] == 0
+
+
+def test_llm_policy_remaps_retry_builder_outside_anchor_preview():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "forgot redirect",
+                    "action": "code_execute",
+                    "content": "patch_builder --path pkg/module.py --replace-line 8 --with '    return 2'",
+                    "done": False,
+                }
+            return {
+                "thought": "picked unrelated line",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 8 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_retry_anchor_preview_remap_task",
+            prompt="write patch.diff using lines 2",
+            workspace_subdir="generic_retry_anchor_preview_remap_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value():\n"
+                        "    return 1\n"
+                        "\n"
+                        "def other():\n"
+                        "    return 3\n"
+                        "\n"
+                        "def unrelated():\n"
+                        "    return 9\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": (
+                        "1: def value():\n"
+                        "2:     return 1\n"
+                        "3: \n"
+                        "4: def other():\n"
+                        "5:     return 3\n"
+                        "6: \n"
+                        "7: def unrelated():\n"
+                        "8:     return 9\n"
+                    ),
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read source anchors",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "1: def value():\n2:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_reason"] == (
+        "malformed_or_non_materializing_patch_builder"
+    )
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["rejected_reason"] == "line_outside_anchor_preview"
+    assert decision.proposal_metadata["artifact_anchor_replacement_attempt"] == 0
+
+
+def test_artifact_retry_context_filters_low_signal_anchor_lines():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_low_signal_anchor_filter_task",
+            prompt="write patch.diff using lines 1-7",
+            workspace_subdir="generic_low_signal_anchor_filter_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        '"""module doc"""\n'
+                        "import os\n"
+                        "def value():\n"
+                        '    """doc"""\n'
+                        "    pass\n"
+                        "    total = 1\n"
+                        "    return total\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": (
+                        '1: """module doc"""\n'
+                        "2: import os\n"
+                        "3: def value():\n"
+                        '4:     """doc"""\n'
+                        "5:     pass\n"
+                        "6:     total = 1\n"
+                        "7:     return total\n"
+                    ),
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert context["valid_line_numbers_preview"] == [6, 7]
+    skeletons = "\n".join(context["command_skeletons"])
+    assert "--replace-line 1 " not in skeletons
+    assert "--replace-line 2 " not in skeletons
+    assert "--replace-line 3 " not in skeletons
+    assert "--replace-line 4 " not in skeletons
+    assert "--replace-line 5 " not in skeletons
+
+
+def test_artifact_retry_context_prioritizes_safe_anchor_excerpt_after_filtering():
+    source_lines = []
+    for line_number in range(1, 801):
+        if line_number == 340:
+            text = "class Thing:"
+        elif line_number == 341:
+            text = "    def value(self):"
+        elif line_number == 643:
+            text = "        result = old_value"
+        else:
+            text = f"        filler_{line_number} = {line_number}"
+        source_lines.append(f"{line_number}: {text}")
+
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_prioritized_safe_anchor_excerpt_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_prioritized_safe_anchor_excerpt_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::Thing lines 340-643\n"
+                    " 340: class Thing:\n"
+                    " 341:     def value(self):\n"
+                    " 643:         result = old_value\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "\n".join(line.split(": ", 1)[1] for line in source_lines) + "\n",
+                    "source_lines/pkg/module.py.lines": "\n".join(source_lines) + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert context["valid_line_numbers_preview"][0] == 643
+    excerpt = context["source_lines_excerpt"]
+    assert "643:         result = old_value" in excerpt[:600]
+    assert excerpt.index("643:         result = old_value") < excerpt.index("340: class Thing:")
+
+
+def test_llm_policy_escalates_swe_missing_patch_materialization_retry_once():
+    class ThreeStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "still inspecting",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize patch",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                    "--with 'VALUE = 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = ThreeStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_second_reask_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_second_reask_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 3
+    assert "Escalated materialization attempt" in client.prompts[2]
+    assert client.payloads[1]["artifact_materialization_guard"]["attempt"] == 1
+    assert client.payloads[2]["artifact_materialization_guard"]["attempt"] == 2
+    assert client.payloads[2]["artifact_materialization_guard"]["rejected_command"] == "cat pkg/module.py"
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+        "--with 'VALUE = 2' > patch.diff"
+    )
+    assert decision.proposal_metadata["artifact_materialization_retry_attempt"] == 2
+
+
+def test_llm_policy_materialization_retry_includes_artifact_repair_context():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "repeat source inspection",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize focused patch",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path pkg/module.py --replace-line 11 "
+                    "--with '    return 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_artifact_context_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_artifact_context_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": "### pkg/module.py::value lines 10-12\n  10: def value():\n  11:     return 1",
+                "setup_file_contents": {
+                    "pkg/module.py": "def value():\n    return 1\n",
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "  10: def value():\n  11:     return 1\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="read exact anchors",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": "  10: def value():\n  11:     return 1\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded artifact",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert "Artifact repair context:" in client.prompts[1]
+    assert "source_lines_excerpt" in client.prompts[1]
+    assert "11:     return 1" in client.prompts[1]
+    assert client.payloads[1]["artifact_repair_context"]["source_lines_path"] == "source_lines/pkg/module.py.lines"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 11 --with '    return 2' > patch.diff"
+    assert decision.decision_source == "llm_artifact_materialization_retry"
+
+
+def test_llm_policy_reasks_swe_missing_patch_after_inline_python_source_inspection():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            del decision_prompt
+            self.payloads.append(state_payload)
+            if len(self.payloads) == 1:
+                return {
+                    "thought": "inspect with python",
+                    "action": "code_execute",
+                    "content": "python3 -c \"print(open('pkg/module.py').readlines()[0])\"",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize patch",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                    "--with 'VALUE = 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_inline_python_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_inline_python_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+        "--with 'VALUE = 2' > patch.diff"
+    )
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_command"].startswith("python3 -c")
+
+
+def test_llm_policy_reasks_noop_swe_patch_repeated_command():
+    previous_command = (
+        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+        "--with 'def value(self):' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "repeat the same edit",
+                    "action": "code_execute",
+                    "content": previous_command,
+                    "done": False,
+                }
+            return {
+                "thought": "change executable body",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 12 "
+                    "--with '        return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_noop_reask_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_noop_reask_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="no-op edit",
+            action="code_execute",
+            content=previous_command,
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["SWE patch diff has no meaningful content change"],
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch diff has no meaningful content change",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "replace patch.diff with a behavior-changing executable edit",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert "Artifact semantic repair guard" in client.prompts[1]
+    assert client.payloads[1]["artifact_semantic_repair_guard"]["rejected_command"] == previous_command
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 12 "
+        "--with '        return value + 1' > patch.diff"
+    )
+    assert decision.decision_source == "llm_artifact_semantic_repair"
+    assert decision.proposal_metadata["artifact_semantic_repair_retry"] is True
+
+
+def test_llm_policy_reasks_swe_repair_response_before_terminating():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "cannot continue",
+                    "action": "respond",
+                    "content": "I cannot produce a patch.",
+                    "done": True,
+                }
+            return {
+                "thought": "continue repair",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                    "--with 'VALUE = 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_repair_continue_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_repair_continue_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["missing expected file: patch.diff", "SWE patch verifier missing patch file: patch.diff"],
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert "Artifact repair continue guard" in client.prompts[1]
+    assert client.payloads[1]["artifact_repair_continue_guard"]["required_action"] == "code_execute"
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+        "--with 'VALUE = 2' > patch.diff"
+    )
+    assert decision.decision_source == "llm_artifact_repair_continue"
+
+
+def test_llm_policy_reasks_initial_swe_patch_response_before_any_command():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "stop early",
+                    "action": "respond",
+                    "content": "No patch needed.",
+                    "done": True,
+                }
+            return {
+                "thought": "materialize patch",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '    return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_initial_response_reask_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_initial_response_reask_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"},
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "patch.diff remains on the critical path",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "critic",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert "Artifact repair continue guard" in client.prompts[1]
+    assert client.payloads[1]["artifact_repair_continue_guard"]["required_action"] == "code_execute"
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    return value + 1' > patch.diff"
+    )
+
+
+def test_llm_policy_reasks_generic_artifact_repair_source_read():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize artifact",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '    return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_artifact_repair_task",
+            prompt="write patch artifact",
+            workspace_subdir="generic_artifact_repair_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "patch.diff remains on the critical path",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "critic",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 1
+    assert "artifact_materialization_guard" not in client.payloads[0]
+    assert decision.content == "cat pkg/module.py"
+
+
+def test_llm_policy_reasks_swe_patch_missing_required_identifier():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "generic kwargs change",
+                    "action": "code_execute",
+                    "content": (
+                        "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                        "--with '        return kwargs.get(name)' > patch.diff"
+                    ),
+                    "done": False,
+                }
+            return {
+                "thought": "handle greeting",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 10 "
+                    "--with '        return kwargs.get(\"greeting\", name)' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_identifier_reask_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_identifier_reask_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="generic patch",
+            action="code_execute",
+            content="swe_patch_builder --path pkg/module.py --replace-line 10 --with '        return name' > patch.diff",
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["SWE patch does not reference required issue identifier: greeting"],
+            },
+        )
+    )
+    state.active_subgoal = "rewrite SWE patch.diff to address the named issue identifier"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch does not reference required issue identifier: greeting",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "rewrite patch.diff so the executable source change directly handles `greeting`",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert "Artifact required identifier guard" in client.prompts[1]
+    assert client.payloads[1]["artifact_required_identifier_guard"]["required_identifier"] == "greeting"
+    assert 'kwargs.get("greeting", name)' in decision.content
+    assert decision.decision_source == "llm_artifact_required_identifier_retry"
+    assert decision.proposal_metadata["required_identifier"] == "greeting"
+
+
+def test_llm_policy_allows_initial_swe_source_inspection_when_source_context_exists():
+    class SourceReadClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source even though source_context is available",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "inspect source even though source_context is available",
+                "action": "code_execute",
+                "content": "cat pkg/module.py",
+                "done": False,
+            }
+
+    client = SourceReadClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_source_context_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_source_context_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "VALUE = 1\n",
+                    "source_lines/pkg/module.py.lines": "   1: VALUE = 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 1
+    assert "artifact_materialization_guard" not in client.payloads[0]
+    assert decision.content == "cat pkg/module.py"
+
+
+def test_llm_policy_reasks_source_identical_swe_patch_before_execution():
+    source_identical_command = (
+        "swe_patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    return value' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "rewrite with the same source text",
+                    "action": "code_execute",
+                    "content": source_identical_command,
+                    "done": False,
+                }
+            return {
+                "thought": "change executable behavior",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '        return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_source_identical_patch_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_source_identical_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+                "setup_file_contents": {
+                    "source_context": {"pkg/module.py": "def value():\n    return value\n"}
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_command"] == source_identical_command
+    source_identical_ops = client.payloads[1]["artifact_materialization_guard"][
+        "source_identical_noop_operations"
+    ]
+    assert source_identical_ops[0]["path"] == "pkg/module.py"
+    assert source_identical_ops[0]["start_line"] == 2
+    assert source_identical_ops[0]["end_line"] == 2
+    assert source_identical_ops[0]["existing_source"] == "    return value"
+    assert source_identical_ops[0]["rejected_replacement"] == "    return value"
+    assert source_identical_ops[0]["suggested_statement_range"] == {
+        "start_line": 2,
+        "end_line": 2,
+        "node_type": "Return",
+    }
+    assert "return value" in source_identical_ops[0]["suggested_existing_source"]
+    assert "2:     return value" in source_identical_ops[0]["nearby_source_context"]
+    assert "source_identical_noop_operations" in client.prompts[1]
+    assert "suggested_statement_range" in client.prompts[1]
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+
+def test_artifact_guard_rejects_adjacent_duplicate_executable_line():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_duplicate_adjacent_line_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_duplicate_adjacent_line_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value(labels):\n"
+                        "    return any(\n"
+                        "        use(app_label)\n"
+                        "        for app_label in labels\n"
+                        "        for model in apps.get_models(app_label)\n"
+                        "    )\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 4 "
+        "--with '        for model in apps.get_models(app_label)' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_introduces_adjacent_duplicate_line(state, command)
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "duplicate_adjacent_line"
+
+
+def test_artifact_guard_rejects_python_ast_noop_replacement():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_python_ast_noop_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_python_ast_noop_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value():\n"
+                        "    \"\"\"Return one.\"\"\"\n"
+                        "    return 1\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    \"\"\"Return the value one.\"\"\"' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_python_ast_unchanged(state, command)
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "python_ast_noop"
+
+
+def test_artifact_guard_rejects_unused_signature_parameter():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_unused_signature_parameter_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_unused_signature_parameter_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def parse_line(line):\n    return line.lower()\n",
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 1 "
+        "--with 'def parse_line(line, err_specs=None):' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_unused_python_parameter_names(state, command) == [
+        "parse_line.err_specs"
+    ]
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "unused_signature_parameter"
+
+
+def test_artifact_guard_rejects_invalid_init_return_value():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_invalid_init_return_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_invalid_init_return_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class Reader:\n"
+                        "    def __init__(self, rows=None):\n"
+                        "        self.rows = rows\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '        return rows' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_invalid_init_return_names(state, command) == ["Reader.__init__"]
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "invalid_init_return_value"
+
+
+def test_artifact_guard_rejects_invalid_init_generator():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_invalid_init_generator_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_invalid_init_generator_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class Reader:\n"
+                        "    def __init__(self, rows=None):\n"
+                        "        self.rows = rows\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '        yield from rows' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_invalid_init_generator_names(state, command) == ["Reader.__init__"]
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "invalid_init_generator"
+
+
+def test_artifact_guard_rejects_local_use_before_assignment():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_local_use_before_assignment_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_local_use_before_assignment_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def choose(strict, values):\n"
+                        "    if strict:\n"
+                        "        raw_type_fn = raw_strict\n"
+                        "    else:\n"
+                        "        raw_type_fn = raw_normal\n"
+                        "    return all(raw_type_fn(value) for value in values)\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    if not any(raw_type_fn(value) for value in values):' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_local_load_before_assignment_names(state, command) == [
+        "choose.raw_type_fn"
+    ]
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "local_use_before_assignment"
+
+
+def test_artifact_guard_rejects_definition_header_name_replacement():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_definition_header_name_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_definition_header_name_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class Search:\n"
+                        "    @property\n"
+                        "    def _estimator_type(self):\n"
+                        "        return self.estimator._estimator_type\n"
+                        "\n"
+                        "    def fit(self, X, y=None):\n"
+                        "        return self\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": (
+                        "1: class Search:\n"
+                        "2:     @property\n"
+                        "3:     def _estimator_type(self):\n"
+                        "4:         return self.estimator._estimator_type\n"
+                        "5: \n"
+                        "6:     def fit(self, X, y=None):\n"
+                        "7:         return self\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '    def fit(self, X, y=None, groups=None, **fit_params):' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, command) == "definition_header_removal"
+
+
+def test_llm_policy_reasks_builder_using_artifact_path_as_source():
+    artifact_source_command = (
+        "patch_builder --path patch.diff --replace-line 1 --with 'changed' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "edit artifact as if it were source",
+                    "action": "code_execute",
+                    "content": artifact_source_command,
+                    "done": False,
+                }
+            return {
+                "thought": "edit real source",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_artifact_path_as_source_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_artifact_path_as_source_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    guard = client.payloads[1]["artifact_materialization_guard"]
+    assert guard["rejected_reason"] == "artifact_path_as_source"
+    assert guard["rejected_command"] == artifact_source_command
+    repair_context = client.payloads[1]["artifact_repair_context"]
+    assert repair_context["forbidden_source_paths"] == ["patch.diff"]
+    assert repair_context["preferred_source_path"] == "pkg/module.py"
+    assert repair_context["command_skeletons"][0].startswith(
+        "patch_builder --path pkg/module.py --replace-line 2 "
+    )
+    assert "--path patch.diff" in guard["forbidden_command_patterns"]
+    assert "command_skeletons" in client.prompts[1]
+    assert "never the output artifact path itself" in client.prompts[1]
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+
+def test_llm_policy_remaps_builder_using_artifact_path_as_source_when_repair_is_valid():
+    artifact_source_command = (
+        "patch_builder --path patch.diff --replace-line 2 --with '    return 2' > patch.diff"
+    )
+
+    class OneStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, state_payload
+            self.prompts.append(decision_prompt)
+            return {
+                "thought": "edit artifact as if it were source",
+                "action": "code_execute",
+                "content": artifact_source_command,
+                "done": False,
+            }
+
+    client = OneStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_artifact_path_remap_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_artifact_path_remap_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 1
+    assert decision.decision_source == "artifact_builder_source_path_remap_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+    assert decision.proposal_metadata["rejected_command"] == artifact_source_command
+
+
+def test_llm_policy_reasks_builder_line_out_of_known_source_range():
+    bad_command = "patch_builder --path pkg/module.py --replace-line 999 --with '    return 2' > patch.diff"
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "guess a line number",
+                    "action": "code_execute",
+                    "content": bad_command,
+                    "done": False,
+                }
+            return {
+                "thought": "use source line",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_line_range_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_line_range_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    guard = client.payloads[1]["artifact_materialization_guard"]
+    assert guard["rejected_reason"] == "line_out_of_source_range"
+    assert guard["artifact_guard_rejection_operations"][0]["known_source_line_count"] == 2
+    assert "never use arbitrary issue numbers" in client.prompts[1]
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+
+def test_artifact_retry_context_prioritizes_edit_window_anchors():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    line_numbered = "\n".join(
+        [
+            "96: def before():",
+            "97:     return 0",
+            "98: ",
+            "99: def value():",
+            "100:     total = 1",
+            "101:     return total",
+            "102: ",
+            "103: def after():",
+            "104:     return 3",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_anchor_priority_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_anchor_priority_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::value lines 99-101\n"
+                    " 100:     total = 1\n"
+                    " 101:     return total\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def before():\n    return 0\n\ndef value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": line_numbered + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert context["valid_line_numbers_preview"][:2] == [100, 101]
+    assert context["command_skeletons"][0].startswith(
+        "patch_builder --path pkg/module.py --replace-line 100 "
+    )
+
+
+def test_artifact_retry_context_drops_edit_window_lines_that_conflict_with_source_lines():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    line_numbered = "\n".join(
+        [
+            "120: def build(items):",
+            "121:     for item in items:",
+            "122:         actual = item",
+            "123:         result = actual + 1",
+            "124:     return result",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_stale_edit_window_anchor_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_stale_edit_window_anchor_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::build lines 120-123\n"
+                    " 122:         self, coord: Hashable, edge_order: int = 1, datetime_unit: str = None\n"
+                    " 123:         result = actual + 1\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def build(items):\n"
+                        "    for item in items:\n"
+                        "        actual = item\n"
+                        "        result = actual + 1\n"
+                        "    return result\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": line_numbered + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert "self, coord: Hashable" not in context["edit_windows"]
+    assert "123:         result = actual + 1" in context["edit_windows"]
+    assert 122 not in context["valid_line_numbers_preview"]
+    assert context["valid_line_numbers_preview"][0] == 123
+    assert policy._artifact_builder_outside_retry_anchor_preview(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 122 --with '        actual = item + 1' > patch.diff",
+        context,
+    )
+
+
+def test_artifact_retry_context_filters_definition_headers_from_anchor_preview():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    line_numbered = "\n".join(
+        [
+            "10: class Value:",
+            "11:     def build(self):",
+            "12:         total = 1",
+            "13:         return total",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_anchor_header_filter_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_anchor_header_filter_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::Value lines 10-13\n"
+                    " 10: class Value:\n"
+                    " 11:     def build(self):\n"
+                    " 12:         total = 1\n"
+                    " 13:         return total\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "class Value:\n    def build(self):\n        total = 1\n        return total\n",
+                    "source_lines/pkg/module.py.lines": line_numbered + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert context["anchor_line_policy"] == "replacement_safe_source_lines"
+    assert context["valid_line_numbers_preview"][:2] == [12, 13]
+    assert all(line not in context["valid_line_numbers_preview"] for line in [10, 11])
+    assert context["command_skeletons"][0].startswith(
+        "patch_builder --path pkg/module.py --replace-line 12 "
+    )
+
+
+def test_artifact_retry_context_prioritizes_prompt_line_references():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    line_numbered = "\n".join(
+        [
+            "90: def unrelated():",
+            "91:     return 0",
+            "120: def target():",
+            "121:     value = abs(window).sum()",
+            "122:     return value",
+            "123: ",
+            "124: def after():",
+            "125:     return 1",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_prompt_line_reference_anchor_task",
+            prompt="Fix the calculation described at https://example.test/pkg/module.py#L121-L122.",
+            workspace_subdir="generic_prompt_line_reference_anchor_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::unrelated lines 90-91\n"
+                    " 91:     return 0\n"
+                    "### pkg/module.py::target lines 120-122\n"
+                    " 121:     value = abs(window).sum()\n"
+                    " 122:     return value\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def unrelated():\n"
+                        "    return 0\n\n"
+                        "def target():\n"
+                        "    value = abs(window).sum()\n"
+                        "    return value\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": line_numbered + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert context["prompt_line_numbers_preview"][:2] == [121, 122]
+    assert context["valid_line_numbers_preview"][:2] == [121, 122]
+    assert context["command_skeletons"][0].startswith(
+        "patch_builder --path pkg/module.py --replace-line 121 "
+    )
+
+
+def test_artifact_retry_context_includes_prompt_line_references_in_source_excerpt():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    line_numbered = "\n".join(
+        [
+            "10: def unrelated():",
+            "11:     return 0",
+            "120: def target():",
+            "121:     value = abs(window).sum()",
+            "122:     return value",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_prompt_line_reference_excerpt_task",
+            prompt="Fix the calculation described at https://example.test/pkg/module.py#L121-L122.",
+            workspace_subdir="generic_prompt_line_reference_excerpt_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::unrelated lines 10-11\n"
+                    " 11:     return 0\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def unrelated():\n"
+                        "    return 0\n\n"
+                        "def target():\n"
+                        "    value = abs(window).sum()\n"
+                        "    return value\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": line_numbered + "\n",
+                },
+            },
+        )
+    )
+
+    context = policy._artifact_retry_context_payload(
+        state,
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+    )
+
+    assert "121:     value = abs(window).sum()" in context["source_lines_excerpt"]
+    assert "122:     return value" in context["source_lines_excerpt"]
+
+
+def test_artifact_line_range_guard_accepts_edit_window_anchors():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_edit_window_line_range_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_edit_window_line_range_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::value lines 708-712\n"
+                    " 710:     def value(self):\n"
+                    " 711:         total = 1\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def stub():\n    return 0\n",
+                    "source_lines/pkg/module.py.lines": "1: def stub():\n2:     return 0\n",
+                },
+            },
+        )
+    )
+
+    assert not LLMDecisionPolicy._artifact_builder_line_out_of_known_source_range(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 711 --with '        total = 2' > patch.diff",
+    )
+    assert not LLMDecisionPolicy._artifact_builder_line_out_of_known_source_range(
+        state,
+        (
+            "patch_builder --path pkg/module.py --replace-lines 708 712 "
+            "--with '    def value(self):' --with '        total = 2' > patch.diff"
+        ),
+    )
+    assert LLMDecisionPolicy._artifact_builder_line_out_of_known_source_range(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 900 --with '        total = 2' > patch.diff",
+    )
+
+
+def test_llm_policy_narrows_broad_builder_using_edit_window_header_range():
+    replacement_lines = [
+        "    def value(self):",
+        "        prepared = True",
+        "        total = 2",
+        "        return total",
+        "",
+        "    def other(self):",
+        "        return 3",
+        "        extra = 4",
+        "        return extra",
+        "",
+        "    def final(self):",
+        "        value = self.other()",
+        "        return value",
+        "        unused = value",
+        "        return unused",
+        "        checkpoint = 1",
+        "        checkpoint = 2",
+        "        checkpoint = 3",
+        "        checkpoint = 4",
+        "        checkpoint = 5",
+        "        checkpoint = 6",
+        "        checkpoint = 7",
+    ]
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 708 729 "
+        + " ".join(f"--with {json.dumps(line)}" for line in replacement_lines)
+        + " > patch.diff"
+    )
+
+    class OneStepClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "rewrite a full edit window",
+                "action": "code_execute",
+                "content": broad_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(OneStepClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_broad_builder_edit_window_range_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_broad_builder_edit_window_range_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "artifact_executable_edit_windows": (
+                    "### pkg/module.py::value lines 708-729\n"
+                    " 710:         total = 1\n"
+                    " 711:         return total\n"
+                ),
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value(self):\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": "710:         total = 1\n711:         return total\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_broad_builder_narrow_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 710 --with '        total = 2' > patch.diff"
+    )
+
+
+def test_artifact_broad_builder_narrowing_skips_python_line_shape_mismatches():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_broad_narrow_line_shape_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_broad_narrow_line_shape_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value(flag):\n"
+                        "    \"\"\"Return a value.\"\"\"\n"
+                        "    if flag:\n"
+                        "        return 1\n"
+                        "    return 0\n"
+                    ),
+                },
+            },
+        )
+    )
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 1 5 "
+        "--with 'def value(flag):' "
+        "--with '    if flag:' "
+        "--with '        return 2' "
+        "--with '    return 0' > patch.diff"
+    )
+
+    narrowed = LLMDecisionPolicy._artifact_narrow_broad_builder_command(
+        state,
+        broad_command,
+        artifact_path="patch.diff",
+    )
+
+    assert "--replace-line 2 " not in narrowed
+    assert narrowed == ""
+
+
+def test_llm_policy_reasks_placeholder_artifact_replacement():
+    placeholder_command = (
+        "patch_builder --path pkg/module.py --replace-line 2 --with 'new_code_here' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "emit placeholder",
+                    "action": "code_execute",
+                    "content": placeholder_command,
+                    "done": False,
+                }
+            return {
+                "thought": "emit concrete behavior change",
+                "action": "code_execute",
+                "content": "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff",
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_placeholder_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_placeholder_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return 1\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    guard = client.payloads[1]["artifact_materialization_guard"]
+    assert guard["rejected_reason"] == "placeholder_replacement"
+    assert "new_code" in client.prompts[1]
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+
+def test_llm_policy_narrows_broad_builder_replacement_before_retry_loop():
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 1 10 "
+        "--with 'def value():' "
+        "--with '    total = 2' "
+        "--with '    return total' "
+        "--with '' "
+        "--with 'def other():' "
+        "--with '    return 3' "
+        "--with '' "
+        "--with 'def final():' "
+        "--with '    value = other()' "
+        "--with '    return value' > patch.diff"
+    )
+
+    class OneStepClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "rewrite too much",
+                "action": "code_execute",
+                "content": broad_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(OneStepClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+            "4: ",
+            "5: def other():",
+            "6:     return 3",
+            "7: ",
+            "8: def final():",
+            "9:     value = other()",
+            "10:     return value",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_broad_builder_narrow_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_broad_builder_narrow_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "\n".join(
+                        line.split(": ", 1)[1] if ": " in line else "" for line in source_lines.splitlines()
+                    )
+                    + "\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_broad_builder_narrow_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    )
+
+
+def test_llm_policy_narrows_embedded_multiline_broad_builder_payload():
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 1 10 "
+        "--with 'def value():\n"
+        "    total = 2\n"
+        "    return total\n"
+        "\n"
+        "def other():\n"
+        "    return 3\n"
+        "\n"
+        "def final():\n"
+        "    value = other()\n"
+        "    return value' > patch.diff"
+    )
+
+    class OneStepClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "rewrite too much in one payload",
+                "action": "code_execute",
+                "content": broad_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(OneStepClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+            "4: ",
+            "5: def other():",
+            "6:     return 3",
+            "7: ",
+            "8: def final():",
+            "9:     value = other()",
+            "10:     return value",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_embedded_multiline_broad_builder_narrow_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_embedded_multiline_broad_builder_narrow_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "\n".join(
+                        line.split(": ", 1)[1] if ": " in line else "" for line in source_lines.splitlines()
+                    )
+                    + "\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_broad_builder_narrow_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    )
+
+
+def test_llm_policy_accepts_bounded_broad_builder_when_narrowing_fails():
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 1 10 "
+        "--with 'def value(flag):' "
+        "--with '    if flag:' "
+        "--with '        return [' "
+        "--with '            make_error(\"new\"),' "
+        "--with '        ]' "
+        "--with '    return []' "
+        "--with '' "
+        "--with 'def other():' "
+        "--with '    return 3' "
+        "--with '' > patch.diff"
+    )
+
+    class OneStepClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "multi-line statement needs broad replacement",
+                "action": "code_execute",
+                "content": broad_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(OneStepClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value(flag):",
+            "2:     if flag:",
+            "3:         return make_error(\"old\")",
+            "4:     return []",
+            "5: ",
+            "6: def other():",
+            "7:     return 3",
+            "8: ",
+            "9: ",
+            "10: ",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_broad_builder_last_resort_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_broad_builder_last_resort_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "\n".join(
+                        line.split(": ", 1)[1] if ": " in line else "" for line in source_lines.splitlines()
+                    )
+                    + "\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_broad_builder_last_resort_direct"
+    assert decision.content == broad_command
+    assert decision.proposal_metadata["artifact_broad_builder_last_resort_direct"] is True
+
+
+def test_llm_policy_narrows_broad_builder_replacement_inside_retry_loop():
+    broad_command = (
+        "patch_builder --path pkg/module.py --replace-lines 1 10 "
+        "--with 'def value():' "
+        "--with '    total = 2' "
+        "--with '    return total' "
+        "--with '' "
+        "--with 'def other():' "
+        "--with '    return 3' "
+        "--with '' "
+        "--with 'def final():' "
+        "--with '    value = other()' "
+        "--with '    return value' > patch.diff"
+    )
+
+    class RetryClient:
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, state_payload
+            self.prompts.append(decision_prompt)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "rewrite too much",
+                "action": "code_execute",
+                "content": broad_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(RetryClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+            "4: ",
+            "5: def other():",
+            "6:     return 3",
+            "7: ",
+            "8: def final():",
+            "9:     value = other()",
+            "10:     return value",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_broad_builder_retry_narrow_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_broad_builder_retry_narrow_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "\n".join(
+                        line.split(": ", 1)[1] if ": " in line else "" for line in source_lines.splitlines()
+                    )
+                    + "\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="already inspected",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": source_lines + "\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_broad_builder_narrow_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    )
+    assert decision.proposal_metadata["artifact_materialization_retry_attempt"] == 1
+
+
+def test_llm_policy_constructs_anchor_replacement_after_bad_retry_command():
+    class AnchorClient:
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, state_payload
+            self.prompts.append(decision_prompt)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "bad placeholder command",
+                    "action": "code_execute",
+                    "content": (
+                        "patch_builder --path pkg/module.py --replace-line 999 "
+                        "--with 'new_code_here' > patch.diff"
+                    ),
+                    "done": False,
+                }
+            return {
+                "thought": "provide anchored source line",
+                "action": "code_execute",
+                "content": "2 ||     total = 2",
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(AnchorClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_anchor_replacement_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_anchor_replacement_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="already inspected",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": source_lines + "\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_retry"] is True
+    assert "<line_number> || <replacement source line>" in policy.client.prompts[2]
+
+
+def test_llm_policy_constructs_anchor_replacement_after_source_identical_retry_command():
+    class AnchorSourceIdenticalClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "copy existing source",
+                    "action": "code_execute",
+                    "content": (
+                        "patch_builder --path pkg/module.py --replace-line 2 "
+                        "--with '    total = 1' > patch.diff"
+                    ),
+                    "done": False,
+                }
+            return {
+                "thought": "provide concrete changed line",
+                "action": "code_execute",
+                "content": "2 ||     total = 2",
+                "done": False,
+            }
+
+    client = AnchorSourceIdenticalClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_anchor_source_identical_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_anchor_source_identical_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="already inspected",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": source_lines + "\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_retry"] is True
+    assert decision.proposal_metadata["rejected_reason"] == "source_identical_noop"
+    assert client.payloads[2]["artifact_anchor_repair_guard"]["rejected_reason"] == "source_identical_noop"
+
+
+def test_llm_policy_normalizes_builder_response_in_anchor_replacement_retry():
+    class AnchorBuilderClient:
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, state_payload
+            self.prompts.append(decision_prompt)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect again",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            if len(self.prompts) == 2:
+                return {
+                    "thought": "bad placeholder command",
+                    "action": "code_execute",
+                    "content": (
+                        "patch_builder --path pkg/module.py --replace-line 999 "
+                        "--with 'new_code_here' > patch.diff"
+                    ),
+                    "done": False,
+                }
+            return {
+                "thought": "still returned a builder command",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path patch.diff --replace-line 1 "
+                    "--with '    total = 2' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(AnchorBuilderClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    source_lines = "\n".join(
+        [
+            "1: def value():",
+            "2:     total = 1",
+            "3:     return total",
+        ]
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_anchor_builder_response_retry_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_anchor_builder_response_retry_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": source_lines + "\n",
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="already inspected",
+            action="code_execute",
+            content="cat source_lines/pkg/module.py.lines",
+            selected_skill_id=None,
+            command_result={
+                "command": "cat source_lines/pkg/module.py.lines",
+                "exit_code": 0,
+                "stdout": source_lines + "\n",
+                "stderr": "",
+                "timed_out": False,
+            },
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_source_lines_followup_direct",
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_anchor_replacement_direct"
+    assert decision.content == "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+    assert decision.proposal_metadata["artifact_anchor_replacement_retry"] is True
+
+
+def test_artifact_source_identical_detection_uses_line_numbered_source_fallback():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_line_numbered_noop_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_line_numbered_noop_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     return 1\n",
+                },
+            },
+        )
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_replaces_existing_source(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 2 --with ' return 1' > patch.diff",
+    )
+    details = LLMDecisionPolicy._artifact_source_identical_operation_details(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 2 --with ' return 1' > patch.diff",
+    )
+    assert details[0]["suggested_statement_range"] == {
+        "start_line": 2,
+        "end_line": 2,
+        "node_type": "Return",
+    }
+
+
+def test_artifact_source_identical_statement_range_prefers_parseable_full_source():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_parseable_source_fallback_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_parseable_source_fallback_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "    return value\n",
+                    "pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+
+    details = LLMDecisionPolicy._artifact_source_identical_operation_details(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 2 --with '    return value' > patch.diff",
+    )
+
+    assert details[0]["suggested_statement_range"] == {
+        "start_line": 2,
+        "end_line": 2,
+        "node_type": "Return",
+    }
+    assert details[0]["nearby_source_context"] == "1: def value():\n2:     return value"
+
+
+def test_artifact_materialization_rejects_literal_escaped_newline_replacement():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_escaped_newline_replacement_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_escaped_newline_replacement_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+
+    command = "patch_builder --path pkg/module.py --replace-line 2 --with '    x = 1\\n    return x' > patch.diff"
+
+    assert LLMDecisionPolicy._artifact_builder_has_escaped_newline_replacement(state, command)
+    assert LLMDecisionPolicy._artifact_materialization_rejection_reason(
+        state,
+        command,
+    ) == "escaped_newline_replacement"
+
+
+def test_llm_policy_splits_escaped_newline_builder_replacement_directly():
+    escaped_command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    x = 1\\n    return x' > patch.diff"
+    )
+
+    class OneStepClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "emit escaped newline replacement",
+                "action": "code_execute",
+                "content": escaped_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(OneStepClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_escaped_newline_split_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_escaped_newline_split_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    value = 1\n    return value\n",
+                    "source_lines/pkg/module.py.lines": "1: def value():\n2:     value = 1\n3:     return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source == "artifact_escaped_newline_split_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-lines 2 3 "
+        "--with '    x = 1' --with '    return x' > patch.diff"
+    )
+
+
+def test_artifact_invalid_python_details_flags_statement_keyword_in_expression_context():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_expression_kind_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_expression_kind_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value(flag):\n"
+                        "    if (\n"
+                        "        flag\n"
+                        "    ):\n"
+                        "        return 1\n"
+                    ),
+                },
+            },
+        )
+    )
+
+    details = LLMDecisionPolicy._artifact_invalid_python_replacement_details(
+        state,
+        "patch_builder --path pkg/module.py --replace-line 3 --with '        def bad():' > patch.diff",
+    )
+
+    assert details[0]["attempted_existing_source"] == "        flag"
+    assert details[0]["replacement_syntax_kind_mismatch"]["existing_line"] == "flag"
+    assert "same syntactic kind" in details[0]["replacement_syntax_kind_mismatch"]["repair_hint"]
+
+
+def test_artifact_invalid_python_guard_requires_parseable_baseline_source():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_python_unparseable_baseline_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_python_unparseable_baseline_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value():\n"
+                        "    return 1\n"
+                        "\n"
+                        "def broken():\n"
+                        "    call(\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = "patch_builder --path pkg/module.py --replace-line 2 --with '    return 2' > patch.diff"
+
+    assert not LLMDecisionPolicy._artifact_builder_would_produce_invalid_python(state, command)
+    assert LLMDecisionPolicy._artifact_invalid_python_replacement_details(state, command) == []
+
+
+def test_artifact_invalid_python_guard_uses_base_source_for_truncated_context(tmp_path):
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_source = repo_root / "pkg" / "module.py"
+    repo_source.parent.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    repo_source.write_text("def value():\n    return 1\n\ndef other():\n    return 3\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_python_base_source_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_python_base_source_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "semantic_verifier": {
+                    "kind": "swe_patch_apply_check",
+                    "repo": "owner/repo",
+                    "base_commit": commit,
+                    "repo_cache_root": str(tmp_path / "repos"),
+                    "patch_path": "patch.diff",
+                    "expected_changed_paths": ["pkg/module.py"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value():\n"
+                        "    return 1\n"
+                        "\n"
+                        "def truncated():\n"
+                        "    call(\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = "patch_builder --path pkg/module.py --replace-line 2 --with '    if (' > patch.diff"
+
+    assert LLMDecisionPolicy._artifact_builder_would_produce_invalid_python(state, command)
+    details = LLMDecisionPolicy._artifact_invalid_python_replacement_details(state, command)
+    assert details[0]["path"] == "pkg/module.py"
+    assert "invalid syntax" in details[0]["syntax_error"] or "never closed" in details[0]["syntax_error"]
+
+
+def test_artifact_invalid_python_guard_catches_compile_only_errors():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_invalid_python_compile_only_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_invalid_python_compile_only_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def value(obj):\n"
+                        "    return must_be(\n"
+                        "        \"x\", option=\"option\", obj=obj, id=\"test.E001\"\n"
+                        "    )\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 4 "
+        "--with \"'x', option='option', obj=obj)\" > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_would_produce_invalid_python(state, command)
+    details = LLMDecisionPolicy._artifact_invalid_python_replacement_details(state, command)
+    assert details[0]["path"] == "pkg/module.py"
+    assert "keyword argument repeated" in details[0]["syntax_error"]
+
+
+def test_llm_policy_reasks_malformed_swe_patch_builder_command_before_execution():
+    malformed_command = "swe_patch_builder --path pkg/module.py --replace-line 2 --with 'unterminated > patch.diff"
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "try malformed shell quoting",
+                    "action": "code_execute",
+                    "content": malformed_command,
+                    "done": False,
+                }
+            return {
+                "thought": "use valid quoting",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '        return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_malformed_patch_builder_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_malformed_patch_builder_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+                "setup_file_contents": {
+                    "source_context": {"pkg/module.py": "def value():\n    return value\n"}
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_command"] == malformed_command
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+
+def test_llm_policy_reasks_swe_source_read_when_patch_output_metadata_implies_repair_context():
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "inspect source",
+                    "action": "code_execute",
+                    "content": "cat pkg/module.py",
+                    "done": False,
+                }
+            return {
+                "thought": "materialize patch",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '    return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_output_metadata_context_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_patch_output_metadata_context_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "swe_patch_output_path": "patch.diff",
+                "semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"},
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "patch.diff remains on the critical path",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "critic",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 1
+    assert "artifact_materialization_guard" not in client.payloads[0]
+    assert decision.content == "cat pkg/module.py"
+
+
+def test_llm_policy_reasks_broad_swe_patch_builder_replacement():
+    broad_command = (
+        "swe_patch_builder --path pkg/module.py --replace-lines 1 24 "
+        "--with 'def value():' "
+        + " ".join(f"--with '    line_{index} = {index}'" for index in range(1, 24))
+        + " > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "replace whole function",
+                    "action": "code_execute",
+                    "content": broad_command,
+                    "done": False,
+                }
+            return {
+                "thought": "make focused edit",
+                "action": "code_execute",
+                "content": (
+                    "swe_patch_builder --path pkg/module.py --replace-line 2 "
+                    "--with '    return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_broad_patch_builder_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_broad_patch_builder_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"},
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    assert client.payloads[1]["artifact_materialization_guard"]["rejected_command"] == broad_command
+    assert decision.content == (
+        "swe_patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    return value + 1' > patch.diff"
+    )
+
+
+def test_llm_policy_reasks_definition_header_removing_builder_replacement():
+    destructive_command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "remove a method header by mistake",
+                    "action": "code_execute",
+                    "content": destructive_command,
+                    "done": False,
+                }
+            return {
+                "thought": "edit only the method body",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path pkg/module.py --replace-line 3 "
+                    "--with '        return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_definition_header_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_definition_header_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "class Reader:\n    def value(self):\n        return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    guard = client.payloads[1]["artifact_materialization_guard"]
+    assert guard["rejected_reason"] == "definition_header_removal"
+    assert "definition_header_removal" in client.prompts[1]
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+
+def test_llm_policy_reasks_definition_header_inserting_narrow_replacement():
+    destructive_command = (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '    def value(self):' "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+    class TwoStepClient:
+        def __init__(self) -> None:
+            self.prompts = []
+            self.payloads = []
+
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt
+            self.prompts.append(decision_prompt)
+            self.payloads.append(state_payload)
+            if len(self.prompts) == 1:
+                return {
+                    "thought": "insert a method header into a body line by mistake",
+                    "action": "code_execute",
+                    "content": destructive_command,
+                    "done": False,
+                }
+            return {
+                "thought": "edit only the method body",
+                "action": "code_execute",
+                "content": (
+                    "patch_builder --path pkg/module.py --replace-line 3 "
+                    "--with '        return value + 1' > patch.diff"
+                ),
+                "done": False,
+            }
+
+    client = TwoStepClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_definition_header_insertion_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_definition_header_insertion_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "class Reader:\n    def value(self):\n        return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert len(client.prompts) == 2
+    guard = client.payloads[1]["artifact_materialization_guard"]
+    assert guard["rejected_reason"] == "definition_header_removal"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-line 3 "
+        "--with '        return value + 1' > patch.diff"
+    )
+
+
+def test_artifact_definition_header_guard_rejects_single_header_line_expansion():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_definition_header_expansion_guard_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_definition_header_expansion_guard_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class A:\n"
+                        "    def value(self):\n"
+                        "        \"\"\"Return the current value.\"\"\"\n"
+                        "        return 1\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    def value(self):' --with '        return 2' > patch.diff"
+    )
+
+    assert LLMDecisionPolicy._artifact_builder_removes_definition_header(state, command)
+
+
+def test_artifact_header_signature_expand_direct_for_partial_multiline_signature():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_header_signature_expand_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_header_signature_expand_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class A:\n"
+                        "    def value(self,\n"
+                        "              flag=False):\n"
+                        "        return flag\n"
+                    ),
+                },
+            },
+        )
+    )
+    command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    def value(self, flag=True):' > patch.diff"
+    )
+
+    expanded = LLMDecisionPolicy._artifact_expand_partial_header_signature_builder_command(
+        state,
+        command,
+        artifact_path="patch.diff",
+    )
+
+    assert expanded == (
+        "patch_builder --path pkg/module.py --replace-lines 2 3 "
+        "--with '    def value(self, flag=True):' > patch.diff"
+    )
+    assert not LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, expanded)
+
+
+def test_artifact_materialization_retry_expands_partial_multiline_signature_retry():
+    retry_command = (
+        "patch_builder --path pkg/module.py --replace-line 2 "
+        "--with '    def value(self, flag=True):' > patch.diff"
+    )
+
+    class SignatureRetryClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "collapse the signature",
+                "action": "code_execute",
+                "content": retry_command,
+                "done": False,
+            }
+
+    policy = LLMDecisionPolicy(SignatureRetryClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_header_signature_retry_expand_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_header_signature_retry_expand_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "class A:\n"
+                        "    def value(self,\n"
+                        "              flag=False):\n"
+                        "        return flag\n"
+                    ),
+                },
+            },
+        )
+    )
+
+    decision = policy._artifact_materialization_retry_decision(
+        state=state,
+        system_prompt="system",
+        decision_prompt="prompt",
+        payload={},
+        proposed_content="patch_builder --path pkg/module.py --replace-line 99 --with 'changed' > patch.diff",
+        context_compile_warning=None,
+    )
+
+    assert decision is not None
+    assert decision.decision_source == "artifact_header_signature_expand_direct"
+    assert decision.content == (
+        "patch_builder --path pkg/module.py --replace-lines 2 3 "
+        "--with '    def value(self, flag=True):' > patch.diff"
+    )
+
+
+def test_llm_policy_does_not_reask_swe_missing_patch_before_source_is_inspected():
+    client = CapturingClient()
+    policy = LLMDecisionPolicy(client, config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_missing_patch_first_read_task",
+            prompt="write patch.diff",
+            workspace_subdir="swe_missing_patch_first_read_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch verifier missing patch file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+            "repair_instruction": "write patch.diff now as a source-grounded unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.content == "printf 'hello agent kernel\\n' > hello.txt"
+    assert client.last_payload is not None
+    assert "artifact_materialization_guard" not in client.last_payload
+
+
+def test_llm_policy_does_not_auto_replay_existing_non_python_swe_patch(tmp_path):
+    client = CapturingClient()
     workspace_root = tmp_path / "workspace"
     workspace = workspace_root / "swe_patch_task"
     workspace.mkdir(parents=True)
     (workspace / "patch.diff").write_text(
-        "diff --git a/pkg/module.py b/pkg/module.py\n"
-        "--- a/pkg/module.py\n"
-        "+++ b/pkg/module.py\n"
+        "diff --git a/pkg/module.txt b/pkg/module.txt\n"
+        "--- a/pkg/module.txt\n"
+        "+++ b/pkg/module.txt\n"
         "@@ -1,4 +1,4 @@\n"
         "-old\n"
         "+new\n",
         encoding="utf-8",
     )
     policy = LLMDecisionPolicy(
-        ShouldNotRunClient(),
+        client,
         config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
     )
     state = AgentState(
@@ -242,8 +4693,257 @@ def test_llm_policy_repairs_existing_swe_patch_with_builder_before_more_llm(tmp_
     decision = policy.decide(state)
 
     assert decision.action == "code_execute"
-    assert decision.content == "swe_patch_builder --from-diff patch.diff > patch.diff"
-    assert decision.decision_source == "swe_patch_builder_repair_direct"
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+
+
+def test_llm_policy_does_not_from_diff_repair_broad_swe_patch(tmp_path):
+    client = CapturingClient()
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    broad_changes = "".join(f"-old_{index}\n+new_{index}\n" for index in range(7))
+    (workspace / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,14 +1,14 @@\n"
+        f"{broad_changes}",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.subgoal_diagnoses = {
+        "repair SWE patch.diff until it applies to the base commit": {
+            "path": "patch.diff",
+            "summary": "SWE patch apply check failed: patch does not apply",
+            "repair_instruction": "rewrite patch.diff as a real unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+    assert "rewrite patch.diff as a real unified diff" in client.last_decision_prompt
+
+
+def test_llm_policy_does_not_from_diff_repair_python_swe_patch(tmp_path):
+    client = CapturingClient()
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    (workspace / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-old\n"
+        "+new\n",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.subgoal_diagnoses = {
+        "repair SWE patch.diff until it applies to the base commit": {
+            "path": "patch.diff",
+            "repair_instruction": "rewrite patch.diff as a real unified diff",
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+
+
+def test_llm_policy_does_not_from_diff_after_recent_python_builder_failure(tmp_path):
+    client = CapturingClient()
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    (workspace / "patch.diff").write_text(
+        "diff --git a/module b/module\n"
+        "--- a/module\n"
+        "+++ b/module\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-old\n"
+        "+new\n",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.subgoal_diagnoses = {
+        "repair SWE patch.diff until it applies to the base commit": {
+            "path": "patch.diff",
+            "repair_instruction": "rewrite patch.diff as a real unified diff",
+        }
+    }
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="write python patch",
+            action="code_execute",
+            content="swe_patch_builder --path pkg/module.py --replace-line 10 --with 'VALUE = 2' > patch.diff",
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["SWE patch removes existing Python definitions in pkg/module.py: run"],
+            },
+        )
+    )
+
+    decision = policy.decide(state)
+
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+
+
+def test_llm_policy_does_not_from_diff_repair_semantic_swe_definition_removal(tmp_path):
+    client = CapturingClient()
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    (workspace / "patch.diff").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1,4 +1,2 @@\n"
+        "-    def clone(self):\n"
+        "-        return copy.copy(self)\n"
+        "     def deconstruct(self):\n"
+        "         return name\n",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.active_subgoal = "repair SWE patch.diff without deleting existing source definitions"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch removes existing Python definitions in pkg/module.py: Field.clone",
+            "path": "patch.diff",
+            "repair_instruction": (
+                "rewrite patch.diff as a minimal behavior fix that preserves existing production "
+                "function and class definitions"
+            ),
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.content == "printf 'hello agent kernel\\n' > hello.txt"
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+    assert "do not run patch_builder --from-diff" in client.last_decision_prompt
+    assert "smallest behavior-changing hunk" in client.last_decision_prompt
+
+
+def test_llm_policy_does_not_from_diff_repair_swe_python_syntax_failure(tmp_path):
+    client = CapturingClient()
+    workspace_root = tmp_path / "workspace"
+    workspace = workspace_root / "swe_patch_task"
+    workspace.mkdir(parents=True)
+    (workspace / "patch.diff").write_text(
+        "diff --git a/pkg/settings.py b/pkg/settings.py\n"
+        "--- a/pkg/settings.py\n"
+        "+++ b/pkg/settings.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " import os\n"
+        "-VALUE = 1\n"
+        "+    return value\n",
+        encoding="utf-8",
+    )
+    policy = LLMDecisionPolicy(
+        client,
+        config=KernelConfig(workspace_root=workspace_root, asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="swe_patch_task",
+            prompt="repair patch.diff",
+            workspace_subdir="swe_patch_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "swe_bench_prediction_task": True,
+                "semantic_verifier": {"kind": "swe_patch_apply_check"},
+            },
+        )
+    )
+    state.active_subgoal = "repair SWE patch.diff until changed Python files parse"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "SWE patch python syntax check failed: IndentationError: unexpected indent",
+            "path": "patch.diff",
+            "repair_instruction": (
+                "rewrite patch.diff as an executable Python code change that still parses after application"
+            ),
+        }
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.content == "printf 'hello agent kernel\\n' > hello.txt"
+    assert decision.decision_source != "swe_patch_builder_repair_direct"
+    assert client.last_payload is not None
+    assert "do not run patch_builder --from-diff" in client.last_decision_prompt
+    assert "same indentation level" in client.last_decision_prompt
 
 
 def test_llm_policy_executes_swe_suggested_patch_command_before_live_llm(tmp_path):
@@ -278,8 +4978,8 @@ def test_llm_policy_executes_swe_suggested_patch_command_before_live_llm(tmp_pat
 
     assert decision.action == "code_execute"
     assert decision.content == suggested
-    assert decision.decision_source == "swe_suggested_patch_command_direct"
-    assert decision.proposal_metadata == {"swe_suggested_patch_command": True}
+    assert decision.decision_source == "artifact_suggested_builder_command_direct"
+    assert decision.proposal_metadata == {"artifact_suggested_builder_command": True}
 
 
 def test_llm_policy_does_not_repeat_attempted_swe_suggested_patch_command(tmp_path):
@@ -408,7 +5108,11 @@ class PrimaryRoutingContextProvider:
 
 def test_llm_policy_includes_tolbert_context_packet():
     client = CapturingClient()
-    policy = LLMDecisionPolicy(client, context_provider=NonDeterministicContextProvider())
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=NonDeterministicContextProvider(),
+        config=KernelConfig(asi_coding_require_live_llm=True),
+    )
 
     decision = policy.decide(AgentState(task=TaskBank().get("hello_task")))
 
@@ -420,7 +5124,11 @@ def test_llm_policy_includes_tolbert_context_packet():
 
 def test_llm_policy_emits_decision_progress_stages_for_llm_path():
     client = CapturingClient()
-    policy = LLMDecisionPolicy(client, context_provider=NonDeterministicContextProvider())
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=NonDeterministicContextProvider(),
+        config=KernelConfig(asi_coding_require_live_llm=True),
+    )
     observed = []
 
     policy.set_decision_progress_callback(lambda payload: observed.append(dict(payload)))
@@ -775,7 +5483,11 @@ def test_llm_policy_preserves_context_compile_subphases_from_provider():
             )
 
     client = CapturingClient()
-    policy = LLMDecisionPolicy(client, context_provider=ReportingContextProvider())
+    policy = LLMDecisionPolicy(
+        client,
+        context_provider=ReportingContextProvider(),
+        config=KernelConfig(asi_coding_require_live_llm=True),
+    )
     observed = []
 
     policy.set_decision_progress_callback(lambda payload: observed.append(dict(payload)))
@@ -19107,6 +23819,79 @@ def test_llm_policy_inference_failure_fallback_prefers_trusted_carryover_over_ta
     assert decision.decision_source == "trusted_retrieval_carryover_direct"
     assert decision.retrieval_influenced is True
     assert str(decision.selected_retrieval_span_id).startswith("graph:trusted_retrieval:")
+
+
+def test_llm_policy_inference_failure_fallback_reads_artifact_source_context_in_live_mode():
+    policy = LLMDecisionPolicy(
+        MockLLMClient(),
+        config=KernelConfig(asi_coding_require_live_llm=True),
+    )
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_inference_recovery_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_inference_recovery_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    return value\n",
+                    "source_lines/pkg/module.py.lines": "   1: def value():\n   2:     return value\n",
+                },
+            },
+        )
+    )
+    state.active_subgoal = "materialize expected artifact patch.diff"
+    state.subgoal_diagnoses = {
+        state.active_subgoal: {
+            "summary": "missing expected file: patch.diff",
+            "signals": ["verifier_failure"],
+            "path": "patch.diff",
+            "source_role": "verifier",
+        }
+    }
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="inspect source",
+            action="code_execute",
+            content="cat pkg/module.py",
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["missing expected file: patch.diff"],
+            },
+        )
+    )
+
+    decision = policy.fallback_decision(state, failure_origin="inference_failure")
+
+    assert decision is not None
+    assert decision.action == "code_execute"
+    assert decision.content == "cat source_lines/pkg/module.py.lines"
+    assert decision.decision_source == "artifact_inference_failure_source_context_fallback"
+
+    state.history.append(
+        StepRecord(
+            index=2,
+            thought=decision.thought,
+            action=decision.action,
+            content=decision.content,
+            selected_skill_id=None,
+            command_result=None,
+            verification={
+                "passed": False,
+                "reasons": ["missing expected file: patch.diff"],
+            },
+            decision_source=decision.decision_source,
+        )
+    )
+
+    assert policy.fallback_decision(state, failure_origin="inference_failure") is None
 
 
 def test_tolbert_ranked_candidates_skip_off_surface_trusted_carryover_even_if_candidate_leaks():

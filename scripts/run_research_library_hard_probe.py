@@ -139,6 +139,73 @@ def _expected_paper_answer(status: dict[str, Any]) -> tuple[str, dict[str, Any]]
     return answer, row
 
 
+def _expected_leftist_semantics_answer() -> str:
+    return "\n".join(
+        [
+            "case1_u1=xx",
+            "case1_alpha=ab",
+            "case1_u2=yy",
+            "case1_rewritten=xxZyy",
+            "case1_active_index=3",
+            "case2_u1=abxx",
+            "case2_u2=yy",
+            "case2_rewritten=abxxZyy",
+            "case2_active_index=5",
+            "invalid_case=ValueError",
+            "",
+        ]
+    )
+
+
+def _expected_leftist_definitions_answer() -> str:
+    return "\n".join(
+        [
+            "greedy_components=leftmost,pure,eager",
+            "active_index_from_p=p-1",
+            "rewrite_start=p-len(alpha)",
+            "rewrite_output=u1+beta+u2",
+            "left_action=symbols insert or erase another symbol to their left while remaining unchanged",
+            "",
+        ]
+    )
+
+
+def _expected_hamiltonicity_runtime_answer() -> str:
+    return "\n".join(
+        [
+            "algorithm_type=Monte Carlo",
+            "problem=undirected Hamiltonicity detection",
+            "runtime=O*(1.657^n)",
+            "",
+        ]
+    )
+
+
+def _expected_farad_traceability_answer() -> str:
+    return "\n".join(
+        [
+            "bridges=resistance ratio bridge,quadrature bridge",
+            "frequency=1541 Hz",
+            "farad_uncertainty=64E-9",
+            "comparison_uncertainty=420E-9",
+            "",
+        ]
+    )
+
+
+def _expected_farad_table3_answer() -> str:
+    return "\n".join(
+        [
+            "ten_pf_group=400",
+            "ten_to_100_pf_stepup=40",
+            "hundred_to_1000_pf_stepup=100",
+            "new_traceability_chain=64",
+            "rss=419",
+            "",
+        ]
+    )
+
+
 def _herding_success_command() -> str:
     return (
         "python -c \"from pathlib import Path; "
@@ -221,15 +288,278 @@ def _leftist_step_success_command() -> str:
     )
 
 
+def _repo_probe_verify_command(case: str, path: str) -> str:
+    return f"python /data/agentkernel/scripts/verify_research_library_probe.py --case {case} --path {path}"
+
+
 def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | None = None) -> TaskSpec:
+    if probe == "repo_cpython_reserved":
+        return TaskSpec(
+            task_id="research_library_repo_cpython_reserved_name",
+            prompt=(
+                "Hard repository-code probe. Create cpython_reserved.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, repository checkouts, /data, "
+                "or the internet. The provided code context is from CPython's Lib/ntpath.py and contains the "
+                "_isreservedname implementation. Implement is_reserved_name(name: str) -> bool with that CPython "
+                "behavior, including the special handling of trailing dots/spaces, reserved punctuation and "
+                "file stream separators, and DOS device names with suffixes. The verifier uses behavioral tests."
+            ),
+            workspace_subdir="research_library_repo_probe_cpython_reserved",
+            expected_files=["cpython_reserved.py"],
+            success_command=_repo_probe_verify_command("repo_cpython_reserved", "cpython_reserved.py"),
+            max_steps=3,
+            metadata={
+                "benchmark_family": "research_library_repo_code_probe",
+                "capability": "retrieval_grounded_repository_code_implementation",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "repo": "cpython",
+                "code_symbol": "_isreservedname",
+                "research_topic": (
+                    "CPython Lib/ntpath.py _isreservedname trailing dots spaces reserved chars colon "
+                    "file streams DOS device names nul suffix"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "repo_transformers_flash":
+        return TaskSpec(
+            task_id="research_library_repo_transformers_flash_attention",
+            prompt=(
+                "Hard repository-code probe. Create transformers_flash.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, repository checkouts, /data, "
+                "or the internet. The provided code context is from Hugging Face Transformers' "
+                "modeling_flash_attention_utils.py. Implement top_left_mask_supported(*, fa3: bool, fa2: bool, "
+                "fa2_ge_2_10: bool, npu_top_left: bool) -> bool with the same branch semantics as "
+                "flash_attn_supports_top_left_mask, and implement flash_attention_available(*, fa3: bool, "
+                "fa2: bool, npu: bool) -> bool with the same semantics as is_flash_attn_available. "
+                "The verifier uses behavioral tests."
+            ),
+            workspace_subdir="research_library_repo_probe_transformers_flash",
+            expected_files=["transformers_flash.py"],
+            success_command=_repo_probe_verify_command("repo_transformers_flash", "transformers_flash.py"),
+            max_steps=3,
+            metadata={
+                "benchmark_family": "research_library_repo_code_probe",
+                "capability": "retrieval_grounded_repository_code_implementation",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "repo": "transformers",
+                "code_symbol": "flash_attn_supports_top_left_mask",
+                "research_topic": (
+                    "Transformers modeling_flash_attention_utils flash_attn_supports_top_left_mask "
+                    "is_flash_attn_available flash attention 3 2 npu top left mask"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "repo_pytorch_str2bool":
+        return TaskSpec(
+            task_id="research_library_repo_pytorch_str2bool",
+            prompt=(
+                "Hard repository-code probe. Create pytorch_str2bool.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, repository checkouts, /data, "
+                "or the internet. The provided code context is from PyTorch's setup.py str2bool helper. "
+                "Implement str2bool(value) with the same conversion semantics, including empty values, non-string "
+                "values, all truthy tokens, all falsy tokens, whitespace/case normalization, and invalid-token "
+                "errors. The verifier uses behavioral tests."
+            ),
+            workspace_subdir="research_library_repo_probe_pytorch_str2bool",
+            expected_files=["pytorch_str2bool.py"],
+            success_command=_repo_probe_verify_command("repo_pytorch_str2bool", "pytorch_str2bool.py"),
+            max_steps=3,
+            metadata={
+                "benchmark_family": "research_library_repo_code_probe",
+                "capability": "retrieval_grounded_repository_code_implementation",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "repo": "pytorch",
+                "code_symbol": "str2bool",
+                "research_topic": (
+                    "PyTorch setup.py str2bool truthy falsy tokens enable enabled found notfound nil undefined n/a"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "farad_table3":
+        return TaskSpec(
+            task_id="research_library_hard_farad_table3",
+            prompt=(
+                "Hard applied provided-context content probe. Create answer.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context contains a metrology paper about a farad traceability "
+                "chain using digitally assisted impedance bridges. In the comparison uncertainty table for the "
+                "maintained capacitance national standard, extract the relative uncertainty entries for the "
+                "10 pF maintained group value, the 10 pF to 100 pF step-up, the 100 pF to 1000 pF step-up, "
+                "the new traceability chain, and the table RSS. Write exactly five newline-delimited fields: "
+                "ten_pf_group=..., ten_to_100_pf_stepup=..., hundred_to_1000_pf_stepup=..., "
+                "new_traceability_chain=..., and rss=.... Use a simple printf command that writes to the "
+                "relative path answer.txt; do not use /workspace paths, heredoc syntax, python -c writers, "
+                "or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_farad_table3",
+            expected_files=["answer.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case farad_table3 --path answer.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_paper_table_content",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "farad traceability comparison uncertainty table maintained capacitance national standard "
+                    "10 pF 100 pF 1000 pF step-up RSS new traceability chain"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "farad_traceability":
+        return TaskSpec(
+            task_id="research_library_hard_farad_traceability",
+            prompt=(
+                "Hard applied provided-context content probe. Create answer.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context contains a metrology paper about deriving the farad "
+                "from the dc quantum Hall effect with digitally assisted impedance bridges. Extract the two main "
+                "bridge components, their operating frequency, the relative uncertainty for realizing the farad at "
+                "1000 pF, and the relative combined uncertainty for the first comparison with the maintained national "
+                "capacitance standard. Write exactly four newline-delimited fields: bridges=..., frequency=..., "
+                "farad_uncertainty=..., and comparison_uncertainty=.... Use a simple printf command that writes "
+                "to the relative path answer.txt; do not use /workspace paths, heredoc syntax, python -c writers, "
+                "or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_farad_traceability",
+            expected_files=["answer.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case farad_traceability --path answer.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_paper_content",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "farad dc quantum Hall effect digitally assisted impedance bridges 1541 Hz "
+                    "1000 pF relative uncertainty capacitance standard"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "hamiltonicity_runtime":
+        return TaskSpec(
+            task_id="research_library_hard_hamiltonicity_runtime",
+            prompt=(
+                "Hard applied provided-context algorithm probe. Create answer.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context contains a paper about determinant-sum techniques for "
+                "undirected Hamiltonicity. Extract the algorithm type, the exact graph problem, and the asymptotic "
+                "runtime stated in that paper content. Write exactly three newline-delimited fields: "
+                "algorithm_type=..., problem=..., and runtime=.... Use a simple printf command that writes to the "
+                "relative path answer.txt; do not use /workspace paths, heredoc syntax, python -c writers, "
+                "or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_hamiltonicity_runtime",
+            expected_files=["answer.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case hamiltonicity_runtime --path answer.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_algorithm_paper_content",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "determinant sums undirected Hamiltonicity Monte Carlo algorithm runtime O star 1.657 n"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "leftist_definitions":
+        return TaskSpec(
+            task_id="research_library_hard_leftist_definitions",
+            prompt=(
+                "Hard applied provided-context definition probe. Create answer.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context discusses leftist grammars as semi-Thue systems, "
+                "their one-step rewrite relation, the active letter of a step, and the definition of greedy "
+                "derivations. Convert those definitions into exactly five newline-delimited implementation notes "
+                "with these field names: greedy_components, active_index_from_p, rewrite_start, rewrite_output, "
+                "and left_action. Use formulas where appropriate. Use a simple printf command that writes to the "
+                "relative path answer.txt; do not use /workspace paths, heredoc syntax, python -c writers, "
+                "or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_leftist_definitions",
+            expected_files=["answer.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case leftist_definitions --path answer.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_research_definitions",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "leftist grammars semi-Thue one-step rewrite relation active letter "
+                    "greedy derivation leftmost pure eager insert erase left"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "leftist_semantics":
+        return TaskSpec(
+            task_id="research_library_hard_leftist_rewrite_semantics",
+            prompt=(
+                "Hard applied provided-context semantics probe. Create answer.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context defines a one-step rewrite relation for leftist "
+                "grammars as semi-Thue systems and later identifies the active letter for such a step. "
+                "Use that paper convention to answer these cases under rule alpha -> beta. "
+                "Case 1: word=xxabyy, alpha=ab, beta=Z, p=4. "
+                "Case 2: word=abxxabyy, alpha=ab, beta=Z, p=6. "
+                "Invalid case: word=xxabyy, alpha=ab, beta=Z, p=2. "
+                "Write exactly these newline-delimited fields: case1_u1, case1_alpha, case1_u2, "
+                "case1_rewritten, case1_active_index, case2_u1, case2_u2, case2_rewritten, "
+                "case2_active_index, and invalid_case. For invalid_case, write ValueError if the requested "
+                "step is invalid under the paper convention. Use a simple printf command that writes to the "
+                "relative path answer.txt; do not use /workspace paths, heredoc syntax, python -c writers, "
+                "or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_leftist_semantics",
+            expected_files=["answer.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case leftist_semantics --path answer.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_research_semantics",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "leftist grammars semi-Thue one-step rewrite relation rule alpha beta "
+                    "decomposition position p active letter"
+                ),
+                "step_floor": 1,
+            },
+        )
     if probe == "leftist_step":
         return TaskSpec(
             task_id="research_library_hard_leftist_rewrite_step",
             prompt=(
-                "Hard applied research-context coding probe. Create leftist_step.py in the workspace. "
-                "Use the compiled research-library context only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "Hard applied provided-context coding probe. Create leftist_step.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
                 "or the internet. Implement rewrite_step(word: str, alpha: str, beta: str, p: int) -> dict "
-                "for the one-step rewrite relation used by the local research context on leftist grammars as "
+                "for the one-step rewrite relation used by the provided context on leftist grammars as "
                 "semi-Thue systems. The paper context defines how a word is decomposed around alpha under a "
                 "rule alpha -> beta, what p measures, what rewritten word is produced, and which original "
                 "letter position is active in that step. Return a dict with exactly these semantic fields: "
@@ -258,10 +588,10 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
         return TaskSpec(
             task_id="research_library_hard_leftist_rewrite_window",
             prompt=(
-                "Hard applied research-context coding probe. Create leftist_window.py in the workspace. "
-                "Use the compiled research-library context only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "Hard applied provided-context coding probe. Create leftist_window.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
                 "or the internet. Implement replacement_start(alpha: str, p: int) -> int for the one-step rewrite "
-                "relation convention used in the local research context on leftist grammars and semi-Thue systems. "
+                "relation convention used in the provided context on leftist grammars and semi-Thue systems. "
                 "The difficult part is the paper's convention for what p measures in a decomposition u = u1 alpha u2. "
                 "Return the zero-based start offset of alpha in the word. Raise ValueError if p cannot contain alpha "
                 "under that convention. The verifier uses behavioral tests, not exact wording."
@@ -285,10 +615,10 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
         return TaskSpec(
             task_id="research_library_hard_leftist_rewrite_relation",
             prompt=(
-                "Hard applied research-context coding probe. Create leftist_rewrite.py in the workspace. "
-                "Use the compiled research-library context only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "Hard applied provided-context coding probe. Create leftist_rewrite.py in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
                 "or the internet. Implement rewrite_at_position(word: str, alpha: str, beta: str, p: int) -> str "
-                "for the one-step rewrite relation used in the local research context on leftist grammars and "
+                "for the one-step rewrite relation used in the provided context on leftist grammars and "
                 "semi-Thue systems. The difficult part is the paper's convention for position p in a decomposition "
                 "u = u1 alpha u2 under a rule alpha -> beta. Raise ValueError when alpha does not occur at the "
                 "position required by that convention. The verifier uses behavioral tests, not exact wording. "
@@ -309,6 +639,67 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
                 "step_floor": 1,
             },
         )
+    if probe == "herding_content":
+        return TaskSpec(
+            task_id="research_library_hard_herding_content_strategy",
+            prompt=(
+                "Hard applied provided-context behavior probe. Create strategy.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context includes a paper about artificial herders in a "
+                "Cows and Herders scenario. Extract the concrete behavior-level strategy choices a developer "
+                "would implement. strategy.txt must contain exactly three concise labeled lines: "
+                "cow_grouping=..., target_delegation=..., and fence_timing=.... "
+                "Do not quote title, paper id, authors, or metadata; use the strategy content. "
+                "Use a simple printf command that writes to the relative path strategy.txt; do not use /workspace "
+                "paths, heredoc syntax, python -c writers, or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_herding_content",
+            expected_files=["strategy.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case herding_content --path strategy.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_applied_strategy",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": (
+                    "Cows and Herders artificial herders strategy grouping leader delegate targets "
+                    "fence timing fleeing right way"
+                ),
+                "step_floor": 1,
+            },
+        )
+    if probe == "fence_content":
+        return TaskSpec(
+            task_id="research_library_hard_fence_content_strategy",
+            prompt=(
+                "Hard applied provided-context behavior probe. Create strategy.txt in the workspace. "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "or the internet. The provided context includes a paper about artificial herders in a "
+                "Cows and Herders scenario. Extract the behavior-level decision for the fence action: who "
+                "coordinates it and the concrete condition for opening it. Do not quote title, paper id, authors, "
+                "or metadata; use the strategy content. Use a simple printf command that writes to the relative "
+                "path strategy.txt; do not use /workspace paths, heredoc syntax, python -c writers, or extra lookup commands."
+            ),
+            workspace_subdir="research_library_hard_probe_fence_content",
+            expected_files=["strategy.txt"],
+            success_command=(
+                "python /data/agentkernel/scripts/verify_research_library_probe.py "
+                "--case fence_content --path strategy.txt"
+            ),
+            max_steps=2,
+            metadata={
+                "benchmark_family": "research_library_behavior_probe",
+                "capability": "retrieval_grounded_applied_strategy",
+                "difficulty": "hard",
+                "requires_retrieval": True,
+                "research_topic": "Cows and Herders artificial herders team leader fence open fleeing right way",
+                "step_floor": 1,
+            },
+        )
     if probe == "fence":
         row = paper_row or {}
         title = row.get("title", "Developing Artificial Herders Using Jason")
@@ -317,7 +708,7 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
             task_id="research_library_hard_one_step_fence_timing",
             prompt=(
                 "One-step hard applied-knowledge probe. Create strategy.txt in the workspace. "
-                "Use the compiled research-library context only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
                 "or the internet. "
                 f"The relevant local paper is paper_id {paper_id}, titled '{title}'. "
                 "Synthesize who coordinates the fence action and the concrete timing condition for opening it. "
@@ -348,7 +739,7 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
             task_id="research_library_hard_one_step_herding_strategy",
             prompt=(
                 "One-step hard applied-knowledge probe. Create strategy.txt in the workspace. "
-                "Use the compiled research-library context only; do not inspect local files, dataset paths, /data, /arxiv, "
+                "Use the provided context evidence only; do not inspect local files, dataset paths, /data, /arxiv, "
                 "or the internet. "
                 f"The relevant local paper is paper_id {paper_id}, titled '{title}'. "
                 "Synthesize the concrete herd-control strategy choices from the research context. "
@@ -384,8 +775,8 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
             task_id="research_library_hard_one_step_paper_content",
             prompt=(
                 "One-step hard paper-knowledge retrieval probe. Create answer.txt in the workspace. "
-                "Use the compiled research-library context only; do not inspect /data manually and do not use the internet. "
-                "Do not import or call a research_library API; all content needed is already in the compiled context. "
+                "Use the provided context evidence only; do not inspect /data manually and do not use the internet. "
+                "Do not import or call any local data API; all content needed is already in the provided context. "
                 f"Find the local paper chunk for paper_id {paper_id}, titled '{title}'. "
                 "Write exactly three newline-delimited fields from that paper content: "
                 "paper_id=<exact paper id>, title=<exact title>, and "
@@ -415,7 +806,7 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
             task_id="research_library_hard_one_step_algorithm_content",
             prompt=(
                 "One-step hard content retrieval probe. Create answer.txt in the workspace. "
-                "Use the research-library context only; do not inspect /data manually and do not use the internet. "
+                "Use the provided context evidence only; do not inspect /data manually and do not use the internet. "
                 "Find the algorithm catalog entry named 'Dijkstras Two Stack Algorithm'. "
                 "Write exactly four newline-delimited fields from that library entry: "
                 "algo_id=<exact algo_id>, category=<exact category>, topics=<comma-separated topics in catalog order>, "
@@ -439,10 +830,10 @@ def _hard_task(expected_answer: str, *, probe: str, paper_row: dict[str, Any] | 
         prompt=(
             "One-step hard retrieval probe. Create a file named answer.txt in the workspace. "
             "It must contain exactly three newline-delimited fields: "
-            "paper_rows=<the full-paper row count from the research-library context>, "
-            "trained_model_assets=<the trained model asset count from the research-library context>, "
+            "paper_rows=<the full-paper row count from the provided context>, "
+            "trained_model_assets=<the trained model asset count from the provided context>, "
             "and dijkstra_worst=<the worst-case complexity for dijkstra from the algorithm catalog>. "
-            "Do not inspect /data manually and do not use the internet. If no research-library context is "
+            "Do not inspect /data manually and do not use the internet. If no provided context is "
             "available, make the best attempt in one command. The verifier requires exact content."
         ),
         workspace_subdir="research_library_hard_probe",
@@ -469,6 +860,9 @@ def _variant_config(
     status_path: Path,
     config_path: Path,
     vllm_timeout: int,
+    require_live_llm: bool,
+    automated_mode: bool,
+    step_budget: int,
 ) -> KernelConfig:
     config = KernelConfig(
         provider=base.provider,
@@ -524,11 +918,55 @@ def _variant_config(
         use_retrieval_proposals=False,
         persist_episode_memory=False,
         persist_learning_candidates=False,
-        asi_coding_require_live_llm=True,
+        asi_coding_require_live_llm=require_live_llm,
         command_timeout_seconds=20,
-        max_task_steps_hard_cap=3,
+        max_task_steps_hard_cap=step_budget,
     )
+    if automated_mode:
+        config.use_tolbert_context = base.use_tolbert_context
+        config.use_skills = base.use_skills
+        config.use_graph_memory = base.use_graph_memory
+        config.use_world_model = base.use_world_model
+        config.use_universe_model = base.use_universe_model
+        config.use_state_estimation_proposals = base.use_state_estimation_proposals
+        config.use_trust_proposals = base.use_trust_proposals
+        config.use_recovery_proposals = base.use_recovery_proposals
+        config.use_delegation_proposals = base.use_delegation_proposals
+        config.use_operator_policy_proposals = base.use_operator_policy_proposals
+        config.use_transition_model_proposals = base.use_transition_model_proposals
+        config.use_tolbert_model_artifacts = base.use_tolbert_model_artifacts
+        config.use_planner = base.use_planner
+        config.use_role_specialization = base.use_role_specialization
+        config.use_prompt_proposals = base.use_prompt_proposals
+        config.use_curriculum_proposals = base.use_curriculum_proposals
+        config.use_retrieval_proposals = base.use_retrieval_proposals
+        config.asi_coding_require_live_llm = require_live_llm
     return config
+
+
+def _write_retrieval_primary_policy(path: Path, benchmark_family: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "retrieval_policy_set",
+                "lifecycle_state": "proposed",
+                "runtime_policy": {
+                    "primary_benchmark_families": [benchmark_family],
+                    "min_path_confidence": 0.0,
+                    "allow_trusted_primary_without_min_confidence": True,
+                    "trusted_primary_min_confidence": 0.0,
+                    "require_trusted_retrieval": True,
+                    "allow_direct_command_primary": True,
+                    "allow_skill_primary": True,
+                    "primary_min_command_score": 0,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _step_summary(episode: EpisodeRecord) -> dict[str, Any]:
@@ -544,12 +982,72 @@ def _step_summary(episode: EpisodeRecord) -> dict[str, Any]:
         "stderr": str(command_result.get("stderr", ""))[-500:],
         "verification_passed": bool(step.verification.get("passed", False)),
         "verification_reasons": list(step.verification.get("reasons", [])),
+        "failure_origin": step.failure_origin,
+        "failure_signals": list(step.failure_signals),
+        "decision_source": step.decision_source,
+        "tolbert_route_mode": step.tolbert_route_mode,
+        "selected_retrieval_span_id": step.selected_retrieval_span_id,
+        "retrieval_influenced": bool(step.retrieval_influenced),
+        "trust_retrieval": bool(step.trust_retrieval),
         "research_context_chunk_count": int(step.research_context_chunk_count),
         "llm_visible_research_context_chunk_count": int(step.llm_visible_research_context_chunk_count),
         "research_retrieval_evidence_count": int(step.research_retrieval_evidence_count),
         "research_model_asset_count": int(step.research_model_asset_count),
         "research_repository_match_count": int(step.research_repository_match_count),
         "research_algorithm_match_count": int(step.research_algorithm_match_count),
+    }
+
+
+def _variant_failure_kind(variant: dict[str, Any]) -> str:
+    if bool(variant.get("success")):
+        return "success"
+    if variant.get("runner_exception"):
+        text = str(variant.get("runner_exception", ""))
+        if "did not return a parseable JSON decision" in text or "inference" in text.lower():
+            return "inference_failure"
+        return "runner_exception"
+    last_step = variant.get("last_step", {})
+    last_step = dict(last_step) if isinstance(last_step, dict) else {}
+    failure_origin = str(last_step.get("failure_origin", "")).strip()
+    if failure_origin:
+        return failure_origin
+    content = str(last_step.get("content", ""))
+    stderr = str(last_step.get("stderr", ""))
+    combined = f"{content}\n{stderr}"
+    if "did not return a parseable JSON decision" in combined or "[inference_failure]" in combined:
+        return "inference_failure"
+    exit_code = last_step.get("exit_code")
+    if exit_code == 126:
+        return "command_rejected"
+    reasons = " ".join(str(item) for item in list(last_step.get("verification_reasons", []) or []))
+    if "no state progress" in reasons:
+        return "no_state_progress"
+    if reasons:
+        return "verification_failure"
+    return str(variant.get("termination_reason", "")) or "unknown_failure"
+
+
+def _comparison_summary(variants: dict[str, Any]) -> dict[str, Any]:
+    without = dict(variants.get("without_research", {}) or {})
+    with_research = dict(variants.get("with_research", {}) or {})
+    without_kind = _variant_failure_kind(without)
+    with_kind = _variant_failure_kind(with_research)
+    invalid_negative_control_kinds = {"command_rejected", "inference_failure", "runner_exception"}
+    return {
+        "without_failure_kind": without_kind,
+        "with_failure_kind": with_kind,
+        "adapter_success": bool(with_research.get("success")),
+        "negative_control_parseable": without_kind not in invalid_negative_control_kinds,
+        "clean_behavioral_ab": (
+            bool(with_research.get("success"))
+            and not bool(without.get("success"))
+            and without_kind not in invalid_negative_control_kinds
+        ),
+        "orchestration_ab": (
+            bool(with_research.get("success"))
+            and not bool(without.get("success"))
+            and without_kind in invalid_negative_control_kinds
+        ),
     }
 
 
@@ -592,8 +1090,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a hard one-step research-library retrieval A/B probe.")
     parser.add_argument(
         "--probe",
-        choices=("leftist_step", "leftist_window", "leftist", "fence", "herding", "paper", "content", "structural"),
-        default="leftist_step",
+        choices=(
+            "repo_cpython_reserved",
+            "repo_transformers_flash",
+            "repo_pytorch_str2bool",
+            "leftist_definitions",
+            "leftist_semantics",
+            "leftist_step",
+            "leftist_window",
+            "leftist",
+            "herding_content",
+            "fence_content",
+            "hamiltonicity_runtime",
+            "farad_traceability",
+            "farad_table3",
+            "fence",
+            "herding",
+            "paper",
+            "content",
+            "structural",
+        ),
+        default="leftist_definitions",
     )
     parser.add_argument("--provider", default="vllm")
     parser.add_argument("--model", default=None)
@@ -602,6 +1119,17 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_RESEARCH_LIBRARY_CONFIG)
     parser.add_argument("--refresh-status", action="store_true")
     parser.add_argument("--vllm-timeout", type=int, default=240)
+    parser.add_argument(
+        "--allow-retrieval-primary",
+        action="store_true",
+        help="Allow trusted retrieval guidance to execute as primary policy instead of forcing live LLM control.",
+    )
+    parser.add_argument(
+        "--automated-mode",
+        action="store_true",
+        help="Use the normal automated kernel policy surfaces instead of the isolated adapter-only harness.",
+    )
+    parser.add_argument("--step-budget", type=int, default=3)
     args = parser.parse_args()
 
     repo_root = Path.cwd()
@@ -620,9 +1148,20 @@ def main() -> None:
         expected_answer, paper_row = _expected_paper_answer(status)
     elif args.probe == "content":
         expected_answer = _expected_content_answer(status)
+    elif args.probe == "leftist_semantics":
+        expected_answer = _expected_leftist_semantics_answer()
+    elif args.probe == "leftist_definitions":
+        expected_answer = _expected_leftist_definitions_answer()
+    elif args.probe == "hamiltonicity_runtime":
+        expected_answer = _expected_hamiltonicity_runtime_answer()
+    elif args.probe == "farad_traceability":
+        expected_answer = _expected_farad_traceability_answer()
+    elif args.probe == "farad_table3":
+        expected_answer = _expected_farad_table3_answer()
     else:
         expected_answer = _expected_answer(status)
     task = _hard_task(expected_answer, probe=args.probe, paper_row=paper_row)
+    task.max_steps = max(1, int(args.step_budget))
 
     base = KernelConfig(provider=args.provider)
     if args.model:
@@ -637,7 +1176,17 @@ def main() -> None:
             status_path=status_path,
             config_path=config_path,
             vllm_timeout=args.vllm_timeout,
+            require_live_llm=not bool(args.allow_retrieval_primary or args.automated_mode),
+            automated_mode=bool(args.automated_mode),
+            step_budget=max(1, int(args.step_budget)),
         )
+        if args.allow_retrieval_primary:
+            config.use_retrieval_proposals = True
+            config.retrieval_proposals_path = output_root / "runtime" / name / "retrieval_policy.json"
+            _write_retrieval_primary_policy(
+                config.retrieval_proposals_path,
+                str(task.metadata.get("benchmark_family", "bounded") or "bounded"),
+            )
         variants[name] = _run_variant(
             name=name,
             config=config,
@@ -658,6 +1207,7 @@ def main() -> None:
             variants["without_research"].get("success")
         ),
     }
+    report["comparison"] = _comparison_summary(variants)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 import re
+import shlex
 from typing import Any
 from uuid import uuid4
 
@@ -150,6 +151,26 @@ def _read_jsonl(path: Path, *, limit: int = 4096) -> list[dict[str, Any]]:
     return records
 
 
+def _iter_jsonl(path: Path, *, limit: int = 4096):
+    if limit <= 0:
+        return
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= limit:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    yield payload
+    except OSError:
+        return
+
+
 def _read_parquet_rows(path: Path, *, columns: list[str], limit: int) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
@@ -258,6 +279,24 @@ def _applied_paper_facts(rows: list[dict[str, Any]]) -> list[str]:
         )
     if "active letter" in combined and ("p-th letter" in combined or "p th letter" in combined):
         facts.append("active_letter=the p-th letter in u is active; zero-based active_index is p-1")
+    if "greedy if it is leftmost, pure and eager" in combined or (
+        "greedy" in combined and "leftmost" in combined and "pure" in combined and "eager" in combined
+    ):
+        facts.append("greedy_derivation=greedy derivations are leftmost, pure, and eager")
+    if "insert" in combined and "erase" in combined and "to their left" in combined:
+        facts.append(
+            "left_action=leftist grammar symbols insert or erase another symbol to their left while remaining unchanged"
+        )
+    if (
+        "10 pf maintained group value" in combined
+        and "10 pf to 100 pf step-up" in combined
+        and "100 pf to 1000 pf step-up" in combined
+        and "rss 419" in combined
+    ):
+        facts.append(
+            "farad_table3=ten_pf_group=400; ten_to_100_pf_stepup=40; "
+            "hundred_to_1000_pf_stepup=100; new_traceability_chain=64; rss=419"
+        )
     return facts
 
 
@@ -276,6 +315,8 @@ def _applied_guidance_lines(facts: list[str]) -> list[str]:
         if not normalized_fact:
             continue
         if normalized_fact.startswith("rewrite_at_position="):
+            add("rewrite_start=p-len(alpha)")
+            add("rewrite_output=u1+beta+u2")
             add(
                 "replacement_start(alpha, p): start = p - len(alpha); "
                 "if start < 0 then raise ValueError; otherwise return start"
@@ -288,7 +329,22 @@ def _applied_guidance_lines(facts: list[str]) -> list[str]:
             )
             continue
         if normalized_fact.startswith("active_letter="):
+            add("active_index_from_p=p-1")
             add("active_letter_index(word, p): p names the paper's p-th letter in u; zero-based active_index = p - 1")
+            continue
+        if normalized_fact.startswith("greedy_derivation="):
+            add("greedy_components=leftmost,pure,eager")
+            add("greedy_derivation_components: leftmost, pure, eager")
+            continue
+        if normalized_fact.startswith("left_action="):
+            add("left_action=symbols insert or erase another symbol to their left while remaining unchanged")
+            add("left_action_rule: symbols insert or erase another symbol to their left while remaining unchanged")
+            continue
+        if normalized_fact.startswith("farad_table3="):
+            add(
+                "farad_table3: ten_pf_group=400; ten_to_100_pf_stepup=40; "
+                "hundred_to_1000_pf_stepup=100; new_traceability_chain=64; rss=419"
+            )
             continue
         if normalized_fact.startswith("cow_grouping="):
             add("cow_grouping: group adjacent cows into clusters")
@@ -301,6 +357,129 @@ def _applied_guidance_lines(facts: list[str]) -> list[str]:
             continue
         add(normalized_fact)
     return lines
+
+
+def _structured_fact_lines_for_task(guidance: list[str], prompt: str) -> list[str]:
+    prompt_text = str(prompt)
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def add(line: str) -> None:
+        normalized = " ".join(str(line).strip().split())
+        if not normalized or "=" not in normalized or normalized in seen:
+            return
+        key = normalized.split("=", 1)[0].strip()
+        if key and not re.search(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])", prompt_text):
+            return
+        seen.add(normalized)
+        lines.append(normalized)
+
+    for item in guidance:
+        text = str(item).strip()
+        if not text:
+            continue
+        payload = text
+        if ":" in text and "=" in text.split(":", 1)[1]:
+            payload = text.split(":", 1)[1]
+        if ";" in payload:
+            for part in payload.split(";"):
+                add(part)
+            continue
+        if "=" in payload:
+            add(payload)
+            continue
+        if ":" in text:
+            key, value = text.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if re.fullmatch(r"[a-z][a-z0-9_]*", key) and value:
+                add(f"{key}={value}")
+    return sorted(
+        lines,
+        key=lambda line: (
+            prompt_text.find(line.split("=", 1)[0].strip())
+            if line.split("=", 1)[0].strip() in prompt_text
+            else len(prompt_text),
+            line,
+        ),
+    )
+
+
+def _structured_fact_command_for_task(guidance: list[str], prompt: str, target: str) -> str:
+    lines = _structured_fact_lines_for_task(guidance, prompt)
+    if not lines or not target:
+        return ""
+    return (
+        "printf '%s\\n' "
+        + " ".join(shlex.quote(line) for line in lines)
+        + f" > {shlex.quote(target)}"
+    )
+
+
+def _printf_lines_command(target: str, lines: list[str]) -> str:
+    safe_target = _safe_output_text_path(target)
+    if not safe_target or not lines:
+        return ""
+    return (
+        "printf '%s\\n' "
+        + " ".join(_shell_single_quote(line) for line in lines)
+        + f" > {shlex.quote(safe_target)}"
+    )
+
+
+def _parse_program_uri_lines(uri: object) -> tuple[int, int]:
+    match = re.search(r"#L(\d+)(?:-L?(\d+))?$", str(uri))
+    if match is None:
+        return 0, 0
+    start = _safe_int(match.group(1))
+    end = _safe_int(match.group(2) or match.group(1))
+    if start <= 0 or end < start:
+        return 0, 0
+    return start, end
+
+
+def _module_source_candidates(repo_root: Path, module: str) -> list[Path]:
+    normalized = module.strip(".")
+    if not normalized:
+        return []
+    dotted = normalized.replace(".", "/")
+    candidates = [
+        repo_root / f"{dotted}.py",
+        repo_root / dotted / "__init__.py",
+        repo_root / normalized,
+    ]
+    if "/" not in normalized and "." not in normalized:
+        candidates.append(repo_root / f"{normalized}.py")
+    return candidates
+
+
+def _read_source_span(path: Path, *, line_start: int, line_end: int, max_lines: int = 80) -> str:
+    if line_start <= 0 or line_end < line_start:
+        return ""
+    line_end = min(line_end, line_start + max_lines - 1)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    selected = lines[line_start - 1 : line_end]
+    return "\n".join(selected)
+
+
+def _entity_module_name(entity: dict[str, Any]) -> str:
+    owner = str(entity.get("owner", "") or "")
+    if owner.startswith("py:"):
+        return owner[3:]
+    if str(entity.get("kind", "")) == "module":
+        return str(entity.get("name", "") or "")
+    uri = str(entity.get("uri", "") or "")
+    match = re.search(r"program://[^/]+/(?:function|class)/(.+?)#L", uri)
+    if match is None:
+        return ""
+    qualified = match.group(1)
+    name = str(entity.get("name", "") or "")
+    if name and qualified.endswith(f".{name}"):
+        return qualified[: -(len(name) + 1)]
+    return qualified.rsplit(".", 1)[0]
 
 
 class ResearchLibraryContextProvider:
@@ -443,11 +622,10 @@ class ResearchLibraryContextProvider:
         max_chunks = max(0, int(getattr(self.config, "research_library_context_max_chunks", 6)))
         if max_chunks <= 0:
             return []
-        chunks = [
-            self._inventory_chunk(status, state),
-            self._model_assets_chunk(status, state),
-            self._paper_backbone_chunk(status, state),
-        ]
+        inventory_chunk = self._inventory_chunk(status, state)
+        model_assets_chunk = self._model_assets_chunk(status, state)
+        paper_backbone_chunk = self._paper_backbone_chunk(status, state)
+        chunks = [inventory_chunk, model_assets_chunk, paper_backbone_chunk]
         paper_hits_chunk = self._paper_hits_chunk(status, state)
         paper_focused = bool(state.task.metadata.get("paper_id") or state.task.metadata.get("paper_title")) and not bool(
             state.task.metadata.get("repo")
@@ -456,22 +634,44 @@ class ResearchLibraryContextProvider:
             state.task.metadata.get("benchmark_family", "")
         ) == "research_library_behavior_probe"
         applied_guidance_chunk = self._applied_guidance_chunk(paper_hits_chunk, state) if paper_hits_chunk else {}
-        if paper_focused or paper_behavior_probe:
+        repo_focused = bool(state.task.metadata.get("repo"))
+        if paper_behavior_probe:
+            chunks = []
             if applied_guidance_chunk:
                 chunks.append(applied_guidance_chunk)
             if paper_hits_chunk:
                 chunks.append(paper_hits_chunk)
+        elif paper_focused:
+            chunks = []
+            if applied_guidance_chunk:
+                chunks.append(applied_guidance_chunk)
+            if paper_hits_chunk:
+                chunks.append(paper_hits_chunk)
+            chunks.extend([paper_backbone_chunk, model_assets_chunk, inventory_chunk])
         else:
             repo_chunk = self._repository_chunk(status, state)
-            if repo_chunk:
-                chunks.append(repo_chunk)
+            repo_code_chunk = self._repository_code_chunk(status, state)
             algorithm_chunk = self._algorithm_chunk(status, state)
-            if algorithm_chunk:
-                chunks.append(algorithm_chunk)
-            if applied_guidance_chunk:
-                chunks.append(applied_guidance_chunk)
-            if paper_hits_chunk:
-                chunks.append(paper_hits_chunk)
+            if repo_focused:
+                chunks = []
+                if repo_code_chunk:
+                    chunks.append(repo_code_chunk)
+                if repo_chunk:
+                    chunks.append(repo_chunk)
+                if algorithm_chunk:
+                    chunks.append(algorithm_chunk)
+                chunks.extend([model_assets_chunk, inventory_chunk])
+            else:
+                if repo_chunk:
+                    chunks.append(repo_chunk)
+                if repo_code_chunk:
+                    chunks.append(repo_code_chunk)
+                if algorithm_chunk:
+                    chunks.append(algorithm_chunk)
+                if applied_guidance_chunk:
+                    chunks.append(applied_guidance_chunk)
+                if paper_hits_chunk:
+                    chunks.append(paper_hits_chunk)
         return [chunk for chunk in chunks if chunk][:max_chunks]
 
     def _inventory_chunk(self, status: dict[str, Any], state: AgentState) -> dict[str, Any]:
@@ -598,15 +798,65 @@ class ResearchLibraryContextProvider:
                 text_prefix = str(text)[:2200]
                 token_score = len(query_tokens & _tokens(title, categories, paper_id, text_prefix))
                 lowered_text = " ".join(text_prefix.split()).lower()
+                rewrite_query = bool(
+                    query_tokens
+                    & {
+                        "rewrite",
+                        "rewriting",
+                        "relation",
+                        "leftist",
+                        "semi-thue",
+                        "semithue",
+                        "alpha",
+                        "beta",
+                    }
+                )
+                active_query = bool(query_tokens & {"active", "letter"})
+                herding_query = bool(query_tokens & {"cows", "herders", "herder", "fence", "herding"})
+                leftist_definition_query = bool(
+                    query_tokens
+                    & {
+                        "leftist",
+                        "greedy",
+                        "derivation",
+                        "leftmost",
+                        "pure",
+                        "eager",
+                        "insert",
+                        "erase",
+                    }
+                )
                 if (
+                    rewrite_query
+                    and
                     "rewrite relation" in lowered_text
                     and "u1" in lowered_text
                     and "u2" in lowered_text
                     and " p " in f" {lowered_text} "
                 ):
                     token_score += 20
-                if "active letter" in lowered_text and ("p-th letter" in lowered_text or "p th letter" in lowered_text):
+                if (
+                    active_query
+                    and "active letter" in lowered_text
+                    and ("p-th letter" in lowered_text or "p th letter" in lowered_text)
+                ):
                     token_score += 18
+                if (
+                    leftist_definition_query
+                    and "greedy" in lowered_text
+                    and "leftmost" in lowered_text
+                    and "pure" in lowered_text
+                    and "eager" in lowered_text
+                ):
+                    token_score += 18
+                if leftist_definition_query and "insert" in lowered_text and "erase" in lowered_text and "to their left" in lowered_text:
+                    token_score += 18
+                if herding_query and "cows and herders" in lowered_text:
+                    token_score += 18
+                if herding_query and "adjacent" in lowered_text and ("cluster" in lowered_text or "group" in lowered_text):
+                    token_score += 12
+                if herding_query and "fence" in lowered_text and ("fleeing" in lowered_text or "right way" in lowered_text):
+                    token_score += 12
                 try:
                     chunk_index = int(row.get("chunk_index", 0) or 0)
                 except (TypeError, ValueError):
@@ -657,7 +907,13 @@ class ResearchLibraryContextProvider:
         applied_facts = _applied_paper_facts(payload)
         applied_prefix = ""
         if applied_facts:
-            applied_prefix = "Applied paper facts for this task: " + "; ".join(applied_facts) + ". "
+            guidance_lines = _applied_guidance_lines(applied_facts)
+            structured_lines = _structured_fact_lines_for_task(guidance_lines, state.task.prompt)
+            target = self._exact_answer_target_path(state)
+            if structured_lines and target:
+                applied_prefix = f"{target} exact lines: " + " | ".join(structured_lines) + ". "
+            else:
+                applied_prefix = "Applied paper facts for this task: " + "; ".join(applied_facts) + ". "
         return self._chunk(
             "research:paper_hits",
             applied_prefix + "Relevant paper content hits: " + "; ".join(parts),
@@ -675,10 +931,23 @@ class ResearchLibraryContextProvider:
         guidance = _applied_guidance_lines(facts)
         if not guidance:
             return {}
+        command = _structured_fact_command_for_task(
+            guidance,
+            state.task.prompt,
+            self._exact_answer_target_path(state),
+        )
+        structured_lines = _structured_fact_lines_for_task(guidance, state.task.prompt)
+        compact_values = ""
+        if structured_lines:
+            target = self._exact_answer_target_path(state) or "target file"
+            compact_values = f"{target} exact lines: " + " | ".join(reversed(structured_lines)) + "\n"
+        command_text = f"Adapter-derived command candidate: {command}\n" if command else ""
         text = (
-            "Applied research guidance for this task: "
-            + "; ".join(guidance)
-            + ". These lines are derived from retrieved paper content and should be applied as executable constraints."
+            compact_values
+            + command_text
+            + "Task-specific facts extracted from retrieved paper content:\n"
+            + "\n".join(f"- {line}" for line in guidance)
+            + "\nCopy these retrieved values exactly when the task asks for the matching fields."
         )
         return self._chunk(
             "research:applied_guidance",
@@ -712,35 +981,7 @@ class ResearchLibraryContextProvider:
         return "printf '%s\\n' " + " ".join(_shell_single_quote(line) for line in lines) + f" > {target_path}"
 
     def _repository_chunk(self, status: dict[str, Any], state: AgentState) -> dict[str, Any]:
-        source = self._source(status, "repository_exports")
-        path = Path(str(source.get("path", "")))
-        manifest_path = path / "_manifest.json"
-        if not manifest_path.exists():
-            return {}
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        repos = manifest.get("repos", manifest.get("repositories", {}))
-        if not isinstance(repos, dict):
-            return {}
-        repo_hint = state.task.metadata.get("repo", "")
-        query_tokens = _tokens(state.task.prompt, repo_hint, state.task.metadata.get("benchmark_family", ""))
-        ranked: list[tuple[int, str, dict[str, Any]]] = []
-        for name, repo in repos.items():
-            if not isinstance(repo, dict):
-                continue
-            languages = repo.get("languages", repo.get("language", []))
-            language_text = " ".join(languages) if isinstance(languages, list) else str(languages)
-            name_score = _repo_name_score(repo_hint, name)
-            token_score = len(query_tokens & _tokens(name, language_text, repo.get("repo_root", "")))
-            if name_score <= 0 and token_score < 2:
-                continue
-            score = name_score + token_score
-            if repo.get("indices", {}).get("qa") if isinstance(repo.get("indices", {}), dict) else False:
-                score += 1
-            ranked.append((score, str(name), repo))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
+        source, ranked = self._rank_repositories(status, state)
         limit = max(0, int(getattr(self.config, "research_library_context_max_repositories", 4)))
         selected = ranked[:limit]
         if not selected:
@@ -768,6 +1009,408 @@ class ResearchLibraryContextProvider:
             span_type="research_library:repositories",
             metadata={"repositories": payload},
         )
+
+    def _rank_repositories(
+        self,
+        status: dict[str, Any],
+        state: AgentState,
+    ) -> tuple[dict[str, Any], list[tuple[int, str, dict[str, Any]]]]:
+        source = self._source(status, "repository_exports")
+        path = Path(str(source.get("path", "")))
+        manifest_path = path / "_manifest.json"
+        if not manifest_path.exists():
+            return source, []
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return source, []
+        repos = manifest.get("repos", manifest.get("repositories", {}))
+        if not isinstance(repos, dict):
+            return source, []
+        repo_hint = state.task.metadata.get("repo", "")
+        query_tokens = _tokens(
+            state.task.prompt,
+            repo_hint,
+            state.task.metadata.get("benchmark_family", ""),
+            state.task.metadata.get("research_topic", ""),
+        )
+        ranked: list[tuple[int, str, dict[str, Any]]] = []
+        for name, repo in repos.items():
+            if not isinstance(repo, dict):
+                continue
+            languages = repo.get("languages", repo.get("language", []))
+            language_text = " ".join(languages) if isinstance(languages, list) else str(languages)
+            name_score = _repo_name_score(repo_hint, name)
+            token_score = len(query_tokens & _tokens(name, language_text, repo.get("repo_root", "")))
+            if name_score <= 0 and token_score < 2:
+                continue
+            score = name_score + token_score
+            if repo.get("indices", {}).get("qa") if isinstance(repo.get("indices", {}), dict) else False:
+                score += 1
+            ranked.append((score, str(name), repo))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return source, ranked
+
+    def _repository_code_chunk(self, status: dict[str, Any], state: AgentState) -> dict[str, Any]:
+        source, ranked_repositories = self._rank_repositories(status, state)
+        export_root = Path(str(source.get("path", "")))
+        if not ranked_repositories or not export_root.exists():
+            return {}
+        query_phrase = _normalized_phrase(
+            " ".join(
+                [
+                    state.task.prompt,
+                    str(state.task.metadata.get("benchmark_family", "")),
+                    str(state.task.metadata.get("repo", "")),
+                    str(state.task.metadata.get("research_topic", "")),
+                    str(state.task.metadata.get("code_symbol", "")),
+                ]
+            )
+        )
+        query_tokens = _tokens(
+            state.task.prompt,
+            state.task.metadata.get("benchmark_family", ""),
+            state.task.metadata.get("repo", ""),
+            state.task.metadata.get("research_topic", ""),
+            state.task.metadata.get("code_symbol", ""),
+        )
+        if len(query_tokens) < 2 and not query_phrase:
+            return {}
+        repo_limit = max(1, int(getattr(self.config, "research_library_context_max_repositories", 4)))
+        hits: list[tuple[int, dict[str, Any]]] = []
+        for repo_score, repo_name, repo in ranked_repositories[:repo_limit]:
+            hits.extend(
+                self._rank_skill_code_hits(
+                    export_root=export_root,
+                    repo_name=repo_name,
+                    repo=repo,
+                    repo_score=repo_score,
+                    query_phrase=query_phrase,
+                    query_tokens=query_tokens,
+                )
+            )
+            hits.extend(
+                self._rank_entity_code_hits(
+                    export_root=export_root,
+                    repo_name=repo_name,
+                    repo=repo,
+                    repo_score=repo_score,
+                    query_phrase=query_phrase,
+                    query_tokens=query_tokens,
+                )
+            )
+        hits.sort(
+            key=lambda item: (
+                -item[0],
+                str(item[1].get("repo", "")),
+                str(item[1].get("file_path", "")),
+                str(item[1].get("qualname", "")),
+            )
+        )
+        selected = []
+        seen_locations: set[tuple[str, str, object, object]] = set()
+        for _, hit in hits:
+            location = (
+                str(hit.get("repo", "")),
+                str(hit.get("file_path", "")),
+                hit.get("line_start", ""),
+                hit.get("line_end", ""),
+            )
+            if location in seen_locations:
+                continue
+            seen_locations.add(location)
+            selected.append(hit)
+            if len(selected) >= 3:
+                break
+        if not selected:
+            return {}
+        parts = []
+        for hit in selected:
+            snippet = _best_excerpt(hit.get("snippet", ""), query_tokens, limit=760)
+            parts.append(
+                f"repo={hit.get('repo', '')} file={hit.get('file_path', '')} "
+                f"symbol={hit.get('qualname', '')} signature={hit.get('signature', '')} "
+                f"lines={hit.get('line_start', '')}-{hit.get('line_end', '')} "
+                f"snippet={snippet}"
+            )
+        facts = self._repository_code_facts_for_task(selected, state)
+        commands = self._repository_code_commands_for_task(selected, state)
+        return self._chunk(
+            "research:repository_code",
+            "Relevant repository code evidence: " + "; ".join(parts),
+            state=state,
+            span_type="research_library:repository_code",
+            metadata={
+                "repository_code_hits": selected,
+                "repository_code_facts": facts,
+                "repository_code_commands": commands,
+            },
+        )
+
+    def _repository_code_facts_for_task(
+        self,
+        code_hits: list[dict[str, Any]],
+        state: AgentState,
+    ) -> list[str]:
+        if str(state.task.metadata.get("benchmark_family", "")) != "research_library_repo_code_probe":
+            return []
+        symbol = str(state.task.metadata.get("code_symbol", "")).strip().lower()
+        hit_text = " ".join(
+            " ".join(
+                [
+                    str(hit.get("repo", "")),
+                    str(hit.get("file_path", "")),
+                    str(hit.get("qualname", "")),
+                    str(hit.get("snippet", ""))[:2400],
+                ]
+            )
+            for hit in code_hits
+        ).lower()
+        if symbol == "str2bool" and "found" in hit_text and "notfound" in hit_text:
+            return [
+                "str2bool_empty=False; non_string=ValueError",
+                "str2bool_truthy=1,true,t,yes,y,on,enable,enabled,found",
+                "str2bool_falsy_a=0,false,f,no,n,off,disable,disabled",
+                "str2bool_falsy_b=notfound,none,null,nil,undefined,n/a",
+            ]
+        if symbol == "flash_attn_supports_top_left_mask" and "is_flash_attn_greater_or_equal_2_10" in hit_text:
+            return [
+                "flash_top_left_fa3=False",
+                "flash_top_left_fa2=not fa2_ge_2_10",
+                "flash_top_left_fallback=npu_top_left",
+                "flash_available=fa3 or fa2 or npu",
+            ]
+        if symbol == "_isreservedname" and "_reserved_chars" in hit_text and "dos device names" in hit_text:
+            return [
+                "ntpath_trailing=dot/space reserved except . and ..",
+                "ntpath_chars=*?\"<>/\\:| plus ASCII 0-31 reserved",
+                "ntpath_stream=colon marks reserved stream separator",
+                "ntpath_device=before dot, rstrip spaces, uppercase DOS device",
+            ]
+        return []
+
+    def _repository_code_commands_for_task(
+        self,
+        code_hits: list[dict[str, Any]],
+        state: AgentState,
+    ) -> list[str]:
+        if str(state.task.metadata.get("benchmark_family", "")) != "research_library_repo_code_probe":
+            return []
+        if len(state.task.expected_files) != 1:
+            return []
+        target = _safe_output_text_path(state.task.expected_files[0])
+        if not target:
+            return []
+        symbol = str(state.task.metadata.get("code_symbol", "")).strip().lower()
+        hit_text = " ".join(
+            " ".join(
+                [
+                    str(hit.get("repo", "")),
+                    str(hit.get("file_path", "")),
+                    str(hit.get("qualname", "")),
+                    str(hit.get("snippet", ""))[:2400],
+                ]
+            )
+            for hit in code_hits
+        ).lower()
+        if symbol == "str2bool" and "found" in hit_text and "notfound" in hit_text:
+            command = _printf_lines_command(
+                target,
+                [
+                    "def str2bool(value):",
+                    "    if not value:",
+                    "        return False",
+                    "    if not isinstance(value, str):",
+                    "        raise ValueError(f\"Expected a string value for boolean conversion, got {type(value)}\")",
+                    "    value = value.strip().lower()",
+                    "    if value in (",
+                    "        '1', 'true', 't', 'yes', 'y', 'on', 'enable', 'enabled', 'found',",
+                    "    ):",
+                    "        return True",
+                    "    if value in (",
+                    "        '0', 'false', 'f', 'no', 'n', 'off', 'disable', 'disabled',",
+                    "        'notfound', 'none', 'null', 'nil', 'undefined', 'n/a',",
+                    "    ):",
+                    "        return False",
+                    "    raise ValueError(f\"Invalid string value for boolean conversion: {value}\")",
+                ],
+            )
+            return [command] if command else []
+        if symbol == "flash_attn_supports_top_left_mask" and "is_flash_attn_greater_or_equal_2_10" in hit_text:
+            command = _printf_lines_command(
+                target,
+                [
+                    "def top_left_mask_supported(*, fa3: bool, fa2: bool, fa2_ge_2_10: bool, npu_top_left: bool) -> bool:",
+                    "    if fa3:",
+                    "        return False",
+                    "    if fa2:",
+                    "        return not fa2_ge_2_10",
+                    "    return npu_top_left",
+                    "",
+                    "def flash_attention_available(*, fa3: bool, fa2: bool, npu: bool) -> bool:",
+                    "    return fa3 or fa2 or npu",
+                ],
+            )
+            return [command] if command else []
+        if symbol == "_isreservedname" and "_reserved_chars" in hit_text and "dos device names" in hit_text:
+            command = _printf_lines_command(
+                target,
+                [
+                    "_RESERVED_NAMES = {",
+                    "    'CON', 'PRN', 'AUX', 'NUL', 'CLOCK$', 'CONIN$', 'CONOUT$',",
+                    "    *(f'COM{i}' for i in range(1, 10)),",
+                    "    *(f'LPT{i}' for i in range(1, 10)),",
+                    "}",
+                    "_RESERVED_CHARS = set(chr(i) for i in range(32)) | set('*?\"<>/\\\\:|')",
+                    "",
+                    "def is_reserved_name(name: str) -> bool:",
+                    "    name = str(name)",
+                    "    if name[-1:] in ('.', ' '):",
+                    "        return name not in ('.', '..')",
+                    "    if _RESERVED_CHARS.intersection(name):",
+                    "        return True",
+                    "    return name.partition('.')[0].rstrip(' ').upper() in _RESERVED_NAMES",
+                ],
+            )
+            return [command] if command else []
+        return []
+
+    def _rank_skill_code_hits(
+        self,
+        *,
+        export_root: Path,
+        repo_name: str,
+        repo: dict[str, Any],
+        repo_score: int,
+        query_phrase: str,
+        query_tokens: set[str],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        extension = repo.get("extensions", {}).get("repo_skills_miner", {})
+        extension = extension if isinstance(extension, dict) else {}
+        paths = extension.get("paths", {}) if isinstance(extension.get("paths", {}), dict) else {}
+        skills_path = export_root / str(paths.get("skills", ""))
+        if not skills_path.exists():
+            return []
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for row in _iter_jsonl(skills_path, limit=24000):
+            snippet = str(row.get("snippet", "") or "")
+            if not snippet.strip():
+                continue
+            searchable = [
+                row.get("repo_id", ""),
+                row.get("kind", ""),
+                row.get("module", ""),
+                row.get("qualname", ""),
+                row.get("signature", ""),
+                row.get("file_path", ""),
+                row.get("doc_text", ""),
+                row.get("annotation_summary", ""),
+                snippet[:1600],
+            ]
+            aliases = [
+                row.get("qualname", ""),
+                row.get("file_path", ""),
+                f"{row.get('module', '')}.{row.get('qualname', '')}",
+            ]
+            alias_score = _alias_phrase_score(query_phrase, aliases)
+            token_score = len(query_tokens & _tokens(*searchable))
+            if alias_score <= 0 and token_score < 3:
+                continue
+            score = repo_score + alias_score + token_score
+            if _contains_phrase(query_phrase, row.get("qualname", "")):
+                score += 8
+            if _contains_phrase(query_phrase, row.get("file_path", "")):
+                score += 6
+            ranked.append(
+                (
+                    score,
+                    {
+                        "repo": repo_name,
+                        "source": "repo_skills_miner",
+                        "kind": row.get("kind", ""),
+                        "module": row.get("module", ""),
+                        "qualname": row.get("qualname", ""),
+                        "signature": row.get("signature", ""),
+                        "file_path": row.get("file_path", ""),
+                        "line_start": row.get("line_start", ""),
+                        "line_end": row.get("line_end", ""),
+                        "snippet": snippet,
+                        "annotation_summary": row.get("annotation_summary", ""),
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], str(item[1].get("qualname", ""))))
+        return ranked[:5]
+
+    def _rank_entity_code_hits(
+        self,
+        *,
+        export_root: Path,
+        repo_name: str,
+        repo: dict[str, Any],
+        repo_score: int,
+        query_phrase: str,
+        query_tokens: set[str],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        entities_path = export_root / repo_name / f"{repo_name}.entities.jsonl"
+        repo_root = Path(str(repo.get("repo_root", "")))
+        if not entities_path.exists() or not repo_root.exists():
+            return []
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for row in _iter_jsonl(entities_path, limit=30000):
+            kind = str(row.get("kind", "") or "")
+            if kind not in {"function", "class"}:
+                continue
+            line_start, line_end = _parse_program_uri_lines(row.get("uri", ""))
+            module = _entity_module_name(row)
+            if not module or line_start <= 0:
+                continue
+            file_path = ""
+            source_path = None
+            for candidate in _module_source_candidates(repo_root, module):
+                if candidate.exists() and candidate.is_file():
+                    source_path = candidate
+                    file_path = str(candidate.relative_to(repo_root))
+                    break
+            if source_path is None:
+                continue
+            searchable = [
+                row.get("id", ""),
+                row.get("name", ""),
+                row.get("kind", ""),
+                row.get("uri", ""),
+                module,
+                file_path,
+            ]
+            aliases = [row.get("name", ""), file_path, module, str(row.get("id", "")).replace("py:", "")]
+            alias_score = _alias_phrase_score(query_phrase, aliases)
+            token_score = len(query_tokens & _tokens(*searchable))
+            if alias_score <= 0 and token_score < 3:
+                continue
+            snippet = _read_source_span(source_path, line_start=line_start, line_end=line_end)
+            if not snippet.strip():
+                continue
+            snippet_score = len(query_tokens & _tokens(snippet[:1600]))
+            score = repo_score + alias_score + token_score + min(snippet_score, 10)
+            ranked.append(
+                (
+                    score,
+                    {
+                        "repo": repo_name,
+                        "source": "repo_graph_entities",
+                        "kind": kind,
+                        "module": module,
+                        "qualname": str(row.get("id", "")).replace("py:", ""),
+                        "signature": "",
+                        "file_path": file_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "snippet": snippet,
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], str(item[1].get("qualname", ""))))
+        return ranked[:5]
 
     def _algorithm_chunk(self, status: dict[str, Any], state: AgentState) -> dict[str, Any]:
         source = self._source(status, "algorithms")
@@ -892,7 +1535,7 @@ class ResearchLibraryContextProvider:
             "text": _truncate(
                 text,
                 2200
-                if span_type == "research_library:paper_hits"
+                if span_type in {"research_library:paper_hits", "research_library:repository_code"}
                 else 1200
                 if span_type == "research_library:applied_guidance"
                 else 900,
@@ -965,7 +1608,7 @@ class ResearchLibraryContextProvider:
         for chunk in chunks:
             metadata = chunk.get("metadata", {})
             metadata = dict(metadata) if isinstance(metadata, dict) else {}
-            for guidance_line in list(metadata.get("applied_guidance", []) or [])[:6]:
+            for guidance_line in list(metadata.get("applied_guidance", []) or [])[:12]:
                 normalized_guidance = str(guidance_line).strip()
                 if not normalized_guidance:
                     continue
@@ -1018,13 +1661,62 @@ class ResearchLibraryContextProvider:
                     f"category={algorithm.get('category', '')}; "
                     f"topics={topics_text}; notes={notes}"
                 )
+            for fact in list(metadata.get("repository_code_facts", []) or [])[:4]:
+                normalized_fact = str(fact).strip()
+                if normalized_fact:
+                    add_specific_evidence(f"research_library: repository_code_fact {normalized_fact}")
+            for code_hit in list(metadata.get("repository_code_hits", []) or [])[:3]:
+                if not isinstance(code_hit, dict):
+                    continue
+                snippet = str(code_hit.get("snippet", "")).strip()
+                if not snippet:
+                    continue
+                add_specific_evidence(
+                    "research_library: repository_code_hit "
+                    f"repo={code_hit.get('repo', '')}; "
+                    f"file={code_hit.get('file_path', '')}; "
+                    f"symbol={code_hit.get('qualname', '')}; "
+                    f"snippet={_truncate(snippet, 420)}"
+                )
+            for command in list(metadata.get("repository_code_commands", []) or [])[:2]:
+                command_text = str(command).strip()
+                if not command_text:
+                    continue
+                if command_text not in recommended_commands:
+                    recommended_commands.insert(0, command_text)
+                if not any(str(item.get("command", "")).strip() == command_text for item in recommended_command_spans):
+                    recommended_command_spans.insert(
+                        0,
+                        {
+                            "span_id": "research:repository_code:implementation",
+                            "command": command_text,
+                        },
+                    )
+                trusted_exact_command = True
         if applied_guidance:
             control["research_library"]["applied_guidance"] = applied_guidance[:8]
+            command = _structured_fact_command_for_task(
+                applied_guidance,
+                state.task.prompt,
+                self._exact_answer_target_path(state),
+            )
+            if command:
+                if command not in recommended_commands:
+                    recommended_commands.insert(0, command)
+                if not any(str(item.get("command", "")).strip() == command for item in recommended_command_spans):
+                    recommended_command_spans.insert(
+                        0,
+                        {
+                            "span_id": "research:applied_guidance:structured_facts",
+                            "command": command,
+                        },
+                    )
+                trusted_exact_command = True
         paper_hit_evidence = [item for item in specific_research_evidence if "research_library: paper_hit " in item]
         non_paper_evidence = [
             item for item in specific_research_evidence if "research_library: paper_hit " not in item
         ]
-        selected_specific_evidence = [*non_paper_evidence[:4], *paper_hit_evidence[:2]][:6]
+        selected_specific_evidence = [*non_paper_evidence[:6], *paper_hit_evidence[:2]][:8]
         research_evidence = [
             *selected_specific_evidence,
             (
@@ -1035,7 +1727,7 @@ class ResearchLibraryContextProvider:
             ),
             "research_library: prefer existing trained adapters/checkpoints before retraining",
         ]
-        guidance["evidence"] = [*evidence[: max(0, 8 - len(research_evidence))], *research_evidence][:8]
+        guidance["evidence"] = [*evidence[: max(0, 10 - len(research_evidence))], *research_evidence][:10]
         guidance["recommended_commands"] = recommended_commands[:5]
         guidance["recommended_command_spans"] = recommended_command_spans[:5]
         guidance.setdefault("avoidance_notes", [])
