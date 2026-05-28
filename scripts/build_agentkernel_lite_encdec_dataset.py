@@ -584,29 +584,59 @@ def _research_examples(
 
 AK_USER = "<AK_USER>"
 AK_CHAT = "<AK_CHAT>"
+AK_THINK = "<AK_THINK>"
+AK_DEEP_RESEARCH = "<AK_DEEP_RESEARCH>"
+AK_LOOP = "<AK_LOOP>"
+AK_PLAN = "<AK_PLAN>"
+AK_STATE = "<AK_STATE>"
 AK_CONTEXT = "<AK_CONTEXT>"
+AK_ACTIVE_CONTEXT = "<AK_ACTIVE_CONTEXT>"
 AK_EVIDENCE = "<AK_EVIDENCE>"
 AK_CANDIDATE = "<AK_CANDIDATE>"
+AK_SELECTED_PAPER = "<AK_SELECTED_PAPER>"
+AK_CONTEXT_ID = "<AK_CONTEXT_ID>"
+AK_TARGET_CONTEXT = "<AK_TARGET_CONTEXT>"
 AK_QUERY_REWRITE = "<AK_QUERY_REWRITE>"
 AK_RERANK = "<AK_RERANK>"
 AK_GATHER_CONTEXT = "<AK_GATHER_CONTEXT>"
 AK_RESPOND = "<AK_RESPOND>"
+AK_USE_CONTEXT = "<AK_USE_CONTEXT>"
+AK_NO_RETRIEVAL = "<AK_NO_RETRIEVAL>"
+AK_RETRIEVE_NEW = "<AK_RETRIEVE_NEW>"
 AK_SUFFICIENT = "<AK_SUFFICIENT>"
 AK_INSUFFICIENT = "<AK_INSUFFICIENT>"
 AK_ANSWER = "<AK_ANSWER>"
+AK_CITE = "<AK_CITE>"
+AK_RENDER = "<AK_RENDER>"
+AK_JSON = "<AK_JSON>"
 AGENTKERNEL_SPECIAL_TOKENS = [
     AK_USER,
     AK_CHAT,
+    AK_THINK,
+    AK_DEEP_RESEARCH,
+    AK_LOOP,
+    AK_PLAN,
+    AK_STATE,
     AK_CONTEXT,
+    AK_ACTIVE_CONTEXT,
     AK_EVIDENCE,
     AK_CANDIDATE,
+    AK_SELECTED_PAPER,
+    AK_CONTEXT_ID,
+    AK_TARGET_CONTEXT,
     AK_QUERY_REWRITE,
     AK_RERANK,
     AK_GATHER_CONTEXT,
     AK_RESPOND,
+    AK_USE_CONTEXT,
+    AK_NO_RETRIEVAL,
+    AK_RETRIEVE_NEW,
     AK_SUFFICIENT,
     AK_INSUFFICIENT,
     AK_ANSWER,
+    AK_CITE,
+    AK_RENDER,
+    AK_JSON,
 ]
 
 
@@ -776,6 +806,47 @@ def _candidate_block(candidates: list[dict[str, Any]]) -> str:
             f"{_first_sentences(candidate.get('abstract') or candidate.get('text', ''), limit=360)}"
         )
     return "\n\n".join(parts)
+
+
+def _active_context_block(row: dict[str, Any], evidence: str, *, label: str = "P1") -> str:
+    meta = " | ".join(
+        str(item)
+        for item in [row.get("paper_id", ""), row.get("categories", ""), row.get("year", "")]
+        if item not in ("", None)
+    )
+    meta_line = f"{meta}\n" if meta else ""
+    return (
+        f"{AK_CONTEXT_ID} {label}\n"
+        f"{AK_SELECTED_PAPER} {label}: {row['title']}\n"
+        f"{meta_line}"
+        f"{AK_EVIDENCE} [{label}]: {evidence}"
+    )
+
+
+def _selected_context_followup_prompt(index: int) -> str:
+    prompts = [
+        "Tell me more about the selected paper.",
+        "Explain this paper in more detail.",
+        "What are the main takeaways from it?",
+        "Summarize the loaded paper for me.",
+        "What method does this work use?",
+        "What should I understand about the paper above?",
+        "Give me a clearer explanation of that study.",
+        "What are its results and limitations?",
+    ]
+    return prompts[index % len(prompts)]
+
+
+def _selected_context_retrieval_prompt(index: int) -> str:
+    prompts = [
+        "Find related papers that build on this work.",
+        "What newer work should I read after this paper?",
+        "Compare this selected paper with other research on the topic.",
+        "Gather papers that challenge or extend the loaded study.",
+        "Search for follow-up work connected to this result.",
+        "Find broader literature around the paper above.",
+    ]
+    return prompts[index % len(prompts)]
 
 
 def _paper_query(row: dict[str, Any]) -> str:
@@ -998,6 +1069,125 @@ def _research_multitask_examples_from_rows(
                 "weight": 1.0,
             }
         )
+        active_context = _active_context_block(row, evidence, label="P1")
+        followup_prompt = _selected_context_followup_prompt(index)
+        examples.append(
+            {
+                "source_type": "research_retrieval_multitask",
+                "source_id": f"{paper_id or index}:selected_context_plan",
+                "task_type": "selected_context_followup_plan",
+                "encoder_text": (
+                    f"{AK_CHAT} {AK_LOOP} {AK_PLAN} {AK_STATE} {AK_ACTIVE_CONTEXT} {AK_SELECTED_PAPER}\n"
+                    "AgentKernel Lite loop training example.\n"
+                    "The user has already added a paper to chat. Choose whether to answer from that active context "
+                    "or gather new papers. If the active selected paper is the target, do not retrieve new context.\n"
+                    f"{AK_CONTEXT} Active context:\n"
+                    f"{active_context}\n"
+                    f"{AK_USER} {followup_prompt}\n"
+                    "Return a structured decision with action=respond, target_context_id=P1, and retrieval=none."
+                ),
+                "decoder_text": _structured_decision_text(
+                    action="respond",
+                    content=f"{AK_USE_CONTEXT} {AK_TARGET_CONTEXT}=P1 {AK_NO_RETRIEVAL}",
+                    retrieval_influenced=True,
+                    selected_retrieval_span_id="P1",
+                    metadata={
+                        "task_type": "selected_context_followup_plan",
+                        "loop_action": "respond_from_active_context",
+                        "target_context_id": "P1",
+                        "needs_new_retrieval": False,
+                    },
+                ),
+                "action": "respond",
+                "source_action": "respond",
+                "extension_capability": "",
+                "benchmark_family": "research_library_retrieval",
+                "difficulty": "selected_context_plan",
+                "paper_id": paper_id,
+                "weight": 1.3,
+            }
+        )
+        selected_answer = (
+            f"The selected paper [P1], {title}, is about this: {evidence} "
+            "A useful way to read it is to separate the core problem, the method or argument, "
+            "and the supported takeaway. This explanation is limited to the active paper context."
+        )
+        examples.append(
+            {
+                "source_type": "research_retrieval_multitask",
+                "source_id": f"{paper_id or index}:selected_context_answer",
+                "task_type": "selected_context_answer",
+                "encoder_text": (
+                    f"{AK_CHAT} {AK_LOOP} {AK_RESPOND} {AK_STATE} {AK_ACTIVE_CONTEXT} {AK_SELECTED_PAPER} {AK_USE_CONTEXT}\n"
+                    "AgentKernel Lite selected-context answer training example.\n"
+                    "Answer the user's follow-up from the paper that is already loaded in chat. "
+                    "Do not say retrieval failed and do not introduce unrelated papers.\n"
+                    f"{AK_CONTEXT} Active context:\n"
+                    f"{active_context}\n"
+                    f"{AK_USER} {followup_prompt}\n"
+                    f"Answer directly, cite {AK_CITE} [P1] for supported claims, and keep the response conversational."
+                ),
+                "decoder_text": _structured_decision_text(
+                    action="respond",
+                    content=selected_answer,
+                    retrieval_influenced=True,
+                    selected_retrieval_span_id="P1",
+                    metadata={
+                        "task_type": "selected_context_answer",
+                        "loop_action": "answer_from_active_context",
+                        "target_context_id": "P1",
+                        "needs_new_retrieval": False,
+                    },
+                ),
+                "action": "respond",
+                "source_action": "respond",
+                "extension_capability": "",
+                "benchmark_family": "research_library_retrieval",
+                "difficulty": "selected_context_answer",
+                "paper_id": paper_id,
+                "weight": 1.4,
+            }
+        )
+        retrieval_followup = _selected_context_retrieval_prompt(index)
+        related_query_terms = _term_tokens(title, row.get("abstract", ""), limit=7)
+        related_query = " ".join(["related work", *related_query_terms]).strip()
+        examples.append(
+            {
+                "source_type": "research_retrieval_multitask",
+                "source_id": f"{paper_id or index}:selected_context_retrieve_new",
+                "task_type": "selected_context_retrieve_new_plan",
+                "encoder_text": (
+                    f"{AK_CHAT} {AK_LOOP} {AK_PLAN} {AK_STATE} {AK_ACTIVE_CONTEXT} {AK_SELECTED_PAPER}\n"
+                    "AgentKernel Lite loop training example.\n"
+                    "The selected paper is useful context, but the user is asking for additional literature. "
+                    "Choose gather_context and rewrite the search query without answering yet.\n"
+                    f"{AK_CONTEXT} Active context:\n"
+                    f"{active_context}\n"
+                    f"{AK_USER} {retrieval_followup}\n"
+                    "Return a structured decision with action=gather_context and a compact retrieval query."
+                ),
+                "decoder_text": _structured_decision_text(
+                    action="gather_context",
+                    content=f"{AK_RETRIEVE_NEW} {related_query}",
+                    retrieval_influenced=True,
+                    selected_retrieval_span_id="P1",
+                    metadata={
+                        "task_type": "selected_context_retrieve_new_plan",
+                        "loop_action": "gather_new_context_from_active_context",
+                        "target_context_id": "P1",
+                        "needs_new_retrieval": True,
+                        "retrieval_query": related_query,
+                    },
+                ),
+                "action": "gather_context",
+                "source_action": "gather_context",
+                "extension_capability": "",
+                "benchmark_family": "research_library_retrieval",
+                "difficulty": "selected_context_retrieve_new",
+                "paper_id": paper_id,
+                "weight": 1.2,
+            }
+        )
     return examples
 
 
@@ -1167,12 +1357,16 @@ def build_dataset(
     _write_jsonl(train_path, train_rows)
     _write_jsonl(eval_path, eval_rows)
     source_counts: dict[str, int] = {}
+    task_type_counts: dict[str, int] = {}
     target_action_counts: dict[str, int] = {}
     source_action_counts: dict[str, int] = {}
     extension_counts: dict[str, int] = {}
     for row in rows:
         source_type = str(row.get("source_type", "unknown"))
         source_counts[source_type] = source_counts.get(source_type, 0) + 1
+        task_type = str(row.get("task_type", "") or "")
+        if task_type:
+            task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
         target_action = str(row.get("action", "unknown"))
         target_action_counts[target_action] = target_action_counts.get(target_action, 0) + 1
         source_action = str(row.get("source_action", "unknown"))
@@ -1199,6 +1393,7 @@ def build_dataset(
         "train_examples": len(train_rows),
         "eval_examples": len(eval_rows),
         "source_counts": dict(sorted(source_counts.items())),
+        "task_type_counts": dict(sorted(task_type_counts.items())),
         "target_action_counts": dict(sorted(target_action_counts.items())),
         "source_action_counts": dict(sorted(source_action_counts.items())),
         "extension_counts": dict(sorted(extension_counts.items())),

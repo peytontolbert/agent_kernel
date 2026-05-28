@@ -92,6 +92,18 @@ def validate_harness_spec(spec: dict[str, Any]) -> list[str]:
         argv = phase.get("argv")
         if not isinstance(argv, list) or not argv or any(not isinstance(part, str) or not part for part in argv):
             failures.append(f"phase {name or index} argv must be a non-empty string list")
+        elif "--official-feedback-json" in argv:
+            feedback_index = argv.index("--official-feedback-json") + 1
+            if feedback_index >= len(argv):
+                failures.append(f"phase {name or index} --official-feedback-json requires a path argument")
+            else:
+                feedback_path = argv[feedback_index]
+                required_inputs = phase.get("required_inputs", [])
+                if not isinstance(required_inputs, list) or feedback_path not in required_inputs:
+                    failures.append(
+                        f"phase {name or index} --official-feedback-json path must be listed in required_inputs: "
+                        f"{feedback_path}"
+                    )
         preflight_argv = phase.get("preflight_argv", [])
         if preflight_argv is not None and (
             not isinstance(preflight_argv, list)

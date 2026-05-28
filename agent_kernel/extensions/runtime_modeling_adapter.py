@@ -120,6 +120,27 @@ def generate_hybrid_decoder_text(*, state, bundle_manifest_path: Path, device: s
     )
 
 
+def generate_neural_controller_text(
+    *,
+    manifest_path: Path,
+    encoder_text: str,
+    repo_root: Path,
+    device: str = "cpu",
+    max_new_tokens: int = 512,
+) -> dict[str, object]:
+    from ..modeling.neural_controller_runtime import (
+        generate_neural_controller_text as _generate_neural_controller_text,
+    )
+
+    return _generate_neural_controller_text(
+        manifest_path=manifest_path,
+        encoder_text=encoder_text,
+        repo_root=repo_root,
+        device=device,
+        max_new_tokens=max_new_tokens,
+    )
+
+
 def build_latent_state_summary(**kwargs) -> dict[str, object]:
     from ..modeling.world.latent_state import build_latent_state_summary as _build_latent_state_summary
 
@@ -185,6 +206,7 @@ __all__ = [
     "decode_action_generation_candidates",
     "decode_bounded_action_candidates",
     "generate_hybrid_decoder_text",
+    "generate_neural_controller_text",
     "infer_hybrid_world_signal",
     "latent_command_bias",
     "load_model_artifact",

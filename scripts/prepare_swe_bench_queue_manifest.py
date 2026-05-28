@@ -1378,6 +1378,24 @@ def build_swe_queue_manifest(
             continue
         fail_to_pass = task.get("fail_to_pass", [])
         pass_to_pass = task.get("pass_to_pass", [])
+        official_feedback = task.get("official_feedback") if isinstance(task.get("official_feedback"), dict) else {}
+        artifact_contract_failure = official_feedback.get("artifact_contract_failure", {})
+        artifact_feedback_mode = ""
+        if isinstance(artifact_contract_failure, dict):
+            artifact_feedback_mode = str(artifact_contract_failure.get("mode", "")).strip()
+        official_feedback_mode = str(official_feedback.get("official_failure_mode", "")).strip()
+        suppress_suggested_commands = artifact_feedback_mode in {
+            "artifact_repeated_official_failed_patch",
+            "artifact_literal_constant_assignment_guess",
+            "artifact_invalid_python_replacement",
+            "artifact_policy_terminated",
+            "artifact_inference_failure",
+            "artifact_missing_after_response",
+        } or official_feedback_mode in {
+            "official_pass_to_pass_regression",
+            "official_shallow_constant_patch_failed",
+            "official_fail_to_pass_still_failing",
+        }
         required_patch_identifiers = _required_patch_identifiers(problem)
         executable_windows = _source_executable_edit_windows(
             source_entries,
@@ -1387,6 +1405,8 @@ def build_swe_queue_manifest(
             required_patch_identifiers=required_patch_identifiers,
         )
         suggested_patch_commands = _suggested_patch_commands(source_entries, problem=problem, hints=hints)
+        if suppress_suggested_commands:
+            suggested_patch_commands = []
         task_id = _safe_task_id(instance_id)
         prompt_parts = [
             f"SWE-bench instance: {instance_id}",
@@ -1495,6 +1515,90 @@ def build_swe_queue_manifest(
             prompt_parts.extend(["Fail-to-pass tests:", json.dumps(fail_to_pass, sort_keys=True)])
         if pass_to_pass:
             prompt_parts.extend(["Pass-to-pass tests:", json.dumps(pass_to_pass, sort_keys=True)])
+        prior_patch_tail = ""
+        rejected_patch_tails: list[str] = []
+        if official_feedback:
+            failed_tests = official_feedback.get("failed_tests", [])
+            fail_to_pass_failures = official_feedback.get("fail_to_pass_failures", [])
+            pass_to_pass_failures = official_feedback.get("pass_to_pass_failures", [])
+            pass_to_pass_failure_count = int(official_feedback.get("pass_to_pass_failure_count", 0) or 0)
+            official_failure_mode = official_feedback_mode
+            official_repair_directive = str(official_feedback.get("official_repair_directive", "")).strip()
+            artifact_repair_directive = str(official_feedback.get("artifact_repair_directive", "")).strip()
+            artifact_failure_mode = artifact_feedback_mode
+            if official_failure_mode:
+                prompt_parts.extend(["Official failure mode:", official_failure_mode])
+            if official_repair_directive:
+                prompt_parts.extend(["Official repair directive:", official_repair_directive])
+            if artifact_failure_mode:
+                prompt_parts.extend(["Local artifact failure mode:", artifact_failure_mode])
+            if artifact_repair_directive:
+                prompt_parts.extend(["Local artifact repair directive:", artifact_repair_directive])
+            if suppress_suggested_commands:
+                prompt_parts.extend(
+                    [
+                        "Suggested-command escalation:",
+                        (
+                            "Previous suggested patch commands led to guard exhaustion or rejected official-failed "
+                            "patches. Do not reuse stale suggested commands on this retry; choose a fresh executable "
+                            "source edit from the source/test evidence."
+                        ),
+                    ]
+                )
+            if isinstance(failed_tests, list) and failed_tests:
+                prompt_parts.extend(
+                    [
+                        "Prior official evaluator feedback:",
+                        (
+                            "A previous patch for this instance was unresolved under the official evaluator. "
+                            "Treat these failed tests/logs as verifier evidence for this retry; do not repeat the same patch blindly."
+                        ),
+                        "Official failed tests:",
+                        json.dumps(failed_tests[:30], sort_keys=True),
+                    ]
+                )
+            if isinstance(fail_to_pass_failures, list) and fail_to_pass_failures:
+                prompt_parts.extend(
+                    [
+                        "Official fail-to-pass failures to satisfy:",
+                        json.dumps(fail_to_pass_failures[:30], sort_keys=True),
+                    ]
+                )
+            if isinstance(pass_to_pass_failures, list) and pass_to_pass_failures:
+                prompt_parts.extend(
+                    [
+                        "Official pass-to-pass regressions introduced by the previous patch:",
+                        json.dumps(pass_to_pass_failures[:30], sort_keys=True),
+                    ]
+                )
+            if pass_to_pass_failure_count:
+                prompt_parts.extend(
+                    [
+                        "Official pass-to-pass regression count:",
+                        str(pass_to_pass_failure_count),
+                    ]
+                )
+            log_tail = str(official_feedback.get("post_patch_log_tail", "")).strip()
+            if log_tail:
+                prompt_parts.extend(["Official post-patch log tail:", log_tail[-4000:]])
+            prior_patch_tail = str(official_feedback.get("prior_model_patch_tail", "")).strip()
+            raw_rejected_patch_tails = official_feedback.get("rejected_patch_tails", [])
+            if isinstance(raw_rejected_patch_tails, list):
+                rejected_patch_tails = [
+                    str(value).strip()
+                    for value in raw_rejected_patch_tails
+                    if str(value).strip()
+                ][:8]
+            if prior_patch_tail and prior_patch_tail not in rejected_patch_tails:
+                rejected_patch_tails.append(prior_patch_tail)
+            if prior_patch_tail:
+                prompt_parts.extend(
+                    [
+                        "Prior rejected patch excerpt:",
+                        prior_patch_tail[-4000:],
+                        "The new patch must not repeat the same rejected change unless the official failure evidence proves a narrower corrected variant.",
+                    ]
+                )
         prompt_parts.append(
             "Write only a minimal applyable unified diff to patch.diff. Prefer swe_patch_builder redirection over hand-written hunk headers when changing existing lines. If executing a command, create patch.diff in the current directory. Do not write prose, markdown fences, placeholders, fake imports, '# This is a test file', or explanations."
         )
@@ -1519,6 +1623,7 @@ def build_swe_queue_manifest(
                     "swe_candidate_files": candidate_files,
                     "swe_fail_to_pass": fail_to_pass,
                     "swe_pass_to_pass": pass_to_pass,
+                    "swe_official_feedback": official_feedback,
                     "swe_executable_edit_windows": executable_windows,
                     "swe_suggested_patch_commands": suggested_patch_commands,
                     "swe_patch_workspace_relpath": "patch.diff",
@@ -1536,6 +1641,7 @@ def build_swe_queue_manifest(
                         "patch_path": "patch.diff",
                         "expected_changed_paths": candidate_files,
                         "required_patch_identifiers": required_patch_identifiers,
+                        "forbidden_patch_texts": rejected_patch_tails,
                     }
                     if repo_cache_root
                     else {},

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import hashlib
 import json
 from typing import Any
 
@@ -23,6 +24,75 @@ def _write_jsonl(path: Path, records: list[dict[str, str]]) -> None:
     )
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _records_by_instance(records: object) -> dict[str, dict[str, Any]]:
+    by_instance: dict[str, dict[str, Any]] = {}
+    if not isinstance(records, list):
+        return by_instance
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        instance_id = str(record.get("instance_id", "")).strip()
+        if instance_id:
+            by_instance[instance_id] = record
+    return by_instance
+
+
+def _require_matching_patch_provenance(
+    *,
+    instance_id: str,
+    task_id: str,
+    source: Path,
+    verification_record: dict[str, Any],
+) -> None:
+    if not verification_record:
+        raise ValueError(f"missing verification provenance for instance_id={instance_id}")
+    verified_task_id = str(verification_record.get("task_id", "")).strip()
+    if verified_task_id and verified_task_id != task_id:
+        raise ValueError(
+            f"verification task_id mismatch for instance_id={instance_id}: "
+            f"{verified_task_id} != {task_id}"
+        )
+    patch_path = str(verification_record.get("patch_path", "")).strip()
+    if patch_path and Path(patch_path) != source:
+        raise ValueError(
+            f"verification patch_path mismatch for instance_id={instance_id}: "
+            f"{patch_path} != {source}"
+        )
+    if not source.exists() or source.stat().st_size <= 0:
+        raise ValueError(f"verified patch is missing or empty for instance_id={instance_id}: {source}")
+    expected_size = verification_record.get("patch_size")
+    if expected_size not in (None, "") and int(expected_size) != source.stat().st_size:
+        raise ValueError(f"patch size changed after verification for instance_id={instance_id}")
+    expected_mtime_ns = verification_record.get("patch_mtime_ns")
+    if expected_mtime_ns not in (None, "") and int(expected_mtime_ns) != source.stat().st_mtime_ns:
+        raise ValueError(f"patch mtime changed after verification for instance_id={instance_id}")
+    expected_hash = str(verification_record.get("patch_sha256", "")).strip()
+    if expected_hash and _sha256_file(source) != expected_hash:
+        raise ValueError(f"patch sha256 changed after verification for instance_id={instance_id}")
+
+
+def _verified_patch_source(
+    *,
+    workspace_base: Path,
+    queue_task: dict[str, Any],
+    verification_record: dict[str, Any],
+    strict_verification_report: bool,
+) -> Path:
+    if strict_verification_report:
+        patch_path = str(verification_record.get("patch_path", "")).strip()
+        if patch_path:
+            return Path(patch_path)
+    return workspace_base / str(queue_task.get("workspace_subdir", "")).strip() / "patch.diff"
+
+
 def collect_swe_predictions(
     prediction_task_manifest: dict[str, Any],
     queue_manifest: dict[str, Any],
@@ -31,6 +101,7 @@ def collect_swe_predictions(
     output_jsonl: str,
     instance_ids: list[str] | None = None,
     patch_job_verification: dict[str, Any] | None = None,
+    include_abstained: bool = True,
 ) -> dict[str, Any]:
     prediction_manifest = prediction_task_manifest.get("prediction_manifest")
     if not isinstance(prediction_manifest, dict):
@@ -52,7 +123,18 @@ def collect_swe_predictions(
     requested_ids = {str(value).strip() for value in (instance_ids or []) if str(value).strip()}
     abstained_ids: set[str] = set()
     inferred_abstained_ids: set[str] = set()
+    verified_patch_records: dict[str, dict[str, Any]] = {}
+    abstained_job_records: dict[str, dict[str, Any]] = {}
+    strict_verification_report = False
     if patch_job_verification is not None:
+        strict_verification_report = (
+            str(patch_job_verification.get("report_kind", "")).strip()
+            == "swe_bench_patch_job_verification"
+        )
+        verified_patch_records = _records_by_instance(patch_job_verification.get("verified_patches", []))
+        abstained_job_records = _records_by_instance(patch_job_verification.get("abstained_jobs", []))
+        if strict_verification_report and not verified_patch_records and patch_job_verification.get("successful_instance_ids"):
+            raise ValueError("strict patch job verification missing verified_patches provenance records")
         successful_ids = {
             str(value).strip()
             for value in patch_job_verification.get("successful_instance_ids", [])
@@ -71,7 +153,7 @@ def collect_swe_predictions(
             if missing:
                 raise ValueError("requested instance_ids are not verified successful or abstained: " + ",".join(missing))
         else:
-            requested_ids = selectable_ids
+            requested_ids = selectable_ids if include_abstained else successful_ids
     selected_predictions: list[dict[str, Any]] = []
     for prediction in prediction_manifest.get("predictions", []):
         if not isinstance(prediction, dict):
@@ -82,16 +164,48 @@ def collect_swe_predictions(
         queue_task = queue_by_instance.get(instance_id)
         if not queue_task:
             raise ValueError(f"missing queue task for instance_id={instance_id}")
-        source = workspace_base / str(queue_task.get("workspace_subdir", "")).strip() / "patch.diff"
+        task_id = str(queue_task.get("task_id", "")).strip()
+        verification_record = verified_patch_records.get(instance_id, {})
+        abstention_record = abstained_job_records.get(instance_id, {})
+        source = _verified_patch_source(
+            workspace_base=workspace_base,
+            queue_task=queue_task,
+            verification_record=abstention_record if instance_id in abstained_ids else verification_record,
+            strict_verification_report=strict_verification_report,
+        )
         if instance_id in abstained_ids:
+            if strict_verification_report and not abstention_record:
+                raise ValueError(f"missing abstention provenance for instance_id={instance_id}")
+            if source.exists() and source.stat().st_size > 0:
+                if strict_verification_report and not str(abstention_record.get("patch_sha256", "")).strip():
+                    raise ValueError(
+                        f"abstention for instance_id={instance_id} is stale or lacks patch provenance"
+                    )
+                _require_matching_patch_provenance(
+                    instance_id=instance_id,
+                    task_id=task_id,
+                    source=source,
+                    verification_record=abstention_record,
+                )
+            if not include_abstained:
+                continue
             selected_prediction = dict(prediction)
             selected_prediction.pop("patch_path", None)
             selected_prediction["model_patch"] = ""
             selected_prediction["abstained"] = True
             selected_predictions.append(selected_prediction)
             continue
+        if strict_verification_report:
+            _require_matching_patch_provenance(
+                instance_id=instance_id,
+                task_id=task_id,
+                source=source,
+                verification_record=verification_record,
+            )
         if not source.exists() or source.stat().st_size <= 0:
             inferred_abstained_ids.add(instance_id)
+            if not include_abstained:
+                continue
             selected_prediction = dict(prediction)
             selected_prediction.pop("patch_path", None)
             selected_prediction["model_patch"] = ""
@@ -132,6 +246,7 @@ def main() -> None:
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--instance-ids", nargs="*", default=None)
     parser.add_argument("--patch-job-verification-json", default="")
+    parser.add_argument("--exclude-abstained", action="store_true")
     args = parser.parse_args()
 
     patch_job_verification = (
@@ -144,6 +259,7 @@ def main() -> None:
         output_jsonl=args.output_jsonl,
         instance_ids=args.instance_ids,
         patch_job_verification=patch_job_verification,
+        include_abstained=not bool(args.exclude_abstained),
     )
     print(
         f"copied_patch_count={result['copied_patch_count']} "

@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import KernelConfig
 from .schemas import EpisodeRecord, StepRecord
+from .neural_controller import summarize_neural_controller_shadow_steps
 
 
 def compiled_learning_artifacts_path(config: KernelConfig) -> Path:
@@ -100,6 +101,7 @@ def compile_episode_learning_candidates(
     )
     retrieval_summary = _retrieval_learning_summary(episode.steps)
     syntax_summary = _syntax_learning_summary(episode.steps)
+    neural_controller_summary = summarize_neural_controller_shadow_steps(episode.steps)
     timestamp = datetime.now(UTC).isoformat()
     base = {
         "source_task_id": episode.task_id,
@@ -129,6 +131,13 @@ def compile_episode_learning_candidates(
         "syntax_motor_strong_progress_steps": syntax_summary["strong_progress_steps"],
         "syntax_motor_syntax_safe_steps": syntax_summary["syntax_safe_steps"],
         "syntax_motor_edited_symbols": list(syntax_summary["edited_symbols"]),
+        "neural_controller_shadow_steps": neural_controller_summary["shadow_steps"],
+        "neural_controller_ready_steps": neural_controller_summary["ready_steps"],
+        "neural_controller_action_agreement_steps": neural_controller_summary["action_agreement_steps"],
+        "neural_controller_verified_action_agreement_steps": neural_controller_summary[
+            "verified_action_agreement_steps"
+        ],
+        "neural_controller_control_token_counts": dict(neural_controller_summary["control_token_counts"]),
     }
     candidates: list[dict[str, object]] = []
     if episode.success and commands:

@@ -2,7 +2,19 @@ import hashlib
 import json
 
 from agent_kernel.config import KernelConfig
-from agent_kernel.ops.loop_run_support import _task_semantic_recall_paths
+from agent_kernel.ops.loop_run_support import (
+    _defer_done_for_missing_expected_artifact,
+    _artifact_virtual_context_source_allowed_over_budget,
+    _is_artifact_diagnostic_context_decision_source,
+    _is_artifact_virtual_context_decision_source,
+    _latest_artifact_context_allows_one_materialization_attempt,
+    _missing_expected_artifact_paths,
+    _policy_decision_timeout_seconds,
+    _task_semantic_recall_paths,
+    _verification_failure_signal_codes,
+    verification_payload,
+)
+from agent_kernel.ops.loop_runtime_support import prepare_task_for_run
 from agent_kernel.tasking.curriculum import CurriculumEngine, EpisodeRecord
 from agent_kernel.llm import MockLLMClient
 from agent_kernel.loop import AgentKernel
@@ -13,6 +25,519 @@ from agent_kernel.tasking.task_bank import TaskBank
 from agent_kernel.universe_model import UniverseModel
 from agent_kernel.world_model import WorldModel
 import pytest
+
+
+def test_prepare_task_for_run_applies_task_payload_metadata_without_shared_repo():
+    base = TaskSpec(
+        task_id="runtime_override_base",
+        prompt="base",
+        workspace_subdir="runtime_override_base",
+        expected_files=["base.txt"],
+        metadata={"base": True},
+    )
+    override = TaskSpec(
+        task_id="runtime_override_base",
+        prompt="override",
+        workspace_subdir="runtime_override_base",
+        expected_files=["patch.diff"],
+        metadata={
+            "artifact_backoff_failures": [{"mode": "artifact_missing_after_response"}],
+            "artifact_last_backoff_failure": {"mode": "artifact_missing_after_response"},
+        },
+    )
+
+    prepared = prepare_task_for_run(
+        base,
+        runtime_overrides={"task_payload": override.to_dict()},
+        job_id="job:override",
+        uses_shared_repo_fn=lambda task, runtime_overrides=None: False,
+        prepare_runtime_task_fn=lambda task, runtime_overrides=None, job_id="": task,
+    )
+
+    assert prepared.prompt == "override"
+    assert prepared.expected_files == ["patch.diff"]
+    assert prepared.metadata["artifact_backoff_failures"][0]["mode"] == "artifact_missing_after_response"
+
+
+def test_policy_decision_timeout_uses_llm_total_timeout_cap(monkeypatch):
+    monkeypatch.setenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", "45")
+    config = KernelConfig(llm_timeout_seconds=120, command_timeout_seconds=120)
+
+    assert _policy_decision_timeout_seconds(config) == 55
+
+
+def test_policy_decision_timeout_ignores_invalid_llm_total_timeout(monkeypatch):
+    monkeypatch.setenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", "not-an-int")
+    config = KernelConfig(llm_timeout_seconds=20, command_timeout_seconds=20)
+
+    assert _policy_decision_timeout_seconds(config) == 120
+
+
+def test_artifact_virtual_context_decision_source_is_internal_noop():
+    assert _is_artifact_virtual_context_decision_source("artifact_source_inspection_exhausted_context_read")
+    assert _is_artifact_virtual_context_decision_source("artifact_source_identical_context_read")
+    assert not _is_artifact_virtual_context_decision_source("artifact_source_lines_followup_direct")
+
+
+def test_definition_header_body_pre_context_allows_one_materialization_attempt():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="body pre-context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_definition_header_body_pre_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_definition_header_body_pre_context_read")
+
+
+def test_definition_header_off_anchor_context_allows_one_materialization_attempt():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="off anchor context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_definition_header_off_anchor_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_definition_header_off_anchor_context_read")
+
+
+def test_candidate_set_exhausted_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_candidate_set_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_candidate_set_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="candidate set exhausted context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_candidate_set_exhausted_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_candidate_set_exhausted_context_read")
+
+
+def test_invalid_python_statement_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_invalid_python_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_invalid_python_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="invalid Python statement-range context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_invalid_python_statement_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_invalid_python_statement_context_read")
+
+
+def test_semantic_feedback_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_semantic_feedback_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_semantic_feedback_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="semantic feedback context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_semantic_feedback_source_inspection_blocked_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget(
+        "artifact_semantic_feedback_source_inspection_blocked_context_read"
+    )
+
+
+def test_duplicate_existing_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_duplicate_context_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_duplicate_context_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="duplicate context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_duplicate_existing_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_duplicate_existing_context_read")
+
+
+def test_line_outside_anchor_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_line_anchor_context_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_line_anchor_context_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="line anchor context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_line_outside_anchor_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_line_outside_anchor_context_read")
+
+
+def test_line_outside_anchor_range_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_line_anchor_range_context_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_line_anchor_range_context_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="line anchor range context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_line_outside_anchor_range_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget(
+        "artifact_line_outside_anchor_range_context_read"
+    )
+
+
+def test_repeated_forbidden_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_repeated_forbidden_context_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_repeated_forbidden_context_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="repeated forbidden context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_repeated_forbidden_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_repeated_forbidden_context_read")
+
+
+def test_statement_kind_generic_context_allowed_over_budget():
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_statement_kind_generic_context_budget_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_statement_kind_generic_context_budget_task",
+            expected_files=["patch.diff"],
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="statement kind context",
+            action="code_execute",
+            content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+            selected_skill_id=None,
+            command_result=None,
+            verification={"passed": False},
+            decision_source="artifact_statement_kind_generic_context_read",
+        )
+    )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _artifact_virtual_context_source_allowed_over_budget("artifact_statement_kind_generic_context_read")
+
+
+def test_artifact_source_line_followups_are_neutral_diagnostic_context():
+    assert _is_artifact_diagnostic_context_decision_source("artifact_source_inspection_exhausted_context_read")
+    assert _is_artifact_diagnostic_context_decision_source(
+        "artifact_semantic_feedback_source_inspection_blocked_context_read"
+    )
+    assert _is_artifact_diagnostic_context_decision_source("artifact_duplicate_existing_context_read")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_line_outside_anchor_context_read")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_line_outside_anchor_range_context_read")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_repeated_forbidden_context_read")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_statement_kind_generic_context_read")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_source_lines_followup_direct")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_expected_behavior_source_lines_followup_direct")
+    assert _is_artifact_diagnostic_context_decision_source("artifact_inference_failure_source_context_fallback")
+    assert not _is_artifact_diagnostic_context_decision_source("artifact_anchor_replacement_direct")
+
+
+def test_terminal_failure_codes_are_promoted_to_failure_signals():
+    verification = verification_payload(
+        passed=False,
+        reasons=["exit code was 1"],
+        command_result=CommandResult(
+            command="pytest tests/test_config.py -q",
+            exit_code=1,
+            stdout="FAILED tests/test_config.py::test_parse - AssertionError",
+            stderr="",
+        ),
+    )
+
+    assert "terminal_test_assertion_failure" in verification["failure_codes"]
+    assert _verification_failure_signal_codes(verification) == ["terminal_test_assertion_failure"]
+
+
+def test_artifact_failure_codes_are_promoted_to_failure_signals():
+    verification = verification_payload(
+        passed=False,
+        reasons=["missing expected file: patch.diff"],
+        command_result=CommandResult(command="semantic_artifact_check", exit_code=0, stdout="", stderr=""),
+        outcome_label="missing_expected_file",
+    )
+
+    assert "missing_expected_file" in verification["failure_codes"]
+    assert _verification_failure_signal_codes(verification) == ["missing_expected_file"]
+
+
+def test_static_regression_failure_codes_are_promoted_to_failure_signals():
+    verification = verification_payload(
+        passed=False,
+        reasons=["SWE patch introduces None container misuse in babel/dates.py: patterns:subscript"],
+        outcome_label="none_container_misuse",
+    )
+
+    assert "none_container_misuse" in verification["failure_codes"]
+    assert _verification_failure_signal_codes(verification) == ["none_container_misuse"]
+
+
+def test_neutral_diagnostic_steps_do_not_exhaust_stuckness_budget():
+    task = TaskSpec(
+        task_id="neutral_diagnostic_context_task",
+        prompt="Produce patch.diff.",
+        workspace_subdir="neutral_diagnostic_context_task",
+        expected_files=["patch.diff"],
+    )
+    state = AgentState(task=task)
+    state.consecutive_failures = 1
+    state.repeated_action_count = 1
+    state.consecutive_no_progress_steps = 2
+    state.last_action_signature = "code_execute:python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'"
+
+    decision = ActionDecision(
+        action="code_execute",
+        content="python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'",
+        thought="record artifact context",
+        decision_source="artifact_source_inspection_exhausted_context_read",
+    )
+    state.update_after_step(
+        decision=decision,
+        command_result=CommandResult(command=decision.content, exit_code=0, stdout="", stderr=""),
+        verification_passed=False,
+        step_index=2,
+        progress_delta=0.001,
+        state_transition={"progress_delta": 0.001, "no_progress": False},
+        neutral_diagnostic_step=True,
+    )
+
+    assert state.consecutive_failures == 1
+    assert state.repeated_action_count == 1
+    assert state.consecutive_no_progress_steps == 0
+    assert not state.should_stop_for_stuckness()
+
+
+def test_defer_done_for_missing_expected_artifact_is_bounded(tmp_path):
+    task = TaskSpec(
+        task_id="artifact_done_deferral_task",
+        prompt="write patch.diff",
+        workspace_subdir="artifact_done_deferral_task",
+        expected_files=["patch.diff"],
+        metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = AgentState(task=task)
+
+    assert _missing_expected_artifact_paths(task, workspace) == ["patch.diff"]
+    assert _defer_done_for_missing_expected_artifact(task, workspace, state)
+
+    for index in range(2):
+        state.history.append(
+            StepRecord(
+                index=index + 1,
+                thought="stop",
+                action="respond",
+                content="No safe deterministic command remains.",
+                selected_skill_id=None,
+                command_result=None,
+                verification={
+                    "passed": False,
+                    "reasons": ["policy terminated", "artifact_done_response_deferred"],
+                    "outcome_label": "artifact_missing_after_response_deferred",
+                },
+            )
+        )
+
+    assert not _defer_done_for_missing_expected_artifact(task, workspace, state)
+
+
+def test_defer_done_for_missing_expected_artifact_allows_latest_artifact_context_over_budget(tmp_path):
+    task = TaskSpec(
+        task_id="artifact_done_context_over_budget_task",
+        prompt="write patch.diff",
+        workspace_subdir="artifact_done_context_over_budget_task",
+        expected_files=["patch.diff"],
+        metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = AgentState(task=task)
+
+    for index, source in enumerate(
+        [
+            "artifact_shallow_patch_context_read",
+            "artifact_source_inspection_exhausted_context_read",
+            "artifact_behavior_target_repair_context_read",
+            "artifact_source_identical_context_read",
+            "artifact_malformed_json_context_read",
+            "artifact_behavior_target_repair_context_read",
+        ],
+        start=1,
+    ):
+        state.history.append(
+            StepRecord(
+                index=index,
+                thought="artifact context",
+                action="code_execute",
+                content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+                selected_skill_id=None,
+                command_result={"exit_code": 0},
+                verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+                decision_source=source,
+            )
+        )
+
+    assert _latest_artifact_context_allows_one_materialization_attempt(state)
+    assert _defer_done_for_missing_expected_artifact(task, workspace, state)
+
+
+def test_defer_done_for_missing_expected_artifact_stops_after_exhausted_candidate_context(tmp_path):
+    task = TaskSpec(
+        task_id="artifact_done_exhausted_candidate_task",
+        prompt="write patch.diff",
+        workspace_subdir="artifact_done_exhausted_candidate_task",
+        expected_files=["patch.diff"],
+        metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = AgentState(task=task)
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="expose exhausted context",
+            action="code_execute",
+            content="printf '%s\\n' '{}'",
+            selected_skill_id=None,
+            command_result={"exit_code": 0},
+            verification={"passed": False, "reasons": ["missing expected file: patch.diff"]},
+            decision_source="artifact_candidate_set_exhausted_context_read",
+            proposal_metadata={
+                "artifact_candidate_path": "pkg/module.py",
+                "excluded_candidate_lines": [10, 12],
+            },
+        )
+    )
+
+    assert _missing_expected_artifact_paths(task, workspace) == ["patch.diff"]
+    assert not _defer_done_for_missing_expected_artifact(task, workspace, state)
 
 
 def test_kernel_solves_seed_task(tmp_path):
@@ -187,6 +712,458 @@ def test_kernel_pre_execution_governance_gate_blocks_before_sandbox_run(tmp_path
     assert episode.steps[0].command_governance["blocked"] is True
     assert episode.steps[0].command_governance["block_reason"] == "forbidden_pattern"
     assert any(event.get("event") == "governance_rejected" for event in events)
+
+
+def test_artifact_virtual_context_bypasses_governance_and_sandbox(tmp_path, monkeypatch):
+    class VirtualContextPolicy(Policy):
+        def decide(self, state):
+            del state
+            return ActionDecision(
+                action="code_execute",
+                content="python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n\"\"\"\nrm -rf /tmp/not-real\n\"\"\"\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+                thought="record virtual artifact context",
+                decision_source="artifact_source_inspection_exhausted_context_read",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    sandbox_called = {"value": False}
+    kernel = AgentKernel(config=config, policy=VirtualContextPolicy())
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        sandbox_called["value"] = True
+        raise AssertionError("virtual artifact context should not execute in sandbox")
+
+    monkeypatch.setattr(kernel.sandbox, "run", fail_if_called)
+    episode = kernel.run_task(
+        TaskSpec(
+            task_id="virtual_context_governance_bypass_task",
+            prompt="Record artifact context without executing it.",
+            workspace_subdir="virtual_context_governance_bypass_task",
+            expected_files=["patch.diff"],
+            max_steps=1,
+        )
+    )
+
+    assert sandbox_called["value"] is False
+    assert episode.success is False
+    assert episode.steps[0].command_result["exit_code"] == 0
+    assert episode.steps[0].verification["outcome_label"] == "artifact_virtual_context_recorded"
+    assert episode.steps[0].command_governance == {}
+    assert "governance_rejected" not in episode.steps[0].failure_signals
+
+
+def test_policy_timeout_virtual_context_bypasses_governance_and_sandbox(tmp_path, monkeypatch):
+    class TimeoutContextPolicy(Policy):
+        def decide(self, state):
+            del state
+            return ActionDecision(
+                action="code_execute",
+                content="python3 - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n# compact timeout context\npass\nAGENT_KERNEL_ARTIFACT_CONTEXT",
+                thought="record policy timeout artifact context",
+                decision_source="artifact_policy_timeout_context_read",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+    sandbox_called = {"value": False}
+    kernel = AgentKernel(config=config, policy=TimeoutContextPolicy())
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        sandbox_called["value"] = True
+        raise AssertionError("timeout virtual artifact context should not execute in sandbox")
+
+    monkeypatch.setattr(kernel.sandbox, "run", fail_if_called)
+    episode = kernel.run_task(
+        TaskSpec(
+            task_id="policy_timeout_virtual_context_bypass_task",
+            prompt="Record artifact context without executing it.",
+            workspace_subdir="policy_timeout_virtual_context_bypass_task",
+            expected_files=["patch.diff"],
+            max_steps=1,
+        )
+    )
+
+    assert sandbox_called["value"] is False
+    assert episode.success is False
+    assert episode.steps[0].command_result["exit_code"] == 0
+    assert episode.steps[0].verification["outcome_label"] == "artifact_virtual_context_recorded"
+
+
+def test_repeated_artifact_virtual_contexts_terminate_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+
+    class RepeatedVirtualContextPolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            return ActionDecision(
+                action="code_execute",
+                content=(
+                    "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                    f'{{"step": {state.completed_step_count() + 1}}}\n'
+                    "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                ),
+                thought="record repeated virtual artifact context",
+                decision_source="artifact_source_inspection_exhausted_context_read",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=RepeatedVirtualContextPolicy()).run_task(
+        TaskSpec(
+            task_id="repeated_virtual_context_budget_task",
+            prompt="Record artifact context until the kernel stops the diagnostic loop.",
+            workspace_subdir="repeated_virtual_context_budget_task",
+            expected_files=["patch.diff"],
+            max_steps=10,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is False
+    assert episode.termination_reason == "policy_terminated"
+    assert len(episode.steps) == 7
+    assert episode.steps[-1].action == "respond"
+    assert episode.steps[-1].decision_source == "artifact_materialization_guard"
+    assert episode.steps[-1].proposal_metadata["artifact_diagnostic_context_budget_exhausted"] is True
+    assert episode.steps[-1].proposal_metadata["artifact_diagnostic_context_count"] == 6
+    assert policy_calls["count"] == 6
+
+
+def test_candidate_exhausted_context_gets_one_materialization_attempt_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+    sources = [
+        "artifact_source_lines_followup_direct",
+        "artifact_expected_behavior_source_lines_followup_direct",
+        "artifact_definition_header_context_read",
+        "artifact_source_inspection_exhausted_context_read",
+        "artifact_source_inspection_repeat_blocked_context_read",
+        "artifact_candidate_set_exhausted_context_read",
+    ]
+
+    class CandidateExhaustedThenMaterializePolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            if policy_calls["count"] <= len(sources):
+                return ActionDecision(
+                    action="code_execute",
+                    content=(
+                        "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                        f'{{"step": {state.completed_step_count() + 1}}}\n'
+                        "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                    ),
+                    thought="record bounded artifact diagnostic context",
+                    decision_source=sources[policy_calls["count"] - 1],
+                )
+            return ActionDecision(
+                action="code_execute",
+                content="printf 'materialized patch\\n' > patch.diff",
+                thought="materialize the artifact after candidate context is exhausted",
+                decision_source="artifact_exhausted_budget_materialization_attempt",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=CandidateExhaustedThenMaterializePolicy()).run_task(
+        TaskSpec(
+            task_id="candidate_exhausted_budget_materialization_task",
+            prompt="Record artifact context, then materialize patch.diff.",
+            workspace_subdir="candidate_exhausted_budget_materialization_task",
+            expected_files=["patch.diff"],
+            max_steps=10,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is True
+    assert episode.steps[-1].decision_source == "artifact_exhausted_budget_materialization_attempt"
+    assert policy_calls["count"] == 7
+
+
+def test_source_repeat_context_gets_one_materialization_attempt_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+    sources = [
+        "artifact_source_lines_followup_direct",
+        "artifact_expected_behavior_source_lines_followup_direct",
+        "artifact_definition_header_context_read",
+        "artifact_source_inspection_exhausted_context_read",
+        "artifact_invalid_python_statement_context_read",
+        "artifact_candidate_set_exhausted_context_read",
+        "artifact_source_inspection_repeat_blocked_context_read",
+    ]
+
+    class SourceRepeatThenMaterializePolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            if policy_calls["count"] <= len(sources):
+                return ActionDecision(
+                    action="code_execute",
+                    content=(
+                        "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                        '{"prior_invalid_python_replacement_operations": [{"path": "pkg/module.py"}]}\n'
+                        "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                    ),
+                    thought="record bounded source-repeat artifact diagnostic context",
+                    decision_source=sources[policy_calls["count"] - 1],
+                    proposal_metadata={
+                        "prior_invalid_python_replacement_operations": [{"path": "pkg/module.py"}],
+                    },
+                )
+            return ActionDecision(
+                action="code_execute",
+                content="printf 'materialized patch\\n' > patch.diff",
+                thought="materialize after repeated source-inspection context",
+                decision_source="artifact_source_repeat_budget_materialization_attempt",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=SourceRepeatThenMaterializePolicy()).run_task(
+        TaskSpec(
+            task_id="source_repeat_budget_materialization_task",
+            prompt="Record artifact context, then materialize patch.diff.",
+            workspace_subdir="source_repeat_budget_materialization_task",
+            expected_files=["patch.diff"],
+            max_steps=10,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is True
+    assert episode.steps[-2].decision_source == "artifact_source_inspection_repeat_blocked_context_read"
+    assert episode.steps[-1].decision_source == "artifact_source_repeat_budget_materialization_attempt"
+    assert policy_calls["count"] == 8
+
+
+def test_definition_header_repeat_context_gets_one_materialization_attempt_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+    sources = [
+        "artifact_source_lines_followup_direct",
+        "artifact_expected_behavior_source_lines_followup_direct",
+        "artifact_definition_header_context_read",
+        "artifact_source_inspection_exhausted_context_read",
+        "artifact_source_inspection_repeat_blocked_context_read",
+        "artifact_candidate_set_exhausted_context_read",
+        "artifact_definition_header_repeat_blocked_context_read",
+    ]
+
+    class HeaderRepeatThenMaterializePolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            if policy_calls["count"] <= len(sources):
+                return ActionDecision(
+                    action="code_execute",
+                    content=(
+                        "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                        f'{{"step": {state.completed_step_count() + 1}}}\n'
+                        "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                    ),
+                    thought="record bounded artifact diagnostic context",
+                    decision_source=sources[policy_calls["count"] - 1],
+                )
+            return ActionDecision(
+                action="code_execute",
+                content="printf 'materialized patch\\n' > patch.diff",
+                thought="materialize after repeated header guard context",
+                decision_source="artifact_definition_header_repeat_materialization_attempt",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=HeaderRepeatThenMaterializePolicy()).run_task(
+        TaskSpec(
+            task_id="definition_header_repeat_budget_materialization_task",
+            prompt="Record artifact context, then materialize patch.diff.",
+            workspace_subdir="definition_header_repeat_budget_materialization_task",
+            expected_files=["patch.diff"],
+            max_steps=10,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is True
+    assert episode.steps[-1].decision_source == "artifact_definition_header_repeat_materialization_attempt"
+    assert policy_calls["count"] == 8
+
+
+def test_definition_header_context_gets_one_materialization_attempt_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+    sources = [
+        "artifact_source_lines_followup_direct",
+        "artifact_expected_behavior_source_lines_followup_direct",
+        "artifact_source_inspection_exhausted_context_read",
+        "artifact_candidate_set_exhausted_context_read",
+        "artifact_source_inspection_repeat_blocked_context_read",
+        "artifact_definition_header_context_read",
+    ]
+
+    class HeaderContextThenMaterializePolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            if policy_calls["count"] <= len(sources):
+                return ActionDecision(
+                    action="code_execute",
+                    content=(
+                        "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                        f'{{"step": {state.completed_step_count() + 1}}}\n'
+                        "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                    ),
+                    thought="record bounded artifact diagnostic context",
+                    decision_source=sources[policy_calls["count"] - 1],
+                )
+            return ActionDecision(
+                action="code_execute",
+                content="printf 'materialized patch\n' > patch.diff",
+                thought="materialize after definition-header guard context",
+                decision_source="artifact_definition_header_materialization_attempt",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=HeaderContextThenMaterializePolicy()).run_task(
+        TaskSpec(
+            task_id="definition_header_budget_materialization_task",
+            prompt="Record artifact context, then materialize patch.diff.",
+            workspace_subdir="definition_header_budget_materialization_task",
+            expected_files=["patch.diff"],
+            max_steps=10,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is True
+    assert episode.steps[-1].decision_source == "artifact_definition_header_materialization_attempt"
+    assert policy_calls["count"] == 7
+
+
+def test_policy_timeout_context_gets_one_materialization_attempt_after_budget(tmp_path):
+    policy_calls = {"count": 0}
+    sources = [
+        "artifact_source_lines_followup_direct",
+        "artifact_expected_behavior_source_lines_followup_direct",
+        "artifact_source_inspection_exhausted_context_read",
+        "artifact_candidate_set_exhausted_context_read",
+        "artifact_source_inspection_repeat_blocked_context_read",
+        "artifact_definition_header_context_read",
+        "artifact_definition_header_repeat_blocked_context_read",
+        "artifact_policy_timeout_context_read",
+    ]
+
+    class PolicyTimeoutThenMaterializePolicy(Policy):
+        def decide(self, state):
+            policy_calls["count"] += 1
+            if policy_calls["count"] <= len(sources):
+                return ActionDecision(
+                    action="code_execute",
+                    content=(
+                        "python - <<'AGENT_KERNEL_ARTIFACT_CONTEXT'\n"
+                        f'{{"step": {state.completed_step_count() + 1}}}\n'
+                        "AGENT_KERNEL_ARTIFACT_CONTEXT"
+                    ),
+                    thought="record bounded artifact diagnostic context",
+                    decision_source=sources[policy_calls["count"] - 1],
+                )
+            return ActionDecision(
+                action="code_execute",
+                content="printf 'materialized patch\n' > patch.diff",
+                thought="materialize after compact policy-timeout context",
+                decision_source="artifact_policy_timeout_materialization_attempt",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=PolicyTimeoutThenMaterializePolicy()).run_task(
+        TaskSpec(
+            task_id="policy_timeout_budget_materialization_task",
+            prompt="Record artifact context, then materialize patch.diff.",
+            workspace_subdir="policy_timeout_budget_materialization_task",
+            expected_files=["patch.diff"],
+            max_steps=12,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is True
+    assert episode.steps[-1].decision_source == "artifact_policy_timeout_materialization_attempt"
+    assert policy_calls["count"] == 9
+
+
+def test_artifact_materialization_guard_done_is_not_deferred(tmp_path):
+    class MaterializationGuardPolicy(Policy):
+        def decide(self, state):
+            del state
+            return ActionDecision(
+                action="respond",
+                content="Stopping because no materialization command was produced.",
+                thought="stop materialization loop",
+                done=True,
+                decision_source="artifact_materialization_guard",
+            )
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories",
+    )
+
+    episode = AgentKernel(config=config, policy=MaterializationGuardPolicy()).run_task(
+        TaskSpec(
+            task_id="materialization_guard_terminal_task",
+            prompt="write patch.diff",
+            workspace_subdir="materialization_guard_terminal_task",
+            expected_files=["patch.diff"],
+            max_steps=3,
+            metadata={"artifact_repair_contract": {"artifact_path": "patch.diff"}},
+        )
+    )
+
+    assert episode.success is False
+    assert episode.termination_reason == "policy_terminated"
+    assert len(episode.steps) == 1
+    assert episode.steps[0].decision_source == "artifact_materialization_guard"
+    assert episode.steps[0].verification["outcome_label"] == "policy_terminated"
+    assert "artifact_done_response_deferred" not in episode.steps[0].verification["reasons"]
 
 
 def test_kernel_records_learned_world_signal_from_retained_tolbert_runtime(tmp_path, monkeypatch):
@@ -5222,6 +6199,34 @@ def test_kernel_build_plan_includes_repo_workflow_steps(tmp_path):
     assert "prepare workflow branch fix/release-ready" in plan
     assert "update workflow path src/release_state.txt" in plan
     assert "run workflow test release test script" in plan
+
+
+def test_swe_patch_plan_filters_gold_test_and_doc_paths():
+    kernel = AgentKernel(config=KernelConfig(provider="mock", use_tolbert_context=False))
+    task = TaskSpec(
+        task_id="swe_plan_filter",
+        prompt="create patch.diff",
+        workspace_subdir="swe_plan_filter",
+        expected_files=["patch.diff"],
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "expected_changed_paths": [
+                    "docs/sphinx/source/whatsnew/v0.11.1.rst",
+                    "pkg/module.py",
+                    "tests/test_module.py",
+                ],
+            }
+        },
+    )
+
+    plan = kernel._build_plan(task)
+    summary = kernel.world_model.summarize(task)
+
+    assert "update workflow path pkg/module.py" in plan
+    assert "update workflow path docs/sphinx/source/whatsnew/v0.11.1.rst" not in plan
+    assert "update workflow path tests/test_module.py" not in plan
+    assert summary["workflow_expected_changed_paths"] == ["pkg/module.py"]
 
 
 def test_graph_memory_summarizes_prior_documents(tmp_path):

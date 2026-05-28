@@ -100,6 +100,10 @@ def prepare_task_for_run(
     uses_shared_repo_fn: Callable[..., bool],
     prepare_runtime_task_fn: Callable[..., TaskSpec],
 ) -> TaskSpec:
+    overrides = dict(runtime_overrides or {})
+    task_payload = overrides.get("task_payload")
+    if isinstance(task_payload, dict):
+        task = TaskSpec.from_dict(task_payload)
     if uses_shared_repo_fn(task, runtime_overrides=runtime_overrides):
         return prepare_runtime_task_fn(task, runtime_overrides=runtime_overrides, job_id=job_id)
     return deepcopy(task)

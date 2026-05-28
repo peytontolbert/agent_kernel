@@ -59,6 +59,36 @@ def test_build_swe_prediction_task_manifest_selects_tasks_and_patch_paths(tmp_pa
     assert manifest["prediction_manifest"]["predictions"][0]["patch_path"] == "django__django-1.diff"
 
 
+def test_build_swe_prediction_task_manifest_attaches_official_feedback(tmp_path):
+    module = _load_tasks_module()
+    feedback_path = tmp_path / "official_retry.json"
+    feedback_path.write_text(
+        json.dumps(
+            {
+                "report_kind": "swe_official_failure_retry_report",
+                "failed_jobs": [
+                    {
+                        "instance_id": "django__django-1",
+                        "failed_tests": ["tests/test_time.py::test_parse"],
+                        "post_patch_log_tail": "FAILED tests/test_time.py::test_parse",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = module.build_swe_prediction_task_manifest(
+        _dataset(),
+        output_patch_dir=str(tmp_path / "patches"),
+        model_name_or_path="agentkernel-vllm",
+        limit=1,
+        official_feedback_json=str(feedback_path),
+    )
+
+    assert manifest["tasks"][0]["official_feedback"]["failed_tests"] == ["tests/test_time.py::test_parse"]
+
+
 def test_paths_from_unified_diff_supports_git_and_file_headers():
     module = _load_tasks_module()
 

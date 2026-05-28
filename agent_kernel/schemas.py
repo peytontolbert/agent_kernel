@@ -167,6 +167,56 @@ class CommandResult:
     capabilities_used: list[str] = field(default_factory=list)
 
 
+def classify_command_result_failure(result: CommandResult | None) -> dict[str, Any]:
+    """Classify terminal-boundary failures into generic recovery routes."""
+    if result is None:
+        return {}
+    command = str(result.command).strip()
+    combined = f"{result.stderr}\n{result.stdout}".strip()
+    lowered = combined.lower()
+    if result.timed_out:
+        return _command_failure("timeout", command, combined, confidence=0.98)
+    if result.exit_code == 0:
+        return {}
+    if "syntaxerror" in lowered or "parseerror" in lowered or "invalid syntax" in lowered:
+        return _command_failure("syntax_error", command, combined, confidence=0.95)
+    if "no meaningful change" in lowered or "patch is empty" in lowered or "empty patch" in lowered:
+        return _command_failure("no_op_edit", command, combined, confidence=0.94)
+    if "modulenotfounderror" in lowered or "importerror" in lowered or "cannot find module" in lowered:
+        return _command_failure("import_error", command, combined, confidence=0.93)
+    if "permission denied" in lowered or "eacces" in lowered:
+        return _command_failure("permission_error", command, combined, confidence=0.93)
+    if "no such file or directory" in lowered or "enoent" in lowered:
+        return _command_failure("missing_file", command, combined, confidence=0.9)
+    if "unexpected keyword argument" in lowered or "has no attribute" in lowered or "missing 1 required" in lowered:
+        return _command_failure("api_mismatch", command, combined, confidence=0.82)
+    test_like = any(token in lowered for token in ("failed", "assertionerror", "short test summary info"))
+    command_test_like = any(token in command for token in ("pytest", "tox", "unittest", "npm test", "go test"))
+    if test_like and command_test_like:
+        return _command_failure("test_assertion_failure", command, combined, confidence=0.9)
+    if "traceback (most recent call last)" in lowered or "runtimeerror" in lowered or "typeerror" in lowered:
+        return _command_failure("runtime_exception", command, combined, confidence=0.78)
+    if "version conflict" in lowered or "resolutionimpossible" in lowered or "dependency conflict" in lowered:
+        return _command_failure("dependency_conflict", command, combined, confidence=0.86)
+    if any(token in lowered for token in ("ruff", "flake8", "eslint", "prettier", "gofmt")):
+        return _command_failure("lint_style_failure", command, combined, confidence=0.74)
+    return _command_failure("runtime_or_command_failure", command, combined, confidence=0.55)
+
+
+def _command_failure(mode: str, command: str, output: str, *, confidence: float) -> dict[str, Any]:
+    signature_source = output or command
+    signature = " ".join(signature_source.split())[:240]
+    return {
+        "kind": "terminal_failure_classification",
+        "failure_class": mode,
+        "failure_code": f"terminal_{mode}",
+        "confidence": round(confidence, 3),
+        "command": command[:240],
+        "signature": signature,
+        "evidence_tail": output[-2000:],
+    }
+
+
 @dataclass(slots=True)
 class VerificationResult:
     passed: bool
@@ -348,12 +398,56 @@ def classify_verification_reason(reason: str) -> str:
         return "success_command_failed"
     if "semantic verifier contract malformed" in lowered:
         return "semantic_verifier_contract_malformed"
+    if "swe patch replaces real behavior with placeholder output" in lowered:
+        return "placeholder_output_replacement"
+    if "swe patch makes suspicious config key replacements" in lowered:
+        return "config_key_replacement"
+    if "swe patch duplicates surrounding call wrappers" in lowered:
+        return "duplicate_call_wrapper"
+    if "swe patch inserts python-looking code into non-python file" in lowered:
+        return "non_python_language_mismatch"
+    if "swe patch makes suspicious semantic token flips" in lowered:
+        return "semantic_token_flip"
+    if "swe patch makes suspicious unknown attribute replacements" in lowered:
+        return "unknown_attribute_replacement"
+    if "swe patch introduces private attribute reads" in lowered:
+        return "private_attribute_read"
+    if "swe patch makes suspicious exception contract changes" in lowered:
+        return "exception_contract_regression"
+    if "swe patch adds redundant decorated normalizations" in lowered:
+        return "redundant_decorated_normalization"
+    if "swe patch changes only python string literal values" in lowered:
+        return "string_literal_only_change"
+    if "swe patch changes only python type annotations" in lowered:
+        return "annotation_only_change"
+    if "swe patch makes indentation-only statement moves" in lowered:
+        return "indentation_only_statement_move"
+    if "swe patch introduces none return value paths" in lowered:
+        return "none_return_value_introduced"
+    if "swe patch introduces none container misuse" in lowered:
+        return "none_container_misuse"
+    if "swe patch introduces function object arithmetic" in lowered:
+        return "function_object_arithmetic"
     if "swe patch leaves invalid __init__ return values" in lowered:
         return "invalid_init_return_value"
     if "swe patch leaves invalid __init__ generators" in lowered:
         return "invalid_init_generator"
     if "swe patch introduces local use before assignment" in lowered:
         return "local_use_before_assignment"
+    if "swe patch changes only tests or auxiliary update artifacts" in lowered:
+        return "disallowed_swe_solution_path"
+    if "swe patch removes module registration assignments" in lowered:
+        return "module_registration_removed"
+    if "swe patch introduces unresolved name reads" in lowered:
+        return "unresolved_name_read"
+    if "swe patch removes production return value paths" in lowered:
+        return "return_value_path_removed"
+    if "swe patch makes suspicious isolated boolean return flips" in lowered:
+        return "suspicious_boolean_return_flip"
+    if "swe patch makes suspicious python statement-kind replacements" in lowered:
+        return "statement_kind_replacement"
+    if "swe patch json syntax check failed" in lowered:
+        return "json_syntax_error"
     if "policy terminated" in lowered:
         return "policy_terminated"
     if "governance rejected command" in lowered:

@@ -3,11 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
+import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from agent_kernel.config import KernelConfig
 from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+from agent_kernel.neural_controller import (
+    neural_controller_shadow_promotion_readiness,
+    summarize_neural_controller_shadow_documents,
+)
+from agent_kernel.ops.episode_store import iter_episode_documents
+from scripts.report_neural_controller_runtime_contract_metrics import summarize_runtime_contract_metrics
 
 
 DEFAULT_OUTPUT = Path("web/benchmark_browser/benchmark_index.json")
@@ -15,6 +26,13 @@ DEFAULT_LIVE_OUTPUT = Path("web/benchmark_browser/benchmark_live_status.json")
 DEFAULT_TARGET_PACKET = Path("docs/evidence/a8_coding_superhuman_target_packet_20260426.json")
 DEFAULT_SOURCE_MANIFEST = Path("config/a8_benchmark_dataset_sources.json")
 DEFAULT_SOURCE_STATUS = Path("benchmarks/a8_dataset_sources/status.json")
+DEFAULT_NEURAL_CONTROLLER_SHADOW_METRICS = Path("trajectories/neural_controller/shadow_metrics.json")
+DEFAULT_NEURAL_CONTROLLER_RUNTIME_CONTRACT_METRICS = Path(
+    "trajectories/neural_controller/runtime_contract_metrics_current.json"
+)
+DEFAULT_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE = Path(
+    "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json"
+)
 
 
 A8_BENCHMARK_GATES = [
@@ -335,6 +353,9 @@ def _build_run_spec(path: Path, root: Path) -> dict[str, Any]:
 def _score_from_summary(path: Path, root: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
+    source_path = _summary_source_path(path, root)
+    if source_path is not None and not source_path.exists():
+        return None
     summary = _build_summary(path, root)
     resolved = _number(summary.get("resolved_count"))
     total = _number(summary.get("task_count"))
@@ -347,6 +368,8 @@ def _score_from_summary(path: Path, root: Path) -> dict[str, Any] | None:
         "task_count": int(total),
         "resolve_rate": float(rate or 0.0),
         "score_source": "summary_json",
+        "score_mtime": path.stat().st_mtime,
+        "score_updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
         "summary_json": summary.get("path", ""),
     }
 
@@ -368,6 +391,8 @@ def _score_from_results(path: Path, root: Path) -> dict[str, Any] | None:
         "failed_count": len(failed_ids),
         "resolve_rate": float(result.get("resolve_rate") or 0.0),
         "score_source": "results_json",
+        "score_mtime": path.stat().st_mtime,
+        "score_updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
         "results_json": result.get("path", ""),
         "passed_instance_ids": passed_ids[:50],
         "failed_instance_ids": failed_ids[:50],
@@ -433,32 +458,144 @@ def _prediction_count_from_json(path: Path) -> int | None:
     return None
 
 
+def _prediction_count_from_jsonl(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def _prediction_instance_ids_from_json(path: Path) -> set[str] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return {str(key) for key in payload if str(key)}
+    if isinstance(payload, list):
+        instance_ids: set[str] = set()
+        for item in payload:
+            if isinstance(item, dict):
+                instance_id = _text(item.get("instance_id"))
+                if instance_id:
+                    instance_ids.add(instance_id)
+        return instance_ids
+    return None
+
+
+def _prediction_instance_ids_from_jsonl(path: Path) -> set[str] | None:
+    if not path.exists():
+        return None
+    instance_ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            instance_id = _text(payload.get("instance_id"))
+            if instance_id:
+                instance_ids.add(instance_id)
+    return instance_ids
+
+
+def _pid_is_alive(pid: Any) -> bool | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _summary_source_path(path: Path, root: Path) -> Path | None:
+    try:
+        payload = _read_json_object(path)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    source_path = _text(payload.get("source_path"))
+    if not source_path:
+        return None
+    candidate = Path(source_path)
+    if candidate.is_absolute():
+        return candidate
+    return (root / candidate).resolve()
+
+
+def _verification_summary_from_json(path: Path, root: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json_object(path)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    abstained_jobs = [job for job in payload.get("abstained_jobs", []) if isinstance(job, dict)]
+    reason_counts: dict[str, int] = {}
+    for job in abstained_jobs:
+        reasons = job.get("verification_reasons")
+        if isinstance(reasons, list):
+            reason = str(reasons[0]) if reasons else _text(job.get("reason")) or "unspecified"
+        else:
+            reason = _text(job.get("reason")) or "unspecified"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    top_abstain_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+    ]
+    return {
+        "path": str(path.relative_to(root)) if path.is_relative_to(root) else str(path),
+        "created_at": _text(payload.get("created_at")),
+        "verified_patch_count": int(_number(payload.get("verified_patch_count")) or 0),
+        "abstained_patch_count": int(_number(payload.get("abstained_patch_count")) or 0),
+        "failed_patch_count": int(_number(payload.get("failed_patch_count")) or 0),
+        "skipped_nonterminal_count": int(_number(payload.get("skipped_nonterminal_count")) or 0),
+        "skipped_pre_epoch_count": int(_number(payload.get("skipped_pre_epoch_count")) or 0),
+        "skipped_missing_count": int(_number(payload.get("skipped_missing_count")) or 0),
+        "verification_task_count": int(_number(payload.get("task_count")) or 0),
+        "successful_instance_ids": _json_list(payload.get("successful_instance_ids")),
+        "retry_instance_ids": _json_list(payload.get("retry_instance_ids")),
+        "top_abstain_reasons": top_abstain_reasons,
+    }
+
+
 def _build_rolling_scorecards(root: Path, harness_specs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     scorecards: dict[str, dict[str, Any]] = {}
     for harness in harness_specs:
         benchmark = _text(harness.get("benchmark"))
         run_config = harness.get("run_config") if isinstance(harness.get("run_config"), dict) else {}
         score_kind = _text(run_config.get("score_kind"))
+        score_mode = _text(run_config.get("score_mode")) or score_kind
         if not benchmark or not score_kind:
             continue
         artifacts = harness.get("artifacts") if isinstance(harness.get("artifacts"), dict) else {}
         summary_json = _text(artifacts.get("summary_json"))
         results_json = _text(artifacts.get("results_json"))
         preds_json = _text(artifacts.get("predictions_patch_json"))
+        verification_json = _text(artifacts.get("patch_job_verification_json"))
         summary_path = _resolve_index_path(root, summary_json) if summary_json else None
         results_path = _resolve_index_path(root, results_json) if results_json else None
         preds_path = _resolve_index_path(root, preds_json) if preds_json else None
-        score = (
-            _score_from_summary(summary_path, root)
-            if summary_path is not None
-            else None
-        ) or (
-            _score_from_results(results_path, root)
+        verification_path = _resolve_index_path(root, verification_json) if verification_json else None
+        prediction_instance_ids = _prediction_instance_ids_from_json(preds_path) if preds_path is not None else None
+        summary_score = _score_from_summary(summary_path, root) if summary_path is not None else None
+        results_score = _score_from_results(results_path, root) if results_path is not None else None
+        partial_score = (
+            _score_from_partial_reports(results_path, root, allowed_instance_ids=prediction_instance_ids)
             if results_path is not None
             else None
         )
-        if score is None:
-            score = _score_from_partial_reports(results_path, root) if results_path is not None else None
+        verification_summary = (
+            _verification_summary_from_json(verification_path, root) if verification_path is not None else None
+        )
+        score = _freshest_rolling_score(summary_score, results_score, partial_score)
         if score is None:
             score = {
                 "status": "pending",
@@ -467,49 +604,228 @@ def _build_rolling_scorecards(root: Path, harness_specs: list[dict[str, Any]]) -
                 "resolve_rate": None,
                 "score_source": "",
             }
+        prediction_count = _prediction_count_from_json(preds_path) if preds_path is not None else None
+        if prediction_count == 0:
+            score = {
+                "status": "no_predictions",
+                "resolved_count": 0,
+                "task_count": 0,
+                "failed_count": 0,
+                "resolve_rate": None,
+                "score_source": "no_current_predictions",
+                "remaining_prediction_count": 0,
+            }
+        if score.get("status") == "partial" and prediction_count is not None and score.get("task_count") is not None:
+            score["remaining_prediction_count"] = max(0, int(prediction_count) - int(score.get("task_count") or 0))
+        if preds_path is not None and preds_path.exists() and prediction_count != 0:
+            preds_mtime = preds_path.stat().st_mtime
+            score_mtime = float(score.get("score_mtime") or 0.0)
+            score_task_count = int(score.get("task_count") or 0)
+            score_is_complete_for_predictions = (
+                score.get("status") == "available"
+                and prediction_count is not None
+                and score_task_count >= int(prediction_count)
+            )
+            if not score_mtime:
+                score = {
+                    "status": "running",
+                    "resolved_count": None,
+                    "task_count": prediction_count,
+                    "failed_count": None,
+                    "resolve_rate": None,
+                    "score_source": "official_evaluator_running",
+                    "remaining_prediction_count": prediction_count,
+                }
+            elif preds_mtime > score_mtime and not score_is_complete_for_predictions:
+                score = {
+                    "status": "running",
+                    "resolved_count": None,
+                    "task_count": prediction_count,
+                    "failed_count": None,
+                    "resolve_rate": None,
+                    "score_source": "official_evaluator_running",
+                    "score_mtime": score_mtime,
+                    "score_updated_at": _text(score.get("score_updated_at")),
+                    "previous_resolved_count": score.get("resolved_count"),
+                    "previous_task_count": score.get("task_count"),
+                    "previous_resolve_rate": score.get("resolve_rate"),
+                    "remaining_prediction_count": prediction_count,
+                }
         score.update(
             {
                 "benchmark": benchmark,
                 "score_kind": score_kind,
                 "run_id": _text(run_config.get("run_id")),
+                "score_mode": score_mode,
                 "results_json": results_json,
                 "summary_json": summary_json,
                 "predictions_patch_json": preds_json,
-                "prediction_count": _prediction_count_from_json(preds_path) if preds_path is not None else None,
-                "label": "Rolling completed-subset official score",
+                "patch_job_verification_json": verification_json,
+                "prediction_count": prediction_count,
+                "label": "Rolling raw completed-success official score"
+                if "raw" in score_mode
+                else "Rolling verified-subset official score",
                 "final_leaderboard_score": False,
+                "trusted_leaderboard_evidence": "raw" not in score_mode,
             }
         )
+        if verification_summary is not None:
+            score["verification"] = verification_summary
+            score["verified_patch_count"] = verification_summary["verified_patch_count"]
+            score["abstained_patch_count"] = verification_summary["abstained_patch_count"]
+            score["failed_patch_count"] = verification_summary["failed_patch_count"]
+            score["skipped_nonterminal_count"] = verification_summary["skipped_nonterminal_count"]
+            score["skipped_pre_epoch_count"] = verification_summary["skipped_pre_epoch_count"]
+            score["skipped_missing_count"] = verification_summary["skipped_missing_count"]
         scorecards[f"{benchmark}:{score_kind}"] = score
+    scorecards.update(_discover_swe_live_rolling_scorecards(root))
     return scorecards
 
 
-def _score_from_partial_reports(results_path: Path, root: Path) -> dict[str, Any] | None:
+def _discover_swe_live_rolling_scorecards(root: Path) -> dict[str, dict[str, Any]]:
+    scorecards: dict[str, dict[str, Any]] = {}
+    rolling_root = root / "benchmarks/swe_bench_live/rolling_score"
+    if not rolling_root.exists():
+        return scorecards
+    for score_dir in sorted(path for path in rolling_root.iterdir() if path.is_dir()):
+        results_path = score_dir / "evaluation_results/results.json"
+        summary_path = score_dir / "summary.json"
+        preds_path = score_dir / "preds.json"
+        predictions_jsonl_path = score_dir / "predictions.jsonl"
+        verification_path = score_dir / "patch_jobs_selection.json"
+        if not any(path.exists() for path in (results_path, summary_path, preds_path, predictions_jsonl_path, verification_path)):
+            continue
+        prediction_instance_ids = (
+            _prediction_instance_ids_from_json(preds_path)
+            if preds_path.exists()
+            else _prediction_instance_ids_from_jsonl(predictions_jsonl_path)
+        )
+        summary_score = _score_from_summary(summary_path, root) if summary_path.exists() else None
+        results_score = _score_from_results(results_path, root) if results_path.exists() else None
+        partial_score = (
+            _score_from_partial_reports(results_path, root, allowed_instance_ids=prediction_instance_ids)
+            if results_path.exists()
+            else None
+        )
+        score = _freshest_rolling_score(summary_score, results_score, partial_score)
+        if score is None:
+            score = {
+                "status": "pending",
+                "resolved_count": None,
+                "task_count": None,
+                "failed_count": None,
+                "resolve_rate": None,
+                "score_source": "",
+            }
+        prediction_count = (
+            _prediction_count_from_json(preds_path)
+            if preds_path.exists()
+            else _prediction_count_from_jsonl(predictions_jsonl_path)
+        )
+        prediction_mtime = max(
+            [path.stat().st_mtime for path in (preds_path, predictions_jsonl_path) if path.exists()],
+            default=0.0,
+        )
+        verification_summary = _verification_summary_from_json(verification_path, root) if verification_path.exists() else None
+        if prediction_count == 0:
+            freshness_mtime = max(
+                prediction_mtime,
+                verification_path.stat().st_mtime if verification_path.exists() else 0.0,
+                results_path.stat().st_mtime if results_path.exists() else 0.0,
+            )
+            score = {
+                "status": "no_predictions",
+                "resolved_count": 0,
+                "task_count": 0,
+                "failed_count": 0,
+                "resolve_rate": None,
+                "score_source": "no_current_predictions",
+                "remaining_prediction_count": 0,
+                "score_mtime": freshness_mtime,
+                "score_updated_at": datetime.fromtimestamp(freshness_mtime, tz=timezone.utc).isoformat()
+                if freshness_mtime
+                else "",
+            }
+        score_mode = "raw_completed_success" if "raw" in score_dir.name else "verified_subset"
+        score.update(
+            {
+                "benchmark": "swe_bench_live",
+                "score_kind": f"discovered_{score_dir.name}",
+                "run_id": score_dir.name,
+                "score_mode": score_mode,
+                "results_json": str(results_path.relative_to(root)) if results_path.exists() else "",
+                "summary_json": str(summary_path.relative_to(root)) if summary_path.exists() else "",
+                "predictions_patch_json": str(preds_path.relative_to(root)) if preds_path.exists() else "",
+                "predictions_jsonl": str(predictions_jsonl_path.relative_to(root)) if predictions_jsonl_path.exists() else "",
+                "patch_job_verification_json": str(verification_path.relative_to(root)) if verification_path.exists() else "",
+                "prediction_count": prediction_count,
+                "prediction_mtime": prediction_mtime,
+                "prediction_updated_at": datetime.fromtimestamp(prediction_mtime, tz=timezone.utc).isoformat()
+                if prediction_mtime
+                else "",
+                "label": "Discovered rolling SWE-live score",
+                "final_leaderboard_score": False,
+                "trusted_leaderboard_evidence": False,
+                "discovered_from_rolling_score_dir": True,
+            }
+        )
+        if verification_summary is not None:
+            score["verification"] = verification_summary
+            score["verified_patch_count"] = verification_summary["verified_patch_count"]
+            score["abstained_patch_count"] = verification_summary["abstained_patch_count"]
+            score["failed_patch_count"] = verification_summary["failed_patch_count"]
+            score["skipped_nonterminal_count"] = verification_summary["skipped_nonterminal_count"]
+            score["skipped_pre_epoch_count"] = verification_summary["skipped_pre_epoch_count"]
+            score["skipped_missing_count"] = verification_summary["skipped_missing_count"]
+        scorecards[f"swe_bench_live:discovered:{score_dir.name}"] = score
+    return scorecards
+
+
+def _freshest_rolling_score(
+    summary_score: dict[str, Any] | None,
+    results_score: dict[str, Any] | None,
+    partial_score: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    candidates = [score for score in (summary_score, results_score, partial_score) if score]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda score: float(score.get("score_mtime") or 0.0))
+
+
+def _score_from_partial_reports(
+    results_path: Path,
+    root: Path,
+    allowed_instance_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
     report_dir = results_path.parent
     if not report_dir.exists():
         return None
-    reports: list[dict[str, Any]] = []
+    reports: list[tuple[Path, dict[str, Any]]] = []
     for report_path in sorted(report_dir.glob("*/report.json")):
         try:
             payload = _read_json_object(report_path)
         except (json.JSONDecodeError, ValueError):
             continue
+        instance_id = _text(payload.get("instance_id"))
+        if allowed_instance_ids is not None and instance_id not in allowed_instance_ids:
+            continue
         if isinstance(payload.get("resolved"), bool):
-            reports.append(payload)
+            reports.append((report_path, payload))
     if not reports:
         return None
-    resolved = sum(1 for report in reports if report.get("resolved") is True)
+    resolved = sum(1 for _path, report in reports if report.get("resolved") is True)
     total = len(reports)
     passed_ids = [
         _text(report.get("instance_id"))
-        for report in reports
+        for _path, report in reports
         if report.get("resolved") is True and _text(report.get("instance_id"))
     ]
     failed_ids = [
         _text(report.get("instance_id"))
-        for report in reports
+        for _path, report in reports
         if report.get("resolved") is False and _text(report.get("instance_id"))
     ]
+    score_mtime = max(path.stat().st_mtime for path, _report in reports)
     return {
         "status": "partial",
         "resolved_count": resolved,
@@ -517,11 +833,14 @@ def _score_from_partial_reports(results_path: Path, root: Path) -> dict[str, Any
         "failed_count": len(failed_ids),
         "resolve_rate": resolved / total if total else 0.0,
         "score_source": "partial_report_json",
+        "score_mtime": score_mtime,
+        "score_updated_at": datetime.fromtimestamp(score_mtime, tz=timezone.utc).isoformat(),
         "results_json": str(results_path.relative_to(root)) if results_path.is_relative_to(root) else str(results_path),
         "partial": True,
         "passed_instance_ids": passed_ids[:50],
         "failed_instance_ids": failed_ids[:50],
         "remaining_prediction_count": None,
+        "filtered_to_current_predictions": allowed_instance_ids is not None,
     }
 
 
@@ -535,14 +854,18 @@ def _build_harness_run(path: Path, root: Path) -> dict[str, Any] | None:
     active_phase = payload.get("active_phase") if isinstance(payload.get("active_phase"), dict) else {}
     phase_results = [item for item in payload.get("phase_results", []) if isinstance(item, dict)]
     progress = _latest_prediction_task_progress(path.parent, root)
+    active_pid = active_phase.get("pid")
+    active_pid_alive = _pid_is_alive(active_pid)
     return {
         "path": str(path.relative_to(root)),
         "benchmark": _text(payload.get("benchmark")),
         "success": bool(payload.get("success")),
+        "completed_at": _text(payload.get("completed_at")),
         "failed_phase": _text(payload.get("failed_phase")),
         "active_phase": {
             "name": _text(active_phase.get("name")),
-            "pid": active_phase.get("pid"),
+            "pid": active_pid,
+            "pid_alive": active_pid_alive,
             "elapsed_seconds": active_phase.get("elapsed_seconds"),
             "heartbeat_at": _text(active_phase.get("heartbeat_at")),
             "started_at": _text(active_phase.get("started_at")),
@@ -664,6 +987,10 @@ def _build_queue_snapshot_from_harness(harness: dict[str, Any], root: Path) -> d
     if not queue_path.exists():
         return None
     try:
+        queue_mtime = queue_path.stat().st_mtime
+    except OSError:
+        queue_mtime = 0.0
+    try:
         payload = _read_json_object(queue_path)
     except (json.JSONDecodeError, ValueError):
         return None
@@ -712,6 +1039,19 @@ def _build_queue_snapshot_from_harness(harness: dict[str, Any], root: Path) -> d
             )
     recent_events = sorted(recent_events, key=lambda item: item.get("at", ""))[-20:]
     recent_artifact_failures = sorted(recent_artifact_failures, key=lambda item: item.get("at", ""))[-20:]
+    latest_event_at = _text(recent_events[-1].get("at")) if recent_events else ""
+    recent_activity = False
+    if latest_event_at:
+        try:
+            parsed_latest = datetime.fromisoformat(latest_event_at.replace("Z", "+00:00"))
+            if parsed_latest.tzinfo is None:
+                parsed_latest = parsed_latest.replace(tzinfo=timezone.utc)
+            recent_activity = (datetime.now(timezone.utc) - parsed_latest).total_seconds() <= 900
+        except ValueError:
+            recent_activity = False
+
+    raw_active = state_counts.get("in_progress", 0)
+    active_jobs = raw_active if recent_activity else 0
     completed = state_counts.get("completed", 0)
     safe_stop = state_counts.get("safe_stop", 0)
     failed = state_counts.get("failed", 0)
@@ -719,13 +1059,17 @@ def _build_queue_snapshot_from_harness(harness: dict[str, Any], root: Path) -> d
     return {
         "benchmark": _text(harness.get("benchmark")),
         "queue_path": str(queue_path.relative_to(root)) if queue_path.is_relative_to(root) else str(queue_path),
+        "queue_mtime": queue_mtime,
         "total_jobs": len(jobs),
         "terminal_jobs": terminal,
-        "active_jobs": state_counts.get("in_progress", 0),
+        "active_jobs": active_jobs,
+        "stale_active_jobs": raw_active if raw_active and not recent_activity else 0,
         "queued_jobs": state_counts.get("queued", 0),
         "completed_jobs": completed,
         "safe_stop_jobs": safe_stop,
         "failed_jobs": failed,
+        "latest_event_at": latest_event_at,
+        "recent_activity": recent_activity,
         "state_counts": dict(sorted(state_counts.items())),
         "outcome_counts": dict(sorted(outcome_counts.items())),
         "artifact_failure_mode_counts": dict(sorted(artifact_failure_mode_counts.items())),
@@ -733,6 +1077,16 @@ def _build_queue_snapshot_from_harness(harness: dict[str, Any], root: Path) -> d
         "progress_rate": (terminal / len(jobs)) if jobs else 0.0,
         "recent_events": recent_events,
     }
+
+
+def _queue_snapshot_rank(snapshot: dict[str, Any]) -> tuple[int, float, int, int, int]:
+    return (
+        1 if int(snapshot.get("active_jobs", 0) or 0) > 0 else 0,
+        float(snapshot.get("queue_mtime", 0.0) or 0.0),
+        int(snapshot.get("terminal_jobs", 0) or 0),
+        int(snapshot.get("completed_jobs", 0) or 0),
+        int(snapshot.get("total_jobs", 0) or 0),
+    )
 
 
 def _build_live_events(
@@ -917,6 +1271,198 @@ def _number(value: Any) -> float | None:
     return None
 
 
+def _build_neural_controller_shadow_status(root: Path) -> dict[str, Any]:
+    path = root / DEFAULT_NEURAL_CONTROLLER_SHADOW_METRICS
+    relative = str(DEFAULT_NEURAL_CONTROLLER_SHADOW_METRICS)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "path": relative,
+            "summary": {},
+            "promotion_readiness": {},
+        }
+    try:
+        payload = _read_json_object(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {
+            "status": "unreadable",
+            "path": relative,
+            "summary": {},
+            "promotion_readiness": {},
+        }
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    readiness = payload.get("promotion_readiness") if isinstance(payload.get("promotion_readiness"), dict) else {}
+    return {
+        "status": "available",
+        "path": relative,
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "summary": summary,
+        "promotion_readiness": readiness,
+        "manifest_breakdown": payload.get("manifest_breakdown", []),
+        "shadow_compare_ready": bool(readiness.get("shadow_compare_ready", False)),
+        "kernel_guarded_content_ready": bool(readiness.get("kernel_guarded_content_ready", False)),
+        "content_authority_ready": bool(readiness.get("content_authority_ready", False)),
+        "pure_content_authority_ready": bool(readiness.get("pure_content_authority_ready", False)),
+        "primary_authority_ready": bool(readiness.get("primary_authority_ready", False)),
+        "episodes_with_shadow": summary.get("episodes_with_shadow", 0),
+        "ready_steps": summary.get("ready_steps", 0),
+        "content_comparison_steps": summary.get("content_comparison_steps", 0),
+        "error_rate": summary.get("error_rate", 0.0),
+        "warning_rate": summary.get("warning_rate", 0.0),
+        "verified_action_agreement_rate": summary.get("verified_action_agreement_rate", 0.0),
+        "content_exact_agreement_rate": summary.get("content_exact_agreement_rate", 0.0),
+        "unrepaired_content_exact_agreement_rate": summary.get(
+            "unrepaired_content_exact_agreement_rate",
+            0.0,
+        ),
+        "command_copy_target_repaired_rate": summary.get("command_copy_target_repaired_rate", 0.0),
+    }
+
+
+def _build_neural_controller_runtime_contract_status(root: Path) -> dict[str, Any]:
+    path = root / DEFAULT_NEURAL_CONTROLLER_RUNTIME_CONTRACT_METRICS
+    relative = str(DEFAULT_NEURAL_CONTROLLER_RUNTIME_CONTRACT_METRICS)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "path": relative,
+            "summary": {},
+        }
+    try:
+        payload = _read_json_object(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {
+            "status": "unreadable",
+            "path": relative,
+            "summary": {},
+        }
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    return {
+        "status": "available",
+        "path": relative,
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "summary": summary,
+        "shadow_steps": summary.get("shadow_steps", 0),
+        "runtime_contract_steps": summary.get("runtime_contract_steps", 0),
+        "runtime_contract_task_count": summary.get("runtime_contract_task_count", 0),
+        "runtime_contract_task_ids": summary.get("runtime_contract_task_ids", []),
+        "runtime_contract_success_steps": summary.get("runtime_contract_success_steps", 0),
+        "runtime_contract_coverage_rate": summary.get("runtime_contract_coverage_rate", 0.0),
+        "runtime_contract_success_rate": summary.get("runtime_contract_success_rate", 0.0),
+        "selector_signal_ready": bool(summary.get("selector_signal_ready", False)),
+        "runtime_artifact_failure_mode_counts": summary.get("runtime_artifact_failure_mode_counts", {}),
+        "rowwise_selector_source_counts": summary.get("rowwise_selector_source_counts", {}),
+        "rowwise_selector_policy_counts": summary.get("rowwise_selector_policy_counts", {}),
+    }
+
+
+def _build_neural_controller_selector_activation_status(root: Path) -> dict[str, Any]:
+    path = root / DEFAULT_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE
+    relative = str(DEFAULT_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "path": relative,
+        }
+    try:
+        payload = _read_json_object(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {
+            "status": "unreadable",
+            "path": relative,
+        }
+    return {
+        "status": "available",
+        "path": relative,
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "guarded_selector_activation_ready": bool(payload.get("guarded_selector_activation_ready", False)),
+        "production_guarded_selector_activation_ready": bool(
+            payload.get("production_guarded_selector_activation_ready", False)
+        ),
+        "primary_authority_ready": bool(payload.get("primary_authority_ready", False)),
+        "recommended_runtime_mode": str(payload.get("recommended_runtime_mode", "")).strip(),
+        "selector_policy": str(payload.get("selector_policy", "")).strip(),
+        "runtime_contract_steps": int(payload.get("runtime_contract_steps", 0) or 0),
+        "runtime_contract_task_count": int(payload.get("runtime_contract_task_count", 0) or 0),
+        "blockers": list(payload.get("blockers", []) or []),
+        "production_blockers": list(payload.get("production_blockers", []) or []),
+    }
+
+
+def _refresh_neural_controller_shadow_metrics(root: Path) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[1].resolve()
+    use_runtime_config = root.resolve() == repo_root
+    config = KernelConfig() if use_runtime_config else None
+    episodes_root = Path(config.trajectories_root) if config is not None else root / "trajectories"
+    if not episodes_root.is_absolute():
+        episodes_root = root / episodes_root
+    output_path = (
+        Path(config.neural_controller_shadow_metrics_path)
+        if config is not None
+        else root / DEFAULT_NEURAL_CONTROLLER_SHADOW_METRICS
+    )
+    if not output_path.is_absolute():
+        output_path = root / output_path
+    documents = iter_episode_documents(episodes_root, config=config)
+    reports_dir = Path(config.run_reports_dir) if config is not None else root / "trajectories" / "reports"
+    if not reports_dir.is_absolute():
+        reports_dir = root / reports_dir
+    documents.extend(_iter_neural_controller_report_documents(reports_dir))
+    summary = summarize_neural_controller_shadow_documents(documents)
+    report = {
+        "report_kind": "neural_controller_shadow_metrics",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "episodes_root": str(episodes_root),
+        "summary": summary,
+        "promotion_readiness": neural_controller_shadow_promotion_readiness(summary),
+    }
+    _write_json(output_path, report)
+    return report
+
+
+def _refresh_neural_controller_runtime_contract_metrics(root: Path) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[1].resolve()
+    use_runtime_config = root.resolve() == repo_root
+    config = KernelConfig() if use_runtime_config else None
+    episodes_root = Path(config.trajectories_root) if config is not None else root / "trajectories"
+    if not episodes_root.is_absolute():
+        episodes_root = root / episodes_root
+    output_path = root / DEFAULT_NEURAL_CONTROLLER_RUNTIME_CONTRACT_METRICS
+    documents = iter_episode_documents(episodes_root, config=config)
+    reports_dir = Path(config.run_reports_dir) if config is not None else root / "trajectories" / "reports"
+    if not reports_dir.is_absolute():
+        reports_dir = root / reports_dir
+    documents.extend(_iter_neural_controller_report_documents(reports_dir))
+    report = {
+        "report_kind": "neural_controller_runtime_contract_metrics",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "episodes_root": str(episodes_root),
+        "summary": summarize_runtime_contract_metrics(documents),
+    }
+    _write_json(output_path, report)
+    return report
+
+
+def _iter_neural_controller_report_documents(reports_dir: Path) -> list[dict[str, Any]]:
+    documents: list[dict[str, Any]] = []
+    if not reports_dir.exists():
+        return documents
+    for path in sorted(reports_dir.glob("*.json")):
+        try:
+            payload = _read_json_object(path)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if payload.get("report_kind") == "neural_controller_shadow_dataset_eval" and isinstance(
+            payload.get("documents"),
+            list,
+        ):
+            documents.extend(item for item in payload["documents"] if isinstance(item, dict))
+            continue
+        if payload.get("policy_trace"):
+            documents.append(payload)
+    return documents
+
+
 def _summary_metric(summary: dict[str, Any], metric: str) -> float | None:
     value = _number(summary.get(metric))
     if value is not None:
@@ -978,13 +1524,32 @@ def _run_spec_for_benchmark(run_specs: list[dict[str, Any]], benchmark: str) -> 
 
 
 def _active_run_for_benchmark(harness_runs: list[dict[str, Any]], benchmark: str) -> dict[str, Any] | None:
+    now = datetime.now(timezone.utc)
+
+    def fresh_active_phase(run: dict[str, Any]) -> bool:
+        phase = run.get("active_phase", {}) if isinstance(run.get("active_phase"), dict) else {}
+        if phase.get("pid_alive") is False:
+            return False
+        heartbeat = _text(phase.get("heartbeat_at"))
+        if not heartbeat:
+            return False
+        try:
+            parsed = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (now - parsed).total_seconds() <= 900
+
     candidates = [
         run
         for run in harness_runs
         if run.get("benchmark") == benchmark
         and not run.get("success")
+        and not run.get("completed_at")
         and isinstance(run.get("active_phase"), dict)
         and run.get("active_phase")
+        and fresh_active_phase(run)
     ]
     if not candidates:
         return None
@@ -993,6 +1558,43 @@ def _active_run_for_benchmark(harness_runs: list[dict[str, Any]], benchmark: str
         key=lambda item: str(item.get("active_phase", {}).get("heartbeat_at") or item.get("path") or ""),
         reverse=True,
     )[0]
+
+
+def _queue_activity_run(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    if not snapshot:
+        return None
+    active_jobs = int(snapshot.get("active_jobs", 0) or 0)
+    recent_events = [item for item in snapshot.get("recent_events", []) if isinstance(item, dict)]
+    latest_event = sorted(recent_events, key=lambda item: str(item.get("at", "")))[-1] if recent_events else {}
+    if active_jobs <= 0 and not latest_event:
+        return None
+    benchmark = _text(snapshot.get("benchmark")) or "queue"
+    event_name = _text(latest_event.get("event")) or "queue_activity"
+    task_id = _text(latest_event.get("task_id")) or "delegated_job"
+    heartbeat = _text(latest_event.get("at")) or datetime.now(timezone.utc).isoformat()
+    return {
+        "benchmark": benchmark,
+        "path": snapshot.get("queue_path", ""),
+        "active_phase": {
+            "name": f"Queue activity: {event_name}",
+            "pid": "queue",
+            "elapsed_seconds": None,
+            "heartbeat_at": heartbeat,
+            "active_jobs": active_jobs,
+            "current_task_id": task_id,
+        },
+        "phase_progress": {
+            "status": "running" if active_jobs > 0 else "recent_activity",
+            "processed_items": snapshot.get("terminal_jobs", 0),
+            "total_items": snapshot.get("total_jobs", 0),
+            "selected_tasks": snapshot.get("total_jobs", 0),
+            "updated_at": heartbeat,
+            "current_instance_id": task_id,
+        },
+        "completed_phase_count": 0,
+        "completed_phases": [],
+        "queue_derived": True,
+    }
 
 
 def _required_count(threshold: float | None, dataset_total: int | None) -> int | None:
@@ -1206,14 +1808,22 @@ def build_benchmark_live_status(root: Path) -> dict[str, Any]:
         )
         if path.is_file()
     ]
-    queue_snapshots = {
-        snapshot["benchmark"]: snapshot
-        for snapshot in (
-            _build_queue_snapshot_from_harness(harness, root)
-            for harness in harness_specs
-        )
-        if snapshot is not None and snapshot.get("benchmark")
-    }
+    queue_snapshots: dict[str, dict[str, Any]] = {}
+    for snapshot in (
+        _build_queue_snapshot_from_harness(harness, root)
+        for harness in harness_specs
+    ):
+        if snapshot is None or not snapshot.get("benchmark"):
+            continue
+        benchmark = str(snapshot["benchmark"])
+        previous = queue_snapshots.get(benchmark)
+        if previous is None or _queue_snapshot_rank(snapshot) > _queue_snapshot_rank(previous):
+            queue_snapshots[benchmark] = snapshot
+    for benchmark, snapshot in queue_snapshots.items():
+        if benchmark not in active_runs:
+            queue_run = _queue_activity_run(snapshot)
+            if queue_run is not None:
+                active_runs[benchmark] = queue_run
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
@@ -1222,6 +1832,9 @@ def build_benchmark_live_status(root: Path) -> dict[str, Any]:
         "queue_snapshots_by_benchmark": queue_snapshots,
         "official_scores_by_benchmark": _build_official_scorecards(root, run_specs),
         "rolling_scores": _build_rolling_scorecards(root, harness_specs),
+        "neural_controller_shadow": _build_neural_controller_shadow_status(root),
+        "neural_controller_runtime_contract": _build_neural_controller_runtime_contract_status(root),
+        "neural_controller_selector_activation": _build_neural_controller_selector_activation_status(root),
         "semantic_events": _build_live_events(active_runs=active_runs, queue_snapshots=queue_snapshots),
     }
 
@@ -1298,6 +1911,9 @@ def build_benchmark_browser_index(
             run_specs,
             harness_runs,
         ),
+        "neural_controller_shadow": _build_neural_controller_shadow_status(root),
+        "neural_controller_runtime_contract": _build_neural_controller_runtime_contract_status(root),
+        "neural_controller_selector_activation": _build_neural_controller_selector_activation_status(root),
         "dataset_sources": _build_dataset_sources(root, resolved_source_manifest, resolved_source_status),
         "datasets": datasets,
         "results": results,
@@ -1325,6 +1941,8 @@ def main() -> None:
     parser.add_argument("--source-status", default=str(DEFAULT_SOURCE_STATUS))
     parser.add_argument("--watch-live", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=5.0)
+    parser.add_argument("--refresh-neural-controller-shadow-metrics", action="store_true")
+    parser.add_argument("--refresh-neural-controller-runtime-contract-metrics", action="store_true")
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -1334,6 +1952,26 @@ def main() -> None:
     live_output = Path(args.live_output)
     if not live_output.is_absolute():
         live_output = root / live_output
+    if args.refresh_neural_controller_shadow_metrics:
+        report = _refresh_neural_controller_shadow_metrics(root)
+        summary = report["summary"]
+        print(
+            "refreshed_neural_controller_shadow_metrics "
+            f"episodes={summary.get('episode_count', 0)} "
+            f"shadow_episodes={summary.get('episodes_with_shadow', 0)}",
+            flush=True,
+        )
+    if args.refresh_neural_controller_runtime_contract_metrics:
+        report = _refresh_neural_controller_runtime_contract_metrics(root)
+        summary = report["summary"]
+        print(
+            "refreshed_neural_controller_runtime_contract_metrics "
+            f"shadow_steps={summary.get('shadow_steps', 0)} "
+            f"runtime_contract_steps={summary.get('runtime_contract_steps', 0)} "
+            f"runtime_contract_tasks={summary.get('runtime_contract_task_count', 0)} "
+            f"selector_signal_ready={str(summary.get('selector_signal_ready', False)).lower()}",
+            flush=True,
+        )
     if args.watch_live:
         interval_seconds = max(1.0, float(args.interval_seconds))
         while True:

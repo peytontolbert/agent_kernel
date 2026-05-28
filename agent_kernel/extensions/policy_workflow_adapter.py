@@ -934,6 +934,8 @@ class PolicyWorkflowAdapter:
     def pre_context_recovery_exhaustion_decision(self, state: AgentState) -> ActionDecision | None:
         if self._host._normalized_role(state) != "critic":
             return None
+        if self._host._artifact_latest_repairable_failure(state):
+            return None
         blocked_commands = sorted(state.all_failed_command_signatures())
         if not self.recovery_contract_exhausted(state, blocked_commands=blocked_commands):
             return None
@@ -1201,6 +1203,10 @@ class PolicyWorkflowAdapter:
                 continue
             count = self._safe_int(raw_count, 0)
             if count <= 0:
+                continue
+            if self.trusted_retrieval_requires_patch_artifact_command(state) and not self.command_produces_patch_artifact(
+                state, command_text
+            ):
                 continue
             if not self.command_matches_current_repair_surface(state, command_text):
                 continue
@@ -1539,6 +1545,10 @@ class PolicyWorkflowAdapter:
             canonical = _canonicalize_command(next_command)
             if not canonical or canonical in blocked_commands:
                 continue
+            if self.trusted_retrieval_requires_patch_artifact_command(state) and not self.command_produces_patch_artifact(
+                state, next_command
+            ):
+                continue
             control_score = self._host._command_control_score(state, next_command)
             if control_score <= 0 and self.verification_or_report_command(next_command):
                 control_score = 1
@@ -1651,14 +1661,55 @@ class PolicyWorkflowAdapter:
         return False
 
     @staticmethod
+    def trusted_retrieval_requires_patch_artifact_command(state: AgentState) -> bool:
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        if str(verifier.get("kind", "")).strip() != "swe_patch_apply_check":
+            return False
+        patch_path = str(verifier.get("patch_path", "patch.diff")).strip() or "patch.diff"
+        expected_files = {str(value).strip() for value in state.task.expected_files if str(value).strip()}
+        return patch_path in expected_files or Path(patch_path).name == "patch.diff"
+
+    @staticmethod
+    def command_produces_patch_artifact(state: AgentState, command: str) -> bool:
+        normalized = str(command).strip().lower()
+        if not normalized:
+            return False
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        patch_path = str(verifier.get("patch_path", "patch.diff")).strip() or "patch.diff"
+        patch_name = Path(patch_path).name.lower()
+        if patch_name not in normalized and str(patch_path).strip().lower() not in normalized:
+            return False
+        if "swe_patch_builder" in normalized or "patch_builder" in normalized:
+            return True
+        if "diff --git" in normalized or normalized.startswith("git diff "):
+            return True
+        return any(token in normalized for token in ("> patch.diff", ">patch.diff", "tee patch.diff"))
+
+    @staticmethod
     def command_mentions_current_task_paths(state: AgentState, command: str) -> bool:
         normalized = str(command).strip().lower()
         if not normalized:
             return False
+        metadata = dict(getattr(state.task, "metadata", {}) or {})
+        verifier = metadata.get("semantic_verifier", {})
+        verifier = dict(verifier) if isinstance(verifier, dict) else {}
+        verifier_paths = [
+            str(value).strip()
+            for value in verifier.get("expected_changed_paths", [])
+            if str(value).strip()
+        ]
+        patch_path = str(verifier.get("patch_path", "")).strip()
+        if patch_path:
+            verifier_paths.append(patch_path)
         for value in (
             list(state.task.expected_files)
             + list(state.task.expected_file_contents.keys())
             + list(state.task.forbidden_files)
+            + verifier_paths
         ):
             candidate_path = str(value).strip().lower()
             if candidate_path and candidate_path in normalized:

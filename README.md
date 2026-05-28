@@ -61,7 +61,7 @@ python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 
 
 Treat `hello_task` as a liveness probe only. The main product target is reliable work on `repository`, `project`, `tooling`, `integration`, and `repo_sandbox` families such as `git_repo_test_repair_task`, `git_repo_status_review_task`, and the supervised coding lanes that bias toward repository and project tasks.
 
-`vllm` is the preferred live provider. The current code defaults still fall back to `ollama` unless `AGENT_KERNEL_PROVIDER`, `AGENT_KERNEL_MODEL`, and `AGENT_KERNEL_VLLM_HOST` are set in the shell or passed on the CLI.
+`vllm` is the preferred live provider and the current `KernelConfig` default. Override `AGENT_KERNEL_PROVIDER`, `AGENT_KERNEL_MODEL`, and `AGENT_KERNEL_VLLM_HOST` only when you need a different local runtime.
 
 For implementation verification against the real runtime instead of only mock tests:
 

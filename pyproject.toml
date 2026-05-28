@@ -11,8 +11,50 @@ requires-python = ">=3.10"
 authors = [{ name = "OpenAI Codex" }]
 dependencies = []
 
+[project.optional-dependencies]
+runtime = [
+  "vllm>=0.8; platform_system == 'Linux'",
+]
+tolbert = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "tokenizers>=0.19",
+  "torch>=2.2",
+  "transformers>=4.40",
+]
+data = [
+  "datasets>=2.18",
+  "huggingface-hub>=0.23",
+  "pandas>=2.0",
+  "pyarrow>=15.0",
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+]
+all = [
+  "build>=1.2",
+  "datasets>=2.18",
+  "huggingface-hub>=0.23",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyarrow>=15.0",
+  "PyYAML>=6.0",
+  "pytest>=8.0",
+  "tokenizers>=0.19",
+  "torch>=2.2",
+  "transformers>=4.40",
+  "vllm>=0.8; platform_system == 'Linux'",
+]
+
+[project.scripts]
+agent-kernel = "scripts.run_agent:main"
+agent-kernel-eval = "scripts.run_eval:main"
+agent-kernel-minimal-asi = "scripts.run_minimal_asi:main"
+agent-kernel-ensure-vllm = "scripts.ensure_vllm_runtime:main"
+
 [tool.setuptools.packages.find]
-include = ["agent_kernel*", "evals*"]
+include = ["agent_kernel*", "evals*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import shlex
 from typing import Any
 
@@ -40,6 +41,12 @@ REPAIRABLE_VERIFIER_MARKERS = (
     "SWE patch leaves invalid __init__ return values",
     "SWE patch leaves invalid __init__ generators",
     "SWE patch introduces local use before assignment",
+    "SWE patch is an isolated one-line production Python replacement",
+    "SWE patch adds placeholder success print instead of behavior",
+    "SWE patch introduces self-recursive property access",
+    "SWE patch replaces container initialization with nested assignment",
+    "SWE patch repeats prior official-failed patch exactly",
+    "SWE patch replaces computed production assignment with a literal constant",
 )
 ARTIFACT_DECISION_SOURCES = (
     "artifact_",
@@ -106,6 +113,23 @@ def source_context_by_path(task: TaskSpec) -> dict[str, str]:
         if path.startswith("source_lines/"):
             continue
         contexts.setdefault(path, content)
+    for raw_path, content in setup_file_contents.items():
+        if not isinstance(content, str):
+            continue
+        path = str(raw_path).strip().strip("/")
+        if not path.startswith("source_lines/") or not path.endswith(".lines"):
+            continue
+        source_path = path.removeprefix("source_lines/").removesuffix(".lines").strip("/")
+        if not source_path or source_path in contexts:
+            continue
+        source_lines: list[str] = []
+        for raw_line in content.splitlines():
+            match = re.match(r"^\s*\d+:\s?(.*)$", raw_line)
+            if not match:
+                continue
+            source_lines.append(match.group(1))
+        if source_lines:
+            contexts[source_path] = "\n".join(source_lines)
     return contexts
 
 
@@ -163,11 +187,17 @@ def parse_builder_command(
         if token == "--replace-line" and index + 1 < len(args):
             if not flush_operation():
                 return None
+            raw_line = str(args[index + 1]).strip()
             try:
-                current_start_line = int(args[index + 1])
+                if re.match(r"^\d+\s*-\s*\d+$", raw_line):
+                    start_text, end_text = re.split(r"\s*-\s*", raw_line, maxsplit=1)
+                    current_start_line = int(start_text)
+                    current_end_line = int(end_text)
+                else:
+                    current_start_line = int(raw_line)
+                    current_end_line = current_start_line
             except ValueError:
                 return None
-            current_end_line = current_start_line
             index += 2
             continue
         if token == "--replace-lines" and index + 2 < len(args):
@@ -290,8 +320,21 @@ def classify_artifact_contract_failure_report(report: dict[str, Any]) -> dict[st
             last_decision_source=last_decision_source,
         )
     joined = "\n".join(evidence).lower()
-    if last_decision_source in {"artifact_materialization_guard", "swe_patch_materialization_guard"}:
-        mode = "artifact_materialization_guard_terminal"
+    if (
+        "retry_rejected_reason:escaped_newline_replacement" in joined
+        or "terminal_retry_rejected_reason:escaped_newline_replacement" in joined
+    ):
+        mode = "artifact_escaped_newline_replacement"
+    elif (
+        "retry_rejected_reason:invalid_python_diagnostic_exhausted" in joined
+        or "terminal_retry_rejected_reason:invalid_python_diagnostic_exhausted" in joined
+    ):
+        mode = "artifact_invalid_python_diagnostic_exhausted"
+    elif (
+        "retry_rejected_reason:invalid_python_replacement" in joined
+        or "terminal_retry_rejected_reason:invalid_python_replacement" in joined
+    ):
+        mode = "artifact_invalid_python_replacement"
     elif last_decision_source == "artifact_inference_failure_source_context_fallback":
         mode = "artifact_inference_failure_source_context_exhausted"
     elif "inference_failure" in joined:
@@ -304,12 +347,69 @@ def classify_artifact_contract_failure_report(report: dict[str, Any]) -> dict[st
         mode = "artifact_semantic_noop"
     elif "does not reference required" in joined or "required identifier" in joined:
         mode = "artifact_missing_required_identifier"
+    elif "placeholder output" in joined or "placeholder success print" in joined:
+        mode = "artifact_placeholder_output_replacement"
+    elif "suspicious config key replacements" in joined:
+        mode = "artifact_config_key_replacement"
+    elif "duplicates surrounding call wrappers" in joined:
+        mode = "artifact_duplicate_call_wrapper"
+    elif "python-looking code into non-python file" in joined:
+        mode = "artifact_non_python_language_mismatch"
+    elif "suspicious semantic token flips" in joined:
+        mode = "artifact_semantic_token_flip"
+    elif "suspicious unknown attribute replacements" in joined:
+        mode = "artifact_unknown_attribute_replacement"
+    elif "private attribute reads" in joined:
+        mode = "artifact_private_attribute_read"
+    elif "suspicious exception contract changes" in joined:
+        mode = "artifact_exception_contract_regression"
+    elif "redundant decorated normalizations" in joined:
+        mode = "artifact_redundant_decorated_normalization"
+    elif "changes only python string literal values" in joined:
+        mode = "artifact_string_literal_only_change"
+    elif "changes only python type annotations" in joined:
+        mode = "artifact_annotation_only_change"
+    elif "indentation-only statement moves" in joined:
+        mode = "artifact_indentation_only_statement_move"
+    elif "none return value paths" in joined:
+        mode = "artifact_none_return_value_introduced"
+    elif "none container misuse" in joined:
+        mode = "artifact_none_container_misuse"
+    elif "function object arithmetic" in joined:
+        mode = "artifact_function_object_arithmetic"
     elif "invalid __init__ return values" in joined:
         mode = "artifact_invalid_init_return_value"
     elif "invalid __init__ generators" in joined:
         mode = "artifact_invalid_init_generator"
     elif "local use before assignment" in joined:
         mode = "artifact_local_use_before_assignment"
+    elif "changes only tests or auxiliary update artifacts" in joined:
+        mode = "artifact_disallowed_swe_solution_path"
+    elif "removes module registration assignments" in joined:
+        mode = "artifact_module_registration_removed"
+    elif "introduces unresolved name reads" in joined:
+        mode = "artifact_unresolved_name_read"
+    elif "removes production return value paths" in joined:
+        mode = "artifact_return_value_path_removed"
+    elif "suspicious isolated boolean return flips" in joined:
+        mode = "artifact_suspicious_boolean_return_flip"
+    elif "suspicious python statement-kind replacements" in joined:
+        mode = "artifact_statement_kind_replacement"
+    elif (
+        "isolated one-line production python replacement" in joined
+        or "isolated one-line production python assignment replacement" in joined
+    ):
+        mode = "artifact_shallow_one_line_patch"
+    elif "self-recursive property access" in joined:
+        mode = "artifact_self_recursive_property_access"
+    elif "container initialization with nested assignment" in joined:
+        mode = "artifact_nested_assignment_replacement"
+    elif "repeats prior official-failed patch exactly" in joined or "repeated_official_failed_patch" in joined:
+        mode = "artifact_repeated_official_failed_patch"
+    elif "literal constant" in joined and "computed production assignment" in joined:
+        mode = "artifact_literal_constant_assignment_guess"
+    elif "json syntax check failed" in joined:
+        mode = "artifact_json_syntax_error"
     elif "apply check failed" in joined:
         mode = "artifact_apply_check_failed"
     elif "missing expected file" in joined or "missing artifact file" in joined or "missing patch file" in joined:
@@ -318,6 +418,8 @@ def classify_artifact_contract_failure_report(report: dict[str, Any]) -> dict[st
         mode = "artifact_repair_no_state_progress"
     elif "policy_terminated" in joined or "policy terminated" in joined:
         mode = "artifact_policy_terminated"
+    elif last_decision_source in {"artifact_materialization_guard", "swe_patch_materialization_guard"}:
+        mode = "artifact_materialization_guard_terminal"
     else:
         mode = "artifact_contract_unknown"
     return _artifact_failure_classification(
@@ -383,8 +485,10 @@ def _artifact_failure_evidence(
         if isinstance(proposal_metadata, dict):
             for key in (
                 "retry_rejected_reason",
+                "terminal_retry_rejected_reason",
                 "rejected_command",
                 "retry_command",
+                "terminal_retry_command",
                 "fallback_path",
                 "source_lines_path",
             ):

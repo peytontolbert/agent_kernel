@@ -353,6 +353,12 @@ def test_build_swe_autonomous_harness_spec_defines_end_to_end_phases(tmp_path):
     assert spec["phases"][1]["required_inputs"] == ["tasks.json"]
     assert spec["phases"][4]["required_inputs"][1] == "queue_manifest.json"
     assert spec["phases"][4]["expected_outputs"][0].endswith("patch_jobs_verification.json")
+    drain_phase = spec["phases"][3]
+    assert drain_phase["argv"][drain_phase["argv"].index("--job-timeout-seconds") + 1] == "600"
+    assert drain_phase["env"]["AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR"] == "20"
+    assert drain_phase["env"]["AGENT_KERNEL_LLM_HTTP_TRANSPORT"] == "curl"
+    assert drain_phase["env"]["AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS"] == "75"
+    assert drain_phase["env"]["AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS"] == "2"
     assert spec["phases"][5]["required_inputs"] == [
         "tasks.json",
         "queue_manifest.json",
@@ -420,15 +426,24 @@ def test_build_swe_autonomous_harness_spec_can_target_swe_bench_live(tmp_path):
     phase_names = [phase["name"] for phase in spec["phases"]]
     assert phase_names[0] == "prepare_repo_cache"
     assert "build_live_predictions_json" in phase_names
+    assert "apply_official_results_to_queue" in phase_names
     assert "materialize_results" not in phase_names
     official_phase = next(phase for phase in spec["phases"] if phase["name"] == "official_harness")
     assert official_phase["required_inputs"] == ["preds.json"]
     assert official_phase["expected_outputs"] == ["results/results.json"]
     assert official_phase["cwd"] == str(tmp_path)
+    assert official_phase["argv"][official_phase["argv"].index("--patch_dir") + 1] == str(Path("preds.json").resolve())
+    assert official_phase["argv"][official_phase["argv"].index("--output_dir") + 1] == str(Path("results").resolve())
     assert spec["artifacts"]["live_predictions_json"] == "preds.json"
     assert spec["artifacts"]["repo_cache_manifest_json"] == "repo_cache.json"
     assert spec["artifacts"]["leaderboard_submission_dir"] == "submission/verified/agentkernel"
     assert "SWE-bench Live leaderboard submission package" in spec["autonomy_contract"]["countable_evidence"]
+    apply_phase = next(phase for phase in spec["phases"] if phase["name"] == "apply_official_results_to_queue")
+    assert apply_phase["required_inputs"] == [
+        str(tmp_path / "queue" / "queue.json"),
+        "results/results.json",
+    ]
+    assert apply_phase["env"]["AGENT_KERNEL_RUNTIME_DATABASE_PATH"].endswith("agentkernel.sqlite3")
 
 
 def test_swe_autonomous_harness_queue_budget_scales_with_selected_slice(tmp_path):
@@ -581,6 +596,117 @@ def test_build_swe_retry_harness_spec_from_patch_job_verification(tmp_path):
     assert runner_module.validate_harness_spec(retry) == []
 
 
+def test_build_swe_live_retry_harness_preserves_live_official_evaluator(tmp_path):
+    module = _load_prepare_module()
+    source = module.build_swe_autonomous_harness_spec(
+        benchmark="swe_bench_live",
+        dataset_json="dataset.json",
+        dataset_name="SWE-bench-Live/SWE-bench-Live",
+        split="verified",
+        repo_cache_root="repo_cache",
+        prediction_task_manifest="tasks.json",
+        patch_dir="patches",
+        queue_manifest="queue_manifest.json",
+        queue_root=str(tmp_path / "queue"),
+        workspace_root="workspace",
+        workspace_prefix="swe_live_probe",
+        predictions_jsonl="predictions.jsonl",
+        apply_check_json="apply_check.json",
+        run_spec_json="run_spec.json",
+        run_id="live-run",
+        harness_root=str(tmp_path),
+        max_workers=1,
+        timeout=1800,
+        cache_level="env",
+        namespace="swebench_live",
+        report_dir="results",
+        results_json="results/results.json",
+        summary_json="results/summary.json",
+        output_packet_json="results/a8_benchmark_result.json",
+        python_bin=sys.executable,
+        model_name_or_path="agentkernel",
+        provider="vllm",
+        drain_limit=2,
+        max_source_context_bytes=30000,
+        instance_ids=["repo__pkg-1", "repo__pkg-2"],
+        official_harness_kind="swebench_live",
+    )
+    source["run_config"]["python_bin"] = "/home/peyton/miniconda3/bin/python"
+
+    retry = module.build_swe_retry_harness_spec(
+        source_harness=source,
+        patch_job_verification={
+            "report_kind": "swe_official_failure_retry_report",
+            "patch_job_verification_json": str(tmp_path / "official_retry.json"),
+            "retry_instance_ids": ["repo__pkg-2"],
+        },
+        retry_label="retry1",
+        artifact_dir=tmp_path / "retry",
+        output_harness_json=str(tmp_path / "retry" / "harness.json"),
+    )
+
+    phase_names = [phase["name"] for phase in retry["phases"]]
+    assert "build_live_predictions_json" in phase_names
+    assert "apply_official_results_to_queue" in phase_names
+    prepare_phase = next(phase for phase in retry["phases"] if phase["name"] == "prepare_prediction_tasks")
+    assert str(tmp_path / "official_retry.json") in prepare_phase["required_inputs"]
+    official_phase = next(phase for phase in retry["phases"] if phase["name"] == "official_harness")
+    assert official_phase["argv"][:3] == ["/home/peyton/miniconda3/bin/python", "-m", "evaluation.evaluation"]
+    assert "--patch_dir" in official_phase["argv"]
+    assert Path(official_phase["argv"][official_phase["argv"].index("--patch_dir") + 1]).is_absolute()
+    assert Path(official_phase["argv"][official_phase["argv"].index("--output_dir") + 1]).is_absolute()
+    assert retry["artifacts"]["live_predictions_json"].endswith(".live_preds.json")
+
+
+def test_build_swe_retry_harness_spec_bounds_workspace_prefix(tmp_path):
+    module = _load_prepare_module()
+    long_prefix = "swe_patch_" + "_".join(f"retry_segment_{index}" for index in range(12))
+    source = module.build_swe_autonomous_harness_spec(
+        benchmark="swe_bench_verified",
+        dataset_json="dataset.json",
+        dataset_name="princeton-nlp/SWE-bench_Verified",
+        split="test",
+        repo_cache_root="repo_cache",
+        prediction_task_manifest="tasks.json",
+        patch_dir="patches",
+        queue_manifest="queue_manifest.json",
+        queue_root=str(tmp_path / "queue"),
+        workspace_root="workspace",
+        workspace_prefix=long_prefix,
+        predictions_jsonl="predictions.jsonl",
+        apply_check_json="apply_check.json",
+        run_spec_json="run_spec.json",
+        run_id="autonomous-run",
+        harness_root=str(tmp_path / "swe-bench"),
+        max_workers=1,
+        timeout=1800,
+        cache_level="env",
+        namespace="swebench",
+        report_dir="results",
+        results_json="results/results.json",
+        summary_json="results/summary.json",
+        output_packet_json="results/a8_benchmark_result.json",
+        python_bin=sys.executable,
+        model_name_or_path="agentkernel",
+        provider="vllm",
+        drain_limit=2,
+        max_source_context_bytes=30000,
+        instance_ids=["repo__pkg-1"],
+    )
+
+    retry = module.build_swe_retry_harness_spec(
+        source_harness=source,
+        patch_job_verification={"retry_instance_ids": ["repo__pkg-1"]},
+        retry_label="official_score_feedback_r4_20260513",
+        artifact_dir=tmp_path / "retry",
+        output_harness_json=str(tmp_path / "retry" / "harness.json"),
+    )
+
+    prefix = retry["artifacts"]["workspace_prefix"]
+    assert len(prefix) <= 96
+    assert "official_score_feedback_r4_20260513" in prefix
+
+
 def test_build_swe_success_continuation_harness_from_patch_job_verification(tmp_path):
     module = _load_prepare_module()
     runner_module = _load_runner_module()
@@ -704,6 +830,8 @@ def test_prepare_swe_bench_retry_harness_cli_writes_retry_harness(tmp_path, monk
 
     retry = json.loads(output_path.read_text(encoding="utf-8"))
     assert retry["inputs"]["instance_ids"] == ["repo__pkg-2"]
+    drain_phase = next(phase for phase in retry["phases"] if phase["name"] == "drain_patch_jobs")
+    assert drain_phase["argv"][drain_phase["argv"].index("--limit") + 1] == "5"
     assert "retry_count=1" in capsys.readouterr().out
 
 

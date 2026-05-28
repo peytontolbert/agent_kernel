@@ -210,6 +210,25 @@ def _repo_cache_path(repo_cache_root: str, repo: str) -> Path | None:
     return None
 
 
+def _official_feedback_by_instance(path: str) -> dict[str, dict[str, Any]]:
+    if not str(path).strip():
+        return {}
+    feedback_path = Path(path)
+    if not feedback_path.exists() or not feedback_path.is_file():
+        return {}
+    payload = _read_json_or_jsonl(feedback_path)
+    if not isinstance(payload, dict):
+        return {}
+    feedback: dict[str, dict[str, Any]] = {}
+    for job in payload.get("failed_jobs", []):
+        if not isinstance(job, dict):
+            continue
+        instance_id = str(job.get("instance_id", "")).strip()
+        if instance_id:
+            feedback[instance_id] = dict(job)
+    return feedback
+
+
 def _line_start_offsets(text: str) -> list[int]:
     offsets = [0]
     for index, char in enumerate(text):
@@ -404,6 +423,7 @@ def build_swe_prediction_task_manifest(
     progress_json: str = "",
     progress_every: int = 25,
     output_manifest_json: str = "",
+    official_feedback_json: str = "",
 ) -> dict[str, Any]:
     selected_ids = {value.strip() for value in (instance_ids or []) if value.strip()}
     selected_repos = {value.strip() for value in (repos_filter or []) if value.strip()}
@@ -414,6 +434,7 @@ def build_swe_prediction_task_manifest(
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
     duplicate_instance_ids: list[str] = []
+    official_feedback = _official_feedback_by_instance(official_feedback_json)
     _write_progress(
         progress_path,
         _progress_payload(
@@ -464,6 +485,7 @@ def build_swe_prediction_task_manifest(
             ),
             "fail_to_pass": item.get("FAIL_TO_PASS", item.get("fail_to_pass", [])),
             "pass_to_pass": item.get("PASS_TO_PASS", item.get("pass_to_pass", [])),
+            "official_feedback": official_feedback.get(instance_id, {}),
             "task_prompt": (
                 "Produce a minimal unified diff that resolves the SWE-bench instance. "
                 "Return only the diff; do not include prose or markdown fences."
@@ -554,6 +576,7 @@ def main() -> None:
     parser.add_argument("--max-source-context-bytes", type=int, default=DEFAULT_SOURCE_CONTEXT_BYTES)
     parser.add_argument("--progress-json", default="")
     parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--official-feedback-json", default="")
     args = parser.parse_args()
 
     output_path = Path(args.output_manifest_json)
@@ -569,6 +592,7 @@ def main() -> None:
         progress_json=args.progress_json,
         progress_every=int(args.progress_every),
         output_manifest_json=str(output_path),
+        official_feedback_json=args.official_feedback_json,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

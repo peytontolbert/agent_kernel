@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +58,7 @@ class OllamaClient:
         decision_prompt: str,
         state_payload: dict[str, Any],
     ) -> dict[str, Any]:
+        decision_max_tokens = self._decision_max_tokens_for_payload(state_payload)
         attempts = [
             _render_prompt(
                 decision_prompt=decision_prompt,
@@ -73,7 +76,7 @@ class OllamaClient:
             for field in ("response", "thinking"):
                 parsed = _extract_json_object(data.get(field, ""))
                 if parsed is not None:
-                    return parsed
+                    return self._with_decoding_telemetry(parsed, last_data)
             if data.get("done_reason") != "length":
                 break
         raise ValueError(f"Ollama did not return a parseable JSON decision: {last_data}")
@@ -115,7 +118,7 @@ class OllamaClient:
 
 
 class VLLMClient:
-    _DECISION_MAX_TOKENS = (384, 256, 192, 128, 96, 64)
+    _DECISION_MAX_TOKENS = (384, 256, 192, 128, 96, 64, 48, 32)
 
     def __init__(
         self,
@@ -132,6 +135,22 @@ class VLLMClient:
         self.retry_attempts = max(1, retry_attempts)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
         self.api_key = api_key.strip()
+        raw_total_timeout = os.getenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", "").strip()
+        try:
+            total_timeout = (
+                int(raw_total_timeout)
+                if raw_total_timeout
+                else max(int(timeout_seconds) * 6, 60)
+            )
+        except ValueError:
+            total_timeout = max(int(timeout_seconds) * 6, 60)
+        self.decision_total_timeout_seconds = max(1, total_timeout)
+        raw_min_request_timeout = os.getenv("AGENT_KERNEL_LLM_MIN_REQUEST_TIMEOUT_SECONDS", "").strip()
+        try:
+            min_request_timeout = int(raw_min_request_timeout) if raw_min_request_timeout else 3
+        except ValueError:
+            min_request_timeout = 3
+        self.min_request_timeout_seconds = max(1, min_request_timeout)
 
     def create_decision(
         self,
@@ -140,6 +159,7 @@ class VLLMClient:
         decision_prompt: str,
         state_payload: dict[str, Any],
     ) -> dict[str, Any]:
+        decision_max_tokens = self._decision_max_tokens_for_payload(state_payload)
         attempts = [
             _render_prompt(
                 decision_prompt=decision_prompt,
@@ -160,8 +180,10 @@ class VLLMClient:
         ]
         last_data: dict[str, Any] | None = None
         last_error: Exception | None = None
+        deadline = time.monotonic() + float(self.decision_total_timeout_seconds)
         for prompt in attempts:
-            for max_tokens in self._DECISION_MAX_TOKENS:
+            for max_tokens in decision_max_tokens:
+                remaining_timeout = self._remaining_decision_timeout_or_raise(deadline)
                 parsed: dict[str, Any] | None = None
                 try:
                     data = self._chat_completion(
@@ -169,9 +191,11 @@ class VLLMClient:
                         prompt=prompt,
                         use_json_schema=True,
                         max_tokens=max_tokens,
+                        timeout_seconds=remaining_timeout,
                     )
                 except RuntimeError as exc:
                     last_error = exc
+                    remaining_timeout = self._remaining_decision_timeout_or_raise(deadline, from_exc=exc)
                     try:
                         # Fall back to prompt-only JSON if the server rejects structured output.
                         data = self._chat_completion(
@@ -179,6 +203,7 @@ class VLLMClient:
                             prompt=prompt,
                             use_json_schema=False,
                             max_tokens=max_tokens,
+                            timeout_seconds=remaining_timeout,
                         )
                     except RuntimeError as fallback_exc:
                         last_error = fallback_exc
@@ -199,6 +224,7 @@ class VLLMClient:
                                 prompt=prompt,
                                 use_json_schema=False,
                                 max_tokens=max_tokens,
+                                timeout_seconds=self._remaining_decision_timeout_or_raise(deadline),
                             )
                         except RuntimeError as fallback_exc:
                             last_error = fallback_exc
@@ -208,10 +234,113 @@ class VLLMClient:
                         last_data = data
                         parsed = self._extract_decision(data)
                 if parsed is not None:
-                    return parsed
+                    return self._with_decoding_telemetry(parsed, last_data)
         if last_error is not None:
             raise ValueError(f"vLLM did not return a parseable JSON decision: {last_data}") from last_error
         raise ValueError(f"vLLM did not return a parseable JSON decision: {last_data}")
+
+    def _decision_max_tokens_for_payload(self, state_payload: dict[str, Any]) -> tuple[int, ...]:
+        raw_budget = state_payload.get("decision_token_budget")
+        try:
+            budget = int(raw_budget) if raw_budget is not None else 0
+        except (TypeError, ValueError):
+            budget = 0
+        if _payload_needs_full_artifact_decision_budget(state_payload):
+            if budget > max(self._DECISION_MAX_TOKENS):
+                expanded = (budget,) + tuple(
+                    max_tokens for max_tokens in self._DECISION_MAX_TOKENS if max_tokens < budget
+                )
+                return expanded
+            return self._DECISION_MAX_TOKENS
+        if budget <= 0:
+            return self._DECISION_MAX_TOKENS
+        min_json_decision_tokens = 32
+        bounded = tuple(
+            max_tokens
+            for max_tokens in self._DECISION_MAX_TOKENS
+            if max_tokens <= budget and max_tokens >= min_json_decision_tokens
+        )
+        return bounded or (max(1, budget),)
+
+    @staticmethod
+    def _decision_logprob_telemetry_enabled() -> bool:
+        raw = os.getenv("AGENT_KERNEL_VLLM_DECISION_LOGPROBS", "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _with_decoding_telemetry(cls, decision: dict[str, Any], data: dict[str, Any] | None) -> dict[str, Any]:
+        telemetry = cls._chat_logprob_telemetry(data or {})
+        if not telemetry:
+            return decision
+        metadata = decision.get("proposal_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        decision["proposal_metadata"] = {
+            **metadata,
+            "vllm_decoding_telemetry": telemetry,
+        }
+        return decision
+
+    @staticmethod
+    def _chat_logprob_telemetry(data: dict[str, Any]) -> dict[str, Any]:
+        choices = data.get("choices", [])
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return {}
+        logprobs = choices[0].get("logprobs", {})
+        if not isinstance(logprobs, dict):
+            return {}
+        content = logprobs.get("content", [])
+        if not isinstance(content, list) or not content:
+            return {}
+        token_logprobs: list[float] = []
+        margins: list[float] = []
+        entropies: list[float] = []
+        tokens: list[str] = []
+        for item in content[:64]:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("token", ""))
+            if token:
+                tokens.append(token)
+            try:
+                token_logprobs.append(float(item.get("logprob")))
+            except (TypeError, ValueError):
+                pass
+            top = item.get("top_logprobs", [])
+            if not isinstance(top, list) or len(top) < 2:
+                continue
+            values: list[float] = []
+            for entry in top[:5]:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    values.append(float(entry.get("logprob")))
+                except (TypeError, ValueError):
+                    continue
+            if len(values) < 2:
+                continue
+            ordered = sorted(values, reverse=True)
+            margins.append(float(ordered[0] - ordered[1]))
+            max_logprob = ordered[0]
+            probs = [math.exp(value - max_logprob) for value in values]
+            total = sum(probs)
+            if total > 0:
+                normalized = [value / total for value in probs]
+                entropies.append(float(-sum(p * math.log(max(p, 1e-45)) for p in normalized)))
+
+        def _mean(values: list[float]) -> float:
+            return float(sum(values) / len(values)) if values else 0.0
+
+        return {
+            "token_count": len(content),
+            "sampled_token_count": len(token_logprobs),
+            "mean_logprob": _mean(token_logprobs),
+            "min_logprob": float(min(token_logprobs)) if token_logprobs else 0.0,
+            "mean_top_margin": _mean(margins),
+            "mean_top_entropy": _mean(entropies),
+            "low_margin_token_count": sum(1 for value in margins if value < 0.25),
+            "tokens_preview": tokens[:16],
+        }
 
     def _chat_completion(
         self,
@@ -220,7 +349,9 @@ class VLLMClient:
         prompt: str,
         use_json_schema: bool,
         max_tokens: int,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
+        request_timeout = max(1, int(timeout_seconds if timeout_seconds is not None else self.timeout_seconds))
         payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": [
@@ -228,9 +359,12 @@ class VLLMClient:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0,
-            "max_tokens": max(64, int(max_tokens)),
+            "max_tokens": max(1, int(max_tokens)),
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if self._decision_logprob_telemetry_enabled():
+            payload["logprobs"] = True
+            payload["top_logprobs"] = 5
         if use_json_schema:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -242,12 +376,28 @@ class VLLMClient:
         return _post_json(
             url=f"{self.host}/v1/chat/completions",
             payload=payload,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=min(max(1, int(self.timeout_seconds)), request_timeout),
             retry_attempts=self.retry_attempts,
             retry_backoff_seconds=self.retry_backoff_seconds,
             headers=_authorization_headers(self.api_key),
             error_label="vLLM request",
         )
+
+    @staticmethod
+    def _remaining_decision_timeout(deadline: float) -> int:
+        return int(math.ceil(max(0.0, deadline - time.monotonic())))
+
+    def _remaining_decision_timeout_or_raise(self, deadline: float, *, from_exc: Exception | None = None) -> int:
+        remaining = self._remaining_decision_timeout(deadline)
+        if remaining < self.min_request_timeout_seconds:
+            message = (
+                "vLLM decision exceeded total timeout "
+                f"{self.decision_total_timeout_seconds}s"
+            )
+            if from_exc is not None:
+                raise RuntimeError(message) from from_exc
+            raise RuntimeError(message)
+        return remaining
 
     @staticmethod
     def _is_context_limit_error(error_text: str) -> bool:
@@ -669,6 +819,37 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _payload_needs_full_artifact_decision_budget(state_payload: dict[str, Any]) -> bool:
+    artifact_keys = (
+        "artifact_repair_context",
+        "artifact_materialization_guard",
+        "artifact_repair_continue_guard",
+        "artifact_required_identifier_guard",
+        "artifact_semantic_repair_guard",
+        "artifact_anchor_repair_guard",
+        "artifact_diagnostic_repair",
+        "artifact_action_handoff",
+        "artifact_action_failure_memory",
+        "artifact_placeholder_candidate_guard",
+        "artifact_placeholder_statement_range_guard",
+    )
+    for key in artifact_keys:
+        value = state_payload.get(key)
+        if isinstance(value, dict) and value:
+            return True
+        if isinstance(value, list) and value:
+            return True
+    active_subgoal = str(state_payload.get("active_subgoal", "") or "").lower()
+    if "artifact" in active_subgoal or "patch.diff" in active_subgoal:
+        return True
+    task = state_payload.get("task")
+    if isinstance(task, dict):
+        expected_files = task.get("expected_files", [])
+        if isinstance(expected_files, list) and any(str(path).strip() == "patch.diff" for path in expected_files):
+            return True
+    return False
+
+
 def _render_prompt(*, decision_prompt: str, state_payload: dict[str, Any]) -> str:
     serialized_state = json.dumps(state_payload, ensure_ascii=True, separators=(",", ":"))
     return (
@@ -854,6 +1035,8 @@ def _compact_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
         "artifact_repair_continue_guard",
         "artifact_required_identifier_guard",
         "artifact_semantic_repair_guard",
+        "artifact_anchor_repair_guard",
+        "decoder_uncertainty",
     ):
         if state_payload.get(key) is not None:
             compact_payload[key] = _compact_json_value(
@@ -979,10 +1162,17 @@ def _ultra_lean_state_payload(state_payload: dict[str, Any]) -> dict[str, Any]:
         "artifact_repair_context",
         "artifact_materialization_guard",
         "artifact_repair_continue_guard",
+        "artifact_anchor_repair_guard",
+        "decoder_uncertainty",
     ):
         value = state_payload.get(key)
         if isinstance(value, dict):
-            payload[key] = _minimal_artifact_repair_context(value)
+            if key == "artifact_anchor_repair_guard":
+                payload[key] = _minimal_artifact_anchor_repair_guard(value)
+            elif key == "decoder_uncertainty":
+                payload[key] = _compact_json_value(value, max_depth=2, max_items=8, text_limit=180)
+            else:
+                payload[key] = _minimal_artifact_repair_context(value)
     return payload
 
 
@@ -1033,6 +1223,33 @@ def _minimal_artifact_repair_context(context: dict[str, Any]) -> dict[str, Any]:
             max_items=4,
             text_limit=120,
         )
+    return compact
+
+
+def _minimal_artifact_anchor_repair_guard(context: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "fixed_path",
+        "rejected_reason",
+        "required_response_content",
+        "previous_anchor_response",
+    ):
+        value = context.get(key)
+        if value:
+            compact[key] = _truncate_text_value(value, limit=220)
+    valid_line_numbers = context.get("valid_line_numbers", [])
+    if isinstance(valid_line_numbers, list):
+        compact["valid_line_numbers"] = [
+            int(value)
+            for value in valid_line_numbers[:32]
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+        ]
+    source_lines_excerpt = str(context.get("source_lines_excerpt", "") or "").strip()
+    if source_lines_excerpt:
+        compact["source_lines_excerpt"] = _truncate_block_value(source_lines_excerpt, limit=700)
+    edit_windows = str(context.get("edit_windows", "") or "").strip()
+    if edit_windows:
+        compact["edit_windows"] = _truncate_block_value(edit_windows, limit=500)
     return compact
 
 
@@ -1158,6 +1375,17 @@ def _post_json(
     headers: dict[str, str],
     error_label: str,
 ) -> dict[str, Any]:
+    transport = os.getenv("AGENT_KERNEL_LLM_HTTP_TRANSPORT", "").strip().lower()
+    if transport == "curl" or _needs_subprocess_wall_timeout():
+        return _post_json_with_curl(
+            url=url,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
+            headers=headers,
+            error_label=error_label,
+        )
     body = json.dumps(payload).encode("utf-8")
     req = request.Request(
         url=url,
@@ -1184,6 +1412,74 @@ def _post_json(
                 break
             if retry_backoff_seconds > 0:
                 time.sleep(retry_backoff_seconds * (attempt + 1))
+    raise RuntimeError(f"{error_label} failed after {retry_attempts} attempts: {last_error}")
+
+
+def _needs_subprocess_wall_timeout() -> bool:
+    """urllib socket timeouts are not enough for worker-thread LLM calls."""
+    return threading.current_thread() is not threading.main_thread()
+
+
+def _post_json_with_curl(
+    *,
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    retry_attempts: int,
+    retry_backoff_seconds: float,
+    headers: dict[str, str],
+    error_label: str,
+) -> dict[str, Any]:
+    body = json.dumps(payload)
+    timeout = max(1, int(timeout_seconds))
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--max-time",
+        str(timeout),
+        "--request",
+        "POST",
+    ]
+    for name, value in headers.items():
+        command.extend(["--header", f"{name}: {value}"])
+    command.extend(["--data-binary", "@-", url])
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(retry_attempts))):
+        try:
+            completed = subprocess.run(
+                command,
+                input=body,
+                text=True,
+                capture_output=True,
+                timeout=timeout + 2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = exc
+        else:
+            if completed.returncode == 0:
+                try:
+                    return json.loads(completed.stdout)
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+            else:
+                detail = "\n".join(
+                    part
+                    for part in [
+                        completed.stderr.strip(),
+                        completed.stdout.strip(),
+                    ]
+                    if part
+                )
+                last_error = RuntimeError(
+                    f"curl exited {completed.returncode}: {detail[:1000]}"
+                )
+        if attempt + 1 >= max(1, int(retry_attempts)):
+            break
+        if retry_backoff_seconds > 0:
+            time.sleep(retry_backoff_seconds * (attempt + 1))
     raise RuntimeError(f"{error_label} failed after {retry_attempts} attempts: {last_error}")
 
 

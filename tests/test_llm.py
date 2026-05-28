@@ -1,4 +1,5 @@
 import io
+import threading
 import time
 from urllib import error
 from pathlib import Path
@@ -85,6 +86,13 @@ def test_compact_state_payload_preserves_recent_source_output_and_artifact_guard
             "source_lines_excerpt": "   10: def value():\n   11:     return 1\n",
             "edit_windows": "### pkg/module.py::value lines 10-11",
         },
+        "artifact_anchor_repair_guard": {
+            "fixed_path": "pkg/module.py",
+            "valid_line_numbers": [10, 11],
+            "rejected_reason": "line_outside_anchor_preview",
+            "required_response_content": "<line_number> || <replacement source line>",
+            "source_lines_excerpt": "   10: def value():\n   11:     return 1\n",
+        },
     }
 
     compact = _compact_state_payload(payload)
@@ -94,12 +102,14 @@ def test_compact_state_payload_preserves_recent_source_output_and_artifact_guard
     assert "10: def value()" in step["command_result"]["stdout_preview"]
     assert compact["artifact_materialization_guard"]["rejected_reason"] == "source_inspection"
     assert "10: def value()" in compact["artifact_repair_context"]["source_lines_excerpt"]
+    assert compact["artifact_anchor_repair_guard"]["fixed_path"] == "pkg/module.py"
 
     minimal = _minimal_state_payload(payload)
     assert "command_result" not in minimal["history"][0]
     assert minimal["artifact_repair_context"]["source_lines_path"] == "source_lines/pkg/module.py.lines"
     assert "source_lines_excerpt" not in minimal["artifact_repair_context"]
     assert "edit_windows" not in minimal["artifact_repair_context"]
+    assert minimal["artifact_anchor_repair_guard"]["valid_line_numbers"] == [10, 11]
 
 
 def test_ollama_client_retries_then_succeeds(monkeypatch):
@@ -220,6 +230,156 @@ def test_vllm_client_uses_structured_chat_completion(monkeypatch):
     assert seen["payload"]["messages"][1]["role"] == "user"
 
 
+def test_vllm_client_honors_decision_token_budget(monkeypatch):
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"thought":"ok","action":"respond","content":"done","done":true}'
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        seen["payload"] = json.loads(req.data.decode("utf-8"))
+        return _Response()
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": [], "decision_token_budget": 96},
+    )
+
+    assert decision["action"] == "respond"
+    assert seen["payload"]["max_tokens"] == 96
+
+
+def test_vllm_client_can_request_and_attach_logprob_telemetry(monkeypatch):
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"thought":"ok","action":"respond","content":"done","done":true}'
+                            },
+                            "logprobs": {
+                                "content": [
+                                    {
+                                        "token": "{",
+                                        "logprob": -0.1,
+                                        "top_logprobs": [
+                                            {"token": "{", "logprob": -0.1},
+                                            {"token": "[", "logprob": -1.1},
+                                        ],
+                                    },
+                                    {
+                                        "token": "x",
+                                        "logprob": -0.5,
+                                        "top_logprobs": [
+                                            {"token": "x", "logprob": -0.5},
+                                            {"token": "y", "logprob": -0.6},
+                                        ],
+                                    },
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        seen["payload"] = json.loads(req.data.decode("utf-8"))
+        return _Response()
+
+    monkeypatch.setenv("AGENT_KERNEL_VLLM_DECISION_LOGPROBS", "1")
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert seen["payload"]["logprobs"] is True
+    assert seen["payload"]["top_logprobs"] == 5
+    telemetry = decision["proposal_metadata"]["vllm_decoding_telemetry"]
+    assert telemetry["token_count"] == 2
+    assert telemetry["sampled_token_count"] == 2
+    assert telemetry["low_margin_token_count"] == 1
+    assert telemetry["tokens_preview"] == ["{", "x"]
+
+
+def test_vllm_client_decision_token_budget_keeps_json_floor():
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    assert client._decision_max_tokens_for_payload({"decision_token_budget": 96}) == (96, 64, 48, 32)
+
+
+def test_vllm_client_artifact_decision_budget_uses_full_json_ladder():
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    assert client._decision_max_tokens_for_payload(
+        {
+            "task": {"expected_files": ["patch.diff"]},
+            "artifact_anchor_repair_guard": {"fixed_path": "pkg/module.py"},
+            "decision_token_budget": 96,
+        }
+    ) == VLLMClient._DECISION_MAX_TOKENS
+
+
 def test_vllm_client_falls_back_when_structured_output_request_fails(monkeypatch):
     calls = {"count": 0}
 
@@ -311,6 +471,60 @@ def test_vllm_client_reduces_completion_budget_after_context_limit_error(monkeyp
     assert calls["max_tokens"][:3] == [384, 384, 256]
 
 
+def test_vllm_client_can_retry_below_64_tokens_after_context_limit_error(monkeypatch):
+    calls = {"max_tokens": []}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return (
+                b'{"choices":[{"message":{"content":"'
+                b'{\\"thought\\":\\"ok\\",\\"action\\":\\"respond\\",\\"content\\":\\"done\\",\\"done\\":true}'
+                b'"}}]}'
+            )
+
+    def fake_urlopen(req, timeout):
+        del timeout
+        payload = json.loads(req.data.decode("utf-8"))
+        max_tokens = int(payload["max_tokens"])
+        calls["max_tokens"].append(max_tokens)
+        if max_tokens > 32:
+            raise error.HTTPError(
+                req.full_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(
+                    b'{"error":{"message":"maximum context length exceeded: requested prompt plus output tokens too large"}}'
+                ),
+            )
+        return _Response()
+
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fake_urlopen)
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=1,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    decision = client.create_decision(
+        system_prompt="system",
+        decision_prompt="decision",
+        state_payload={"task": {}, "history": []},
+    )
+
+    assert decision["action"] == "respond"
+    assert 48 in calls["max_tokens"]
+    assert 32 in calls["max_tokens"]
+
+
 def test_vllm_client_uses_ultra_lean_recovery_after_context_limit_errors(monkeypatch):
     calls = {"count": 0, "recovery_prompt_seen": False}
 
@@ -400,6 +614,195 @@ def test_vllm_client_uses_ultra_lean_recovery_after_context_limit_errors(monkeyp
     assert calls["count"] > 1
     assert decision["action"] == "code_execute"
     assert "patch_builder --path pkg/module.py" in decision["content"]
+
+
+def test_vllm_client_enforces_total_decision_timeout(monkeypatch):
+    ticks = {"value": 0.0}
+
+    def fake_monotonic():
+        ticks["value"] += 2.0
+        return ticks["value"]
+
+    monkeypatch.setattr("agent_kernel.llm.time.monotonic", fake_monotonic)
+    monkeypatch.setenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", "3")
+
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=20,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    def always_context_limit(**kwargs):
+        del kwargs
+        raise RuntimeError("maximum context length exceeded")
+
+    monkeypatch.setattr(client, "_chat_completion", always_context_limit)
+
+    with pytest.raises(RuntimeError, match="vLLM decision exceeded total timeout 3s"):
+        client.create_decision(
+            system_prompt="system",
+            decision_prompt="decision",
+            state_payload={"task": {}, "history": []},
+        )
+
+
+def test_vllm_client_default_total_timeout_matches_policy_budget(monkeypatch):
+    monkeypatch.delenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", raising=False)
+
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=20,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    assert client.decision_total_timeout_seconds == 120
+
+
+def test_vllm_client_does_not_start_curl_with_tiny_remaining_budget(monkeypatch):
+    ticks = {"values": iter([0.0, 43.5])}
+
+    def fake_monotonic():
+        return next(ticks["values"])
+
+    monkeypatch.setattr("agent_kernel.llm.time.monotonic", fake_monotonic)
+    monkeypatch.setenv("AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("AGENT_KERNEL_LLM_MIN_REQUEST_TIMEOUT_SECONDS", "3")
+
+    client = VLLMClient(
+        host="http://127.0.0.1:8000",
+        model_name="test-model",
+        timeout_seconds=45,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    def fail_if_called(**kwargs):
+        del kwargs
+        raise AssertionError("should not start a request with less than the minimum budget")
+
+    monkeypatch.setattr(client, "_chat_completion", fail_if_called)
+
+    with pytest.raises(RuntimeError, match="vLLM decision exceeded total timeout 45s"):
+        client.create_decision(
+            system_prompt="system",
+            decision_prompt="decision",
+            state_payload={"task": {}, "history": []},
+        )
+
+
+def test_post_json_can_use_curl_transport(monkeypatch):
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok": true}'
+        stderr = ""
+
+    def fake_run(command, input, text, capture_output, timeout, check):
+        seen["command"] = command
+        seen["input"] = input
+        seen["text"] = text
+        seen["capture_output"] = capture_output
+        seen["timeout"] = timeout
+        seen["check"] = check
+        return Completed()
+
+    monkeypatch.setenv("AGENT_KERNEL_LLM_HTTP_TRANSPORT", "curl")
+    monkeypatch.setattr("agent_kernel.llm.subprocess.run", fake_run)
+
+    result = _post_json(
+        url="http://127.0.0.1:8000/v1/chat/completions",
+        payload={"hello": "world"},
+        timeout_seconds=3,
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        headers={"Content-Type": "application/json"},
+        error_label="test request",
+    )
+
+    assert result == {"ok": True}
+    assert seen["timeout"] == 5
+    assert "--max-time" in seen["command"]
+    assert "3" in seen["command"]
+    assert seen["input"] == '{"hello": "world"}'
+
+
+def test_post_json_worker_thread_uses_curl_for_wall_timeout(monkeypatch):
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok": true}'
+        stderr = ""
+
+    def fake_run(command, input, text, capture_output, timeout, check):
+        seen["command"] = command
+        seen["input"] = input
+        seen["timeout"] = timeout
+        return Completed()
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("worker thread should use subprocess transport")
+
+    monkeypatch.delenv("AGENT_KERNEL_LLM_HTTP_TRANSPORT", raising=False)
+    monkeypatch.setattr("agent_kernel.llm.request.urlopen", fail_urlopen)
+    monkeypatch.setattr("agent_kernel.llm.subprocess.run", fake_run)
+
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            result.update(
+                _post_json(
+                    url="http://127.0.0.1:8000/v1/chat/completions",
+                    payload={"hello": "worker"},
+                    timeout_seconds=4,
+                    retry_attempts=1,
+                    retry_backoff_seconds=0.0,
+                    headers={"Content-Type": "application/json"},
+                    error_label="worker request",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion surfaced below
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert result == {"ok": True}
+    assert "--max-time" in seen["command"]
+    assert "4" in seen["command"]
+    assert seen["timeout"] == 6
+    assert seen["input"] == '{"hello": "worker"}'
+
+
+def test_post_json_curl_transport_preserves_error_body(monkeypatch):
+    class Completed:
+        returncode = 22
+        stdout = '{"error":{"message":"maximum context length exceeded"}}'
+        stderr = "curl: (22) The requested URL returned error: 400"
+
+    monkeypatch.setenv("AGENT_KERNEL_LLM_HTTP_TRANSPORT", "curl")
+    monkeypatch.setattr("agent_kernel.llm.subprocess.run", lambda *args, **kwargs: Completed())
+
+    with pytest.raises(RuntimeError, match="maximum context length exceeded"):
+        _post_json(
+            url="http://127.0.0.1:8000/v1/chat/completions",
+            payload={"hello": "world"},
+            timeout_seconds=3,
+            retry_attempts=1,
+            retry_backoff_seconds=0.0,
+            headers={"Content-Type": "application/json"},
+            error_label="test request",
+        )
 
 
 def test_model_stack_client_uses_token_generation_endpoint(monkeypatch):

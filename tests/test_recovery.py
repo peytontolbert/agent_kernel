@@ -44,6 +44,9 @@ def test_recovery_policy_snapshot_applies_retained_recovery_controls(tmp_path: P
     assert snapshot["max_post_rollback_file_count"] == 0
     assert should_restore_on_outcome(config, "safe_stop") is False
     assert should_restore_on_outcome(config, "unsafe_ambiguous") is True
+    assert should_restore_on_outcome(config, "semantic_unverified") is False
+    assert should_restore_on_outcome(config, "artifact_ready") is False
+    assert should_restore_on_outcome(config, "official_passed") is False
 
 
 def test_recovery_annotation_reports_post_rollback_verification(tmp_path: Path):

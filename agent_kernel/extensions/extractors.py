@@ -7,6 +7,7 @@ import re
 from ..config import KernelConfig, current_external_task_manifests_paths
 from ..ops.episode_store import iter_episode_documents
 from ..learning_compiler import load_learning_candidates
+from ..neural_controller import summarize_neural_controller_shadow_steps
 from ..schemas import EpisodeRecord
 from ..tasking.task_bank import TaskBank
 
@@ -98,6 +99,7 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
     changed_paths = _episode_changed_paths(episode)
     recovery_traces = _episode_recovery_traces(episode, verifier_obligations=verifier_obligations)
     edit_patches = _episode_edit_patches(episode)
+    neural_controller_shadow = summarize_neural_controller_shadow_steps(episode.steps)
     return {
         "task_id": episode.task_id,
         "success": episode.success,
@@ -137,6 +139,7 @@ def build_episode_summary(episode: EpisodeRecord) -> dict[str, object]:
         ],
         "recovery_trace_count": len(recovery_traces),
         "recovery_traces": recovery_traces[:4],
+        "neural_controller_shadow": neural_controller_shadow,
     }
 
 

@@ -82,6 +82,27 @@ function liveRenderSignature(live) {
       state: event.state,
       outcome: event.outcome,
     })),
+    rolling_scores: Object.entries(live.rolling_scores || {}).map(([key, score]) => ({
+      key,
+      status: score.status,
+      score_mode: score.score_mode,
+      resolved_count: score.resolved_count,
+      task_count: score.task_count,
+      failed_count: score.failed_count,
+      resolve_rate: score.resolve_rate,
+      prediction_count: score.prediction_count,
+      remaining_prediction_count: score.remaining_prediction_count,
+      score_source: score.score_source,
+      score_updated_at: score.score_updated_at,
+    })),
+    official_scores: Object.entries(live.official_scores_by_benchmark || {}).map(([key, score]) => ({
+      key,
+      status: score.status,
+      resolved_count: score.resolved_count,
+      task_count: score.task_count,
+      resolve_rate: score.resolve_rate,
+      score_updated_at: score.score_updated_at,
+    })),
   });
 }
 
@@ -285,14 +306,38 @@ function renderLive() {
   const activeJobs = Number(primaryQueue.active_jobs || 0);
   const failed = Number(primaryQueue.failed_jobs || 0);
   const progressPct = Math.round((Number(primaryQueue.progress_rate) || 0) * 100);
-  const visibleScore = [...rollingScores, ...officialScores].find(
-    (score) => score.status === "partial" || score.status === "available",
-  );
+  const scoreFreshnessRank = (score) =>
+    Date.parse(score?.score_updated_at || score?.prediction_updated_at || "") ||
+    Number(score?.score_mtime || score?.prediction_mtime || 0) * 1000 ||
+    0;
+  const scoreIsDisplayable = (score) => ["running", "partial", "available", "no_predictions"].includes(String(score?.status || ""));
+  const rawCompletedScore = rollingScores
+    .filter((score) => String(score.score_mode || "").includes("raw") && scoreIsDisplayable(score))
+    .sort((a, b) => scoreFreshnessRank(b) - scoreFreshnessRank(a))[0];
+  const visibleScore =
+    rawCompletedScore ||
+    [...rollingScores, ...officialScores].find(
+      (score) => scoreIsDisplayable(score),
+    );
+  const visibleVerification = visibleScore?.verification || {};
   const visibleScoreRate = number(visibleScore?.resolve_rate);
   const scoreText = visibleScore
-    ? `${pct(visibleScoreRate || 0)} · ${visibleScore.resolved_count ?? 0}/${visibleScore.task_count ?? 0}`
+    ? visibleScore.status === "no_predictions"
+      ? `0 submitted · verifier ${visibleScore.verified_patch_count ?? 0} ready`
+      : visibleScore.status === "running" && visibleScoreRate === null
+      ? `scoring · ${visibleScore.task_count ?? visibleScore.prediction_count ?? 0} submitted`
+      : visibleScore.status === "partial" && visibleScore.prediction_count
+        ? `${pct(visibleScoreRate || 0)} · ${visibleScore.resolved_count ?? 0}/${visibleScore.task_count ?? 0} scored · ${visibleScore.prediction_count} submitted`
+      : `${pct(visibleScoreRate || 0)} · ${visibleScore.resolved_count ?? 0}/${visibleScore.task_count ?? 0}`
     : "pending";
-  const scoreLabel = visibleScore?.status === "partial" ? "partial score" : "official score";
+  const scoreLabel =
+    visibleScore?.final_leaderboard_score === false
+      ? String(visibleScore?.score_mode || "").includes("raw")
+        ? "raw completed score"
+        : "verified subset score"
+      : visibleScore?.status === "partial"
+        ? "partial official score"
+        : "official score";
   const countCloud = (counts = {}) =>
     Object.entries(counts)
       .map(([key, value]) => `<span>${esc(key)} <strong>${esc(value)}</strong></span>`)
@@ -335,14 +380,24 @@ function renderLive() {
             <div class="countCloud">${countCloud(snapshot.state_counts)}</div>
           </div>
           <div class="countBlock">
-            <p class="meta">Outcome counts</p>
+            <p class="meta">Kernel job outcomes (local artifact result, not official score)</p>
             <div class="countCloud">${countCloud(snapshot.outcome_counts) || "<span>none yet</span>"}</div>
           </div>
+          <p class="meta">A queue success means the kernel completed a local patch artifact. Official scoring only counts patches that pass artifact-contract verification and are submitted to the evaluator.</p>
         </div>
       </article>`,
     )
     .join("");
   const scoreCards = [...officialScores, ...rollingScores]
+    .filter((score) => {
+      const isSweLive = score.benchmark === "swe_bench_live";
+      const mode = String(score.score_mode || "");
+      const kind = String(score.score_kind || "");
+      if (!isSweLive) return true;
+      if (mode === "raw_completed_success" || kind === "raw_completed_success_subset") return true;
+      return score.final_leaderboard_score !== false;
+    })
+    .sort((a, b) => scoreFreshnessRank(b) - scoreFreshnessRank(a))
     .map((score) => {
       const available = score.status === "available" || score.status === "partial";
       const rate = number(score.resolve_rate);
@@ -352,17 +407,50 @@ function renderLive() {
       const failedCount = score.failed_count ?? (number(score.task_count) !== null && number(score.resolved_count) !== null ? Number(score.task_count) - Number(score.resolved_count) : "pending");
       const passedList = (score.passed_instance_ids || []).slice(0, 8).join(" · ");
       const failedList = (score.failed_instance_ids || []).slice(0, 8).join(" · ");
+      const rawMode = String(score.score_mode || "").includes("raw");
+      const remaining = score.remaining_prediction_count ?? null;
+      const scoreFreshness = score.score_updated_at ? `<p class="meta">score updated ${esc(score.score_updated_at)}</p>` : "";
+      const predictionFreshness = score.prediction_updated_at ? `<p class="meta">predictions updated ${esc(score.prediction_updated_at)}</p>` : "";
+      const verification = score.verification || {};
+      const verifiedPatchCount = verification.verified_patch_count ?? score.verified_patch_count ?? null;
+      const abstainedPatchCount = verification.abstained_patch_count ?? score.abstained_patch_count ?? null;
+      const skippedNonterminalCount = verification.skipped_nonterminal_count ?? score.skipped_nonterminal_count ?? null;
+      const skippedPreEpochCount = verification.skipped_pre_epoch_count ?? score.skipped_pre_epoch_count ?? null;
+      const skippedMissingCount = verification.skipped_missing_count ?? score.skipped_missing_count ?? null;
+      const topAbstainReasons = (verification.top_abstain_reasons || [])
+        .slice(0, 4)
+        .map((item) => `<span>${esc(item.count)} ${esc(item.reason)}</span>`)
+        .join("");
+      const verifierLine =
+        verifiedPatchCount !== null
+          ? `<p class="meta">Verifier submitted ${esc(verifiedPatchCount)} completed patches; abstained ${esc(abstainedPatchCount ?? 0)} for artifact-contract risk; skipped ${esc(skippedNonterminalCount ?? 0)} nonterminal and ${esc(skippedPreEpochCount ?? 0)} pre-epoch jobs.</p>`
+          : "";
+      const missingLine =
+        skippedMissingCount
+          ? `<p class="meta">${esc(skippedMissingCount)} manifest tasks were skipped because their queue records were pruned or absent from the current live queue.</p>`
+          : "";
+      const previousScore =
+        score.status === "running" && score.previous_task_count
+          ? `<p class="meta">Previous completed score: ${esc(score.previous_resolved_count ?? 0)}/${esc(score.previous_task_count)} (${esc(pct(number(score.previous_resolve_rate) || 0))}).</p>`
+          : "";
       return card(
         `${score.benchmark || "benchmark"} ${isRolling ? "rolling score" : "official score"}`,
         score.summary_json || score.results_json || score.run_spec_path || "",
         `${available ? progress(rate || 0) : progress(0)}
-         <p><strong>${available ? pct(rate || 0) : "pending"}</strong> ${score.status === "partial" ? "partial official subset" : "official"} resolve rate.</p>
-         <p>${esc(resolved)}/${esc(totalScoreTasks)} resolved after official evaluator · ${esc(failedCount)} failed/evaluated-unresolved. Queue completion is not score.</p>
-         ${score.prediction_count !== undefined && score.prediction_count !== null ? `<p class="meta">${esc(score.prediction_count)} predictions in subset.</p>` : ""}
+         <p><strong>${available ? pct(rate || 0) : score.status === "running" ? "running" : score.status === "no_predictions" ? "0 submitted" : "pending"}</strong> ${rawMode ? "raw completed-success official subset" : score.status === "partial" ? "partial verified official subset" : isRolling ? "verified official subset" : "official"} resolve rate.</p>
+         <p>${esc(resolved)}/${esc(totalScoreTasks)} resolved by the official evaluator · ${esc(failedCount)} failed/evaluated-unresolved. ${rawMode ? "This scores completed queue successes for visibility; it is not trusted leaderboard evidence." : "Queue success is raw artifact completion, not official resolution."}</p>
+         ${score.prediction_count !== undefined && score.prediction_count !== null ? `<p class="meta">${esc(score.prediction_count)} ${rawMode ? "raw completed-success" : "verified"} predictions submitted in this scoring subset.</p>` : ""}
+         ${verifierLine}
+         ${missingLine}
+         ${remaining !== null ? `<p class="meta">${esc(remaining)} submitted predictions still awaiting official report.</p>` : ""}
+         ${previousScore}
          ${passedList ? `<p class="meta">Passed: ${esc(passedList)}</p>` : ""}
          ${failedList ? `<p class="meta">Failed: ${esc(failedList)}</p>` : ""}
+         ${topAbstainReasons ? `<div class="countBlock"><p class="meta">Top verifier abstain reasons</p><div class="countCloud">${topAbstainReasons}</div></div>` : ""}
+         ${scoreFreshness}
+         ${predictionFreshness}
          <p class="meta">source ${esc(score.score_source || "waiting for results.json")} · ${esc(score.score_kind || score.benchmark_role || "benchmark")}</p>`,
-        pill(available ? (score.status === "partial" ? "partial score" : isRolling ? "subset scored" : "scored") : "pending", available ? "good" : "warn"),
+        pill(available ? (score.status === "partial" ? "partial score" : isRolling ? "subset scored" : "scored") : score.status === "running" ? "scoring" : score.status === "no_predictions" ? "no predictions" : "pending", available ? "good" : "warn"),
       );
     })
     .join("");
@@ -403,7 +491,7 @@ function renderLive() {
       </div>
       <div class="heroProgress">
         <div class="progress"><div class="bar" style="width: ${progressPct}%"></div></div>
-        <p class="meta">${esc(progressPct)}% terminal queue progress. Score shown above is official-evaluator derived; partial scores use completed report.json files before final results.json exists.</p>
+        <p class="meta">${esc(progressPct)}% terminal queue progress. Score shown above is official-evaluator derived over verified/submitted patches only; queue completed/success is not the score denominator. ${visibleVerification.verified_patch_count !== undefined ? `Verifier submitted ${esc(visibleVerification.verified_patch_count)} and abstained ${esc(visibleVerification.abstained_patch_count || 0)}.` : ""}</p>
       </div>
     </section>
 

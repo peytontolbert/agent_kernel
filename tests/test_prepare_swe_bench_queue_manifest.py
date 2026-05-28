@@ -104,6 +104,67 @@ def test_build_swe_queue_manifest_creates_external_tasks(tmp_path):
     ]
 
 
+def test_build_swe_queue_manifest_includes_official_retry_feedback(tmp_path):
+    module = _load_queue_module()
+    base = _prediction_task_manifest(tmp_path)
+    base["tasks"][0]["official_feedback"] = {
+        "failed_tests": ["tests/test_time.py::test_parse"],
+        "fail_to_pass_failures": ["tests/test_time.py::test_parse"],
+        "pass_to_pass_failures": ["tests/test_time.py::test_existing"],
+        "pass_to_pass_failure_count": 1,
+        "official_failure_mode": "official_pass_to_pass_regression",
+        "official_repair_directive": "Preserve existing behavior before retrying.",
+        "artifact_contract_failure": {"mode": "artifact_missing_after_response", "repairable": True},
+        "artifact_repair_directive": "Create patch.diff directly with an allowed patch builder command.",
+        "post_patch_log_tail": "FAILED tests/test_time.py::test_parse - AssertionError",
+        "prior_model_patch_tail": "diff --git a/dates.py b/dates.py\n+bad prior patch",
+    }
+
+    manifest = module.build_swe_queue_manifest(base)
+    task = manifest["tasks"][0]
+
+    assert "Prior official evaluator feedback:" in task["prompt"]
+    assert "tests/test_time.py::test_parse" in task["prompt"]
+    assert "Official fail-to-pass failures to satisfy:" in task["prompt"]
+    assert "Official pass-to-pass regressions introduced by the previous patch:" in task["prompt"]
+    assert "tests/test_time.py::test_existing" in task["prompt"]
+    assert "Official pass-to-pass regression count:" in task["prompt"]
+    assert "Official failure mode:" in task["prompt"]
+    assert "official_pass_to_pass_regression" in task["prompt"]
+    assert "Official repair directive:" in task["prompt"]
+    assert "Preserve existing behavior before retrying." in task["prompt"]
+    assert "Local artifact failure mode:" in task["prompt"]
+    assert "artifact_missing_after_response" in task["prompt"]
+    assert "Local artifact repair directive:" in task["prompt"]
+    assert "Create patch.diff directly" in task["prompt"]
+    assert "Suggested-command escalation:" in task["prompt"]
+    assert "FAILED tests/test_time.py::test_parse" in task["prompt"]
+    assert "Prior rejected patch excerpt:" in task["prompt"]
+    assert "bad prior patch" in task["prompt"]
+    assert task["metadata"]["swe_official_feedback"]["failed_tests"] == ["tests/test_time.py::test_parse"]
+    assert task["suggested_commands"] == []
+    assert task["metadata"]["swe_suggested_patch_commands"] == []
+    assert task["metadata"]["semantic_verifier"]["forbidden_patch_texts"] == [
+        "diff --git a/dates.py b/dates.py\n+bad prior patch"
+    ]
+
+
+def test_build_swe_queue_manifest_suppresses_suggested_commands_after_official_failure(tmp_path):
+    module = _load_queue_module()
+    base = _prediction_task_manifest(tmp_path)
+    base["tasks"][0]["official_feedback"] = {
+        "official_failure_mode": "official_pass_to_pass_regression",
+        "official_repair_directive": "Preserve existing behavior before retrying.",
+    }
+
+    manifest = module.build_swe_queue_manifest(base)
+    task = manifest["tasks"][0]
+
+    assert "Suggested-command escalation:" in task["prompt"]
+    assert task["suggested_commands"] == []
+    assert task["metadata"]["swe_suggested_patch_commands"] == []
+
+
 def test_build_swe_queue_manifest_preserves_focused_duplicate_source_context(tmp_path):
     module = _load_queue_module()
     base = _prediction_task_manifest(tmp_path)

@@ -2,7 +2,31 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
+
+
+def _is_swe_disallowed_solution_path(path: str) -> bool:
+    normalized = str(path).replace("\\", "/").strip("/")
+    name = Path(normalized).name.lower()
+    if not normalized:
+        return True
+    if normalized.startswith(("test/", "tests/", "doc/", "docs/", ".github/", "features/", "examples/", "ci/")):
+        return True
+    if "/test/" in f"/{normalized}/" or "/tests/" in f"/{normalized}/" or "/docs/" in f"/{normalized}/":
+        return True
+    if "/examples/" in f"/{normalized}/" or "/mpl-data/" in f"/{normalized}/":
+        return True
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    return name in {"readme.md", "changelog.md", "changelog.rst", "changes.md", "changes.rst", "makefile"}
+
+
+def _swe_patch_candidate_files(verifier: dict[str, object]) -> list[str]:
+    paths = [str(path).strip() for path in verifier.get("expected_changed_paths", []) if str(path).strip()]
+    if str(verifier.get("kind", "")).strip() != "swe_patch_apply_check":
+        return paths
+    return [path for path in paths if not _is_swe_disallowed_solution_path(path)]
 
 
 def learned_world_progress_payload(latent_state_summary: dict[str, object]) -> dict[str, object]:
@@ -150,11 +174,7 @@ def _swe_candidate_path_repair_brief(state) -> str:
     if not candidate_files:
         verifier = metadata.get("semantic_verifier", {})
         verifier = dict(verifier) if isinstance(verifier, dict) else {}
-        candidate_files = [
-            str(path).strip()
-            for path in verifier.get("expected_changed_paths", [])
-            if str(path).strip()
-        ]
+        candidate_files = _swe_patch_candidate_files(verifier)
     if not candidate_files:
         return ""
     high_value_windows = _swe_high_value_window_repair_preview(metadata)
@@ -394,6 +414,66 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
         elif text.startswith("SWE patch introduces local use before assignment in "):
             path = "patch.diff"
             subgoal = "repair SWE patch.diff without unbound local reads"
+        elif text.startswith("SWE patch changes only tests or auxiliary update artifacts: "):
+            path = "patch.diff"
+            subgoal = "rewrite SWE patch.diff against production source instead of tests or update helpers"
+        elif text == "SWE patch replaces real behavior with placeholder output":
+            path = "patch.diff"
+            subgoal = "rewrite SWE patch.diff with real behavior instead of placeholder output"
+        elif text.startswith("SWE patch makes suspicious config key replacements in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff while preserving config keys and editing values intentionally"
+        elif text.startswith("SWE patch inserts Python-looking code into non-Python file "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff using the target file's native language"
+        elif text.startswith("SWE patch makes suspicious semantic token flips in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without bare semantic token flips"
+        elif text.startswith("SWE patch removes module registration assignments in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff while preserving module registration assignments"
+        elif text.startswith("SWE patch makes suspicious unknown attribute replacements in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without guessing unknown object attributes"
+        elif text.startswith("SWE patch introduces private attribute reads in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without new private attribute dependencies"
+        elif text.startswith("SWE patch makes suspicious exception contract changes in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff while preserving exception/control-flow contracts"
+        elif text.startswith("SWE patch adds redundant decorated normalizations in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without redundant decorator-covered normalization"
+        elif text.startswith("SWE patch changes only Python string literal values in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff with executable behavior change, not message-only text"
+        elif text.startswith("SWE patch changes only Python type annotations in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff with runtime behavior change, not annotation-only edits"
+        elif text.startswith("SWE patch makes indentation-only statement moves in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff by replacing the complete control-flow block"
+        elif text.startswith("SWE patch introduces None return value paths in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff while preserving concrete return contracts"
+        elif text.startswith("SWE patch duplicates surrounding call wrappers in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without duplicating an existing call wrapper"
+        elif text.startswith("SWE patch introduces unresolved name reads in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without unresolved name reads"
+        elif text.startswith("SWE patch removes production return value paths in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff while preserving return-value paths"
+        elif text.startswith("SWE patch makes suspicious isolated boolean return flips in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff with condition-aware logic instead of a bare boolean flip"
+        elif text.startswith("SWE patch makes suspicious Python statement-kind replacements in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff without one-line statement-kind regressions"
+        elif text.startswith("SWE patch JSON syntax check failed in "):
+            path = "patch.diff"
+            subgoal = "repair SWE patch.diff until changed JSON files parse"
         elif text.startswith("SWE patch verifier missing patch file: "):
             path = text.removeprefix("SWE patch verifier missing patch file: ").strip() or "patch.diff"
             subgoal = f"materialize expected artifact {path}"
@@ -516,6 +596,105 @@ def verifier_failure_entries(verification_reasons: list[object]) -> list[dict[st
                     "rewrite patch.diff so every local variable is assigned before its first read; do not move calls "
                     "above the assignment they depend on, and prefer a narrow statement-level edit that preserves the "
                     "existing initialization order"
+                )
+            elif text.startswith("SWE patch changes only tests or auxiliary update artifacts: "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff against production source, not tests, fixtures, snapshots, conftest, or "
+                    "update/generate helper scripts; choose the implementation path responsible for the failing behavior"
+                )
+            elif text.startswith("SWE patch removes module registration assignments in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff while preserving module-level registration assignments such as check/rule/plugin "
+                    "instances; place any new state initialization inside the relevant class or method"
+                )
+            elif text.startswith("SWE patch introduces unresolved name reads in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so every new name read is bound by a local assignment, parameter, import, or "
+                    "module-level definition visible in the source context"
+                )
+            elif text == "SWE patch replaces real behavior with placeholder output":
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff with source-grounded behavior; do not replace error handling, returns, or logging "
+                    "with generic print/click output such as 'patch applied'"
+                )
+            elif text.startswith("SWE patch makes suspicious config key replacements in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so existing configuration keys are preserved; edit only values unless the issue "
+                    "explicitly requires renaming a key"
+                )
+            elif text.startswith("SWE patch inserts Python-looking code into non-Python file "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff in the target file's native syntax; do not insert Python expressions, imports, "
+                    "or function calls into shell/completion/config files"
+                )
+            elif text.startswith("SWE patch makes suspicious semantic token flips in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff with contextual data-structure changes; do not make a bare paired-token "
+                    "substitution such as female/male without updating the surrounding keyed structure consistently"
+                )
+            elif text.startswith("SWE patch makes suspicious unknown attribute replacements in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff using attributes already visible in source context or a validated fallback; "
+                    "do not guess a new attribute on the same object"
+                )
+            elif text.startswith("SWE patch introduces private attribute reads in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff without introducing reads of another object's private/protected attributes; "
+                    "use public accessors or existing local data flow"
+                )
+            elif text.startswith("SWE patch makes suspicious exception contract changes in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff while preserving existing exception propagation and validation predicates; do "
+                    "not replace data-condition checks with exception-type checks or bare re-raises with generic new exceptions"
+                )
+            elif text.startswith("SWE patch adds redundant decorated normalizations in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff without adding normalization calls already guaranteed by a decorator; change "
+                    "the upstream parsed/generated value or remove the redundant transformation"
+                )
+            elif text.startswith("SWE patch changes only Python string literal values in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as an executable behavior change; do not submit typo/message-only string edits "
+                    "unless the task explicitly targets text and a targeted test validates it"
+                )
+            elif text.startswith("SWE patch changes only Python type annotations in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as a runtime behavior change; do not submit type-hint-only edits for runtime failures"
+                )
+            elif text.startswith("SWE patch makes indentation-only statement moves in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff by replacing the complete surrounding control-flow block; do not move an existing "
+                    "statement solely by changing indentation"
+                )
+            elif text.startswith("SWE patch introduces None return value paths in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff while preserving concrete return-value contracts; do not add return None where "
+                    "the function previously returned computed values"
+                )
+            elif text.startswith("SWE patch duplicates surrounding call wrappers in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so edits inside a call replace only the inner argument/expression, or replace the "
+                    "complete surrounding call statement; do not insert a duplicate outer call inside itself"
+                )
+            elif text.startswith("SWE patch removes production return value paths in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff while preserving the function's return contract; replace return expressions with "
+                    "return expressions unless changing the complete surrounding control-flow block"
+                )
+            elif text.startswith("SWE patch makes suspicious isolated boolean return flips in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff as condition-aware logic rather than a bare terminal True/False fallback flip; "
+                    "anchor the change to the issue behavior and preserve existing default semantics"
+                )
+            elif text.startswith("SWE patch makes suspicious Python statement-kind replacements in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so one-line edits preserve the original statement kind and assignment target; "
+                    "if a different statement kind is required, replace the complete surrounding statement or block"
+                )
+            elif text.startswith("SWE patch JSON syntax check failed in "):
+                entry["repair_instruction"] = (
+                    "rewrite patch.diff so changed JSON files parse; replace complete JSON members/objects and preserve "
+                    "commas, brackets, and quoting"
                 )
             elif text.startswith("SWE patch diff includes unexpected path: "):
                 entry["repair_instruction"] = (

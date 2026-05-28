@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -77,6 +78,13 @@ def prepare_runtime_task(
     overrides = dict(runtime_overrides or {})
     verifier_metadata = prepared.metadata.get("semantic_verifier", {})
     semantic_verifier = dict(verifier_metadata) if isinstance(verifier_metadata, dict) else {}
+    if str(semantic_verifier.get("kind", "")).strip() == "swe_patch_apply_check":
+        try:
+            step_floor = int(os.getenv("AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR", "0") or 0)
+        except ValueError:
+            step_floor = 0
+        if step_floor > 0:
+            prepared.max_steps = max(int(prepared.max_steps), step_floor)
     required_worker_branches = _normalize_paths(overrides.get("required_worker_branches"))
     if required_worker_branches:
         semantic_verifier["required_merged_branches"] = list(required_worker_branches)

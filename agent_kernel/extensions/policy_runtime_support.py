@@ -30,6 +30,7 @@ from ..extensions.improvement.transition_model_improvement import (
 )
 from ..extensions.policy_command_utils import canonicalize_command as _canonicalize_command
 from ..extensions.runtime_modeling_adapter import (
+    generate_neural_controller_text,
     load_model_artifact,
     retained_tolbert_action_generation_policy,
     retained_tolbert_active_decoder_runtime,
@@ -40,6 +41,15 @@ from ..extensions.runtime_modeling_adapter import (
     retained_tolbert_runtime_policy,
     retained_tolbert_universal_decoder_runtime,
     score_hybrid_candidates,
+)
+from ..neural_controller import (
+    NeuralControllerAdvisory,
+    build_neural_controller_encoder_text,
+    build_neural_controller_advisory,
+    guarded_neural_controller_source,
+    load_neural_controller_manifest,
+    parse_neural_controller_line_protocol,
+    repair_line_protocol_with_command_copy_target,
 )
 from ..resource_registry import runtime_resource_registry
 from ..resource_types import PROMPT_RESOURCE_DECISION, PROMPT_RESOURCE_SYSTEM, subsystem_resource_id
@@ -202,6 +212,7 @@ class PolicyRuntimeSupport:
         self._tolbert_active_decoder_runtime_cache: dict[str, object] | None = None
         self._prompt_policy_payload_cache: dict[str, object] | None = None
         self._retrieval_payload_cache: dict[str, object] | None = None
+        self._neural_controller_advisory_cache: NeuralControllerAdvisory | None = None
         self.last_hybrid_runtime_error: str = ""
 
     def prompt_template(self, name: str) -> str:
@@ -229,6 +240,202 @@ class PolicyRuntimeSupport:
 
     def retrieval_overrides(self) -> dict[str, object]:
         return effective_retrieval_overrides(self.retrieval_payload())
+
+    def neural_controller_advisory(self) -> NeuralControllerAdvisory:
+        if self._neural_controller_advisory_cache is not None:
+            return self._neural_controller_advisory_cache
+        if not self.config.use_neural_controller:
+            self._neural_controller_advisory_cache = build_neural_controller_advisory(
+                manifest=None,
+                mode="disabled",
+                source="config_disabled",
+            )
+            return self._neural_controller_advisory_cache
+        guarded_runtime = self._guarded_neural_controller_runtime_config()
+        baseline_manifest_text = str(guarded_runtime.get("baseline_manifest_path", "")).strip() if guarded_runtime else ""
+        manifest_path = Path(baseline_manifest_text) if baseline_manifest_text else self.config.neural_controller_manifest_path
+        if not self._normalized_optional_path_string(manifest_path):
+            manifest_path = self.config.neural_controller_manifest_path
+        if not manifest_path.is_absolute():
+            manifest_path = self.repo_root / manifest_path
+        fallback_families = tuple(
+            getattr(self.config, "neural_controller_guarded_fallback_families", ()) or ()
+        )
+        if not fallback_families and guarded_runtime:
+            fallback_families = tuple(guarded_runtime.get("fallback_families", ()) or ())
+        candidate_manifest_path = self._normalized_optional_path_string(
+            getattr(self.config, "neural_controller_guarded_candidate_manifest_path", "")
+        )
+        if not candidate_manifest_path and guarded_runtime:
+            candidate_manifest_path = str(guarded_runtime.get("candidate_manifest_path", "")).strip()
+        self._neural_controller_advisory_cache = build_neural_controller_advisory(
+            manifest=load_neural_controller_manifest(manifest_path),
+            mode=self.config.neural_controller_mode,
+            source="full_agent_kernel_runtime",
+            guarded_fallback_families=fallback_families,
+            guarded_candidate_manifest_path=candidate_manifest_path,
+            guarded_selector_policy=str(
+                getattr(self.config, "neural_controller_guarded_selector_policy", "family_fallback")
+            ).strip()
+            or "family_fallback",
+        )
+        return self._neural_controller_advisory_cache
+
+    def _guarded_neural_controller_runtime_config(self) -> dict[str, object]:
+        report_raw = getattr(self.config, "neural_controller_guarded_report_path", Path(""))
+        report_text = self._normalized_optional_path_string(report_raw)
+        if not report_text:
+            return {}
+        report_path = Path(report_text)
+        if not report_path.is_absolute():
+            report_path = self.repo_root / report_path
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(report, dict):
+            return {}
+
+        def report_manifest_path(key: str) -> str:
+            raw = str(report.get(key, "")).strip()
+            if not raw:
+                return ""
+            path = Path(raw)
+            if not path.is_absolute():
+                path = self.repo_root / path
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return ""
+            if not isinstance(payload, dict):
+                return ""
+            manifest = str(payload.get("manifest_path", "")).strip()
+            if not manifest:
+                return ""
+            manifest_path = Path(manifest)
+            if not manifest_path.is_absolute():
+                manifest_path = self.repo_root / manifest_path
+            return str(manifest_path)
+
+        fallback = [
+            str(item).strip()
+            for item in report.get("fallback_families", [])
+            if str(item).strip()
+        ]
+        return {
+            "report_path": str(report_path),
+            "baseline_manifest_path": report_manifest_path("baseline_report_path"),
+            "candidate_manifest_path": report_manifest_path("candidate_report_path"),
+            "fallback_families": tuple(dict.fromkeys(fallback)),
+        }
+
+    @staticmethod
+    def _normalized_optional_path_string(raw: object) -> str:
+        text = str(raw or "").strip()
+        if text in {"", "."}:
+            return ""
+        return text
+
+    def neural_controller_shadow_prediction(self, *, state_payload: dict[str, object]) -> dict[str, object]:
+        advisory = self.neural_controller_advisory()
+        if not advisory.enabled:
+            return {}
+        if not bool(getattr(self.config, "neural_controller_shadow_generate", False)):
+            return {}
+        if not advisory.ready:
+            return {"enabled": True, "ready": False, "warnings": list(advisory.warnings)}
+        manifest_path = Path(advisory.manifest_path)
+        if not manifest_path.is_absolute():
+            manifest_path = self.repo_root / manifest_path
+        encoder_text = build_neural_controller_encoder_text(state_payload=state_payload)
+        try:
+            generated = generate_neural_controller_text(
+                manifest_path=manifest_path,
+                encoder_text=encoder_text,
+                repo_root=self.repo_root,
+                device=str(getattr(self.config, "neural_controller_device", "cpu")).strip() or "cpu",
+                max_new_tokens=int(getattr(self.config, "neural_controller_max_new_tokens", 512) or 512),
+            )
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "ready": False,
+                "error": str(exc).strip() or exc.__class__.__name__,
+                "manifest_path": str(manifest_path),
+            }
+        raw_line_protocol = parse_neural_controller_line_protocol(str(generated.get("generated_text", "")))
+        line_protocol, repair_warnings = repair_line_protocol_with_command_copy_target(
+            raw_line_protocol,
+            encoder_text=encoder_text,
+        )
+        result = {
+            "enabled": True,
+            "ready": True,
+            "manifest_path": str(manifest_path),
+            "generated_text": str(generated.get("generated_text", "")),
+            "generated_token_count": int(generated.get("generated_token_count", 0) or 0),
+            "policy_heads": dict(generated.get("policy_heads", {}))
+            if isinstance(generated.get("policy_heads", {}), dict)
+            else {},
+            "scalar_control": dict(generated.get("scalar_control", {}))
+            if isinstance(generated.get("scalar_control", {}), dict)
+            else {},
+            "raw_line_protocol": raw_line_protocol,
+            "line_protocol": line_protocol,
+            "warnings": repair_warnings,
+        }
+        if advisory.mode != "guarded" or not advisory.guarded_candidate_manifest_path:
+            return result
+
+        candidate_path = Path(advisory.guarded_candidate_manifest_path)
+        if not candidate_path.is_absolute():
+            candidate_path = self.repo_root / candidate_path
+        try:
+            candidate_generated = generate_neural_controller_text(
+                manifest_path=candidate_path,
+                encoder_text=encoder_text,
+                repo_root=self.repo_root,
+                device=str(getattr(self.config, "neural_controller_device", "cpu")).strip() or "cpu",
+                max_new_tokens=int(getattr(self.config, "neural_controller_max_new_tokens", 512) or 512),
+            )
+            candidate_raw = parse_neural_controller_line_protocol(
+                str(candidate_generated.get("generated_text", ""))
+            )
+            candidate_line_protocol, candidate_warnings = repair_line_protocol_with_command_copy_target(
+                candidate_raw,
+                encoder_text=encoder_text,
+            )
+            guarded = guarded_neural_controller_source(
+                candidate_line_protocol=candidate_line_protocol,
+                baseline_line_protocol=line_protocol,
+                fallback_families=tuple(advisory.guarded_fallback_families),
+            )
+        except Exception as exc:
+            result["guarded"] = {
+                "ready": False,
+                "error": str(exc).strip() or exc.__class__.__name__,
+                "candidate_manifest_path": str(candidate_path),
+                "fallback_families": list(advisory.guarded_fallback_families),
+                "selected_source": "baseline",
+            }
+            return result
+        result["guarded"] = {
+            "ready": True,
+            "candidate_manifest_path": str(candidate_path),
+            "fallback_families": list(advisory.guarded_fallback_families),
+            "selector_policy": str(advisory.guarded_selector_policy),
+            "selected_source": str(guarded.get("source", "baseline")),
+            "candidate_family": str(guarded.get("candidate_family", "")),
+            "candidate_generated_token_count": int(candidate_generated.get("generated_token_count", 0) or 0),
+            "baseline_line_protocol": line_protocol,
+            "candidate_raw_line_protocol": candidate_raw,
+            "candidate_line_protocol": candidate_line_protocol,
+            "candidate_warnings": candidate_warnings,
+        }
+        result["line_protocol"] = dict(guarded.get("line_protocol", line_protocol))
+        result["raw_line_protocol"] = candidate_raw if result["guarded"]["selected_source"] == "candidate" else raw_line_protocol
+        result["warnings"] = candidate_warnings if result["guarded"]["selected_source"] == "candidate" else repair_warnings
+        return result
 
     def policy_controls(self) -> dict[str, object]:
         if self._policy_controls_cache is not None:

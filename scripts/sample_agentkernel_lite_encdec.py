@@ -154,10 +154,12 @@ def _load_tokenizer(manifest: dict[str, Any]):
     return HuggingFaceTokenizer(tokenizer_dir, str(manifest.get("tokenizer_name", "")))
 
 
-def _load_prompts(path: Path | None) -> list[str]:
+def _load_prompts(path: Path | None, inline_prompts: list[str] | None = None) -> list[str]:
+    prompts = [prompt for prompt in (inline_prompts or []) if str(prompt).strip()]
+    if prompts:
+        return prompts
     if path is None:
         return DEFAULT_PROMPTS
-    prompts: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         text = line.strip()
         if text and not text.startswith("#"):
@@ -201,6 +203,7 @@ def _generate(
     tokenizer,
     prompt: str,
     *,
+    decoder_prefix: str = "",
     device: torch.device,
     max_encoder_tokens: int,
     max_new_tokens: int,
@@ -209,7 +212,19 @@ def _generate(
     repetition_penalty: float,
 ) -> str:
     enc_ids = tokenizer.encode(prompt, max_length=max_encoder_tokens)
-    dec_ids = [int(tokenizer.bos_token_id)]
+    prefix_ids: list[int] = []
+    if str(decoder_prefix).strip():
+        prefix_ids = [
+            int(token_id)
+            for token_id in tokenizer.encode(str(decoder_prefix), max_length=128)
+            if int(token_id)
+            not in {
+                int(tokenizer.bos_token_id),
+                int(tokenizer.eos_token_id),
+                int(tokenizer.pad_token_id),
+            }
+        ]
+    dec_ids = [int(tokenizer.bos_token_id), *prefix_ids]
     forbidden = {int(tokenizer.pad_token_id), int(tokenizer.unk_token_id)}
     with torch.no_grad():
         enc = torch.tensor([enc_ids], dtype=torch.long, device=device)
@@ -236,12 +251,14 @@ def main() -> None:
     parser.add_argument("--bundle-dir", required=True)
     parser.add_argument("--repo-root", default=str(_repo_root()))
     parser.add_argument("--prompts-file", default="")
+    parser.add_argument("--prompt", action="append", default=[], help="Inline prompt to decode. May be repeated.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-encoder-tokens", type=int, default=768)
     parser.add_argument("--max-new-tokens", type=int, default=220)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--decoder-prefix", default="")
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
@@ -264,7 +281,7 @@ def main() -> None:
     model.to(device).eval()
 
     prompts_path = Path(args.prompts_file).resolve() if str(args.prompts_file).strip() else None
-    prompts = _load_prompts(prompts_path)
+    prompts = _load_prompts(prompts_path, [str(item) for item in args.prompt])
     print(
         json.dumps(
             {
@@ -285,6 +302,7 @@ def main() -> None:
             model,
             tokenizer,
             prompt,
+            decoder_prefix=str(args.decoder_prefix),
             device=device,
             max_encoder_tokens=int(args.max_encoder_tokens),
             max_new_tokens=int(args.max_new_tokens),

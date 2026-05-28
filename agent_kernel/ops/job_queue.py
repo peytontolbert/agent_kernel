@@ -4,9 +4,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import socket
 import subprocess
@@ -15,6 +17,7 @@ from uuid import uuid4
 
 from ..config import KernelConfig
 from ..extensions.delegation_policy import delegation_policy_snapshot
+from ..extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
 from ..learning_compiler import persist_episode_learning_candidates
 from ..loop import AgentKernel
 from .preflight import (
@@ -58,10 +61,99 @@ _CHECKPOINT_OUTPUT_TAIL_MAX_LINES = 40
 _ARTIFACT_GUARD_BACKOFF_EVENT = "artifact_guard_backoff_requeued"
 _ARTIFACT_GUARD_BACKOFF_LIMIT = 3
 _ARTIFACT_GUARD_BACKOFF_PRIORITY_DELTA = 100
+_ARTIFACT_RETRY_CONVERGENCE_LIMIT = 3
+_APPLY_MISSING_PATH_PATTERN = re.compile(r"error:\s+(.+?):\s+No such file or directory")
+_HOST_RESOURCE_GUARD_MOCK_PROVIDERS = {"", "mock", "dry_run"}
 
 
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _parse_proc_meminfo_kb(text: str) -> dict[str, int]:
+    parsed: dict[str, int] = {}
+    for raw_line in str(text).splitlines():
+        if ":" not in raw_line:
+            continue
+        key, raw_value = raw_line.split(":", 1)
+        parts = raw_value.strip().split()
+        if not parts:
+            continue
+        try:
+            parsed[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+    return parsed
+
+
+def _host_memory_pressure_reason_from_meminfo(
+    meminfo_text: str,
+    *,
+    min_available_mb: float,
+    max_swap_used_ratio: float,
+) -> str:
+    if min_available_mb <= 0 and max_swap_used_ratio >= 1:
+        return ""
+    meminfo = _parse_proc_meminfo_kb(meminfo_text)
+    available_mb = float(meminfo.get("MemAvailable", meminfo.get("MemFree", 0))) / 1024.0
+    swap_total = float(meminfo.get("SwapTotal", 0))
+    swap_free = float(meminfo.get("SwapFree", 0))
+    swap_used_ratio = (swap_total - swap_free) / swap_total if swap_total > 0 else 0.0
+    low_available = min_available_mb > 0 and available_mb < min_available_mb
+    swap_exhausted = max_swap_used_ratio < 1 and swap_used_ratio >= max_swap_used_ratio
+    # Full swap can remain as stale pressure after memory has recovered. Do not
+    # deadlock delegated jobs when MemAvailable is comfortably above the guard.
+    swap_pressure_blocks = swap_exhausted and (
+        min_available_mb <= 0 or available_mb < max(min_available_mb * 2.0, min_available_mb + 1024.0)
+    )
+    if not (low_available or swap_pressure_blocks):
+        return ""
+    return (
+        "resource_limit:host_memory_pressure:"
+        f"available_mb={available_mb:.0f}:"
+        f"min_available_mb={min_available_mb:.0f}:"
+        f"swap_used_ratio={swap_used_ratio:.3f}:"
+        f"max_swap_used_ratio={max_swap_used_ratio:.3f}"
+    )
+
+
+def _delegated_host_resource_block_reason(config: KernelConfig) -> str:
+    provider = str(getattr(config, "provider", "") or "").strip().lower()
+    default_min_available_mb = 0.0 if provider in _HOST_RESOURCE_GUARD_MOCK_PROVIDERS else 4096.0
+    min_available_mb = _env_float(
+        "AGENT_KERNEL_DELEGATED_JOB_MIN_AVAILABLE_MEMORY_MB",
+        default_min_available_mb,
+    )
+    max_swap_used_ratio = _env_float(
+        "AGENT_KERNEL_DELEGATED_JOB_MAX_SWAP_USED_RATIO",
+        0.95 if min_available_mb > 0 else 1.0,
+    )
+    if min_available_mb <= 0 and max_swap_used_ratio >= 1:
+        return ""
+    meminfo_path = Path(os.environ.get("AGENT_KERNEL_DELEGATED_JOB_MEMINFO_PATH", "/proc/meminfo"))
+    try:
+        meminfo_text = meminfo_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return _host_memory_pressure_reason_from_meminfo(
+        meminfo_text,
+        min_available_mb=min_available_mb,
+        max_swap_used_ratio=max_swap_used_ratio,
+    )
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -77,6 +169,580 @@ def _parse_timestamp(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _latest_existing_attempt_artifact(path: Path) -> Path | None:
+    """Return the current attempt artifact or its newest stale retry archive.
+
+    Retry recovery archives checkpoints/reports before starting a fresh attempt.
+    Failure-memory readers must still see the archived terminal evidence;
+    otherwise official/artifact feedback disappears exactly when the next retry
+    needs it.
+    """
+
+    if path.exists() and path.is_file():
+        return path
+    parent = path.parent
+    try:
+        candidates = [candidate for candidate in parent.glob(f"{path.name}.stale_before_attempt*") if candidate.is_file()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def _job_prior_apply_missing_source_paths(job: object) -> list[str]:
+    paths: set[str] = set()
+
+    def add_from_text(value: object) -> None:
+        for match in _APPLY_MISSING_PATH_PATTERN.finditer(str(value)):
+            path = match.group(1).strip().strip("/")
+            if path:
+                paths.add(path)
+
+    history = getattr(job, "history", [])
+    if isinstance(history, list):
+        for event in history:
+            if isinstance(event, dict):
+                add_from_text(event.get("detail", ""))
+            else:
+                add_from_text(event)
+    outcome_reasons = getattr(job, "outcome_reasons", [])
+    if isinstance(outcome_reasons, list):
+        for reason in outcome_reasons:
+            add_from_text(reason)
+    checkpoint_path = _latest_existing_attempt_artifact(Path(str(getattr(job, "checkpoint_path", "") or "")))
+    if checkpoint_path is not None:
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        checkpoint_history = checkpoint.get("history", []) if isinstance(checkpoint, dict) else []
+        if isinstance(checkpoint_history, list):
+            for step in checkpoint_history:
+                if not isinstance(step, dict):
+                    continue
+                verification = step.get("verification", {})
+                reasons = verification.get("reasons", []) if isinstance(verification, dict) else []
+                if isinstance(reasons, list):
+                    for reason in reasons:
+                        add_from_text(reason)
+                terminal_metadata = step.get("terminal_metadata", {})
+                if isinstance(terminal_metadata, dict):
+                    add_from_text(terminal_metadata.get("diagnostic", ""))
+    return sorted(paths)
+
+
+def _job_prior_artifact_failure_memory(job: object) -> dict[str, object]:
+    """Carry typed artifact failure state across terminal-job retries.
+
+    OpenClaw-style runtime contracts treat a blocked tool/action result as a
+    structured fact for the next attempt, not just a log line. Keep this compact:
+    the policy only needs the mode, forbidden command shapes, and next repair
+    class.
+    """
+
+    report: dict[str, object] = {}
+    report_path = _latest_existing_attempt_artifact(Path(str(getattr(job, "report_path", "") or "")))
+    if report_path is not None:
+        try:
+            loaded_report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded_report = {}
+        if isinstance(loaded_report, dict):
+            report = loaded_report
+    if not report:
+        checkpoint_path = _latest_existing_attempt_artifact(Path(str(getattr(job, "checkpoint_path", "") or "")))
+        if checkpoint_path is not None:
+            try:
+                loaded_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded_checkpoint = {}
+            if isinstance(loaded_checkpoint, dict):
+                report = {
+                    "outcome": loaded_checkpoint.get("outcome") or loaded_checkpoint.get("status"),
+                    "policy_trace": loaded_checkpoint.get("history", []),
+                    "last_decision_source": loaded_checkpoint.get("last_decision_source", ""),
+                    "termination_reason": loaded_checkpoint.get("termination_reason", ""),
+                }
+    if not report:
+        return {}
+
+    classification = classify_artifact_contract_failure_report(report)
+    if not classification or not classification.get("repairable"):
+        return {}
+    mode = str(classification.get("mode", "")).strip()
+    if not mode or mode in {"not_artifact_contract", "artifact_contract_success"}:
+        return {}
+
+    evidence = [
+        str(item).strip()
+        for item in list(classification.get("evidence", []) or [])[:12]
+        if str(item).strip()
+    ]
+    forbidden_commands: list[str] = []
+    retry_reasons: list[str] = []
+    for item in evidence:
+        if item.startswith("rejected_command:"):
+            forbidden_commands.append(item.split(":", 1)[1].strip()[:1000])
+        elif item.startswith("retry_command:"):
+            forbidden_commands.append(item.split(":", 1)[1].strip()[:1000])
+        elif item.startswith("retry_rejected_reason:"):
+            retry_reasons.append(item.split(":", 1)[1].strip()[:160])
+    trace = report.get("policy_trace", [])
+    if isinstance(trace, list):
+        for step in trace[-12:]:
+            if not isinstance(step, dict):
+                continue
+            metadata = step.get("proposal_metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            for key in ("rejected_command", "retry_command", "terminal_retry_command"):
+                command = str(metadata.get(key, "")).strip()
+                if command:
+                    forbidden_commands.append(command[:1000])
+            for key in ("retry_rejected_reason", "rejected_reason", "terminal_guard_rejected_reason"):
+                reason = str(metadata.get(key, "")).strip()
+                if reason and reason != "None":
+                    retry_reasons.append(reason[:160])
+
+    blocked_action_classes: list[str] = []
+    required_repair_mode = "bounded_artifact_builder"
+    repair_directive = "Use one schema-valid artifact builder command; do not repeat prior failed command shapes."
+    if mode == "artifact_escaped_newline_replacement":
+        blocked_action_classes.append("raw_multiline_with_payload")
+        required_repair_mode = "typed_multiline_artifact_builder"
+        repair_directive = (
+            "Use --replace-lines with one --with argument per output line. Do not put literal newlines inside a "
+            "single --with payload."
+        )
+    elif mode in {"artifact_invalid_python_replacement", "artifact_invalid_python_diagnostic_exhausted"}:
+        blocked_action_classes.append("invalid_python_replacement")
+        required_repair_mode = "statement_range_artifact_builder"
+        repair_directive = (
+            "Replace a complete syntactic statement/block range. Do not replace one line with multiple statements "
+            "unless the replace range spans the same number of complete output lines."
+        )
+    elif mode == "artifact_shallow_one_line_patch":
+        blocked_action_classes.append("shallow_one_line_patch")
+        required_repair_mode = "structured_multiline_artifact_builder"
+        repair_directive = (
+            "Do not submit another isolated one-line production edit. Use the smallest complete behavior range with "
+            "semantic evidence from source/test excerpts."
+        )
+    elif "materialization_guard" in mode or "missing" in mode:
+        blocked_action_classes.append("non_materializing_response")
+        required_repair_mode = "materialize_patch_artifact"
+
+    return {
+        "kind": "prior_artifact_failure_memory",
+        "mode": mode,
+        "last_decision_source": str(classification.get("last_decision_source", "")).strip(),
+        "blocked_action_classes": blocked_action_classes[:6],
+        "required_repair_mode": required_repair_mode,
+        "repair_directive": repair_directive,
+        "forbidden_commands": list(dict.fromkeys(forbidden_commands))[:6],
+        "retry_rejected_reasons": list(dict.fromkeys(retry_reasons))[:8],
+        "evidence": evidence[:10],
+    }
+
+
+def _runtime_overrides_with_job_failure_memory(
+    runtime_overrides: dict[str, object],
+    job: object,
+) -> dict[str, object]:
+    enriched = _runtime_overrides_with_official_failure_memory(runtime_overrides, job)
+    timeout_reason = _job_prior_timeout_reason(job)
+    if timeout_reason:
+        enriched = _runtime_overrides_with_job_timeout_memory(
+            dict(enriched or {}),
+            job,
+            reason=timeout_reason,
+        )
+    prior_artifact_failure = _job_prior_artifact_failure_memory(job)
+    if prior_artifact_failure:
+        enriched = dict(enriched)
+        task_payload = (
+            dict(enriched.get("task_payload", {}))
+            if isinstance(enriched.get("task_payload", {}), dict)
+            else {}
+        )
+        metadata = (
+            dict(task_payload.get("metadata", {}))
+            if isinstance(task_payload.get("metadata", {}), dict)
+            else {}
+        )
+        previous = metadata.get("artifact_prior_failure_memories", [])
+        previous_list = (
+            [dict(item) for item in previous if isinstance(item, dict)]
+            if isinstance(previous, list)
+            else []
+        )
+        previous_list.append(dict(prior_artifact_failure))
+        metadata["artifact_prior_failure_memory"] = dict(prior_artifact_failure)
+        metadata["artifact_prior_failure_memories"] = previous_list[-5:]
+        task_payload["metadata"] = metadata
+        enriched["task_payload"] = task_payload
+    missing_paths = _job_prior_apply_missing_source_paths(job)
+    if not missing_paths:
+        return enriched
+    enriched = dict(enriched)
+    task_payload = dict(enriched.get("task_payload", {})) if isinstance(enriched.get("task_payload", {}), dict) else {}
+    metadata = dict(task_payload.get("metadata", {})) if isinstance(task_payload.get("metadata", {}), dict) else {}
+    existing = {
+        str(path).strip().strip("/")
+        for path in metadata.get("artifact_prior_missing_source_paths", [])
+        if str(path).strip()
+    } if isinstance(metadata.get("artifact_prior_missing_source_paths", []), list) else set()
+    metadata["artifact_prior_missing_source_paths"] = sorted(existing | set(missing_paths))
+    task_payload["metadata"] = metadata
+    enriched["task_payload"] = task_payload
+    return enriched
+
+
+def _runtime_overrides_with_official_failure_memory(
+    runtime_overrides: dict[str, object],
+    job: object,
+) -> dict[str, object]:
+    if str(getattr(job, "outcome", "")).strip() != "official_failed":
+        return runtime_overrides
+    report_path = _latest_existing_attempt_artifact(Path(str(getattr(job, "report_path", "") or "")))
+    if report_path is None:
+        return runtime_overrides
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return runtime_overrides
+    if not isinstance(report, dict):
+        return runtime_overrides
+    task_metadata = report.get("task_metadata", {})
+    if not isinstance(task_metadata, dict):
+        return runtime_overrides
+    verifier = task_metadata.get("semantic_verifier", {})
+    if not isinstance(verifier, dict) or str(verifier.get("kind", "")).strip() != "swe_patch_apply_check":
+        return runtime_overrides
+    workspace = Path(str(report.get("workspace", "") or ""))
+    patch_name = str(verifier.get("patch_path", "patch.diff") or "patch.diff").strip() or "patch.diff"
+    patch_path = workspace / patch_name if workspace else Path(patch_name)
+    try:
+        failed_patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        failed_patch_text = ""
+    if not failed_patch_text.strip():
+        return runtime_overrides
+    enriched = dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    task_payload = dict(enriched.get("task_payload", {})) if isinstance(enriched.get("task_payload", {}), dict) else {}
+    metadata = dict(task_payload.get("metadata", {})) if isinstance(task_payload.get("metadata", {}), dict) else {}
+    semantic_verifier = (
+        dict(metadata.get("semantic_verifier", {}))
+        if isinstance(metadata.get("semantic_verifier", {}), dict)
+        else {}
+    )
+    existing_forbidden = [
+        str(value)
+        for value in semantic_verifier.get("forbidden_patch_texts", [])
+        if str(value).strip()
+    ] if isinstance(semantic_verifier.get("forbidden_patch_texts", []), list) else []
+    if failed_patch_text not in existing_forbidden:
+        existing_forbidden.append(failed_patch_text)
+    semantic_verifier["forbidden_patch_texts"] = existing_forbidden[-5:]
+    metadata["semantic_verifier"] = semantic_verifier
+    prior = metadata.get("kernel_prior_official_failures", [])
+    failures = [dict(item) for item in prior if isinstance(item, dict)] if isinstance(prior, list) else []
+    failures.append(
+        {
+            "recorded_at": _utcnow(),
+            "outcome": "official_failed",
+            "task_id": str(getattr(job, "task_id", "")).strip(),
+            "patch_sha256": _sha256_text(failed_patch_text),
+            "report_path": str(report_path),
+            "failure_reasons": _report_verifier_reasons(report),
+        }
+    )
+    metadata["kernel_prior_official_failures"] = failures[-5:]
+    task_payload["metadata"] = metadata
+    enriched["task_payload"] = task_payload
+    return enriched
+
+
+def _report_verifier_reasons(report: dict[str, object]) -> list[str]:
+    packet = report.get("acceptance_packet", {})
+    verifier = packet.get("verifier_result", {}) if isinstance(packet, dict) else {}
+    reasons = verifier.get("reasons", []) if isinstance(verifier, dict) else []
+    if isinstance(reasons, list):
+        normalized = [str(reason).strip() for reason in reasons if str(reason).strip()]
+        if normalized:
+            return normalized[-8:]
+    outcome_reasons = report.get("outcome_reasons", [])
+    if isinstance(outcome_reasons, list):
+        return [str(reason).strip() for reason in outcome_reasons if str(reason).strip()][-8:]
+    return []
+
+
+def _job_prior_timeout_reason(job: object) -> str:
+    history = getattr(job, "history", [])
+    if not isinstance(history, list):
+        return ""
+    for entry in reversed(history):
+        if not isinstance(entry, dict):
+            continue
+        detail = str(entry.get("detail", "")).strip()
+        event = str(entry.get("event", "")).strip()
+        if "isolated delegated job exceeded" in detail:
+            return detail
+        if event == "stale_in_progress_requeued" and "exceeded" in detail:
+            return detail
+    return ""
+
+
+def _job_prior_decision_progress(job: object) -> dict[str, object]:
+    raw_checkpoint_path = str(getattr(job, "checkpoint_path", "") or "").strip()
+    if not raw_checkpoint_path:
+        return {}
+    checkpoint_path = Path(raw_checkpoint_path)
+    if not checkpoint_path.name:
+        return {}
+    progress_path = checkpoint_path.with_name(f"{checkpoint_path.stem}.progress.json")
+    if not progress_path.exists() or not progress_path.is_file():
+        return {}
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(progress, dict):
+        return {}
+    return {
+        key: progress.get(key)
+        for key in (
+            "event",
+            "step_stage",
+            "step_index",
+            "cognitive_stage",
+            "subphase",
+            "verification_passed",
+            "updated_at",
+        )
+        if key in progress
+    }
+
+
+def _runtime_overrides_with_job_timeout_memory(
+    runtime_overrides: dict[str, object],
+    job: object,
+    *,
+    reason: str,
+) -> dict[str, object]:
+    progress = _job_prior_decision_progress(job)
+    if not progress:
+        return runtime_overrides
+    enriched = dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    task_payload = dict(enriched.get("task_payload", {})) if isinstance(enriched.get("task_payload", {}), dict) else {}
+    metadata = dict(task_payload.get("metadata", {})) if isinstance(task_payload.get("metadata", {}), dict) else {}
+    timeout_event = {
+        "reason": str(reason).strip(),
+        "recorded_at": _utcnow(),
+        "progress": progress,
+    }
+    prior = metadata.get("kernel_prior_timeout_events", [])
+    events = [dict(item) for item in prior if isinstance(item, dict)] if isinstance(prior, list) else []
+    events.append(timeout_event)
+    metadata["kernel_last_timeout_event"] = timeout_event
+    metadata["kernel_prior_timeout_events"] = events[-5:]
+    stage = str(progress.get("step_stage", "")).strip()
+    if stage:
+        prior_stages = metadata.get("kernel_prior_timeout_stages", [])
+        stages = [str(item).strip() for item in prior_stages if str(item).strip()] if isinstance(prior_stages, list) else []
+        if stage not in stages:
+            stages.append(stage)
+        metadata["kernel_prior_timeout_stages"] = stages[-8:]
+    task_payload["metadata"] = metadata
+    enriched["task_payload"] = task_payload
+    return enriched
+
+
+def _checkpoint_history(path: Path) -> list[dict[str, object]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    history = payload.get("history", [])
+    return [dict(item) for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+
+
+def _artifact_terminal_signature(history: list[dict[str, object]]) -> str:
+    if not history:
+        return ""
+    terminal_step = history[-1]
+    for step in reversed(history):
+        if str(step.get("decision_source", "")).strip() == "artifact_materialization_guard":
+            terminal_step = step
+            break
+    metadata = terminal_step.get("proposal_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    source = str(terminal_step.get("decision_source", "")).strip()
+    retry_reason = str(metadata.get("retry_rejected_reason", "")).strip()
+    rejected_reason = str(metadata.get("rejected_reason", "")).strip()
+    terminal_reason = str(metadata.get("terminal_guard_rejected_reason", "")).strip()
+    retry_command = str(metadata.get("retry_command", "")).strip()
+    latest_context = ""
+    preferred_context_sources = {
+        "artifact_behavior_target_body_retry_exhausted_context_read",
+        "artifact_behavior_target_enclosing_block_context_read",
+        "artifact_behavior_target_enclosing_block_failed_context_read",
+        "artifact_behavior_target_statement_kind_timeout_context_read",
+        "artifact_behavior_target_statement_kind_failed_context_read",
+        "artifact_behavior_target_statement_kind_context_read",
+        "artifact_behavior_target_body_timeout_failed_context_read",
+        "artifact_behavior_target_body_timeout_context_read",
+        "artifact_behavior_target_body_retry_failed_context_read",
+        "artifact_behavior_target_body_retry_context_read",
+        "artifact_behavior_target_body_context_read",
+        "artifact_behavior_target_region_escape_context_read",
+        "artifact_behavior_target_repair_context_read",
+    }
+    for step in reversed(history):
+        decision_source = str(step.get("decision_source", "")).strip()
+        if not decision_source.startswith("artifact_") or decision_source == "artifact_materialization_guard":
+            continue
+        if latest_context and decision_source not in preferred_context_sources:
+            continue
+        step_metadata = step.get("proposal_metadata", {})
+        if not isinstance(step_metadata, dict):
+            step_metadata = {}
+        spans = ",".join(
+            str(item).strip()
+            for item in step_metadata.get("operation_spans", [])
+            if str(item).strip()
+        ) if isinstance(step_metadata.get("operation_spans", []), list) else ""
+        latest_context = "|".join(
+            [
+                decision_source,
+                str(step_metadata.get("retry_rejected_reason", "")).strip(),
+                str(step_metadata.get("rejected_reason", "")).strip(),
+                str(step_metadata.get("terminal_guard_rejected_reason", "")).strip(),
+                spans[:80],
+            ]
+        )
+        if decision_source in preferred_context_sources:
+            break
+    if not source.startswith("artifact_") and not retry_reason and not rejected_reason and not terminal_reason:
+        return ""
+    return "|".join(
+        [
+            source,
+            latest_context,
+            retry_reason,
+            rejected_reason,
+            terminal_reason,
+            retry_command[:160],
+        ]
+    )
+
+
+def _artifact_retry_convergence_report(job: object) -> dict[str, object]:
+    raw_checkpoint_path = str(getattr(job, "checkpoint_path", "") or "").strip()
+    if not raw_checkpoint_path:
+        return {}
+    checkpoint_path = Path(raw_checkpoint_path)
+    if not checkpoint_path.name:
+        return {}
+    paths = list(checkpoint_path.parent.glob(f"{checkpoint_path.name}.stale_before_attempt*"))
+    current_signature = ""
+    if checkpoint_path.exists():
+        current_signature = _artifact_terminal_signature(_checkpoint_history(checkpoint_path))
+        paths.append(checkpoint_path)
+    signatures: list[str] = []
+    for path in sorted(paths, key=lambda item: item.stat().st_mtime if item.exists() else 0.0)[-8:]:
+        signature = _artifact_terminal_signature(_checkpoint_history(path))
+        if signature:
+            signatures.append(signature)
+    if not signatures:
+        return {}
+    if checkpoint_path.exists() and not current_signature:
+        return {}
+    counts: dict[str, int] = {}
+    for signature in signatures:
+        if current_signature and signature != current_signature:
+            continue
+        counts[signature] = counts.get(signature, 0) + 1
+    if not counts:
+        return {}
+    signature, count = max(counts.items(), key=lambda item: item[1])
+    return {
+        "kind": "artifact_retry_convergence",
+        "signature": signature,
+        "signature_count": count,
+        "sampled_attempts": len(signatures),
+        "limit": _ARTIFACT_RETRY_CONVERGENCE_LIMIT,
+    }
+
+
+def _runtime_overrides_with_retry_convergence_blocker(
+    runtime_overrides: dict[str, object],
+    *,
+    report: dict[str, object],
+) -> dict[str, object]:
+    enriched = dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    task_payload = dict(enriched.get("task_payload", {})) if isinstance(enriched.get("task_payload", {}), dict) else {}
+    metadata = dict(task_payload.get("metadata", {})) if isinstance(task_payload.get("metadata", {}), dict) else {}
+    metadata["kernel_retry_convergence_blocker"] = dict(report)
+    blockers = metadata.get("kernel_retry_convergence_blockers", [])
+    blocker_list = [dict(item) for item in blockers if isinstance(item, dict)] if isinstance(blockers, list) else []
+    blocker_list.append(dict(report))
+    metadata["kernel_retry_convergence_blockers"] = blocker_list[-5:]
+    task_payload["metadata"] = metadata
+    enriched["task_payload"] = task_payload
+    return enriched
+
+
+def _runtime_overrides_with_retry_convergence_replan(
+    runtime_overrides: dict[str, object],
+    *,
+    report: dict[str, object],
+) -> dict[str, object]:
+    enriched = dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    task_payload = dict(enriched.get("task_payload", {})) if isinstance(enriched.get("task_payload", {}), dict) else {}
+    metadata = dict(task_payload.get("metadata", {})) if isinstance(task_payload.get("metadata", {}), dict) else {}
+    metadata["kernel_retry_convergence_replan"] = dict(report)
+    attempted = metadata.get("kernel_retry_convergence_replan_attempts", [])
+    attempts = [dict(item) for item in attempted if isinstance(item, dict)] if isinstance(attempted, list) else []
+    attempts.append(dict(report))
+    metadata["kernel_retry_convergence_replan_attempts"] = attempts[-5:]
+    task_payload["metadata"] = metadata
+    enriched["task_payload"] = task_payload
+    return enriched
+
+
+def _retry_convergence_replan_already_attempted(job: object, report: dict[str, object]) -> bool:
+    runtime_overrides = getattr(job, "runtime_overrides", {})
+    if not isinstance(runtime_overrides, dict):
+        return False
+    task_payload = runtime_overrides.get("task_payload", {})
+    if not isinstance(task_payload, dict):
+        return False
+    metadata = task_payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return False
+    signature = str(report.get("signature", "")).strip()
+    attempts = metadata.get("kernel_retry_convergence_replan_attempts", [])
+    if not signature or not isinstance(attempts, list):
+        return False
+
+    def equivalent(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        # Older stored signatures did not include the latest diagnostic context
+        # component. Keep those attempts valid when the new component is empty.
+        return left.replace("||", "|", 1) == right or right.replace("||", "|", 1) == left
+
+    return any(
+        isinstance(attempt, dict) and equivalent(str(attempt.get("signature", "")).strip(), signature)
+        for attempt in attempts
+    )
 
 
 def _job_id(task_id: str) -> str:
@@ -292,11 +958,24 @@ def _scheduler_fairness_boost(job: "DelegatedJob") -> int:
     return min(3, outstanding)
 
 
+def _scheduler_timeout_requeue_count(job: "DelegatedJob") -> int:
+    count = 0
+    for entry in getattr(job, "history", []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("event", "")).strip() != "stale_in_progress_requeued":
+            continue
+        detail = str(entry.get("detail", "")).strip()
+        if "wall_time_exceeded" in detail or "timed out" in detail:
+            count += 1
+    return count
+
+
 def _scheduler_candidate_sort_key(
     job: "DelegatedJob",
     *,
     worker_job: bool,
-) -> tuple[int, float, int, float, str]:
+) -> tuple[int, int, int, int, float, float, str]:
     state_rank = 0 if job.state == "in_progress" else 1
     deadline = _parse_timestamp(job.deadline_at)
     queued = _parse_timestamp(job.queued_at)
@@ -305,10 +984,12 @@ def _scheduler_candidate_sort_key(
     first_blocked = _parse_timestamp(getattr(job, "scheduler_first_blocked_at", ""))
     first_blocked_rank = first_blocked.timestamp() if first_blocked is not None else float("inf")
     fairness_boost = _scheduler_fairness_boost(job)
+    timeout_requeues = _scheduler_timeout_requeue_count(job)
     worker_rank = 0 if worker_job else 1
     return (
         worker_rank,
         state_rank,
+        timeout_requeues,
         -(int(job.priority) + fairness_boost),
         first_blocked_rank if fairness_boost > 0 else queued_rank,
         deadline_rank,
@@ -1026,13 +1707,27 @@ class DelegatedJobQueue:
         raise ValueError(f"unknown job_id: {job_id}")
 
     @staticmethod
+    def _has_resume_artifact(job: "DelegatedJob") -> bool:
+        for raw_path in (job.checkpoint_path, job.report_path):
+            path_text = str(raw_path).strip()
+            if not path_text:
+                continue
+            path = Path(path_text)
+            if path.exists():
+                return True
+            if path.name:
+                progress_path = path.with_name(f"{path.stem}.progress.json")
+                if progress_path.exists():
+                    return True
+        return False
+
+    @staticmethod
     def _resumable_in_progress(job: "DelegatedJob") -> bool:
         return bool(
             job.state == "in_progress"
             and (
                 str(job.last_error).strip()
-                or str(job.checkpoint_path).strip()
-                or str(job.report_path).strip()
+                or DelegatedJobQueue._has_resume_artifact(job)
             )
         )
 
@@ -1235,6 +1930,11 @@ class DelegatedJobQueue:
                     outcome_reasons=[],
                     last_error="",
                     scheduler_blocked_open=False,
+                    runtime_overrides=_runtime_overrides_with_artifact_backoff_failure(
+                        job.runtime_overrides,
+                        report_path=report_path,
+                        reason=reason,
+                    ),
                     history=[dict(entry) for entry in job.history],
                 )
                 self._append_history(
@@ -1282,11 +1982,11 @@ class DelegatedJobQueue:
         reason: str = "retry terminal job",
         priority: int | None = None,
         limit: int = 0,
+        force_policy_retry: bool = False,
     ) -> list[DelegatedJob]:
         target_states = set(states or {"safe_stop", "failed"})
-        if "completed" in target_states:
-            raise ValueError("retry_terminal_refuses_completed_jobs")
-        invalid_states = target_states - TERMINAL_JOB_STATES
+        retryable_states = TERMINAL_JOB_STATES | {"cancel_requested", "completed"}
+        invalid_states = target_states - retryable_states
         if invalid_states:
             raise ValueError(f"retry_terminal_invalid_states:{','.join(sorted(invalid_states))}")
         target_job_ids = {job_id.strip() for job_id in (job_ids or set()) if job_id.strip()}
@@ -1302,6 +2002,65 @@ class DelegatedJobQueue:
                     continue
                 if job.state not in target_states:
                     continue
+                if job.state == "completed" and str(job.outcome).strip() not in {
+                    "semantic_unverified",
+                    "official_failed",
+                }:
+                    continue
+                convergence_report = _artifact_retry_convergence_report(job)
+                if int(convergence_report.get("signature_count", 0) or 0) >= _ARTIFACT_RETRY_CONVERGENCE_LIMIT:
+                    if force_policy_retry or not _retry_convergence_replan_already_attempted(job, convergence_report):
+                        updated = replace(
+                            job,
+                            state="queued",
+                            priority=job.priority if priority is None else int(priority),
+                            finished_at="",
+                            cancel_requested_at="",
+                            outcome="",
+                            outcome_reasons=[],
+                            last_error="",
+                            scheduler_blocked_open=False,
+                            runtime_overrides=_runtime_overrides_with_job_failure_memory(
+                                _runtime_overrides_with_retry_convergence_replan(
+                                    dict(job.runtime_overrides or {}),
+                                    report=convergence_report,
+                                ),
+                                job,
+                            ),
+                            history=[dict(entry) for entry in job.history],
+                        )
+                        self._append_history(
+                            updated,
+                            event=(
+                                "retry_convergence_policy_retry_queued"
+                                if force_policy_retry
+                                else "retry_convergence_replan_queued"
+                            ),
+                            detail=str(convergence_report.get("signature", ""))[:1000],
+                        )
+                        jobs[index] = updated
+                        retried.append(updated)
+                        continue
+                    blocked = replace(
+                        job,
+                        scheduler_blocked_open=True,
+                        last_error=(
+                            "artifact retry convergence guard blocked blind retry: "
+                            f"{convergence_report.get('signature', '')}"
+                        )[:1000],
+                        runtime_overrides=_runtime_overrides_with_retry_convergence_blocker(
+                            dict(job.runtime_overrides or {}),
+                            report=convergence_report,
+                        ),
+                        history=[dict(entry) for entry in job.history],
+                    )
+                    self._append_history(
+                        blocked,
+                        event="retry_convergence_blocked",
+                        detail=str(convergence_report.get("signature", ""))[:1000],
+                    )
+                    jobs[index] = blocked
+                    continue
                 updated = replace(
                     job,
                     state="queued",
@@ -1312,6 +2071,10 @@ class DelegatedJobQueue:
                     outcome_reasons=[],
                     last_error="",
                     scheduler_blocked_open=False,
+                    runtime_overrides=_runtime_overrides_with_job_failure_memory(
+                        dict(job.runtime_overrides or {}),
+                        job,
+                    ),
                     history=[dict(entry) for entry in job.history],
                 )
                 self._append_history(updated, event="retry_queued", detail=retry_reason)
@@ -1326,6 +2089,7 @@ class DelegatedJobQueue:
         reason: str = "requeue stale in-progress job without active runner",
         priority: int | None = None,
         limit: int = 0,
+        force_resumable: bool = False,
     ) -> list[DelegatedJob]:
         active = {job_id.strip() for job_id in (active_job_ids or set()) if job_id.strip()}
         detail = reason.strip() or "requeue stale in-progress job without active runner"
@@ -1338,7 +2102,7 @@ class DelegatedJobQueue:
                 job = jobs[index]
                 if job.state != "in_progress" or job.job_id in active:
                     continue
-                if self._resumable_in_progress(job):
+                if self._resumable_in_progress(job) and not force_resumable:
                     continue
                 updated = replace(
                     job,
@@ -1351,6 +2115,11 @@ class DelegatedJobQueue:
                     outcome_reasons=[],
                     last_error="",
                     scheduler_blocked_open=False,
+                    runtime_overrides=_runtime_overrides_with_job_timeout_memory(
+                        dict(job.runtime_overrides or {}),
+                        job,
+                        reason=detail,
+                    ),
                     history=[dict(entry) for entry in job.history],
                 )
                 self._append_history(updated, event="stale_in_progress_requeued", detail=detail)
@@ -1551,6 +2320,28 @@ def _archive_nonresumable_retry_artifacts(
         path.replace(archive_path)
         archived.append(archive_path)
     return archived
+
+
+def _checkpoint_is_terminal_payload(checkpoint_path: Path) -> bool:
+    if not checkpoint_path.exists() or not checkpoint_path.is_file():
+        return False
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status", "")).strip()
+    termination_reason = str(payload.get("termination_reason", "")).strip()
+    if status in {"completed", "safe_stop", "failed", "cancelled", "expired"}:
+        return True
+    return bool(payload.get("episode")) and termination_reason in {
+        "success",
+        "policy_terminated",
+        "setup_failed",
+        "worker_command_failed",
+        "final_semantic_recheck_failed",
+    }
 
 
 def _write_delegated_job_progress(
@@ -1884,6 +2675,31 @@ def _worker_command_verification_result(
     )
 
 
+def _final_semantic_recheck_failure(task: TaskSpec, workspace_path: Path) -> list[str]:
+    verifier = task.metadata.get("semantic_verifier", {}) if isinstance(task.metadata, dict) else {}
+    if not isinstance(verifier, dict):
+        return []
+    if str(verifier.get("kind", "")).strip() != "swe_patch_apply_check":
+        return []
+    verification = Verifier().verify(
+        task,
+        workspace_path,
+        CommandResult(command="final_semantic_recheck", exit_code=0, stdout="", stderr=""),
+    )
+    if verification.passed:
+        return []
+    return [str(reason).strip() for reason in verification.reasons if str(reason).strip()] or [
+        "final semantic verifier rejected completed job"
+    ]
+
+
+def _requires_official_benchmark_scoring(task: TaskSpec) -> bool:
+    verifier = task.metadata.get("semantic_verifier", {}) if isinstance(task.metadata, dict) else {}
+    if not isinstance(verifier, dict):
+        return False
+    return str(verifier.get("kind", "")).strip() == "swe_patch_apply_check"
+
+
 def _run_worker_command_task(
     *,
     job: DelegatedJob,
@@ -2048,7 +2864,9 @@ def _artifact_guard_terminal_backoff_reason(report_path: Path, job: DelegatedJob
         return ""
     if not isinstance(payload, dict):
         return ""
-    failure = payload.get("artifact_contract_failure", {})
+    failure = classify_artifact_contract_failure_report(payload)
+    if failure.get("mode") == "not_artifact_contract":
+        failure = payload.get("artifact_contract_failure", {})
     if not isinstance(failure, dict):
         return ""
     mode = str(failure.get("mode", "")).strip()
@@ -2091,6 +2909,42 @@ def _job_was_artifact_guard_backoff_requeued(job: DelegatedJob) -> bool:
     return isinstance(last, dict) and str(last.get("event", "")).strip() == _ARTIFACT_GUARD_BACKOFF_EVENT
 
 
+def _runtime_overrides_with_artifact_backoff_failure(
+    runtime_overrides: dict[str, object],
+    *,
+    report_path: Path,
+    reason: str,
+) -> dict[str, object]:
+    updated = dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    task_payload = updated.get("task_payload")
+    if not isinstance(task_payload, dict):
+        return updated
+    task_payload = dict(task_payload)
+    metadata = task_payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = dict(metadata)
+    failure: dict[str, object] = {}
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        report = {}
+    if isinstance(report, dict) and isinstance(report.get("artifact_contract_failure"), dict):
+        failure = dict(report["artifact_contract_failure"])
+    if not failure:
+        failure = {"kind": "artifact_contract_failure", "mode": "", "evidence": []}
+    failure["backoff_reason"] = str(reason).strip()
+    failure["recorded_at"] = _utcnow()
+    prior = metadata.get("artifact_backoff_failures", [])
+    failures = [dict(item) for item in prior if isinstance(item, dict)] if isinstance(prior, list) else []
+    failures.append(failure)
+    metadata["artifact_last_backoff_failure"] = failure
+    metadata["artifact_backoff_failures"] = failures[-5:]
+    task_payload["metadata"] = metadata
+    updated["task_payload"] = task_payload
+    return updated
+
+
 def run_next_delegated_job(
     queue: DelegatedJobQueue,
     *,
@@ -2102,9 +2956,11 @@ def run_next_delegated_job(
     attempted_budget_blocked: set[str] = set()
     attempted_dependency_blocked: set[str] = set()
     attempted_preflight_blocked: set[str] = set()
+    attempted_resource_blocked: set[str] = set()
     deferred_budget_blocked: DelegatedJob | None = None
     deferred_dependency_blocked: DelegatedJob | None = None
     deferred_preflight_blocked: DelegatedJob | None = None
+    deferred_resource_blocked: DelegatedJob | None = None
     resolved_config = base_config or KernelConfig()
     try:
         bank = TaskBank(config=resolved_config)
@@ -2125,7 +2981,12 @@ def run_next_delegated_job(
         repo = repo_root or Path(__file__).resolve().parents[1]
         stale_in_progress_requeued = False
         for candidate in raw_candidates:
-            if candidate.job_id in attempted_budget_blocked | attempted_dependency_blocked | attempted_preflight_blocked:
+            if candidate.job_id in (
+                attempted_budget_blocked
+                | attempted_dependency_blocked
+                | attempted_preflight_blocked
+                | attempted_resource_blocked
+            ):
                 continue
             resumable = bool(
                 candidate.state == "in_progress"
@@ -2146,6 +3007,7 @@ def run_next_delegated_job(
                     attempted_budget_blocked.discard(candidate.job_id)
                     attempted_dependency_blocked.discard(candidate.job_id)
                     attempted_preflight_blocked.discard(candidate.job_id)
+                    attempted_resource_blocked.discard(candidate.job_id)
                     stale_in_progress_requeued = True
                     break
                 continue
@@ -2192,6 +3054,17 @@ def run_next_delegated_job(
         for candidate, candidate_config, candidate_task, candidate_runtime_task, worker_job, resumable in prepared_candidates:
             config = candidate_config
             task = candidate_task
+            resource_block_reason = _delegated_host_resource_block_reason(candidate_config)
+            if resource_block_reason:
+                queue.record_scheduler_decision(
+                    candidate.job_id,
+                    decision="deferred:resource_blocked",
+                    detail=resource_block_reason,
+                )
+                deferred = queue.defer(candidate.job_id, reason=resource_block_reason)
+                attempted_resource_blocked.add(candidate.job_id)
+                deferred_resource_blocked = deferred
+                continue
             dependencies_ready, dependency_reason = delegated_job_dependency_status(queue, candidate)
             if not dependencies_ready:
                 queue.record_scheduler_decision(
@@ -2311,12 +3184,19 @@ def run_next_delegated_job(
                 queue.record_scheduler_decision(candidate.job_id, decision=decision, detail=f"priority={candidate.priority}")
                 break
         if claimed_job is None or config is None or task is None or runtime_task is None:
-            return deferred_budget_blocked or deferred_dependency_blocked or deferred_preflight_blocked
+            return (
+                deferred_resource_blocked
+                or deferred_budget_blocked
+                or deferred_dependency_blocked
+                or deferred_preflight_blocked
+            )
 
         job = claimed_job
         checkpoint_path, report_path = delegated_job_paths(config, job)
         progress_path = delegated_job_progress_path(config, job)
-        if not resumable and job.attempt_count > 1:
+        if not resumable and (
+            job.attempt_count > 1 or _checkpoint_is_terminal_payload(checkpoint_path)
+        ):
             archived_retry_artifacts = _archive_nonresumable_retry_artifacts(
                 checkpoint_path=checkpoint_path,
                 report_path=report_path,
@@ -2438,11 +3318,19 @@ def run_next_delegated_job(
                     )
                 else:
                     kernel = AgentKernel(config=config)
+                    run_runtime_overrides = _runtime_overrides_with_job_failure_memory(
+                        dict(job.runtime_overrides or {}),
+                        job,
+                    )
+                    run_task = task
+                    run_task_payload = run_runtime_overrides.get("task_payload")
+                    if isinstance(run_task_payload, dict):
+                        run_task = TaskSpec.from_dict(run_task_payload)
                     episode = kernel.run_task(
-                        task,
+                        run_task,
                         checkpoint_path=checkpoint_path,
                         resume=checkpoint_path.exists(),
-                        runtime_overrides=job.runtime_overrides,
+                        runtime_overrides=run_runtime_overrides,
                         job_id=job.job_id,
                         progress_callback=lambda payload: _write_delegated_job_progress(
                             progress_path,
@@ -2513,13 +3401,74 @@ def run_next_delegated_job(
                 before_workspace_snapshot=before_workspace_snapshot,
                     )
             outcome, outcome_reasons = classify_run_outcome(episode=episode, preflight=preflight)
+            episode_workspace_path = Path(str(episode.workspace)).resolve() if episode is not None else workspace_path
+            if not episode_workspace_path.exists():
+                episode_workspace_path = workspace_path
             artifact_bytes = _artifact_bytes(
-                workspace_path=workspace_path,
+                workspace_path=episode_workspace_path,
                 checkpoint_path=checkpoint_path,
                 report_path=report,
                 expected_files=list(getattr(runtime_task, "expected_files", [])),
             )
-            terminal_state = "completed" if outcome == "success" else "safe_stop" if outcome == "safe_stop" else "failed"
+            final_recheck_reasons = _final_semantic_recheck_failure(runtime_task, episode_workspace_path)
+            if outcome == "success" and final_recheck_reasons:
+                outcome = "safe_stop"
+                outcome_reasons = [
+                    "final_semantic_recheck_failed",
+                    *final_recheck_reasons,
+                ]
+                report = write_unattended_task_report(
+                    task=runtime_task,
+                    config=config,
+                    episode=episode,
+                    preflight=preflight,
+                    report_path=report_path,
+                    before_workspace_snapshot=before_workspace_snapshot,
+                    outcome_override="safe_stop",
+                    outcome_reasons_override=outcome_reasons,
+                    termination_reason_override="final_semantic_recheck_failed",
+                    extra_uncertainties=[
+                        "job episode reported success but final semantic verifier rejected the workspace artifact"
+                    ],
+                )
+                artifact_bytes = _artifact_bytes(
+                    workspace_path=episode_workspace_path,
+                    checkpoint_path=checkpoint_path,
+                    report_path=report,
+                    expected_files=list(getattr(runtime_task, "expected_files", [])),
+                )
+            elif outcome == "success" and _requires_official_benchmark_scoring(runtime_task):
+                outcome = "semantic_unverified"
+                outcome_reasons = [
+                    "artifact_ready",
+                    "semantic_unverified",
+                    "official_scoring_required",
+                ]
+                report = write_unattended_task_report(
+                    task=runtime_task,
+                    config=config,
+                    episode=episode,
+                    preflight=preflight,
+                    report_path=report_path,
+                    before_workspace_snapshot=before_workspace_snapshot,
+                    outcome_override=outcome,
+                    outcome_reasons_override=outcome_reasons,
+                    termination_reason_override="semantic_unverified",
+                    extra_uncertainties=[
+                        "patch.diff passed local artifact checks but still requires official benchmark scoring"
+                    ],
+                )
+                artifact_bytes = _artifact_bytes(
+                    workspace_path=episode_workspace_path,
+                    checkpoint_path=checkpoint_path,
+                    report_path=report,
+                    expected_files=list(getattr(runtime_task, "expected_files", [])),
+                )
+            terminal_state = (
+                "completed"
+                if outcome in {"success", "semantic_unverified", "official_passed"}
+                else "safe_stop" if outcome == "safe_stop" else "failed"
+            )
             last_error = ""
             acceptance_gate_failed, acceptance_gate_reason = _acceptance_promotion_gate(report)
             if acceptance_gate_failed:

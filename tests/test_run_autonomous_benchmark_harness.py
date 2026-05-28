@@ -67,6 +67,22 @@ def test_validate_harness_spec_rejects_unknown_kernel_owned_phase():
     assert "autonomy_contract.kernel_owned_phases references unknown phase: missing_phase" in failures
 
 
+def test_validate_harness_spec_requires_official_feedback_as_required_input():
+    module = _load_runner_module()
+    spec = _harness_spec("artifact.txt")
+    spec["phases"][0]["argv"].extend(["--official-feedback-json", "feedback.json"])
+
+    failures = module.validate_harness_spec(spec)
+
+    assert (
+        "phase write_artifact --official-feedback-json path must be listed in required_inputs: feedback.json"
+        in failures
+    )
+
+    spec["phases"][0]["required_inputs"] = ["feedback.json"]
+    assert module.validate_harness_spec(spec) == []
+
+
 def test_check_harness_prerequisites_rejects_missing_account_gate(tmp_path):
     module = _load_runner_module()
     spec = _harness_spec("artifact.txt")

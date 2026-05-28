@@ -217,7 +217,7 @@ class Sandbox:
         heredoc_segment = self._parse_simple_cat_heredoc(normalized)
         if heredoc_segment is not None:
             return [heredoc_segment]
-        if any(marker in normalized for marker in ("`", "$(", "${")):
+        if any(marker in normalized for marker in ("$(", "${")):
             raise ValueError(f"blocked unsupported shell expansion: {normalized}")
 
         lexer = shlex.shlex(normalized, posix=True, punctuation_chars="&|;<>")
@@ -423,8 +423,14 @@ class Sandbox:
                 continue
             if token == "--replace-line" and index + 1 < len(args):
                 flush_operation()
-                current_start_line = int(args[index + 1])
-                current_end_line = current_start_line
+                raw_line = str(args[index + 1]).strip()
+                if re.match(r"^\d+\s*-\s*\d+$", raw_line):
+                    start_text, end_text = re.split(r"\s*-\s*", raw_line, maxsplit=1)
+                    current_start_line = int(start_text)
+                    current_end_line = int(end_text)
+                else:
+                    current_start_line = int(raw_line)
+                    current_end_line = current_start_line
                 index += 2
                 continue
             if token == "--replace-lines" and index + 2 < len(args):

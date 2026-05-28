@@ -7,8 +7,14 @@ import sys
 
 from agent_kernel.config import KernelConfig
 from agent_kernel.ops.job_queue import (
+    DelegatedJob,
     DelegatedJobQueue,
     DelegatedRuntimeController,
+    _artifact_terminal_signature,
+    _host_memory_pressure_reason_from_meminfo,
+    _runtime_overrides_with_job_timeout_memory,
+    _runtime_overrides_with_job_failure_memory,
+    _scheduler_candidate_sort_key,
     delegated_job_progress_path,
     drain_delegated_jobs,
     enqueue_with_parallel_worker_decomposition,
@@ -26,6 +32,387 @@ def _load_script_module(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_latest_active_job_progress_mtime_ignores_empty_checkpoint_path(tmp_path):
+    module = _load_script_module("run_job_queue.py")
+
+    class Job:
+        state = "in_progress"
+
+        def __init__(self, checkpoint_path: str) -> None:
+            self.checkpoint_path = checkpoint_path
+
+    class Queue:
+        def list_jobs(self, states=None):
+            del states
+            return [Job(""), Job(str(tmp_path / "checkpoint.json"))]
+
+    progress = tmp_path / "checkpoint.progress.json"
+    progress.write_text("{}", encoding="utf-8")
+
+    assert module._latest_active_job_progress_mtime(Queue()) == progress.stat().st_mtime
+
+
+def test_retry_failure_memory_carries_artifact_contract_mode(tmp_path):
+    report = {
+        "report_kind": "unattended_task_report",
+        "task_id": "swe_patch_repo__project-1",
+        "outcome": "safe_stop",
+        "last_decision_source": "artifact_materialization_guard",
+        "artifact_contract_failure": {"last_decision_source": "artifact_materialization_guard"},
+        "policy_trace": [
+            {
+                "decision_source": "artifact_invalid_python_statement_context_read",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "escaped_newline_replacement",
+                    "rejected_command": (
+                        "swe_patch_builder --path pkg/module.py --replace-line 4 "
+                        "--with 'if value:\\n    return value' > patch.diff"
+                    ),
+                },
+            },
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "escaped_newline_replacement",
+                    "retry_command": (
+                        "swe_patch_builder --path pkg/module.py --replace-lines 4 5 "
+                        "--with 'if value:' --with '    return value' > patch.diff"
+                    ),
+                },
+            },
+        ],
+    }
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    job = DelegatedJob(
+        job_id="job-1",
+        task_id="swe_patch_repo__project-1",
+        state="safe_stop",
+        report_path=str(report_path),
+        outcome="safe_stop",
+    )
+
+    overrides = _runtime_overrides_with_job_failure_memory({}, job)
+    metadata = overrides["task_payload"]["metadata"]
+    memory = metadata["artifact_prior_failure_memory"]
+
+    assert memory["mode"] == "artifact_escaped_newline_replacement"
+    assert memory["required_repair_mode"] == "typed_multiline_artifact_builder"
+    assert "raw_multiline_with_payload" in memory["blocked_action_classes"]
+    assert memory["forbidden_commands"]
+
+
+def test_isolated_timeout_reason_prefers_wall_time_cap():
+    module = _load_script_module("run_job_queue.py")
+
+    assert (
+        module._isolated_timeout_reason(
+            now=240.0,
+            started_at=0.0,
+            last_activity_at=239.0,
+            timeout_seconds=240,
+        )
+        == "wall_time_exceeded:240s"
+    )
+    assert (
+        module._isolated_timeout_reason(
+            now=300.0,
+            started_at=100.0,
+            last_activity_at=0.0,
+            timeout_seconds=240,
+        )
+        == "no_progress:240s"
+    )
+    assert (
+        module._isolated_timeout_reason(
+            now=120.0,
+            started_at=0.0,
+            last_activity_at=60.0,
+            timeout_seconds=240,
+        )
+        == ""
+    )
+
+
+def test_isolated_timeout_requeue_priority_sinks_below_remaining_queue():
+    module = _load_script_module("run_job_queue.py")
+
+    class Job:
+        def __init__(self, priority: int) -> None:
+            self.priority = priority
+
+    class Queue:
+        def list_jobs(self, states=None):
+            del states
+            return [Job(0), Job(-50), Job(-141)]
+
+    assert module._isolated_timeout_requeue_priority(Queue()) == -241
+
+
+def test_isolated_child_nonzero_exit_requeues_stale_in_progress():
+    module = _load_script_module("run_job_queue.py")
+
+    class Job:
+        job_id = "job-1"
+        task_id = "task-1"
+        state = "queued"
+        priority = -101
+
+    class Queue:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def list_jobs(self, states=None):
+            del states
+            return [Job()]
+
+        def requeue_stale_in_progress(self, **kwargs):
+            self.calls.append(kwargs)
+            return [Job()]
+
+    queue = Queue()
+
+    requeued = module._requeue_after_isolated_child_exit(queue, returncode=-9)
+
+    assert len(requeued) == 1
+    assert queue.calls[0]["active_job_ids"] == set()
+    assert queue.calls[0]["force_resumable"] is True
+    assert queue.calls[0]["limit"] == 1
+    assert queue.calls[0]["priority"] == -201
+    assert "code=-9" in queue.calls[0]["reason"]
+
+
+def test_isolated_child_zero_exit_does_not_requeue():
+    module = _load_script_module("run_job_queue.py")
+
+    class Queue:
+        def requeue_stale_in_progress(self, **kwargs):
+            raise AssertionError("zero exit should not requeue")
+
+    assert module._requeue_after_isolated_child_exit(Queue(), returncode=0) == []
+
+
+def test_isolated_run_next_output_pauses_on_queued_deferral():
+    module = _load_script_module("run_job_queue.py")
+
+    assert module._isolated_run_next_output_has_no_runnable_job(
+        "job_id=job-1 state=queued task_id=task-1 outcome= detail=resource_limit:host_memory_pressure"
+    )
+    assert not module._isolated_run_next_output_has_no_runnable_job(
+        "job_id=job-1 state=completed task_id=task-1 outcome=success"
+    )
+
+
+def test_isolated_timeout_terminal_candidate_after_repeated_timeouts():
+    module = _load_script_module("run_job_queue.py")
+
+    class Job:
+        def __init__(self, job_id: str, timeout_count: int) -> None:
+            self.job_id = job_id
+            self.history = [
+                {
+                    "event": "stale_in_progress_requeued",
+                    "detail": "isolated delegated job timed out: wall_time_exceeded:240s",
+                }
+                for _ in range(timeout_count)
+            ]
+
+    class Queue:
+        def list_jobs(self, states=None):
+            del states
+            return [Job("low", 1), Job("limit", 2)]
+
+    selected = module._isolated_timeout_terminal_candidate(Queue(), timeout_requeue_limit=3)
+
+    assert selected.job_id == "limit"
+
+
+def test_isolated_timeout_terminal_artifacts_are_repairable(tmp_path):
+    module = _load_script_module("run_job_queue.py")
+
+    class Queue:
+        queue_path = tmp_path / "queue.json"
+
+    class Job:
+        job_id = "job:swe_patch_repo__pkg-1:abc"
+        task_id = "swe_patch_repo__pkg-1"
+        checkpoint_path = ""
+        report_path = ""
+
+    checkpoint_path, report_path = module._write_isolated_timeout_terminal_artifacts(
+        Queue(),
+        Job(),
+        timeout_reason="wall_time_exceeded:240s",
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "safe_stop"
+    assert report["artifact_contract_failure"]["mode"] == "artifact_isolated_timeout_requeue_limit"
+    assert report["artifact_contract_failure"]["repairable"] is True
+
+
+def test_isolated_timeout_terminal_artifacts_preserve_prior_trace(tmp_path):
+    module = _load_script_module("run_job_queue.py")
+
+    class Queue:
+        queue_path = tmp_path / "queue.json"
+
+    checkpoint_path = tmp_path / "checkpoints" / "job_timeout.json"
+    report_path = tmp_path / "reports" / "job_report_job_timeout.json"
+    checkpoint_path.parent.mkdir(parents=True)
+    report_path.parent.mkdir(parents=True)
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "status": "in_progress",
+                "history": [
+                    {
+                        "index": 7,
+                        "action": "code_execute",
+                        "decision_source": "artifact_single_candidate_inspection_blocked_context_read",
+                        "verification": {"passed": False},
+                        "proposal_metadata": {"retry_rejected_reason": "source_inspection_repeat_blocked"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    checkpoint_path.with_name("job_timeout.progress.json").write_text(
+        json.dumps({"step_stage": "llm_request", "step_index": 8}) + "\n",
+        encoding="utf-8",
+    )
+
+    Job = type(
+        "Job",
+        (),
+        {
+            "job_id": "job:timeout",
+            "task_id": "timeout_task",
+            "checkpoint_path": str(checkpoint_path),
+            "report_path": str(report_path),
+        },
+    )
+
+    _, written_report_path = module._write_isolated_timeout_terminal_artifacts(
+        Queue(),
+        Job(),
+        timeout_reason="wall_time_exceeded:900s",
+    )
+
+    report = json.loads(written_report_path.read_text(encoding="utf-8"))
+    assert report["policy_trace"][0]["decision_source"] == "artifact_single_candidate_inspection_blocked_context_read"
+    assert report["artifact_contract_failure"]["last_decision_source"] == (
+        "artifact_single_candidate_inspection_blocked_context_read"
+    )
+    assert report["isolated_timeout_progress"]["step_stage"] == "llm_request"
+
+
+def test_runtime_overrides_carry_prior_apply_missing_source_paths(tmp_path):
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "verification": {
+                            "reasons": [
+                                "SWE patch apply check failed: error: checkpoint/missing.py: No such file or directory"
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Job:
+        history = [
+            {
+                "detail": (
+                    "repairable artifact contract backoff requeue: "
+                    "SWE patch apply check failed: error: missing/context/path.py: No such file or directory"
+                )
+            }
+        ]
+        outcome_reasons = []
+
+    Job.checkpoint_path = str(checkpoint_path)
+
+    overrides = {
+        "task_payload": {
+            "metadata": {
+                "artifact_prior_missing_source_paths": ["old/missing.py"],
+                "benchmark_family": "repository",
+            }
+        }
+    }
+
+    enriched = _runtime_overrides_with_job_failure_memory(overrides, Job())
+
+    metadata = enriched["task_payload"]["metadata"]
+    assert metadata["artifact_prior_missing_source_paths"] == [
+        "checkpoint/missing.py",
+        "missing/context/path.py",
+        "old/missing.py",
+    ]
+    assert metadata["benchmark_family"] == "repository"
+
+
+def test_runtime_overrides_carry_prior_timeout_stage_from_history(tmp_path):
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.with_name("checkpoint.progress.json").write_text(
+        json.dumps(
+            {
+                "event": "decision_progress",
+                "step_stage": "memory_retrieved",
+                "step_index": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Job:
+        history = [
+            {
+                "event": "stale_in_progress_requeued",
+                "detail": "isolated delegated job exceeded 120s",
+            }
+        ]
+        outcome_reasons = []
+
+    Job.checkpoint_path = str(checkpoint_path)
+
+    enriched = _runtime_overrides_with_job_failure_memory(
+        {"task_payload": {"metadata": {"benchmark_family": "repository"}}},
+        Job(),
+    )
+
+    metadata = enriched["task_payload"]["metadata"]
+    assert metadata["benchmark_family"] == "repository"
+    assert metadata["kernel_prior_timeout_stages"] == ["memory_retrieved"]
+    assert metadata["kernel_last_timeout_event"]["reason"] == "isolated delegated job exceeded 120s"
+
+
+def test_runtime_overrides_timeout_memory_tolerates_empty_checkpoint_path():
+    class Job:
+        checkpoint_path = ""
+
+    overrides = {"task_payload": {"metadata": {"benchmark_family": "repository"}}}
+
+    assert (
+        _runtime_overrides_with_job_timeout_memory(
+            overrides,
+            Job(),
+            reason="stale in-progress job had no active lease",
+        )
+        == overrides
+    )
 
 
 def _install_successful_kernel(monkeypatch):
@@ -170,6 +557,69 @@ def test_runtime_overrides_parse_asi_coding_live_llm_flag():
     )
 
     assert overrides["asi_coding_require_live_llm"] is True
+
+
+def test_swe_patch_artifact_completion_is_semantic_unverified(monkeypatch, tmp_path):
+    _install_successful_kernel(monkeypatch)
+    repo_root = tmp_path / "repos" / "owner" / "repo"
+    repo_root.mkdir(parents=True)
+    source = repo_root / "x.py"
+    source.write_text("def value(value):\n    return value\n", encoding="utf-8")
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+    subprocess.run(["git", "add", "x.py"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, stdout=subprocess.DEVNULL)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+    source.write_text("def value(value):\n    if value is None:\n        return 0\n    return value\n", encoding="utf-8")
+    patch_text = subprocess.check_output(["git", "diff"], cwd=repo_root, text=True)
+
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    task = TaskSpec(
+        task_id="swe_patch_probe",
+        prompt="create patch",
+        workspace_subdir="swe_patch_probe",
+        expected_files=["patch.diff"],
+        expected_file_contents={"patch.diff": patch_text},
+        metadata={
+            "semantic_verifier": {
+                "kind": "swe_patch_apply_check",
+                "repo": "owner/repo",
+                "base_commit": commit,
+                "repo_cache_root": str(tmp_path / "repos"),
+                "patch_path": "patch.diff",
+            }
+        },
+    )
+    queued = queue.enqueue(
+        task_id=task.task_id,
+        runtime_overrides={"task_payload": task.to_dict()},
+    )
+
+    finished = run_next_delegated_job(queue, base_config=config, repo_root=Path(__file__).resolve().parents[1])
+
+    assert finished is not None
+    assert finished.job_id == queued.job_id
+    assert finished.state == "completed"
+    assert finished.outcome == "semantic_unverified"
+    assert finished.outcome_reasons == [
+        "artifact_ready",
+        "semantic_unverified",
+        "official_scoring_required",
+    ]
 
 
 def test_queue_claim_next_respects_deadline_then_priority(tmp_path):
@@ -855,6 +1305,106 @@ def test_run_next_delegated_job_starts_terminal_retry_from_clean_checkpoint(monk
     assert progress_path.with_name("hello.progress.json.stale_before_attempt2").exists()
 
 
+def test_run_next_delegated_job_archives_terminal_checkpoint_even_on_first_claim(monkeypatch, tmp_path):
+    from agent_kernel.ops import job_queue as job_queue_module
+    from agent_kernel.ops.shared_repo import prepare_runtime_task
+
+    run_calls: list[dict[str, object]] = []
+
+    class RecordingKernel:
+        def __init__(self, config):
+            self.config = config
+
+        def run_task(
+            self,
+            task,
+            checkpoint_path=None,
+            resume=False,
+            runtime_overrides=None,
+            job_id=None,
+            progress_callback=None,
+        ):
+            del progress_callback
+            run_calls.append(
+                {
+                    "resume": bool(resume),
+                    "checkpoint_exists_at_start": bool(checkpoint_path and checkpoint_path.exists()),
+                }
+            )
+            runtime_task = prepare_runtime_task(
+                task,
+                runtime_overrides=dict(runtime_overrides or {}),
+                job_id=job_id,
+            )
+            workspace = self.config.workspace_root / runtime_task.workspace_subdir
+            workspace.mkdir(parents=True, exist_ok=True)
+            if checkpoint_path is not None:
+                checkpoint_path.write_text(json.dumps({"status": "new_attempt"}), encoding="utf-8")
+            return EpisodeRecord(
+                task_id=runtime_task.task_id,
+                prompt=runtime_task.prompt,
+                workspace=str(workspace),
+                success=True,
+                steps=[],
+                task_metadata=dict(getattr(runtime_task, "metadata", {})),
+                task_contract={
+                    "prompt": runtime_task.prompt,
+                    "workspace_subdir": runtime_task.workspace_subdir,
+                    "setup_commands": list(getattr(runtime_task, "setup_commands", [])),
+                    "success_command": getattr(runtime_task, "success_command", ""),
+                    "suggested_commands": list(getattr(runtime_task, "suggested_commands", [])),
+                    "expected_files": list(getattr(runtime_task, "expected_files", [])),
+                    "expected_output_substrings": list(getattr(runtime_task, "expected_output_substrings", [])),
+                    "forbidden_files": list(getattr(runtime_task, "forbidden_files", [])),
+                    "forbidden_output_substrings": list(getattr(runtime_task, "forbidden_output_substrings", [])),
+                    "expected_file_contents": dict(getattr(runtime_task, "expected_file_contents", {})),
+                    "max_steps": int(getattr(runtime_task, "max_steps", 1)),
+                    "metadata": dict(getattr(runtime_task, "metadata", {})),
+                },
+                termination_reason="verification_passed",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(job_queue_module, "AgentKernel", RecordingKernel)
+    config = KernelConfig(
+        provider="mock",
+        use_tolbert_context=False,
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    job = queue.enqueue(task_id="hello_task", priority=5)
+    checkpoint_path, report_path = job_queue_module.delegated_job_paths(config, job)
+    progress_path = job_queue_module.delegated_job_progress_path(config, job)
+    checkpoint_path.write_text(
+        json.dumps({"status": "completed", "episode": {"success": True}, "termination_reason": "success"}),
+        encoding="utf-8",
+    )
+    report_path.write_text(json.dumps({"report_kind": "terminal"}), encoding="utf-8")
+    progress_path.write_text(json.dumps({"event": "terminal"}), encoding="utf-8")
+
+    claimed = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+    )
+
+    assert claimed is not None
+    assert claimed.state == "completed"
+    assert run_calls == [{"resume": False, "checkpoint_exists_at_start": False}]
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["status"] == "new_attempt"
+    assert checkpoint_path.with_name(f"{checkpoint_path.name}.stale_before_attempt1").exists()
+    assert report_path.with_name(f"{report_path.name}.stale_before_attempt1").exists()
+    assert progress_path.with_name(f"{progress_path.name}.stale_before_attempt1").exists()
+
+
 def test_delegated_job_queue_retry_terminal_resets_safe_stop_without_deleting_evidence(tmp_path):
     queue = DelegatedJobQueue(tmp_path / "queue.json")
     safe_stop = queue.enqueue(task_id="hello_task", priority=5)
@@ -906,6 +1456,375 @@ def test_delegated_job_queue_retry_terminal_resets_safe_stop_without_deleting_ev
     assert retried_safe_stop.report_path.endswith("safe.json")
     assert retried_safe_stop.history[-1]["event"] == "retry_queued"
     assert queue.get(completed.job_id).state == "completed"
+
+
+def test_delegated_job_queue_retry_terminal_can_retry_semantic_unverified_completed_job(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    semantic_unverified = queue.enqueue(task_id="swe_patch_probe", priority=4)
+    success = queue.enqueue(task_id="finished_task", priority=3)
+
+    queue.finalize(
+        semantic_unverified.job_id,
+        state="completed",
+        checkpoint_path=tmp_path / "checkpoints" / "semantic.json",
+        report_path=tmp_path / "reports" / "semantic.json",
+        outcome="semantic_unverified",
+        outcome_reasons=["artifact_ready", "official_scoring_required"],
+    )
+    queue.finalize(
+        success.job_id,
+        state="completed",
+        checkpoint_path=tmp_path / "checkpoints" / "success.json",
+        report_path=tmp_path / "reports" / "success.json",
+        outcome="success",
+        outcome_reasons=[],
+    )
+
+    retried = queue.retry_terminal(
+        states={"completed"},
+        priority=1,
+        reason="retry after official feedback",
+    )
+
+    assert [job.job_id for job in retried] == [semantic_unverified.job_id]
+    assert queue.get(semantic_unverified.job_id).state == "queued"
+    assert queue.get(semantic_unverified.job_id).outcome == ""
+    assert queue.get(semantic_unverified.job_id).history[-1]["event"] == "retry_queued"
+    assert queue.get(success.job_id).state == "completed"
+    assert queue.get(success.job_id).outcome == "success"
+
+
+def test_delegated_job_queue_retry_terminal_replans_repeated_artifact_convergence_once(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="artifact_task", priority=5)
+    checkpoint_path = tmp_path / "checkpoints" / "artifact.json"
+    report_path = tmp_path / "reports" / "artifact.json"
+
+    queue.finalize(
+        job.job_id,
+        state="safe_stop",
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+        outcome="safe_stop",
+        outcome_reasons=["policy_terminated"],
+        last_error="artifact terminal",
+    )
+
+    repeated_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "definition_header_removal",
+                    "rejected_reason": "python_ast_noop",
+                    "terminal_guard_rejected_reason": "python_ast_noop",
+                    "retry_command": "patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'",
+                },
+            }
+        ]
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", ".stale_before_attempt2", ".stale_before_attempt3"):
+        checkpoint_path.with_name(f"{checkpoint_path.name}{suffix}").write_text(
+            json.dumps(repeated_terminal),
+            encoding="utf-8",
+        )
+
+    retried = queue.retry_terminal(states={"safe_stop"}, reason="blind retry", priority=10)
+
+    assert [retried_job.job_id for retried_job in retried] == [job.job_id]
+    replanned = queue.get(job.job_id)
+    assert replanned is not None
+    assert replanned.state == "queued"
+    assert replanned.priority == 10
+    assert replanned.scheduler_blocked_open is False
+    assert replanned.history[-1]["event"] == "retry_convergence_replan_queued"
+    metadata = replanned.runtime_overrides["task_payload"]["metadata"]
+    assert metadata["kernel_retry_convergence_replan"]["signature_count"] == 3
+    assert metadata["kernel_retry_convergence_replan_attempts"][0]["signature_count"] == 3
+
+
+def test_delegated_job_queue_retry_terminal_blocks_after_replan_attempt(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="artifact_task", priority=5)
+    checkpoint_path = tmp_path / "checkpoints" / "artifact.json"
+    report_path = tmp_path / "reports" / "artifact.json"
+    repeated_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "definition_header_removal",
+                    "rejected_reason": "python_ast_noop",
+                    "terminal_guard_rejected_reason": "python_ast_noop",
+                    "retry_command": "patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'",
+                },
+            }
+        ]
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", ".stale_before_attempt2", ".stale_before_attempt3"):
+        checkpoint_path.with_name(f"{checkpoint_path.name}{suffix}").write_text(
+            json.dumps(repeated_terminal),
+            encoding="utf-8",
+        )
+    signature = (
+        "artifact_materialization_guard|definition_header_removal|python_ast_noop|"
+        "python_ast_noop|patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'"
+    )
+    runtime_overrides = {
+        "task_payload": {
+            "task_id": "artifact_task",
+            "prompt": "repair",
+            "workspace_subdir": ".",
+            "metadata": {
+                "kernel_retry_convergence_replan_attempts": [
+                    {
+                        "kind": "artifact_retry_convergence",
+                        "signature": signature,
+                        "signature_count": 3,
+                    }
+                ]
+            },
+        }
+    }
+    queued = queue.get(job.job_id)
+    assert queued is not None
+    queued.runtime_overrides = runtime_overrides
+    queue._persist_job(queued)
+    queue.finalize(
+        job.job_id,
+        state="safe_stop",
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+        outcome="safe_stop",
+        outcome_reasons=["policy_terminated"],
+        last_error="artifact terminal",
+    )
+
+    retried = queue.retry_terminal(states={"safe_stop"}, reason="blind retry")
+
+    assert retried == []
+    blocked = queue.get(job.job_id)
+    assert blocked is not None
+    assert blocked.state == "safe_stop"
+    assert blocked.scheduler_blocked_open is True
+    assert blocked.history[-1]["event"] == "retry_convergence_blocked"
+
+
+def test_delegated_job_queue_retry_terminal_allows_explicit_policy_retry_after_convergence(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="artifact_task", priority=5)
+    checkpoint_path = tmp_path / "checkpoints" / "artifact.json"
+    report_path = tmp_path / "reports" / "artifact.json"
+    repeated_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "definition_header_removal",
+                    "rejected_reason": "python_ast_noop",
+                    "terminal_guard_rejected_reason": "python_ast_noop",
+                    "retry_command": "patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'",
+                },
+            }
+        ]
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", ".stale_before_attempt2", ".stale_before_attempt3"):
+        checkpoint_path.with_name(f"{checkpoint_path.name}{suffix}").write_text(
+            json.dumps(repeated_terminal),
+            encoding="utf-8",
+        )
+    signature = (
+        "artifact_materialization_guard|definition_header_removal|python_ast_noop|"
+        "python_ast_noop|patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'"
+    )
+    queued = queue.get(job.job_id)
+    assert queued is not None
+    queued.runtime_overrides = {
+        "task_payload": {
+            "task_id": "artifact_task",
+            "prompt": "repair",
+            "workspace_subdir": ".",
+            "metadata": {
+                "kernel_retry_convergence_replan_attempts": [
+                    {
+                        "kind": "artifact_retry_convergence",
+                        "signature": signature,
+                        "signature_count": 3,
+                    }
+                ]
+            },
+        }
+    }
+    queue._persist_job(queued)
+    queue.finalize(
+        job.job_id,
+        state="safe_stop",
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+        outcome="safe_stop",
+        outcome_reasons=["policy_terminated"],
+        last_error="artifact terminal",
+    )
+
+    retried = queue.retry_terminal(
+        states={"safe_stop"},
+        reason="retry after kernel policy hardening",
+        priority=10,
+        force_policy_retry=True,
+    )
+
+    assert [retried_job.job_id for retried_job in retried] == [job.job_id]
+    replanned = queue.get(job.job_id)
+    assert replanned is not None
+    assert replanned.state == "queued"
+    assert replanned.priority == 10
+    assert replanned.scheduler_blocked_open is False
+    assert replanned.history[-1]["event"] == "retry_convergence_policy_retry_queued"
+
+
+def test_delegated_job_queue_retry_terminal_ignores_stale_convergence_after_new_failure_mode(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="artifact_task", priority=5)
+    checkpoint_path = tmp_path / "checkpoints" / "artifact.json"
+    report_path = tmp_path / "reports" / "artifact.json"
+    repeated_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "definition_header_removal",
+                    "rejected_reason": "python_ast_noop",
+                    "terminal_guard_rejected_reason": "python_ast_noop",
+                    "retry_command": "patch_builder --path pkg/module.py --replace-line 1 --with 'def bad():'",
+                },
+            }
+        ]
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in (".stale_before_attempt2", ".stale_before_attempt3", ".stale_before_attempt4"):
+        checkpoint_path.with_name(f"{checkpoint_path.name}{suffix}").write_text(
+            json.dumps(repeated_terminal),
+            encoding="utf-8",
+        )
+    checkpoint_path.write_text(
+        json.dumps({"history": [{"decision_source": "llm", "content": "inference timeout"}]}),
+        encoding="utf-8",
+    )
+    queue.finalize(
+        job.job_id,
+        state="safe_stop",
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+        outcome="safe_stop",
+        outcome_reasons=["policy_terminated"],
+    )
+
+    retried = queue.retry_terminal(states={"safe_stop"}, reason="retry after new kernel hardening")
+
+    assert [retried_job.job_id for retried_job in retried] == [job.job_id]
+    assert queue.get(job.job_id).history[-1]["event"] == "retry_queued"
+
+
+def test_delegated_job_queue_retry_terminal_separates_latest_artifact_reject_reason(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="artifact_task", priority=5)
+    checkpoint_path = tmp_path / "checkpoints" / "artifact.json"
+    report_path = tmp_path / "reports" / "artifact.json"
+    retry_command = "patch_builder --path pkg/module.py --replace-line 10 --with 'return value'"
+    stale_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_placeholder_candidate_failed_context_read",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "rejected_reason": "malformed_or_non_materializing_patch_builder",
+                },
+            },
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "retry_command": retry_command,
+                },
+            },
+        ]
+    }
+    current_terminal = {
+        "history": [
+            {
+                "decision_source": "artifact_placeholder_candidate_failed_context_read",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "rejected_reason": "statement_kind_replacement",
+                },
+            },
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "retry_command": retry_command,
+                },
+            },
+        ]
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in (".stale_before_attempt2", ".stale_before_attempt3", ".stale_before_attempt4"):
+        checkpoint_path.with_name(f"{checkpoint_path.name}{suffix}").write_text(
+            json.dumps(stale_terminal),
+            encoding="utf-8",
+        )
+    checkpoint_path.write_text(json.dumps(current_terminal), encoding="utf-8")
+    queue.finalize(
+        job.job_id,
+        state="safe_stop",
+        checkpoint_path=checkpoint_path,
+        report_path=report_path,
+        outcome="safe_stop",
+        outcome_reasons=["policy_terminated"],
+    )
+
+    retried = queue.retry_terminal(states={"safe_stop"}, reason="retry after reject-class hardening")
+
+    assert [retried_job.job_id for retried_job in retried] == [job.job_id]
+    retried_job = queue.get(job.job_id)
+    assert retried_job is not None
+    assert retried_job.history[-1]["event"] == "retry_queued"
+
+
+def test_artifact_terminal_signature_prefers_body_context_over_placeholder():
+    signature = _artifact_terminal_signature(
+        [
+            {
+                "decision_source": "artifact_behavior_target_body_retry_exhausted_context_read",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_body_retry_exhausted",
+                    "operation_spans": ["2:2"],
+                },
+            },
+            {
+                "decision_source": "artifact_placeholder_candidate_failed_context_read",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "rejected_reason": "malformed_or_non_materializing_patch_builder",
+                    "terminal_guard_rejected_reason": "malformed_or_non_materializing_patch_builder",
+                },
+            },
+            {
+                "decision_source": "artifact_materialization_guard",
+                "proposal_metadata": {
+                    "retry_rejected_reason": "behavior_target_region_escape",
+                    "retry_command": "patch_builder --path pkg/module.py --replace-line 99 --with bad > patch.diff",
+                },
+            },
+        ]
+    )
+
+    assert "artifact_behavior_target_body_retry_exhausted_context_read" in signature
+    assert "artifact_placeholder_candidate_failed_context_read" not in signature
+    assert "2:2" in signature
 
 
 def test_delegated_job_queue_artifact_guard_backoff_requeues_with_lower_priority(tmp_path):
@@ -984,6 +1903,45 @@ def test_repairable_artifact_contract_failure_gets_backoff_reason(tmp_path):
     assert "artifact_anchor_replacement_direct" in reason
 
 
+def test_artifact_guard_backoff_reason_reclassifies_specific_terminal_mode(tmp_path):
+    from agent_kernel.ops import job_queue as job_queue_module
+
+    report_path = tmp_path / "reports" / "artifact.json"
+    report_path.parent.mkdir()
+    report_path.write_text(
+        json.dumps(
+            {
+                "outcome": "safe_stop",
+                "last_decision_source": "artifact_materialization_guard",
+                "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+                "artifact_contract_failure": {
+                    "mode": "artifact_materialization_guard_terminal",
+                    "repairable": True,
+                    "last_decision_source": "artifact_materialization_guard",
+                },
+                "policy_trace": [
+                    {
+                        "decision_source": "artifact_materialization_guard",
+                        "verification_reasons": ["policy terminated"],
+                        "proposal_metadata": {
+                            "retry_rejected_reason": "invalid_python_diagnostic_exhausted",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Job:
+        history = []
+
+    reason = job_queue_module._artifact_guard_terminal_backoff_reason(report_path, Job())
+
+    assert "artifact_invalid_python_diagnostic_exhausted" in reason
+    assert "artifact_materialization_guard_terminal" not in reason
+
+
 def test_invalid_init_return_artifact_failure_is_specific_repairable_mode():
     from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
 
@@ -1009,6 +1967,129 @@ def test_invalid_init_return_artifact_failure_is_specific_repairable_mode():
     assert classification["mode"] == "artifact_invalid_init_return_value"
     assert classification["repairable"] is True
     assert classification["last_decision_source"] == "artifact_anchor_replacement_direct"
+
+
+def test_none_container_misuse_artifact_failure_is_specific_repairable_mode():
+    from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+
+    classification = classify_artifact_contract_failure_report(
+        {
+            "outcome": "safe_stop",
+            "last_decision_source": "artifact_anchor_candidate_suggestion_direct",
+            "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+            "policy_trace": [
+                {
+                    "decision_source": "artifact_anchor_candidate_suggestion_direct",
+                    "verification_reasons": [
+                        "SWE patch introduces None container misuse in babel/dates.py: patterns:subscript",
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert classification["mode"] == "artifact_none_container_misuse"
+    assert classification["repairable"] is True
+    assert classification["last_decision_source"] == "artifact_anchor_candidate_suggestion_direct"
+
+
+def test_repeated_official_failed_patch_artifact_failure_is_specific_repairable_mode():
+    from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+
+    classification = classify_artifact_contract_failure_report(
+        {
+            "outcome": "safe_stop",
+            "last_decision_source": "artifact_anchor_candidate_suggestion_direct",
+            "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+            "policy_trace": [
+                {
+                    "decision_source": "artifact_anchor_candidate_suggestion_direct",
+                    "verification_reasons": ["SWE patch repeats prior official-failed patch exactly"],
+                }
+            ],
+        }
+    )
+
+    assert classification["mode"] == "artifact_repeated_official_failed_patch"
+    assert classification["repairable"] is True
+
+
+def test_literal_constant_assignment_artifact_failure_is_specific_repairable_mode():
+    from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+
+    classification = classify_artifact_contract_failure_report(
+        {
+            "outcome": "safe_stop",
+            "last_decision_source": "artifact_anchor_candidate_suggestion_direct",
+            "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+            "policy_trace": [
+                {
+                    "decision_source": "artifact_anchor_candidate_suggestion_direct",
+                    "verification_reasons": [
+                        "SWE patch replaces computed production assignment with a literal constant without enough repair structure",
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert classification["mode"] == "artifact_literal_constant_assignment_guess"
+    assert classification["repairable"] is True
+
+
+def test_materialization_guard_preserves_specific_terminal_retry_reason():
+    from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+
+    classification = classify_artifact_contract_failure_report(
+        {
+            "outcome": "safe_stop",
+            "last_decision_source": "artifact_materialization_guard",
+            "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+            "policy_trace": [
+                {
+                    "decision_source": "artifact_materialization_guard",
+                    "verification_reasons": ["policy terminated"],
+                    "proposal_metadata": {
+                        "retry_rejected_reason": "escaped_newline_replacement",
+                        "terminal_retry_rejected_reason": "escaped_newline_replacement",
+                    },
+                }
+            ],
+            "outcome_reasons": ["policy_terminated"],
+        }
+    )
+
+    assert classification["mode"] == "artifact_escaped_newline_replacement"
+    assert classification["repairable"] is True
+    assert classification["last_decision_source"] == "artifact_materialization_guard"
+
+
+def test_materialization_guard_preserves_prior_semantic_artifact_mode():
+    from agent_kernel.extensions.artifact_repair_contracts import classify_artifact_contract_failure_report
+
+    classification = classify_artifact_contract_failure_report(
+        {
+            "outcome": "safe_stop",
+            "last_decision_source": "artifact_materialization_guard",
+            "task_metadata": {"semantic_verifier": {"kind": "swe_patch_apply_check", "patch_path": "patch.diff"}},
+            "policy_trace": [
+                {
+                    "decision_source": "artifact_anchor_candidate_suggestion_direct",
+                    "verification_reasons": [
+                        "SWE patch introduces None container misuse in pkg/module.py: patterns:subscript",
+                    ],
+                },
+                {
+                    "decision_source": "artifact_materialization_guard",
+                    "verification_reasons": ["policy terminated"],
+                },
+            ],
+            "outcome_reasons": ["policy_terminated"],
+        }
+    )
+
+    assert classification["mode"] == "artifact_none_container_misuse"
+    assert classification["repairable"] is True
 
 
 def test_run_next_delegated_job_reaps_stale_lease_and_resumes_orphaned_job(monkeypatch, tmp_path):
@@ -1143,6 +2224,96 @@ def test_run_next_delegated_job_requeues_stale_in_progress_without_resume_artifa
     assert final_stale.attempt_count == 2
     assert any(entry["event"] == "stale_in_progress_requeued" for entry in final_stale.history)
     assert queue.get(queued.job_id).state == "queued"
+
+
+def test_delegated_job_queue_force_requeues_resumable_in_progress_job(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.with_name("checkpoint.progress.json").write_text(
+        json.dumps(
+            {
+                "event": "decision_progress",
+                "step_stage": "memory_retrieved",
+                "step_index": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumable = queue.enqueue(
+        task_id="hello_task",
+        priority=10,
+        checkpoint_path=str(checkpoint_path),
+        runtime_overrides={"task_payload": {"metadata": {"benchmark_family": "bounded"}}},
+    )
+    assert queue.claim(resumable.job_id) is not None
+
+    skipped = queue.requeue_stale_in_progress(
+        active_job_ids=set(),
+        reason="ordinary stale sweep",
+    )
+    assert skipped == []
+    assert queue.get(resumable.job_id).state == "in_progress"
+
+    requeued = queue.requeue_stale_in_progress(
+        active_job_ids=set(),
+        reason="isolated delegated job exceeded 120s",
+        priority=3,
+        force_resumable=True,
+    )
+
+    assert [job.job_id for job in requeued] == [resumable.job_id]
+    final_job = queue.get(resumable.job_id)
+    assert final_job.state == "queued"
+    assert final_job.priority == 3
+    assert final_job.outcome == ""
+    assert final_job.history[-1]["event"] == "stale_in_progress_requeued"
+    assert final_job.history[-1]["detail"] == "isolated delegated job exceeded 120s"
+    metadata = final_job.runtime_overrides["task_payload"]["metadata"]
+    assert metadata["benchmark_family"] == "bounded"
+    assert metadata["kernel_prior_timeout_stages"] == ["memory_retrieved"]
+    assert metadata["kernel_last_timeout_event"]["progress"]["step_stage"] == "memory_retrieved"
+
+
+def test_in_progress_with_only_planned_checkpoint_path_is_not_resumable(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    planned_checkpoint = tmp_path / "missing_checkpoint.json"
+    orphaned = queue.enqueue(
+        task_id="hello_task",
+        priority=10,
+        checkpoint_path=str(planned_checkpoint),
+    )
+    assert queue.claim(orphaned.job_id) is not None
+
+    requeued = queue.requeue_stale_in_progress(
+        active_job_ids=set(),
+        reason="stale in-progress job had no active lease and no resume artifact",
+    )
+
+    assert [job.job_id for job in requeued] == [orphaned.job_id]
+    assert queue.get(orphaned.job_id).state == "queued"
+
+
+def test_retry_terminal_can_requeue_cancel_requested_job(tmp_path):
+    queue = DelegatedJobQueue(tmp_path / "queue.json")
+    job = queue.enqueue(task_id="hello_task", priority=5)
+    assert queue.claim(job.job_id) is not None
+    queue.cancel(job.job_id)
+
+    retried = queue.retry_terminal(
+        states={"cancel_requested"},
+        job_ids={job.job_id},
+        reason="retry cancelled probe",
+        priority=7,
+    )
+
+    assert [item.job_id for item in retried] == [job.job_id]
+    updated = queue.get(job.job_id)
+    assert updated.state == "queued"
+    assert updated.priority == 7
+    assert updated.cancel_requested_at == ""
+    assert updated.outcome == ""
+    assert updated.history[-1]["event"] == "retry_queued"
+    assert updated.history[-1]["detail"] == "retry cancelled probe"
 
 
 def test_run_job_queue_enqueue_cli(monkeypatch, tmp_path):
@@ -1981,6 +3152,89 @@ def test_run_next_delegated_job_defers_preflight_blocked_job_without_attempt(tmp
     assert deferred.last_error.startswith("preflight_blocked:operator_policy")
 
 
+def test_host_memory_pressure_reason_blocks_low_available_or_swap_pressure():
+    meminfo = "\n".join(
+        [
+            "MemTotal:       32768000 kB",
+            "MemFree:          800000 kB",
+            "MemAvailable:    3000000 kB",
+            "SwapTotal:       8000000 kB",
+            "SwapFree:         100000 kB",
+        ]
+    )
+
+    reason = _host_memory_pressure_reason_from_meminfo(
+        meminfo,
+        min_available_mb=4096,
+        max_swap_used_ratio=0.95,
+    )
+
+    assert reason.startswith("resource_limit:host_memory_pressure:")
+    assert "available_mb=2930" in reason
+    assert "swap_used_ratio=0.988" in reason
+
+
+def test_host_memory_pressure_reason_allows_stale_swap_when_memory_recovered():
+    meminfo = "\n".join(
+        [
+            "MemTotal:       32768000 kB",
+            "MemFree:         1200000 kB",
+            "MemAvailable:   25000000 kB",
+            "SwapTotal:       8000000 kB",
+            "SwapFree:           1000 kB",
+        ]
+    )
+
+    reason = _host_memory_pressure_reason_from_meminfo(
+        meminfo,
+        min_available_mb=4096,
+        max_swap_used_ratio=0.95,
+    )
+
+    assert reason == ""
+
+
+def test_run_next_delegated_job_defers_resource_blocked_job_without_attempt(monkeypatch, tmp_path):
+    from agent_kernel.ops import job_queue as job_queue_module
+
+    config = KernelConfig(
+        provider="vllm",
+        use_tolbert_context=False,
+        sandbox_command_containment_mode="disabled",
+        workspace_root=tmp_path / "workspace",
+        trajectories_root=tmp_path / "trajectories" / "episodes",
+        run_reports_dir=tmp_path / "trajectories" / "reports",
+        run_checkpoints_dir=tmp_path / "trajectories" / "checkpoints",
+        delegated_job_queue_path=tmp_path / "trajectories" / "jobs" / "queue.json",
+        delegated_job_runtime_state_path=tmp_path / "trajectories" / "jobs" / "runtime_state.json",
+    )
+    config.ensure_directories()
+    queue = DelegatedJobQueue(config.delegated_job_queue_path)
+    queued = queue.enqueue(task_id="hello_task", priority=1)
+    monkeypatch.setattr(
+        job_queue_module,
+        "_delegated_host_resource_block_reason",
+        lambda candidate_config: "resource_limit:host_memory_pressure:available_mb=512",
+    )
+
+    deferred = run_next_delegated_job(
+        queue,
+        base_config=config,
+        repo_root=Path(__file__).resolve().parents[1],
+        enforce_preflight=False,
+    )
+
+    assert deferred is not None
+    assert deferred.job_id == queued.job_id
+    assert deferred.state == "queued"
+    assert deferred.attempt_count == 0
+    assert deferred.last_error == "resource_limit:host_memory_pressure:available_mb=512"
+    refreshed = queue.get(queued.job_id)
+    assert refreshed is not None
+    assert refreshed.scheduler_blocked_count == 1
+    assert refreshed.scheduler_blocked_open is True
+
+
 def test_run_next_delegated_job_writes_progress_sidecar(monkeypatch, tmp_path):
     _install_successful_kernel(monkeypatch)
     config = KernelConfig(
@@ -2065,6 +3319,28 @@ def test_run_next_delegated_job_applies_bounded_fairness_boost(tmp_path):
     assert updated is not None
     assert updated.scheduler_selected_count == 1
     assert updated.scheduler_unblock_count == 1
+
+
+def test_scheduler_sorts_timed_out_requeues_after_fresh_jobs():
+    timed_out = DelegatedJob(
+        job_id="timed-out",
+        task_id="hello_task",
+        priority=100,
+        history=[
+            {
+                "event": "stale_in_progress_requeued",
+                "detail": "isolated delegated job timed out: wall_time_exceeded:240s",
+            }
+        ],
+    )
+    fresh = DelegatedJob(job_id="fresh", task_id="math_task", priority=-100)
+
+    ordered = sorted(
+        [timed_out, fresh],
+        key=lambda job: _scheduler_candidate_sort_key(job, worker_job=False),
+    )
+
+    assert [job.job_id for job in ordered] == ["fresh", "timed-out"]
 
 
 def test_run_next_delegated_job_rotates_budget_group_when_consecutive_limit_hit(tmp_path):

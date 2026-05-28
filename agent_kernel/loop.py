@@ -229,8 +229,22 @@ class AgentKernel:
             termination_reason = str(checkpoint.get("termination_reason", "max_steps_reached"))
 
         effective_step_limit = self._resolved_task_step_limit(task)
-        remaining_steps = max(0, effective_step_limit - state.completed_step_count())
-        for _ in range(remaining_steps):
+        artifact_context_extension_steps = 0
+        artifact_context_extension_limit = 3
+        while True:
+            completed_steps = state.completed_step_count()
+            within_step_limit = completed_steps < effective_step_limit
+            artifact_context_extension_allowed = (
+                artifact_context_extension_steps < artifact_context_extension_limit
+                and completed_steps >= effective_step_limit
+                and loop_run_support._latest_artifact_context_allows_one_materialization_attempt(state)
+                and loop_run_support._task_has_artifact_contract(task)
+                and not success
+            )
+            if not within_step_limit and not artifact_context_extension_allowed:
+                break
+            if artifact_context_extension_allowed:
+                artifact_context_extension_steps += 1
             success, termination_reason, should_break = loop_run_support.execute_step(
                 self,
                 task=task,

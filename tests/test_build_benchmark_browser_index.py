@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timezone
 import importlib.util
 import json
 import sys
@@ -99,6 +100,140 @@ def test_build_benchmark_browser_index_normalizes_swe_artifacts(tmp_path):
     assert swe_gate["threshold"] == 0.8
     assert swe_gate["status"] == "no_evidence"
     assert index["a8_progress"]["gate_count"] == 7
+
+
+def test_browser_index_surfaces_neural_controller_shadow_metrics(tmp_path):
+    module = _load_indexer_module()
+    _write_json(
+        tmp_path / "trajectories/neural_controller/shadow_metrics.json",
+        {
+            "report_kind": "neural_controller_shadow_metrics",
+            "summary": {
+                "episodes_with_shadow": 3,
+                "ready_steps": 9,
+                "verified_action_agreement_rate": 0.75,
+            },
+            "promotion_readiness": {
+                "shadow_compare_ready": True,
+                "content_authority_ready": False,
+                "primary_authority_ready": False,
+            },
+        },
+    )
+    _write_json(
+        tmp_path / "trajectories/neural_controller/runtime_contract_metrics_current.json",
+        {
+            "report_kind": "neural_controller_runtime_contract_metrics",
+            "summary": {
+                "shadow_steps": 3,
+                "runtime_contract_steps": 2,
+                "runtime_contract_task_count": 2,
+                "runtime_contract_task_ids": ["a", "b"],
+                "runtime_contract_success_steps": 1,
+                "runtime_contract_coverage_rate": 0.666667,
+                "runtime_contract_success_rate": 0.5,
+                "selector_signal_ready": True,
+                "rowwise_selector_policy_counts": {"candidate_contract_improves": 2},
+            },
+        },
+    )
+    _write_json(
+        tmp_path / "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json",
+        {
+            "report_kind": "neural_controller_selector_activation_gate",
+            "guarded_selector_activation_ready": True,
+            "production_guarded_selector_activation_ready": True,
+            "primary_authority_ready": False,
+            "recommended_runtime_mode": "guarded",
+            "selector_policy": "candidate_contract_improves",
+            "runtime_contract_steps": 25,
+            "runtime_contract_task_count": 25,
+            "blockers": [],
+            "production_blockers": [],
+        },
+    )
+
+    index = module.build_benchmark_browser_index(tmp_path)
+    live = module.build_benchmark_live_status(tmp_path)
+
+    assert index["neural_controller_shadow"]["status"] == "available"
+    assert index["neural_controller_shadow"]["episodes_with_shadow"] == 3
+    assert index["neural_controller_shadow"]["shadow_compare_ready"] is True
+    assert index["neural_controller_shadow"]["content_authority_ready"] is False
+    assert index["neural_controller_shadow"]["primary_authority_ready"] is False
+    assert index["neural_controller_runtime_contract"]["status"] == "available"
+    assert index["neural_controller_runtime_contract"]["runtime_contract_steps"] == 2
+    assert index["neural_controller_runtime_contract"]["runtime_contract_task_count"] == 2
+    assert index["neural_controller_runtime_contract"]["selector_signal_ready"] is True
+    assert index["neural_controller_selector_activation"]["status"] == "available"
+    assert index["neural_controller_selector_activation"]["production_guarded_selector_activation_ready"] is True
+    assert index["neural_controller_selector_activation"]["primary_authority_ready"] is False
+    assert live["neural_controller_shadow"]["ready_steps"] == 9
+    assert live["neural_controller_runtime_contract"]["runtime_contract_success_steps"] == 1
+    assert live["neural_controller_selector_activation"]["recommended_runtime_mode"] == "guarded"
+
+
+def test_browser_index_refreshes_neural_controller_shadow_metrics_from_episodes(tmp_path):
+    module = _load_indexer_module()
+    _write_json(
+        tmp_path / "trajectories/episode_1.json",
+        {
+            "task_id": "episode_1",
+            "steps": [
+                {
+                    "proposal_metadata": {
+                        "neural_controller_shadow": {
+                            "ready": True,
+                            "action_agreement": True,
+                            "control_tokens": ["<AK_VERIFY>"],
+                        }
+                    },
+                    "verification": {"passed": True},
+                }
+            ],
+        },
+    )
+
+    report = module._refresh_neural_controller_shadow_metrics(tmp_path)
+    index = module.build_benchmark_browser_index(tmp_path)
+
+    assert report["summary"]["episodes_with_shadow"] == 1
+    assert report["summary"]["verified_action_agreement_steps"] == 1
+    assert index["neural_controller_shadow"]["status"] == "available"
+    assert index["neural_controller_shadow"]["episodes_with_shadow"] == 1
+
+
+def test_browser_index_refreshes_neural_controller_runtime_contract_metrics_from_episodes(tmp_path):
+    module = _load_indexer_module()
+    _write_json(
+        tmp_path / "trajectories/episode_1.json",
+        {
+            "task_id": "episode_1",
+            "steps": [
+                {
+                    "proposal_metadata": {
+                        "neural_controller_shadow": {
+                            "ready": True,
+                            "runtime_artifact_failure_mode": "artifact_contract_success",
+                            "runtime_contract_success": True,
+                            "rowwise_selector_policy": "candidate_contract_improves",
+                        }
+                    },
+                    "verification": {"passed": True},
+                }
+            ],
+        },
+    )
+
+    report = module._refresh_neural_controller_runtime_contract_metrics(tmp_path)
+    index = module.build_benchmark_browser_index(tmp_path)
+
+    assert report["summary"]["shadow_steps"] == 1
+    assert report["summary"]["runtime_contract_steps"] == 1
+    assert report["summary"]["runtime_contract_task_count"] == 1
+    assert report["summary"]["selector_signal_ready"] is True
+    assert index["neural_controller_runtime_contract"]["status"] == "available"
+    assert index["neural_controller_runtime_contract"]["selector_signal_ready"] is True
 
 
 def test_browser_index_normalizes_swe_bench_live_results_shape(tmp_path):
@@ -205,6 +340,7 @@ def test_a8_progress_treats_swe_verified_slice_as_partial_until_full_count_met(t
 
 def test_browser_index_surfaces_active_harness_run_separately_from_completed_slice(tmp_path):
     module = _load_indexer_module()
+    heartbeat = datetime.now(timezone.utc).isoformat()
     _write_json(
         tmp_path / "benchmarks/swe_bench_verified/swe_bench_verified_test_dataset.json",
         [{"instance_id": "django__django-1"}, {"instance_id": "django__django-2"}],
@@ -225,15 +361,15 @@ def test_browser_index_surfaces_active_harness_run_separately_from_completed_sli
             "benchmark": "swe_bench_verified",
             "success": False,
             "phase_results": [{"name": "enqueue_patch_jobs", "returncode": 0, "elapsed_seconds": 4.5}],
-            "active_phase": {
-                "name": "drain_patch_jobs",
-                "pid": 123,
-                "elapsed_seconds": 42.0,
-                "heartbeat_at": "2026-04-27T22:00:00+00:00",
-                "started_at": "2026-04-27T21:59:00+00:00",
+                "active_phase": {
+                    "name": "drain_patch_jobs",
+                    "pid": 123,
+                    "elapsed_seconds": 42.0,
+                    "heartbeat_at": heartbeat,
+                    "started_at": heartbeat,
+                },
             },
-        },
-    )
+        )
     _write_json(
         tmp_path / "config/autonomous_benchmark_harnesses/swe_harness.json",
         {
@@ -512,7 +648,93 @@ def test_live_status_surfaces_partial_rolling_score_from_reports(tmp_path):
     assert score["resolve_rate"] == 0.5
     assert score["score_source"] == "partial_report_json"
     assert score["passed_instance_ids"] == ["a"]
-    assert score["failed_instance_ids"] == ["b"]
+
+
+def test_live_status_ignores_stale_raw_summary_and_filters_partial_reports_to_current_predictions(tmp_path):
+    module = _load_indexer_module()
+    _write_json(
+        tmp_path / "config/autonomous_benchmark_harnesses/swe_bench_live_raw_completed_rolling_score.json",
+        {
+            "spec_version": "asi_v1",
+            "report_kind": "autonomous_benchmark_harness_spec",
+            "benchmark": "swe_bench_live",
+            "run_config": {
+                "run_id": "rolling-live-raw",
+                "score_kind": "raw_completed_success_subset",
+                "score_mode": "raw_completed_success",
+            },
+            "artifacts": {
+                "summary_json": "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/summary.json",
+                "results_json": "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/evaluation_results/results.json",
+                "predictions_patch_json": "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/preds.json",
+            },
+        },
+    )
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/summary.json",
+        {
+            "report_kind": "official_swe_bench_summary",
+            "source_path": str(
+                tmp_path
+                / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/evaluation_results/results.json"
+            ),
+            "task_count": 5,
+            "resolved_count": 0,
+            "resolve_rate": 0.0,
+        },
+    )
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/preds.json",
+        {
+            "current-a": {"model_patch": "diff --git a/a b/a"},
+            "current-b": {"model_patch": "diff --git a/b b/b"},
+        },
+    )
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/evaluation_results/current-a/report.json",
+        {"instance_id": "current-a", "resolved": True},
+    )
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/evaluation_results/current-b/report.json",
+        {"instance_id": "current-b", "resolved": False},
+    )
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/raw_completed_latest/evaluation_results/stale-c/report.json",
+        {"instance_id": "stale-c", "resolved": False},
+    )
+
+    live = module.build_benchmark_live_status(tmp_path)
+
+    score = live["rolling_scores"]["swe_bench_live:raw_completed_success_subset"]
+    assert score["status"] == "partial"
+    assert score["score_source"] == "partial_report_json"
+    assert score["task_count"] == 2
+    assert score["resolved_count"] == 1
+    assert score["prediction_count"] == 2
+    assert score["filtered_to_current_predictions"] is True
+    assert score["failed_instance_ids"] == ["current-b"]
+
+
+def test_live_status_does_not_surface_dead_harness_pid_as_active(tmp_path):
+    module = _load_indexer_module()
+    _write_json(
+        tmp_path / "benchmarks/swe_bench_live/rolling_score/harness_dead_log.json",
+        {
+            "report_kind": "autonomous_benchmark_harness_run_log",
+            "benchmark": "swe_bench_live",
+            "success": False,
+            "active_phase": {
+                "name": "official_raw_completed_subset_harness",
+                "pid": 999999999,
+                "heartbeat_at": "2999-01-01T00:00:00+00:00",
+            },
+            "phase_results": [],
+        },
+    )
+
+    live = module.build_benchmark_live_status(tmp_path)
+
+    assert "swe_bench_live" not in live["active_runs_by_benchmark"]
 
 
 def test_live_status_classifies_artifact_contract_failures_generically(tmp_path):

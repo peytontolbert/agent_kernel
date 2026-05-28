@@ -57,7 +57,7 @@ def _write_fixture(tmp_path: Path, *, state: str = "completed", outcome: str = "
     return queue_json, queue_manifest, workspace_root
 
 
-def test_verify_swe_patch_jobs_accepts_successful_jobs_with_patches(tmp_path):
+def test_verify_swe_patch_jobs_abstains_stale_successful_jobs_with_patches(tmp_path):
     module = _load_module()
     queue_json, queue_manifest, workspace_root = _write_fixture(tmp_path)
 
@@ -68,10 +68,38 @@ def test_verify_swe_patch_jobs_accepts_successful_jobs_with_patches(tmp_path):
     )
 
     assert result["success"] is True
+    assert result["verified_patch_count"] == 0
+    assert result["abstained_patch_count"] == 1
+    assert result["successful_instance_ids"] == []
+    assert result["retry_instance_ids"] == ["repo__pkg-1"]
+    assert result["failures"] == []
+    abstained_record = result["abstained_jobs"][0]
+    assert abstained_record["job_id"] == "job-1"
+    assert abstained_record["task_id"] == "swe_patch_instance"
+    assert abstained_record["instance_id"] == "repo__pkg-1"
+    assert abstained_record["reason"] == "stale_artifact_success_requires_reconciliation"
+    assert result["queue_epoch"]["queue_json_sha256"]
+    assert result["queue_epoch"]["queue_manifest_sha256"]
+
+
+def test_verify_swe_patch_jobs_accepts_semantic_unverified_artifact_ready_jobs(tmp_path):
+    module = _load_module()
+    queue_json, queue_manifest, workspace_root = _write_fixture(
+        tmp_path,
+        state="completed",
+        outcome="semantic_unverified",
+    )
+
+    result = module.verify_swe_patch_jobs(
+        queue_json=queue_json,
+        queue_manifest=queue_manifest,
+        workspace_root=workspace_root,
+    )
+
+    assert result["success"] is True
     assert result["verified_patch_count"] == 1
     assert result["successful_instance_ids"] == ["repo__pkg-1"]
-    assert result["retry_instance_ids"] == []
-    assert result["failures"] == []
+    assert result["verified_patches"][0]["outcome"] == "semantic_unverified"
 
 
 def test_verify_swe_patch_jobs_accepts_safe_stop_as_abstention(tmp_path):
@@ -192,7 +220,11 @@ def test_verify_swe_patch_jobs_marks_semantic_artifact_failure_retryable(tmp_pat
     assert result["abstained_patch_count"] == 1
     assert result["retry_instance_ids"] == ["repo__pkg-1"]
     assert result["abstained_jobs"][0]["reason"] == "semantic_artifact_failure"
-    assert "SWE patch leaves invalid __init__ generators" in result["abstained_jobs"][0]["verification_reasons"][0]
+    assert any(
+        "SWE patch leaves invalid __init__ generators" in reason
+        or "isolated one-line production Python replacement" in reason
+        for reason in result["abstained_jobs"][0]["verification_reasons"]
+    )
 
 
 def test_verify_swe_patch_jobs_rejects_nonterminal_unresolved_job(tmp_path):
@@ -236,3 +268,82 @@ def test_verify_swe_patch_jobs_can_skip_nonterminal_for_rolling_score(tmp_path):
     assert result["skipped_nonterminal_count"] == 1
     assert result["skipped_nonterminal_jobs"][0]["reason"] == "nonterminal_skipped"
     assert result["retry_instance_ids"] == []
+
+
+def test_verify_swe_patch_jobs_can_abstain_missing_completed_patch_for_rolling_score(tmp_path):
+    module = _load_module()
+    queue_json, queue_manifest, workspace_root = _write_fixture(
+        tmp_path,
+        state="completed",
+        outcome="success",
+        write_patch=False,
+    )
+
+    result = module.verify_swe_patch_jobs(
+        queue_json=queue_json,
+        queue_manifest=queue_manifest,
+        workspace_root=workspace_root,
+        missing_patches_as_abstentions=True,
+    )
+
+    assert result["success"] is True
+    assert result["verified_patch_count"] == 0
+    assert result["abstained_patch_count"] == 1
+    assert result["abstained_jobs"][0]["reason"] == "missing_patch"
+    assert result["retry_instance_ids"] == ["repo__pkg-1"]
+
+
+def test_verify_swe_patch_jobs_uses_report_workspace_fallback_for_resumed_jobs(tmp_path):
+    module = _load_module()
+    queue_manifest = tmp_path / "queue_manifest.json"
+    queue_json = tmp_path / "queue.json"
+    stale_workspace_root = tmp_path / "old_workspace_root"
+    actual_workspace = tmp_path / "workspace" / "probe" / "swe_patch_instance"
+    actual_workspace.mkdir(parents=True)
+    (actual_workspace / "patch.diff").write_text(
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "reports" / "job_report.json"
+    report_path.parent.mkdir()
+    report_path.write_text(json.dumps({"workspace": str(actual_workspace)}), encoding="utf-8")
+    queue_manifest.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "swe_patch_instance",
+                        "workspace_subdir": "probe/swe_patch_instance",
+                        "metadata": {"swe_instance_id": "repo__pkg-1"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    queue_json.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "job_id": "job-1",
+                        "task_id": "swe_patch_instance",
+                        "state": "completed",
+                        "outcome": "success",
+                        "report_path": str(report_path),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = module.verify_swe_patch_jobs(
+        queue_json=queue_json,
+        queue_manifest=queue_manifest,
+        workspace_root=stale_workspace_root,
+    )
+
+    assert result["success"] is True
+    assert result["verified_patch_count"] == 1
+    assert result["verified_patches"][0]["patch_path"] == str(actual_workspace / "patch.diff")

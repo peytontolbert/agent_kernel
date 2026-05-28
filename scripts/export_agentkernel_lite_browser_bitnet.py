@@ -47,6 +47,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _csv_patterns(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
 def _materialize_lazy_modules(model: torch.nn.Module) -> None:
     for module in model.modules():
         ensure_self_attn = getattr(module, "_ensure_self_attn", None)
@@ -107,7 +111,7 @@ def _write_readme(*, browser_dir: Path, source_bundle: Path, model_manifest: dic
         f"- Parameters before BitNet packing: `{parameter_count}`",
         f"- Final eval loss: `{final_eval}`",
         "- Browser entrypoint: `manifest.json`",
-        "- Runtime: Model Stack browser BitNet WebGPU encoder-decoder",
+        "- Runtime: Model Stack browser BitNet WebGPU encoder-decoder with packed BitNet WASM fallback",
         "- Tokenizer: AgentKernel byte-level BPE attached under `tokenizer/`",
         "",
         "Web app route after uploading this directory to Hugging Face:",
@@ -116,7 +120,7 @@ def _write_readme(*, browser_dir: Path, source_bundle: Path, model_manifest: dic
         "?modelStackManifest=https://huggingface.co/<org>/<repo>/resolve/main/manifest.json",
         "```",
         "",
-        "Safari/WebGPU serving notes: host over HTTPS. Large model files are fetched by the browser and cached by the app.",
+        "Serving notes: WebGPU is used when available; Safari or other no-WebGPU browsers use the packed BitNet WASM fallback. Large model files are fetched by the browser and cached by the app.",
         "",
     ]
     (browser_dir / "README.md").write_text("\n".join(readme), encoding="utf-8")
@@ -166,26 +170,43 @@ def export_browser_bitnet(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(str(args.device))
     model.to(device)
 
-    quant_summary = apply_compression(
-        model,
-        quant={
-            "scheme": "bitnet",
-            "weight_opt": "none",
-            "activation_quant": "none",
-            "spin": False,
-            "spin_random": True,
-            "spin_seed": int(args.spin_seed),
-        },
-    )
+    quant_include = _csv_patterns(str(args.quant_include))
+    quant_exclude = _csv_patterns(str(args.quant_exclude))
+    dense_float32_include = _csv_patterns(str(args.dense_float32_include))
+    quant_summary: dict[str, Any] = {"quant": {"scheme": "none", "num": 0, "modules": []}}
+    if bool(args.quantize_bitnet):
+        quant_summary = apply_compression(
+            model,
+            quant={
+                "scheme": "bitnet",
+                "include": quant_include or None,
+                "exclude": quant_exclude or None,
+                "weight_opt": "none",
+                "activation_quant": "none",
+                "spin": False,
+                "spin_random": True,
+                "spin_seed": int(args.spin_seed),
+            },
+        )
     manifest_path = export_browser_bitnet_bundle(
         model.cpu().eval(),
         output_dir,
         model_cfg=cfg,
         max_seq_len=int(args.max_seq_len),
+        dense_dtype=str(args.dense_dtype),
+        dense_float32_patterns=dense_float32_include,
     )
 
     browser_manifest = _read_json(manifest_path)
     browser_manifest["tokenizer"] = _copy_tokenizer(tokenizer_dir, output_dir)
+    browser_manifest["compression"] = {
+        "quantization": quant_summary.get("quant", {}),
+        "quantize_bitnet": bool(args.quantize_bitnet),
+        "quant_include": quant_include,
+        "quant_exclude": quant_exclude,
+        "dense_dtype": str(args.dense_dtype),
+        "dense_float32_include": dense_float32_include,
+    }
     browser_manifest["agentkernel_lite"] = {
         "source_bundle_manifest_path": str(bundle_manifest_path),
         "source_model_dir": str(model_dir),
@@ -208,9 +229,14 @@ def export_browser_bitnet(args: argparse.Namespace) -> dict[str, Any]:
         "source_tokenizer_dir": str(tokenizer_dir),
         "device": str(device),
         "max_seq_len": int(args.max_seq_len),
+        "dense_dtype": str(args.dense_dtype),
+        "dense_float32_include": dense_float32_include,
         "dense_tensor_count": len(browser_manifest.get("dense_tensors", {}) or {}),
         "layer_count": len(browser_manifest.get("layers", []) or []),
         "quantization": quant_summary.get("quant", {}),
+        "quantize_bitnet": bool(args.quantize_bitnet),
+        "quant_include": quant_include,
+        "quant_exclude": quant_exclude,
         "size_bytes": _directory_size(output_dir),
         "model": asdict(cfg),
         "tokenizer": browser_manifest.get("tokenizer", {}),
@@ -247,7 +273,12 @@ def main() -> None:
     parser.add_argument("--webapp-model-dir", default="")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-seq-len", type=int, default=1024)
+    parser.add_argument("--dense-dtype", choices=("float32", "float16"), default="float32")
+    parser.add_argument("--dense-float32-include", default="")
     parser.add_argument("--spin-seed", type=int, default=0)
+    parser.add_argument("--quantize-bitnet", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--quant-include", default="")
+    parser.add_argument("--quant-exclude", default="")
     args = parser.parse_args()
     summary = export_browser_bitnet(args)
     print(json.dumps(summary, indent=2, sort_keys=True))

@@ -21,6 +21,33 @@ _MAX_PRIORITY_WORKSPACE_PREVIEW_CHARS = 1600
 _MAX_TARGETED_PREVIEW_WINDOWS = 3
 
 
+def _is_swe_patch_verifier(verifier: dict[str, object]) -> bool:
+    return str(verifier.get("kind", "")).strip() == "swe_patch_apply_check"
+
+
+def _is_swe_disallowed_solution_path(path: str) -> bool:
+    normalized = str(path).replace("\\", "/").strip("/")
+    name = Path(normalized).name.lower()
+    if not normalized:
+        return True
+    if normalized.startswith(("test/", "tests/", "doc/", "docs/", ".github/", "features/", "examples/", "ci/")):
+        return True
+    if "/test/" in f"/{normalized}/" or "/tests/" in f"/{normalized}/" or "/docs/" in f"/{normalized}/":
+        return True
+    if "/examples/" in f"/{normalized}/" or "/mpl-data/" in f"/{normalized}/":
+        return True
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    return name in {"readme.md", "changelog.md", "changelog.rst", "changes.md", "changes.rst", "makefile"}
+
+
+def _workflow_expected_changed_paths(verifier: dict[str, object]) -> list[str]:
+    paths = [str(path).strip() for path in verifier.get("expected_changed_paths", []) if str(path).strip()]
+    if not _is_swe_patch_verifier(verifier):
+        return paths
+    return [path for path in paths if not _is_swe_disallowed_solution_path(path)]
+
+
 class WorldModel:
     def __init__(self, config: KernelConfig | None = None) -> None:
         self.config = config or KernelConfig()
@@ -694,11 +721,7 @@ class WorldModel:
         ]
         return {
             "kind": str(verifier.get("kind", "")).strip(),
-            "expected_changed_paths": [
-                str(path).strip()
-                for path in verifier.get("expected_changed_paths", [])
-                if str(path).strip()
-            ],
+            "expected_changed_paths": _workflow_expected_changed_paths(verifier),
             "generated_paths": [
                 str(path).strip()
                 for path in verifier.get("generated_paths", [])

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 from datetime import UTC, datetime
+import hashlib
 import json
 import shlex
 import shutil
@@ -32,6 +33,18 @@ def _write_json(path: Path, payload: dict[str, Any] | list[str]) -> None:
 def _safe_label(value: str) -> str:
     safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value.strip())
     return safe.strip("_") or "retry"
+
+
+def _bounded_workspace_prefix(base: str, label: str, *, max_chars: int = 96) -> str:
+    base_label = _safe_label(base) if base else "swe_bench_retry"
+    retry_label = _safe_label(label)
+    combined = f"{base_label}_{retry_label}"
+    if len(combined) <= max_chars:
+        return combined
+    digest = hashlib.sha1(combined.encode("utf-8")).hexdigest()[:12]
+    label_budget = max(12, min(40, max_chars // 2))
+    base_budget = max(8, max_chars - label_budget - len(digest) - 2)
+    return f"{base_label[:base_budget].rstrip('_')}_{retry_label[-label_budget:].lstrip('_')}_{digest}"
 
 
 def build_swe_bench_command(
@@ -302,6 +315,30 @@ def _queue_env(queue_root: str) -> dict[str, str]:
     }
 
 
+def _swe_live_guarded_neural_controller_env() -> dict[str, str]:
+    return {
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "guarded",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MANIFEST_PATH": (
+            "artifacts/agentkernel_controller/"
+            "seq2seq_controller_v64_source_1536_from_v63/agentkernel_controller_manifest.json"
+        ),
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_CANDIDATE_MANIFEST_PATH": (
+            "artifacts/agentkernel_controller/"
+            "seq2seq_controller_v28_train_select_fullgate_v9/agentkernel_controller_manifest.json"
+        ),
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE_PATH": (
+            "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json"
+        ),
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+    }
+
+
 def _queue_max_queued_budget(*, selected_ids: list[str], limit: int, drain_limit: int) -> int:
     """Return a queue budget that can admit the intended harness slice."""
     if not selected_ids and limit <= 0:
@@ -355,6 +392,7 @@ def build_swe_autonomous_harness_spec(
     live_submission_dir: str = "",
     live_submission_subset: str = "",
     live_system_name: str = "Agent Kernel",
+    official_feedback_json: str = "",
 ) -> dict[str, Any]:
     if benchmark not in DEFAULT_DATASETS:
         raise ValueError("benchmark must be one of " + ",".join(DEFAULT_DATASETS))
@@ -397,6 +435,8 @@ def build_swe_autonomous_harness_spec(
         prepare_args.extend(["--instance-ids", *selected_ids])
     if limit > 0:
         prepare_args.extend(["--limit", str(limit)])
+    if str(official_feedback_json).strip():
+        prepare_args.extend(["--official-feedback-json", str(official_feedback_json).strip()])
     repo_cache_manifest_json = str(repo_cache_manifest_json).strip()
     if prepare_repo_cache and not repo_cache_manifest_json:
         repo_cache_manifest_json = str(Path(prediction_task_manifest).with_name(f"repo_cache_{run_id}.json"))
@@ -434,6 +474,17 @@ def build_swe_autonomous_harness_spec(
     # for full SWE-Bench Verified.
     queue_env["AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS"] = "1000"
     queue_env["AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS"] = "0"
+    # SWE benchmark patch jobs need breadth-first retry throughput. The global
+    # frontier floor is intentionally high for open-ended tasks, but it lets one
+    # hard patch consume too many repair steps before queue backoff.
+    queue_env["AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR"] = "20"
+    # Force VLLM decisions through the subprocess transport in autonomous
+    # benchmark lanes so per-request wall timeouts are enforced consistently.
+    queue_env["AGENT_KERNEL_LLM_HTTP_TRANSPORT"] = "curl"
+    queue_env["AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS"] = "75"
+    queue_env["AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS"] = "2"
+    if benchmark == "swe_bench_live":
+        queue_env.update(_swe_live_guarded_neural_controller_env())
     patch_jobs_verification_json = str(Path(queue_root) / "patch_jobs_verification.json")
     queue_max_queued_per_budget_group = _queue_max_queued_budget(
         selected_ids=selected_ids,
@@ -463,6 +514,8 @@ def build_swe_autonomous_harness_spec(
         "drain",
         "--limit",
         str(drain_limit),
+        "--job-timeout-seconds",
+        "600",
         "--provider",
         provider,
         "--model",
@@ -470,15 +523,15 @@ def build_swe_autonomous_harness_spec(
         "--enforce-preflight",
         "0",
         "--use-tolbert-context",
-        "0",
+        "1",
         "--use-graph-memory",
-        "0",
+        "1",
         "--use-world-model",
-        "0",
+        "1",
         "--use-retrieval-proposals",
-        "0",
+        "1",
         "--use-trust-proposals",
-        "0",
+        "1",
         "--asi-coding-require-live-llm",
         "1",
     ]
@@ -569,9 +622,9 @@ def build_swe_autonomous_harness_spec(
             python_bin=python_bin,
             dataset_name=resolved_dataset,
             split=split,
-            predictions_json=live_predictions_json,
+            predictions_json=str(Path(live_predictions_json).resolve()),
             platform=live_platform,
-            output_dir=report_dir,
+            output_dir=str(Path(report_dir).resolve()),
             workers=max_workers,
             overwrite=live_overwrite,
             instance_ids=selected_ids or None,
@@ -635,6 +688,14 @@ def build_swe_autonomous_harness_spec(
         "--output-json",
         live_predictions_json,
     ]
+    live_apply_official_results_args = [
+        python_bin,
+        "scripts/apply_swe_live_official_results_to_queue.py",
+        "--queue-json",
+        queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"],
+        "--results-json",
+        results_json,
+    ]
     live_submission_subset = str(live_submission_subset).strip() or split
     if is_live and not live_submission_dir:
         live_submission_dir = str(Path(report_dir).parent / "submission" / live_submission_subset / "agentkernel")
@@ -668,6 +729,9 @@ def build_swe_autonomous_harness_spec(
         open_limits.append(
             "SWE-bench Live leaderboard ranking requires packaging preds.json/results.json/README.md and submitting them through the official PR flow."
         )
+    prepare_prediction_required_inputs = [dataset_json, repo_cache_root]
+    if str(official_feedback_json).strip():
+        prepare_prediction_required_inputs.append(str(official_feedback_json).strip())
     artifacts = {
         "prediction_task_manifest": prediction_task_manifest,
         "prediction_task_progress_json": prediction_task_progress_json,
@@ -702,7 +766,7 @@ def build_swe_autonomous_harness_spec(
         _phase(
             "prepare_prediction_tasks",
             prepare_args,
-            required_inputs=[dataset_json, repo_cache_root],
+            required_inputs=prepare_prediction_required_inputs,
             expected_outputs=[prediction_task_manifest, prediction_task_progress_json],
         ),
         _phase(
@@ -767,6 +831,14 @@ def build_swe_autonomous_harness_spec(
                     required_inputs=[live_predictions_json],
                     expected_outputs=[results_json],
                     gate="official SWE-bench Live evaluator must complete",
+                ),
+                _phase(
+                    "apply_official_results_to_queue",
+                    live_apply_official_results_args,
+                    env=queue_env,
+                    required_inputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"], results_json],
+                    expected_outputs=[queue_env["AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH"]],
+                    gate="official SWE-bench Live results must update the same delegated queue storage used by patch jobs",
                 ),
                 _phase("summarize_results", summarize_args, required_inputs=[results_json], expected_outputs=[summary_json]),
                 _phase(
@@ -898,7 +970,9 @@ def build_swe_retry_harness_spec(
         raise ValueError("source harness benchmark must be one of " + ",".join(DEFAULT_DATASETS))
     artifact_dir.mkdir(parents=True, exist_ok=True)
     workspace_prefix = str(artifacts.get("workspace_prefix", "swe_bench_retry")).strip().strip("/") or "swe_bench_retry"
+    retry_workspace_prefix = _bounded_workspace_prefix(workspace_prefix, label)
     resolved_run_id = str(run_id).strip() or f"{str(run_config.get('run_id', 'swe_retry')).strip() or 'swe_retry'}_{label}"
+    python_bin = str(run_config.get("python_bin", sys.executable)).strip() or sys.executable
     spec = build_swe_autonomous_harness_spec(
         benchmark=benchmark,
         dataset_json=str(inputs.get("dataset_json", "")).strip(),
@@ -910,7 +984,7 @@ def build_swe_retry_harness_spec(
         queue_manifest=str(artifact_dir / f"queue_manifest_{label}.json"),
         queue_root=str(artifact_dir / f"queue_{label}"),
         workspace_root=str(artifacts.get("workspace_root", "workspace")).strip() or "workspace",
-        workspace_prefix=f"{workspace_prefix}_{label}",
+        workspace_prefix=retry_workspace_prefix,
         predictions_jsonl=str(artifact_dir / f"predictions_{label}.jsonl"),
         apply_check_json=str(artifact_dir / f"predictions_{label}_apply_check.json"),
         run_spec_json=str(artifact_dir / f"a8_run_spec_{label}.json"),
@@ -925,13 +999,24 @@ def build_swe_retry_harness_spec(
         results_json=str(artifact_dir / f"evaluation_results_{label}" / "results.json"),
         summary_json=str(artifact_dir / f"evaluation_results_{label}" / "summary.json"),
         output_packet_json=str(artifact_dir / f"evaluation_results_{label}" / "a8_benchmark_result.json"),
-        python_bin=str(run_config.get("python_bin", sys.executable)).strip() or sys.executable,
+        python_bin=python_bin,
         model_name_or_path=str(run_config.get("model_name_or_path", "agentkernel")).strip() or "agentkernel",
         provider=str(run_config.get("provider", "vllm")).strip() or "vllm",
-        drain_limit=len(retry_instance_ids),
+        # Retries can consume one slot for source/context repair, one for
+        # artifact backoff, and additional slots for isolated timeout recovery.
+        # Give each retry enough turns to either produce a patch or terminalize,
+        # otherwise verification can see queued nonterminal jobs and block
+        # official scoring.
+        drain_limit=max(len(retry_instance_ids), len(retry_instance_ids) * 5),
         max_source_context_bytes=int(inputs.get("max_source_context_bytes", 30000) or 30000),
         instance_ids=retry_instance_ids,
         limit=0,
+        official_harness_kind="swebench_live" if benchmark == "swe_bench_live" else "swebench",
+        live_overwrite=1 if benchmark == "swe_bench_live" else 0,
+        live_submission_subset=str(inputs.get("split", "test")).strip() or "test",
+        official_feedback_json=str(patch_job_verification.get("patch_job_verification_json", "")).strip()
+        if str(patch_job_verification.get("report_kind", "")).strip() == "swe_official_failure_retry_report"
+        else "",
     )
     spec["source_retry"] = {
         "source_harness_json": str(source_harness.get("source_harness_json", "")),

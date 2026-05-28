@@ -379,17 +379,25 @@ def _report_acceptance_packet(
         for rule in semantic_verifier.get("report_rules", [])
         if isinstance(rule, dict)
     ]
-    verifier_reasons: list[str] = []
-    for step in episode.steps if episode is not None else []:
-        verification = step.verification or {}
-        if isinstance(verification, dict):
-            verifier_reasons.extend(
-                str(reason).strip()
-                for reason in verification.get("reasons", [])
-                if str(reason).strip()
-            )
+    terminal_verification: dict[str, Any] = {}
+    if episode is not None:
+        for step in reversed(list(episode.steps or [])):
+            verification = step.verification or {}
+            if isinstance(verification, dict) and verification:
+                terminal_verification = dict(verification)
+                break
+    verifier_reasons = [
+        str(reason).strip()
+        for reason in terminal_verification.get("reasons", [])
+        if str(reason).strip()
+    ]
     if not verifier_reasons:
         verifier_reasons = [reason for reason in outcome_reasons if reason]
+    verifier_passed = (
+        bool(terminal_verification.get("passed", False))
+        if terminal_verification
+        else (bool(episode.success) if episode is not None else outcome == "success")
+    )
     return {
         "task_id": task.task_id,
         "synthetic_worker": bool(metadata.get("synthetic_worker")),
@@ -410,9 +418,17 @@ def _report_acceptance_packet(
         "report_rules": report_rules,
         "verifier_result": {
             "kind": str(semantic_verifier.get("kind", "")).strip(),
-            "passed": bool(episode.success) if episode is not None else outcome == "success",
+            "passed": verifier_passed,
             "outcome": outcome,
             "reasons": verifier_reasons,
+            "outcome_label": str(terminal_verification.get("outcome_label", "")).strip(),
+            "failure_codes": [
+                str(code).strip()
+                for code in terminal_verification.get("failure_codes", [])
+                if str(code).strip()
+            ]
+            if isinstance(terminal_verification.get("failure_codes", []), list)
+            else [],
         },
         "capability_usage": capability_usage,
     }
@@ -1576,8 +1592,57 @@ def _report_policy_trace(steps: list[StepRecord]) -> list[dict[str, Any]]:
         proposal_metadata = _report_artifact_proposal_metadata(step)
         if proposal_metadata:
             item["proposal_metadata"] = proposal_metadata
+        neural_controller_metadata = _report_neural_controller_metadata(step)
+        if neural_controller_metadata:
+            item["neural_controller"] = neural_controller_metadata
         trace.append(item)
     return trace
+
+
+def _report_neural_controller_metadata(step: StepRecord) -> dict[str, Any]:
+    metadata = step.proposal_metadata if isinstance(step.proposal_metadata, dict) else {}
+    if not metadata:
+        return {}
+    advisory = metadata.get("neural_controller_advisory", {})
+    shadow = metadata.get("neural_controller_shadow", {})
+    payload: dict[str, Any] = {}
+    if isinstance(advisory, dict) and advisory:
+        payload["advisory"] = {
+            "mode": str(advisory.get("mode", "")).strip(),
+            "manifest_path": str(advisory.get("manifest_path", "")).strip(),
+            "ready": bool(advisory.get("ready", False)),
+            "shadow_attempted": bool(advisory.get("shadow_attempted", False)),
+            "shadow_generated": bool(advisory.get("shadow_generated", False)),
+            "surface_count": int(advisory.get("surface_count", 0) or 0),
+            "warnings": [
+                str(value).strip()
+                for value in advisory.get("warnings", [])
+                if str(value).strip()
+            ][:6],
+        }
+    if isinstance(shadow, dict) and shadow:
+        payload["shadow"] = {
+            "ready": bool(shadow.get("ready", False)),
+            "manifest_path": str(shadow.get("manifest_path", "")).strip(),
+            "predicted_action": str(shadow.get("predicted_action", "")).strip(),
+            "action_agreement": bool(shadow.get("action_agreement", False)),
+            "content_exact_agreement": bool(shadow.get("content_exact_agreement", False)),
+            "control_tokens": [
+                str(value).strip()
+                for value in shadow.get("control_tokens", [])
+                if str(value).strip()
+            ][:12],
+            "error": str(shadow.get("error", "")).strip(),
+            "warnings": [
+                str(value).strip()
+                for value in shadow.get("warnings", [])
+                if str(value).strip()
+            ][:6],
+            "policy_heads": dict(shadow.get("policy_heads", {}))
+            if isinstance(shadow.get("policy_heads", {}), dict)
+            else {},
+        }
+    return payload
 
 
 def _report_artifact_proposal_metadata(step: StepRecord) -> dict[str, Any]:

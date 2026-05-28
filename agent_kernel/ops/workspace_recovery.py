@@ -89,6 +89,8 @@ def should_restore_on_runner_exception(config: KernelConfig) -> bool:
 def should_restore_on_outcome(config: KernelConfig, outcome: str) -> bool:
     policy = recovery_policy_snapshot(config)
     normalized = str(outcome).strip()
+    if normalized in {"artifact_ready", "semantic_unverified", "official_passed"}:
+        return False
     if normalized == "safe_stop":
         return bool(policy.get("rollback_on_safe_stop", False))
     if normalized != "success":

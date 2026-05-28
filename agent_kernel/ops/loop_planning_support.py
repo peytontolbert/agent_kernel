@@ -1,10 +1,34 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from ..extensions.improvement.prompt_improvement import retained_planner_controls
 from ..schemas import TaskSpec
+
+
+def _is_swe_disallowed_solution_path(path: str) -> bool:
+    normalized = str(path).replace("\\", "/").strip("/")
+    name = Path(normalized).name.lower()
+    if not normalized:
+        return True
+    if normalized.startswith(("test/", "tests/", "doc/", "docs/", ".github/", "features/", "examples/", "ci/")):
+        return True
+    if "/test/" in f"/{normalized}/" or "/tests/" in f"/{normalized}/" or "/docs/" in f"/{normalized}/":
+        return True
+    if "/examples/" in f"/{normalized}/" or "/mpl-data/" in f"/{normalized}/":
+        return True
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    return name in {"readme.md", "changelog.md", "changelog.rst", "changes.md", "changes.rst", "makefile"}
+
+
+def _workflow_expected_changed_paths(contract: dict[str, Any]) -> list[str]:
+    paths = [str(path).strip() for path in contract.get("expected_changed_paths", []) if str(path).strip()]
+    if str(contract.get("kind", "")).strip() != "swe_patch_apply_check":
+        return paths
+    return [path for path in paths if not _is_swe_disallowed_solution_path(path)]
 
 
 def build_plan(kernel: Any, task: TaskSpec) -> list[str]:
@@ -100,7 +124,7 @@ def workflow_plan_steps(task: TaskSpec, *, planner_controls: dict[str, object] |
         preserved_steps = preserved_steps[:max_preserved]
         if bool(controls.get("prefer_preserved_artifacts_first", False)):
             steps.extend(preserved_steps)
-    for path in contract.get("expected_changed_paths", []):
+    for path in _workflow_expected_changed_paths(contract):
         normalized = str(path).strip()
         if normalized:
             steps.append(f"update workflow path {normalized}")

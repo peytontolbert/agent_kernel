@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from pathlib import Path
+import json
 import os
 import sys
 
@@ -123,6 +124,37 @@ def _default_vllm_python_bin() -> str:
     return sys.executable
 
 
+def _neural_controller_primary_gate_ready(path: Path) -> bool:
+    if not str(path).strip():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("report_kind", "")).strip() == "neural_controller_retained_promotion_gate"
+        and bool(payload.get("primary_authority_ready", False))
+    )
+
+
+def _neural_controller_selector_activation_gate_ready(path: Path) -> bool:
+    if not str(path).strip():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("report_kind", "")).strip() == "neural_controller_selector_activation_gate"
+        and bool(payload.get("production_guarded_selector_activation_ready", False))
+        and not bool(payload.get("primary_authority_ready", False))
+    )
+
+
 @dataclass(slots=True)
 class KernelConfig:
     provider: str = os.getenv("AGENT_KERNEL_PROVIDER", "vllm")
@@ -183,6 +215,53 @@ class KernelConfig:
     use_prompt_proposals: bool = os.getenv("AGENT_KERNEL_USE_PROMPT_PROPOSALS", "1") == "1"
     use_curriculum_proposals: bool = os.getenv("AGENT_KERNEL_USE_CURRICULUM_PROPOSALS", "1") == "1"
     use_retrieval_proposals: bool = os.getenv("AGENT_KERNEL_USE_RETRIEVAL_PROPOSALS", "1") == "1"
+    use_neural_controller: bool = os.getenv("AGENT_KERNEL_USE_NEURAL_CONTROLLER", "0") == "1"
+    neural_controller_mode: str = os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_MODE", "shadow")
+    neural_controller_manifest_path: Path = Path(
+        os.getenv(
+            "AGENT_KERNEL_NEURAL_CONTROLLER_MANIFEST_PATH",
+            "artifacts/agentkernel_controller/seq2seq_controller_stage1/agentkernel_controller_manifest.json",
+        )
+    )
+    neural_controller_guarded_candidate_manifest_path: Path = Path(
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_CANDIDATE_MANIFEST_PATH", "")
+    )
+    neural_controller_guarded_report_path: Path = Path(
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_REPORT_PATH", "")
+    )
+    neural_controller_guarded_fallback_families: tuple[str, ...] = _split_env_csv(
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_FALLBACK_FAMILIES"
+    )
+    neural_controller_guarded_selector_policy: str = os.getenv(
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY",
+        "family_fallback",
+    )
+    neural_controller_device: str = os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE", "cuda")
+    neural_controller_shadow_generate: bool = (
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE", "0") == "1"
+    )
+    neural_controller_max_new_tokens: int = int(os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_MAX_NEW_TOKENS", "320"))
+    neural_controller_shadow_metrics_path: Path = Path(
+        os.getenv(
+            "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_METRICS_PATH",
+            "trajectories/neural_controller/shadow_metrics.json",
+        )
+    )
+    neural_controller_retained_promotion_gate_path: Path = Path(
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_RETAINED_PROMOTION_GATE_PATH", "")
+    )
+    neural_controller_selector_activation_gate_path: Path = Path(
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE_PATH", "")
+    )
+    neural_controller_guarded_dry_run_compare: bool = (
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE", "0") == "1"
+    )
+    neural_controller_guarded_dry_run_switch: bool = (
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH", "0") == "1"
+    )
+    neural_controller_guarded_dry_run_workspace_budget_bytes: int = int(
+        os.getenv("AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES", "50000000")
+    )
     use_research_library_context: bool = os.getenv("AGENT_KERNEL_USE_RESEARCH_LIBRARY_CONTEXT", "0") == "1"
     research_library_standalone_context: bool = (
         os.getenv("AGENT_KERNEL_RESEARCH_LIBRARY_STANDALONE_CONTEXT", "0") == "1"
@@ -798,6 +877,43 @@ class KernelConfig:
             raise ValueError("vllm_python_bin must be non-empty when vllm autostart is enabled")
         if not self.model_name.strip():
             raise ValueError("model_name must be non-empty")
+        neural_controller_mode = self.neural_controller_mode.strip().lower().replace("-", "_")
+        if neural_controller_mode not in {"disabled", "shadow", "advisory", "guarded", "primary"}:
+            raise ValueError(f"unsupported neural_controller_mode: {self.neural_controller_mode}")
+        neural_controller_guarded_selector_policy = (
+            self.neural_controller_guarded_selector_policy.strip().lower().replace("-", "_")
+        )
+        if neural_controller_guarded_selector_policy not in {
+            "family_fallback",
+            "candidate_contract_improves",
+        }:
+            raise ValueError(
+                "unsupported neural_controller_guarded_selector_policy: "
+                f"{self.neural_controller_guarded_selector_policy}"
+            )
+        if (
+            bool(self.use_neural_controller)
+            and neural_controller_mode == "guarded"
+            and neural_controller_guarded_selector_policy == "candidate_contract_improves"
+            and not _neural_controller_selector_activation_gate_ready(
+                self.neural_controller_selector_activation_gate_path
+            )
+        ):
+            raise ValueError(
+                "neural_controller_guarded_selector_policy='candidate_contract_improves' requires "
+                "a production-ready selector activation gate"
+            )
+        if bool(self.use_neural_controller) and neural_controller_mode == "primary":
+            gate_path = self.neural_controller_retained_promotion_gate_path
+            if not _neural_controller_primary_gate_ready(gate_path):
+                raise ValueError(
+                    "neural_controller_mode='primary' requires a retained promotion gate; use shadow or advisory"
+                )
+        _require_positive_int("neural_controller_max_new_tokens", self.neural_controller_max_new_tokens)
+        _require_positive_int(
+            "neural_controller_guarded_dry_run_workspace_budget_bytes",
+            self.neural_controller_guarded_dry_run_workspace_budget_bytes,
+        )
 
         storage_backend = self.storage_backend.strip().lower()
         if storage_backend not in {"json", "sqlite"}:
@@ -899,6 +1015,8 @@ class KernelConfig:
         self.benchmark_candidates_path.parent.mkdir(parents=True, exist_ok=True)
         self.retrieval_proposals_path.parent.mkdir(parents=True, exist_ok=True)
         self.retrieval_asset_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        self.neural_controller_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        self.neural_controller_shadow_metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.research_library_status_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_model_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self.tolbert_supervised_datasets_dir.mkdir(parents=True, exist_ok=True)

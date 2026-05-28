@@ -193,13 +193,15 @@ class AgentState:
         state_regressed: bool = False,
         state_transition: dict[str, object] | None = None,
         software_work_objective: str = "",
+        neutral_diagnostic_step: bool = False,
     ) -> None:
         signature = f"{decision.action}:{decision.content}"
-        if signature == self.last_action_signature:
-            self.repeated_action_count += 1
-        else:
-            self.last_action_signature = signature
-            self.repeated_action_count = 1
+        if not neutral_diagnostic_step:
+            if signature == self.last_action_signature:
+                self.repeated_action_count += 1
+            else:
+                self.last_action_signature = signature
+                self.repeated_action_count = 1
 
         if verification_passed:
             self.consecutive_failures = 0
@@ -207,17 +209,17 @@ class AgentState:
             self.active_subgoal = ""
             self.subgoal_diagnoses = {}
             self.planner_recovery_artifact = {}
-        else:
+        elif not neutral_diagnostic_step:
             self.consecutive_failures += 1
         if command_result is not None:
             if progress_delta > 0:
                 self.consecutive_no_progress_steps = 0
-            else:
+            elif not neutral_diagnostic_step:
                 self.consecutive_no_progress_steps += 1
         self.latest_state_transition = dict(state_transition or {})
         if state_regressed:
             self.latest_state_transition["regressed"] = True
-        if command_result is not None:
+        if command_result is not None and not neutral_diagnostic_step:
             self._record_software_work_outcome(
                 objective=software_work_objective,
                 step_index=step_index,

@@ -159,7 +159,14 @@ def critic_direct_decision(
         )
         if plan_progress_decision is not None:
             return plan_progress_decision
-    if state.context_packet is not None and policy._has_retrieval_signal(state) and state.history and state.consecutive_failures > 0:
+    if (
+        state.context_packet is not None
+        and policy._has_retrieval_signal(state)
+        and state.history
+        and state.consecutive_failures > 0
+    ):
+        if policy._artifact_latest_repairable_failure(state):
+            return None
         return ActionDecision(
             thought="Pause unsafe repetition and hand control back to synthesis.",
             action="respond",
@@ -167,6 +174,8 @@ def critic_direct_decision(
             done=True,
         )
     if policy._recovery_contract_exhausted(state, blocked_commands=blocked_commands):
+        if policy._artifact_latest_repairable_failure(state):
+            return None
         return ActionDecision(
             thought="No safe task-contract recovery command remains.",
             action="respond",

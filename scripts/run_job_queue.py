@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import re
+import signal
+import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,6 +19,7 @@ from agent_kernel.ops.job_queue import (
     TERMINAL_JOB_STATES,
     DelegatedJobQueue,
     DelegatedRuntimeController,
+    _scheduler_timeout_requeue_count,
     delegated_job_dependency_status,
     drain_delegated_jobs,
     enqueue_with_parallel_worker_decomposition,
@@ -30,6 +36,16 @@ from agent_kernel.ops.unattended_controller import discover_structural_classes, 
 
 def _load_report_payload(report_path: str) -> dict[str, object]:
     path = Path(str(report_path).strip())
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_json_payload(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
     try:
@@ -278,6 +294,302 @@ def _readiness_payload(readiness: dict[str, object]) -> dict[str, object]:
         if isinstance(readiness.get("discovered_structural_family_aliases", []), list)
         else [],
     }
+
+
+def _drain_delegated_jobs_isolated(
+    *,
+    queue: DelegatedJobQueue,
+    args: argparse.Namespace,
+    script_path: Path,
+) -> int:
+    limit = max(0, int(getattr(args, "limit", 0) or 0))
+    timeout_seconds = max(1, int(getattr(args, "job_timeout_seconds", 0) or 0))
+    drained = 0
+    while limit <= 0 or drained < limit:
+        command = [
+            sys.executable,
+            str(script_path),
+            "run-next",
+            "--enforce-preflight",
+            str(getattr(args, "enforce_preflight", "1")),
+        ]
+        child = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        started_at = time.time()
+        last_activity = started_at
+        timed_out = False
+        timeout_reason = ""
+        while child.poll() is None:
+            progress_mtime = _latest_active_job_progress_mtime(queue)
+            if progress_mtime is not None and progress_mtime > last_activity:
+                last_activity = progress_mtime
+            timeout_reason = _isolated_timeout_reason(
+                now=time.time(),
+                started_at=started_at,
+                last_activity_at=last_activity,
+                timeout_seconds=timeout_seconds,
+            )
+            if timeout_reason:
+                _terminate_isolated_child(child)
+                try:
+                    child.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _terminate_isolated_child(child, force=True)
+                timed_out = True
+                break
+            time.sleep(1.0)
+        stdout, stderr = child.communicate()
+        if timed_out:
+            terminal_timeout_job = _isolated_timeout_terminal_candidate(queue)
+            if terminal_timeout_job is not None:
+                checkpoint_path, report_path = _write_isolated_timeout_terminal_artifacts(
+                    queue,
+                    terminal_timeout_job,
+                    timeout_reason=timeout_reason,
+                )
+                finalized = queue.finalize(
+                    getattr(terminal_timeout_job, "job_id"),
+                    state="safe_stop",
+                    checkpoint_path=checkpoint_path,
+                    report_path=report_path,
+                    outcome="safe_stop",
+                    outcome_reasons=["isolated_timeout_requeue_limit", timeout_reason],
+                    last_error=f"isolated delegated job timed out repeatedly: {timeout_reason}",
+                )
+                drained += 1
+                print(
+                    "isolated_timeout_terminal "
+                    f"job_id={finalized.job_id} state={finalized.state} task_id={finalized.task_id} "
+                    f"attempts={finalized.attempt_count} reason={timeout_reason}"
+                )
+                continue
+            next_priority = _isolated_timeout_requeue_priority(queue)
+            requeued = queue.requeue_stale_in_progress(
+                active_job_ids=set(),
+                reason=f"isolated delegated job timed out: {timeout_reason}",
+                priority=next_priority,
+                limit=1,
+                force_resumable=True,
+            )
+            drained += 1
+            for job in requeued:
+                print(
+                    "isolated_timeout "
+                    f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
+                    f"priority={job.priority} reason={timeout_reason}"
+                )
+            if not requeued:
+                print(f"isolated_timeout no_requeue timeout_seconds={timeout_seconds} reason={timeout_reason}")
+            continue
+        output = stdout.strip()
+        error_output = stderr.strip()
+        if output:
+            print(output)
+        if error_output:
+            print(error_output, file=sys.stderr)
+        if "queue=empty" in output:
+            break
+        if _isolated_run_next_output_has_no_runnable_job(output):
+            break
+        drained += 1
+        if child.returncode != 0:
+            print(f"isolated_child_exit code={child.returncode}", file=sys.stderr)
+            requeued = _requeue_after_isolated_child_exit(queue, returncode=int(child.returncode))
+            drained += len(requeued)
+            for job in requeued:
+                print(
+                    "isolated_child_exit_requeued "
+                    f"job_id={job.job_id} state={job.state} task_id={job.task_id} "
+                    f"priority={job.priority} code={child.returncode}"
+                )
+    return drained
+
+
+def _isolated_run_next_output_has_no_runnable_job(output: str) -> bool:
+    for raw_line in str(output).splitlines():
+        line = raw_line.strip()
+        if line == "no_runnable_job=1":
+            return True
+    return False
+
+
+def _requeue_after_isolated_child_exit(queue: DelegatedJobQueue, *, returncode: int) -> list[object]:
+    """Recover jobs orphaned when an isolated child exits before finalizing.
+
+    The child may die outside Python exception handling, for example from SIGKILL,
+    process pruning, or host resource pressure. If that happens after claim but
+    before finalization, leaving the job in_progress blocks autonomous progress.
+    """
+    if int(returncode) == 0:
+        return []
+    priority = _isolated_timeout_requeue_priority(queue)
+    return queue.requeue_stale_in_progress(
+        active_job_ids=set(),
+        reason=f"isolated delegated child exited nonzero before finalizing: code={int(returncode)}",
+        priority=priority,
+        limit=1,
+        force_resumable=True,
+    )
+
+
+def _isolated_timeout_requeue_priority(queue: DelegatedJobQueue) -> int | None:
+    priorities: list[int] = []
+    for job in queue.list_jobs(states={"queued", "in_progress"}):
+        try:
+            priorities.append(int(getattr(job, "priority", 0)))
+        except (TypeError, ValueError):
+            priorities.append(0)
+    if not priorities:
+        return None
+    return min(priorities) - 100
+
+
+def _isolated_timeout_terminal_candidate(
+    queue: DelegatedJobQueue,
+    *,
+    timeout_requeue_limit: int = 3,
+) -> object | None:
+    limit = max(1, int(timeout_requeue_limit))
+    candidates = sorted(
+        queue.list_jobs(states={"in_progress"}),
+        key=lambda job: (-_scheduler_timeout_requeue_count(job), str(getattr(job, "job_id", ""))),
+    )
+    for job in candidates:
+        if _scheduler_timeout_requeue_count(job) + 1 >= limit:
+            return job
+    return None
+
+
+def _write_isolated_timeout_terminal_artifacts(
+    queue: DelegatedJobQueue,
+    job: object,
+    *,
+    timeout_reason: str,
+) -> tuple[Path, Path]:
+    safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(getattr(job, "job_id", "job")).strip() or "job")
+    checkpoint_path_text = str(getattr(job, "checkpoint_path", "")).strip()
+    checkpoint_path = Path(checkpoint_path_text) if checkpoint_path_text else Path()
+    if not checkpoint_path_text:
+        checkpoint_path = queue.queue_path.parent / "checkpoints" / f"{safe_job_id}_isolated_timeout.json"
+    report_path_text = str(getattr(job, "report_path", "")).strip()
+    report_path = Path(report_path_text) if report_path_text else Path()
+    if not report_path_text:
+        report_path = queue.queue_path.parent / "reports" / f"job_report_{safe_job_id}_isolated_timeout.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    prior_checkpoint = _load_json_payload(checkpoint_path)
+    prior_report = _load_json_payload(report_path)
+    progress_path = checkpoint_path.with_name(checkpoint_path.name.replace(".json", ".progress.json"))
+    progress_payload = _load_json_payload(progress_path)
+    prior_history = prior_checkpoint.get("history", prior_report.get("history", []))
+    if not isinstance(prior_history, list):
+        prior_history = []
+    prior_policy_trace = prior_report.get("policy_trace", [])
+    if not isinstance(prior_policy_trace, list):
+        prior_policy_trace = []
+    if not prior_policy_trace:
+        prior_policy_trace = [
+            {
+                "index": step.get("index"),
+                "decision_source": step.get("decision_source"),
+                "action": step.get("action"),
+                "verification_passed": (step.get("verification") or {}).get("passed")
+                if isinstance(step.get("verification"), dict)
+                else None,
+                "proposal_metadata": step.get("proposal_metadata", {})
+                if isinstance(step.get("proposal_metadata", {}), dict)
+                else {},
+            }
+            for step in prior_history
+            if isinstance(step, dict)
+        ]
+    last_decision_source = "isolated_timeout_guard"
+    if prior_history and isinstance(prior_history[-1], dict):
+        last_decision_source = str(prior_history[-1].get("decision_source", "")).strip() or last_decision_source
+    checkpoint_payload = {
+        **prior_checkpoint,
+        "status": "safe_stop",
+        "success": False,
+        "termination_reason": "isolated_timeout_requeue_limit",
+        "timeout_reason": timeout_reason,
+        "task_id": str(getattr(job, "task_id", "")).strip(),
+        "history": prior_history,
+        "isolated_timeout_progress": progress_payload,
+    }
+    report_payload = {
+        **prior_report,
+        "report_kind": "unattended_task_report",
+        "task_id": str(getattr(job, "task_id", "")).strip(),
+        "success": False,
+        "outcome": "safe_stop",
+        "outcome_reasons": ["isolated_timeout_requeue_limit", timeout_reason],
+        "termination_reason": "isolated_timeout_requeue_limit",
+        "history": prior_history,
+        "policy_trace": prior_policy_trace,
+        "isolated_timeout_progress": progress_payload,
+        "artifact_contract_failure": {
+            "kind": "artifact_contract_failure",
+            "mode": "artifact_isolated_timeout_requeue_limit",
+            "repairable": True,
+            "last_decision_source": last_decision_source,
+            "evidence": [timeout_reason],
+        },
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return checkpoint_path, report_path
+
+
+def _isolated_timeout_reason(
+    *,
+    now: float,
+    started_at: float,
+    last_activity_at: float,
+    timeout_seconds: int,
+) -> str:
+    timeout = max(1, int(timeout_seconds))
+    if now - started_at >= timeout:
+        return f"wall_time_exceeded:{timeout}s"
+    if now - last_activity_at >= timeout:
+        return f"no_progress:{timeout}s"
+    return ""
+
+
+def _terminate_isolated_child(child: subprocess.Popen, *, force: bool = False) -> None:
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.killpg(child.pid, sig)
+        return
+    except OSError:
+        pass
+    if force:
+        child.kill()
+    else:
+        child.terminate()
+
+
+def _latest_active_job_progress_mtime(queue: DelegatedJobQueue) -> float | None:
+    latest: float | None = None
+    for job in queue.list_jobs(states={"in_progress"}):
+        raw_checkpoint_path = str(getattr(job, "checkpoint_path", "") or "").strip()
+        if not raw_checkpoint_path:
+            continue
+        checkpoint_path = Path(raw_checkpoint_path)
+        if not checkpoint_path.name:
+            continue
+        progress_path = checkpoint_path.with_name(f"{checkpoint_path.stem}.progress.json")
+        try:
+            mtime = progress_path.stat().st_mtime
+        except OSError:
+            continue
+        if latest is None or mtime > latest:
+            latest = mtime
+    return latest
 
 
 def _job_payload(job: object, readiness: dict[str, object]) -> dict[str, object]:
@@ -772,7 +1084,8 @@ def _runtime_overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
 def _apply_base_config_overrides(config: KernelConfig, args: argparse.Namespace) -> None:
     overrides = _runtime_overrides_from_args(args)
     for field, value in overrides.items():
-        setattr(config, field, value)
+        if hasattr(config, field):
+            setattr(config, field, value)
     if getattr(args, "max_concurrency", None) is not None:
         config.delegated_job_max_concurrency = max(1, int(args.max_concurrency))
     if getattr(args, "max_active_per_budget_group", None) is not None:
@@ -869,6 +1182,7 @@ def _build_parser() -> argparse.ArgumentParser:
     retry_terminal.add_argument("--reason", default="retrying terminal jobs after kernel hardening")
     retry_terminal.add_argument("--priority", type=int, default=None)
     retry_terminal.add_argument("--limit", type=int, default=0)
+    retry_terminal.add_argument("--force-policy-retry", choices=("0", "1"), default="0")
     retry_terminal.add_argument("--json", action="store_true")
 
     next_runnable = subparsers.add_parser("next-runnable")
@@ -892,6 +1206,7 @@ def _build_parser() -> argparse.ArgumentParser:
     drain = subparsers.add_parser("drain")
     drain.add_argument("--limit", type=int, default=0)
     drain.add_argument("--enforce-preflight", choices=("0", "1"), default="1")
+    drain.add_argument("--job-timeout-seconds", type=int, default=0)
     _add_runtime_override_args(drain)
     _add_governance_args(drain)
     return parser
@@ -1077,6 +1392,7 @@ def main() -> None:
             reason=str(getattr(args, "reason", "")).strip() or "retrying terminal jobs",
             priority=getattr(args, "priority", None),
             limit=max(0, int(getattr(args, "limit", 0) or 0)),
+            force_policy_retry=str(getattr(args, "force_policy_retry", "0")) == "1",
         )
         if getattr(args, "json", False):
             print(
@@ -1791,7 +2107,19 @@ def main() -> None:
         if job is None:
             print("queue=empty")
             return
-        print(f"job_id={job.job_id} state={job.state} task_id={job.task_id} outcome={job.outcome}")
+        detail = str(getattr(job, "last_error", "") or "").strip()
+        suffix = f" detail={detail}" if detail else ""
+        print(f"job_id={job.job_id} state={job.state} task_id={job.task_id} outcome={job.outcome}{suffix}")
+        return
+
+    isolated_timeout = max(0, int(getattr(args, "job_timeout_seconds", 0) or 0))
+    if isolated_timeout > 0:
+        drained_count = _drain_delegated_jobs_isolated(
+            queue=queue,
+            args=args,
+            script_path=Path(__file__).resolve(),
+        )
+        print(f"drained={drained_count}")
         return
 
     drained = drain_delegated_jobs(
