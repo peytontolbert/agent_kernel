@@ -33,10 +33,10 @@ The current kernel is already beyond a toy seed-task loop. It now has:
 - a verifier-driven task runtime in [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py)
 - an unattended outer loop in [`scripts/run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py)
 - retained-vs-candidate improvement flow in [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py)
-- trust and family-breadth accounting in [`agent_kernel/trust.py`](/data/agentkernel/agent_kernel/trust.py)
+- trust and family-breadth accounting in [`agent_kernel/extensions/trust.py`](/data/agentkernel/agent_kernel/extensions/trust.py)
 - bounded structured editing plus syntax-motor support in
   [`agent_kernel/modeling/policy/decoder.py`](/data/agentkernel/agent_kernel/modeling/policy/decoder.py)
-  and [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py)
+  and [`agent_kernel/extensions/syntax_motor.py`](/data/agentkernel/agent_kernel/extensions/syntax_motor.py)
 
 The blocker is not "the runtime cannot do coding at all." The blocker is that the system still does
 not convert unattended work into broad, child-native, repeatable coding gains with counted external
@@ -126,9 +126,9 @@ Why this is AGI-critical:
 
 Primary surfaces:
 
-- [`agent_kernel/trust.py`](/data/agentkernel/agent_kernel/trust.py)
-- [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py)
-- [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py)
+- [`agent_kernel/extensions/trust.py`](/data/agentkernel/agent_kernel/extensions/trust.py)
+- [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py)
+- [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py)
 - [`scripts/run_supervisor_loop.py`](/data/agentkernel/scripts/run_supervisor_loop.py)
 - [`scripts/run_autonomous_compounding_check.py`](/data/agentkernel/scripts/run_autonomous_compounding_check.py)
 
@@ -261,10 +261,10 @@ Why this is AGI-critical:
 
 Primary surfaces:
 
-- [`agent_kernel/retrieval_improvement.py`](/data/agentkernel/agent_kernel/retrieval_improvement.py)
+- [`agent_kernel/extensions/improvement/retrieval_improvement.py`](/data/agentkernel/agent_kernel/extensions/improvement/retrieval_improvement.py)
 - [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py)
-- [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
-- [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+- [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
+- [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py)
 - [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py)
 
 What the live evidence says:
@@ -296,7 +296,7 @@ Primary surfaces:
 - [`agent_kernel/state.py`](/data/agentkernel/agent_kernel/state.py)
 - [`agent_kernel/world_model.py`](/data/agentkernel/agent_kernel/world_model.py)
 - [`agent_kernel/modeling/policy/decoder.py`](/data/agentkernel/agent_kernel/modeling/policy/decoder.py)
-- [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py)
+- [`agent_kernel/extensions/syntax_motor.py`](/data/agentkernel/agent_kernel/extensions/syntax_motor.py)
 
 What the live evidence says:
 
@@ -327,11 +327,11 @@ runtime-managed, family-spanning unattended coding yield.
    [`scripts/run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py),
    [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py)
 2. Family-breadth and counted trust:
-   [`agent_kernel/trust.py`](/data/agentkernel/agent_kernel/trust.py),
-   [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py),
+   [`agent_kernel/extensions/trust.py`](/data/agentkernel/agent_kernel/extensions/trust.py),
+   [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py),
    [`scripts/run_supervisor_loop.py`](/data/agentkernel/scripts/run_supervisor_loop.py)
 3. Retrieval carryover into trusted repair:
-   [`agent_kernel/retrieval_improvement.py`](/data/agentkernel/agent_kernel/retrieval_improvement.py),
+   [`agent_kernel/extensions/improvement/retrieval_improvement.py`](/data/agentkernel/agent_kernel/extensions/improvement/retrieval_improvement.py),
    [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py)
 4. Long-horizon repo execution quality:
    [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py),

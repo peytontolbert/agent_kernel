@@ -355,3 +355,16 @@ Without those, the campaign can improve:
 But it cannot honestly optimize for `A8`.
 
 It can only optimize the current closure harness.
+
+These are minimum inputs for A8-oriented work, not an A8 crossing threshold. A real `A8` claim
+requires sustained superhuman coding evidence: repeated windows, strong-human baseline comparison,
+large enough task volume, broad unfamiliar-domain transfer, long-horizon transfer, low regression,
+and recursive compounding that survives retained-baseline checks over time.
+
+The current target benchmark anchors are:
+
+- Codeforces-equivalent rating at or above `3000`
+- MLE-bench gold-level performance
+- strong SWE-bench Verified resolve rate
+- strong SWE-Rebench resolve rate on fresh issues
+- RE-Bench win evidence against human experts

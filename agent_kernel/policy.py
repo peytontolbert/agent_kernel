@@ -2197,6 +2197,28 @@ class LLMDecisionPolicy(Policy):
                 )
                 if invalid_python_context is not None:
                     return invalid_python_context
+        if rejected_retry_reason == "artifact_path_as_source":
+            source_path_repair_command = self._artifact_rewrite_artifact_source_builder_command(
+                state,
+                proposed_content,
+                artifact_path=artifact_path,
+                artifact_repair_context=artifact_repair_context,
+            )
+            if source_path_repair_command:
+                return ActionDecision(
+                    thought=(
+                        "Repair an artifact builder handoff that used the output artifact as the source path."
+                    ),
+                    action=CODE_EXECUTE,
+                    content=source_path_repair_command,
+                    done=False,
+                    decision_source="artifact_source_path_rewrite_direct",
+                    proposal_metadata={
+                        "artifact_source_path_rewrite_direct": True,
+                        "rejected_command": proposed_content,
+                        "rejected_reason": rejected_retry_reason,
+                    },
+                )
         if rejected_retry_reason == "duplicate_existing_context_replacement":
             duplicate_context = self._artifact_duplicate_existing_context_read_decision(
                 state,
@@ -6513,6 +6535,75 @@ class LLMDecisionPolicy(Policy):
                         "retry_command": last_retry_command,
                         "retry_rejected_reason": last_retry_rejected_reason,
                         "artifact_candidate_path": path,
+                        "excluded_candidate_lines": sorted(excluded_candidate_lines)[:48],
+                    },
+                )
+            fallback_records = [
+                record
+                for record in candidate_records
+                if isinstance(record, dict)
+                and str(record.get("path", path)).strip().strip("/") == str(path).strip().strip("/")
+            ]
+            fallback_lines: list[int] = []
+            for record in fallback_records:
+                raw_line = record.get("line")
+                try:
+                    line_number = int(raw_line)
+                except (TypeError, ValueError):
+                    continue
+                if line_number in excluded_candidate_lines or line_number in fallback_lines:
+                    continue
+                fallback_lines.append(line_number)
+            if not fallback_lines:
+                for raw_line in valid_line_numbers:
+                    try:
+                        line_number = int(raw_line)
+                    except (TypeError, ValueError):
+                        continue
+                    if line_number in excluded_candidate_lines or line_number in fallback_lines:
+                        continue
+                    fallback_lines.append(line_number)
+            if fallback_lines:
+                context = {
+                    "mode": "source_path_alias_repair",
+                    "artifact_path": artifact_path,
+                    "builder_command": builder_command,
+                    "source_path": path,
+                    "invalid_prior_command": str(last_retry_command)[:900],
+                    "rejection": "artifact_path_as_source",
+                    "allowed_body_line_numbers": fallback_lines[:12],
+                    "candidate_edit_records": [
+                        self._artifact_virtual_candidate_context_record(record)
+                        for record in fallback_records[:12]
+                        if isinstance(record, dict)
+                    ],
+                    "required_next_action": (
+                        "The prior command used the output artifact as --path. Emit one builder command with "
+                        "the source_path shown here. Do not use patch.diff as --path. Choose one allowed body "
+                        "line or one contiguous source range from candidate_edit_records."
+                    ),
+                    "valid_command_shapes": [
+                        f"{builder_command} --path {path} --replace-line <allowed_line> --with '<changed executable source line>' > {artifact_path}",
+                        f"{builder_command} --path {path} --replace-lines <allowed_start> <end> --with '<changed executable source line 1>' [--with '<changed executable source line 2>' ...] > {artifact_path}",
+                    ],
+                }
+                return ActionDecision(
+                    thought="Recover from patch-builder source path aliasing with existing source candidate anchors.",
+                    action=CODE_EXECUTE,
+                    content=self._artifact_virtual_context_noop_command(json.dumps(context, indent=2, sort_keys=True)),
+                    done=False,
+                    decision_source="artifact_source_path_alias_escape_context_read",
+                    proposal_metadata={
+                        "artifact_source_path_alias_escape_context_read": True,
+                        "artifact_placeholder_candidate_retry": True,
+                        "artifact_placeholder_candidate_attempts": max_candidate_attempts,
+                        "artifact_materialization_retry_attempt": retry_attempt,
+                        "rejected_command": effective_rejected_command,
+                        "rejected_reason": effective_rejected_reason,
+                        "retry_command": last_retry_command,
+                        "retry_rejected_reason": last_retry_rejected_reason,
+                        "artifact_candidate_path": path,
+                        "allowed_body_line_numbers": fallback_lines[:12],
                         "excluded_candidate_lines": sorted(excluded_candidate_lines)[:48],
                     },
                 )
@@ -20716,6 +20807,59 @@ class LLMDecisionPolicy(Policy):
         if LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, candidate):
             return ""
         return candidate
+
+    @staticmethod
+    def _artifact_rewrite_artifact_source_builder_command(
+        state: AgentState,
+        command: str,
+        *,
+        artifact_path: str,
+        artifact_repair_context: dict[str, object],
+    ) -> str:
+        spec = LLMDecisionPolicy._artifact_builder_command_spec(state, command, require_redirect=True)
+        if spec is None:
+            return ""
+        if not LLMDecisionPolicy._artifact_builder_uses_artifact_as_source(state, command):
+            return ""
+        builder = str(spec.get("builder") or "patch_builder").strip() or "patch_builder"
+        candidate_paths: list[str] = []
+        preferred_path = str(artifact_repair_context.get("preferred_source_path", "")).strip().strip("/")
+        if preferred_path:
+            candidate_paths.append(preferred_path)
+        allowed_paths = artifact_repair_context.get("allowed_source_paths", [])
+        if isinstance(allowed_paths, list):
+            candidate_paths.extend(str(path).strip().strip("/") for path in allowed_paths if str(path).strip())
+        candidate_paths.extend(LLMDecisionPolicy._artifact_source_context_by_path(state).keys())
+
+        seen_paths: set[str] = set()
+        operations = list(spec.get("operations", []) or [])
+        if not operations:
+            return ""
+        for path in candidate_paths:
+            if not path or path in seen_paths or path == str(artifact_path).strip().strip("/"):
+                continue
+            seen_paths.add(path)
+            command_parts = [f"{builder} --path {shlex.quote(path)}"]
+            for start_line, end_line, replacement_lines in operations:
+                try:
+                    start = int(start_line)
+                    end = int(end_line)
+                except (TypeError, ValueError):
+                    return ""
+                if start == end:
+                    command_parts.append(f"--replace-line {start}")
+                else:
+                    command_parts.append(f"--replace-lines {start} {end}")
+                expanded_lines = LLMDecisionPolicy._artifact_expanded_replacement_lines(replacement_lines)
+                if not expanded_lines:
+                    return ""
+                command_parts.extend(f"--with {shlex.quote(str(line))}" for line in expanded_lines)
+            candidate = " ".join(command_parts) + f" > {artifact_path}"
+            if _canonicalize_command(candidate) in state.all_failed_command_signatures():
+                continue
+            if not LLMDecisionPolicy._artifact_builder_guard_rejection_reason(state, candidate):
+                return candidate
+        return ""
 
     @staticmethod
     def _artifact_escaped_newline_split_rejected_context_read_decision(

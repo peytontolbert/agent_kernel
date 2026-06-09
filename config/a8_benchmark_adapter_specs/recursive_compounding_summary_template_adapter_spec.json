@@ -1,0 +1,45 @@
+{
+  "benchmark": "recursive_compounding",
+  "created_at": "2026-04-27T22:26:36.726839+00:00",
+  "metrics": {
+    "retained_gain_runs": {
+      "aliases": [
+        "retained_gain_runs",
+        "retained_runs",
+        "metrics.retained_gain_runs",
+        "metrics.retained_runs"
+      ],
+      "minimum": 0,
+      "required": true,
+      "type": "integer"
+    },
+    "verified_recursive_compounding": {
+      "aliases": [
+        "verified_recursive_compounding",
+        "metrics.verified_recursive_compounding",
+        "recursive_compounding_verified",
+        "metrics.recursive_compounding_verified"
+      ],
+      "must_be_true": true,
+      "required": true,
+      "type": "bool"
+    },
+    "window_count": {
+      "aliases": [
+        "window_count",
+        "windows",
+        "metrics.window_count",
+        "metrics.windows"
+      ],
+      "minimum": 0,
+      "required": true,
+      "type": "integer"
+    }
+  },
+  "open_limits": [
+    "This adapter spec maps an already-produced benchmark summary into an A8 result packet.",
+    "It does not execute the benchmark and does not make summary values trustworthy by itself."
+  ],
+  "report_kind": "a8_benchmark_adapter_spec",
+  "spec_version": "asi_v1"
+}

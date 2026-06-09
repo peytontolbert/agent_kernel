@@ -1,0 +1,60 @@
+{
+  "adapter": {
+    "adapter_spec_json": "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json",
+    "conservative_comparison_report": true,
+    "output_packet_json": "/data/agentkernel/benchmarks/swe_bench_live/leaderboard_result_verified.json",
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/swe_bench_live/summary_verified.json"
+  },
+  "benchmark": "swe_bench_live",
+  "benchmark_role": "standalone_leaderboard",
+  "open_limits": [
+    "This is standalone online leaderboard evidence for the Agent Kernel plus model combo, not A8 lane evidence.",
+    "This run is locally runnable after dataset, evaluator, and repo-cache preflight; it is not leaderboard evidence until the official evaluator and submission package complete.",
+    "Leaderboard rank is claimed only after submitting the generated preds.json/results.json/README.md through the official SWE-bench Live submission PR process."
+  ],
+  "ready_to_run": true,
+  "report_kind": "standalone_benchmark_run_spec",
+  "runner": {
+    "agent_kernel_runtime_env": {
+      "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_CANDIDATE_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v28_train_select_fullgate_v9/agentkernel_controller_manifest.json",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v64_source_1536_from_v63/agentkernel_controller_manifest.json",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "guarded",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE_PATH": "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json",
+      "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+      "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "1"
+    },
+    "artifact_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard",
+    "cache_level": "env",
+    "dataset_json": "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+    "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+    "drain_limit": 0,
+    "fetch_repo_cache": false,
+    "harness_root": "/data/agentkernel/other_repos/SWE-bench-Live",
+    "kind": "swebench_live_autonomous_queue",
+    "max_workers": 4,
+    "model_name_or_path": "Qwen/Qwen3.5-9B",
+    "namespace": "swebench_live",
+    "platform": "linux",
+    "predictions_patch_json": "/data/agentkernel/benchmarks/predictions/swe_bench_live_verified_preds.json",
+    "predictions_path": "/data/agentkernel/benchmarks/predictions/swe_bench_live_verified_predictions.jsonl",
+    "prepare_repo_cache": true,
+    "provider": "vllm",
+    "repo_cache_manifest_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/repo_cache_agentkernel_swe_bench_live_verified_leaderboard.json",
+    "repo_cache_root": "/data/agentkernel/benchmarks/repo_cache",
+    "report_dir": "/data/agentkernel/benchmarks/swe_bench_live/evaluation_results_verified",
+    "results_json": "/data/agentkernel/benchmarks/swe_bench_live/evaluation_results_verified/results.json",
+    "run_id": "agentkernel_swe_bench_live_verified_leaderboard",
+    "split": "verified",
+    "submission_dir": "/data/agentkernel/benchmarks/swe_bench_live/submissions/verified/agentkernel",
+    "submission_subset": "verified",
+    "system_name": "Agent Kernel",
+    "timeout": 1800
+  },
+  "spec_version": "asi_v1"
+}

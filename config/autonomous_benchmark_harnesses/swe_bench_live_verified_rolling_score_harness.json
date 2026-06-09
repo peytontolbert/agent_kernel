@@ -1,0 +1,203 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomous_benchmark_harness_spec",
+  "benchmark": "swe_bench_live",
+  "created_at": "2026-04-29T18:00:00+00:00",
+  "autonomy_contract": {
+    "operator_role": "launch_and_monitor_only",
+    "selection_mode": "completed_patch_jobs_subset",
+    "kernel_owned_phases": [
+      "verify_completed_patch_jobs",
+      "collect_completed_predictions",
+      "build_completed_live_predictions_json",
+      "clear_previous_subset_results",
+      "official_subset_harness",
+      "summarize_subset_results"
+    ],
+    "prohibited_manual_interventions": [
+      "manual per-instance patch authoring",
+      "manual prediction JSON editing",
+      "claiming rolling subset score as final leaderboard score"
+    ],
+    "countable_evidence": [
+      "official SWE-bench Live evaluator results for completed first-pass subset",
+      "rolling subset score clearly separated from final leaderboard score"
+    ]
+  },
+  "inputs": {
+    "source_harness_log": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/harness_swe_bench_live_verified_leaderboard_log.json",
+    "source_queue_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_agentkernel_swe_bench_live_verified_leaderboard/queue.json",
+    "source_queue_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_manifest_agentkernel_swe_bench_live_verified_leaderboard.json",
+    "source_prediction_task_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/prediction_tasks_agentkernel_swe_bench_live_verified_leaderboard.json",
+    "workspace_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+    "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+    "split": "verified",
+    "platform": "linux"
+  },
+  "run_config": {
+    "run_id": "agentkernel_swe_bench_live_verified_rolling_first_pass_latest",
+    "harness_root": "/data/agentkernel/other_repos/SWE-bench-Live",
+    "workers": 2,
+    "overwrite": 1,
+    "score_kind": "first_pass_completed_subset"
+  },
+  "artifacts": {
+    "rolling_root": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest",
+    "patch_job_verification_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/patch_jobs_verification.json",
+    "predictions_jsonl": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/predictions.jsonl",
+    "predictions_patch_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json",
+    "report_dir": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results",
+    "results_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results/results.json",
+    "summary_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/summary.json"
+  },
+  "phases": [
+    {
+      "name": "verify_completed_patch_jobs",
+      "kind": "command",
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/verify_swe_bench_patch_jobs.py",
+        "--queue-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_agentkernel_swe_bench_live_verified_leaderboard/queue.json",
+        "--queue-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_manifest_agentkernel_swe_bench_live_verified_leaderboard.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/patch_jobs_verification.json",
+        "--allow-nonterminal",
+        "--completed-only",
+        "--completed-after",
+        "2026-04-29T23:05:36+00:00"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_agentkernel_swe_bench_live_verified_leaderboard/queue.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_manifest_agentkernel_swe_bench_live_verified_leaderboard.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/patch_jobs_verification.json"
+      ],
+      "gate": "completed successful patch jobs are selected; queued/in-progress jobs are skipped"
+    },
+    {
+      "name": "collect_completed_predictions",
+      "kind": "command",
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/collect_swe_bench_predictions.py",
+        "--prediction-task-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/prediction_tasks_agentkernel_swe_bench_live_verified_leaderboard.json",
+        "--queue-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_manifest_agentkernel_swe_bench_live_verified_leaderboard.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+        "--output-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/predictions.jsonl",
+        "--patch-job-verification-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/patch_jobs_verification.json",
+        "--exclude-abstained"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/prediction_tasks_agentkernel_swe_bench_live_verified_leaderboard.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/queue_manifest_agentkernel_swe_bench_live_verified_leaderboard.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/patch_jobs_verification.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/predictions.jsonl"
+      ]
+    },
+    {
+      "name": "build_completed_live_predictions_json",
+      "kind": "command",
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_live_submission.py",
+        "preds",
+        "--predictions-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/predictions.jsonl",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/predictions.jsonl"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json"
+      ]
+    },
+    {
+      "name": "clear_previous_subset_results",
+      "kind": "command",
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/clear_benchmark_output_dir.py",
+        "--directory",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results",
+        "--require-under",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results"
+      ],
+      "gate": "remove stale rolling evaluator outputs before official subset scoring"
+    },
+    {
+      "name": "official_subset_harness",
+      "kind": "command",
+      "cwd": "/data/agentkernel/other_repos/SWE-bench-Live",
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "-m",
+        "evaluation.evaluation",
+        "--dataset",
+        "SWE-bench-Live/SWE-bench-Live",
+        "--split",
+        "verified",
+        "--platform",
+        "linux",
+        "--patch_dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json",
+        "--output_dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results",
+        "--workers",
+        "2",
+        "--overwrite",
+        "1"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/preds.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results/results.json"
+      ],
+      "gate": "official SWE-bench Live evaluator scores only currently completed predictions"
+    },
+    {
+      "name": "summarize_subset_results",
+      "kind": "command",
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_a8_run.py",
+        "summarize",
+        "--results-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results/results.json",
+        "--output-summary-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/summary.json"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/evaluation_results/results.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/first_pass_latest/summary.json"
+      ]
+    }
+  ],
+  "open_limits": [
+    "This rolling score evaluates completed first-pass patch jobs only; it is not the final SWE-bench Live leaderboard score.",
+    "Queued or in-progress tasks are skipped from the denominator until they have completed patch artifacts.",
+    "Final leaderboard score still comes from the full standalone harness output and submission packet."
+  ]
+}

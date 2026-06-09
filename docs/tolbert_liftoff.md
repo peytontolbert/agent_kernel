@@ -32,7 +32,7 @@ Planned package boundary:
 - [`agent_kernel/modeling/ssm/`](/data/agentkernel/agent_kernel/modeling/ssm): selective-scan and state-space modeling primitives for improved hybrid-runtime work
 - [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py): task execution loop
 - [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py): runtime routing between model capabilities and fallbacks
-- [`agent_kernel/preflight.py`](/data/agentkernel/agent_kernel/preflight.py): trust and safety gates
+- [`agent_kernel/ops/preflight.py`](/data/agentkernel/agent_kernel/ops/preflight.py): trust and safety gates
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py): retain/reject lifecycle for runtime artifacts
 
 The rule is:
@@ -45,10 +45,10 @@ The rule is:
 
 Today the repo already has the seed of this architecture:
 
-- the seed TOLBERT service compiles a strict `ContextPacket` in [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+- the seed TOLBERT service compiles a strict `ContextPacket` in [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py)
 - the runtime orders TOLBERT before policy decoding in [`docs/architecture.md`](/data/agentkernel/docs/architecture.md)
-- retained retrieval assets already materialize a TOLBERT runtime bundle in [`agent_kernel/tolbert_assets.py`](/data/agentkernel/agent_kernel/tolbert_assets.py)
-- the retained-artifact loop already decides whether runtime changes should survive in [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py)
+- retained retrieval assets already materialize a TOLBERT runtime bundle in [`agent_kernel/extensions/tolbert_assets.py`](/data/agentkernel/agent_kernel/extensions/tolbert_assets.py)
+- the retained-artifact loop already decides whether runtime changes should survive in [`agent_kernel/extensions/strategy/subsystems.py`](/data/agentkernel/agent_kernel/extensions/strategy/subsystems.py)
 - the first internal hybrid latent/runtime path now lives in [`agent_kernel/modeling/tolbert/`](/data/agentkernel/agent_kernel/modeling/tolbert)
 
 That is enough to support staged expansion without inventing a second architecture.

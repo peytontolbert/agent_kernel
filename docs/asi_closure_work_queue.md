@@ -122,7 +122,7 @@ One of them also failed on:
 Primary code surfaces:
 
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py)
-- [`agent_kernel/tolbert_model_improvement.py`](/data/agentkernel/agent_kernel/tolbert_model_improvement.py)
+- [`agent_kernel/extensions/improvement/tolbert_model_improvement.py`](/data/agentkernel/agent_kernel/extensions/improvement/tolbert_model_improvement.py)
 - [`agent_kernel/modeling/tolbert/runtime.py`](/data/agentkernel/agent_kernel/modeling/tolbert/runtime.py)
 
 ### 4. Counted Trust-Breadth Gap
@@ -256,7 +256,7 @@ Stage 1 is the shortest path to closing the exact failures surfaced by the `2026
   measurable routing plus retrieval-influence evidence
 - owned_paths:
   - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py)
-  - [`agent_kernel/tolbert_model_improvement.py`](/data/agentkernel/agent_kernel/tolbert_model_improvement.py)
+  - [`agent_kernel/extensions/improvement/tolbert_model_improvement.py`](/data/agentkernel/agent_kernel/extensions/improvement/tolbert_model_improvement.py)
   - [`agent_kernel/modeling/tolbert/runtime.py`](/data/agentkernel/agent_kernel/modeling/tolbert/runtime.py)
   - [`tests/test_improvement.py`](/data/agentkernel/tests/test_improvement.py)
   - [`tests/test_liftoff.py`](/data/agentkernel/tests/test_liftoff.py)

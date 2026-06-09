@@ -1,0 +1,514 @@
+{
+  "artifacts": {
+    "apply_check_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513_apply_check.json",
+    "output_packet_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/a8_benchmark_result.json",
+    "patch_dir": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/patches_official_score_feedback_r5_20260513",
+    "patch_jobs_verification_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/patch_jobs_verification.json",
+    "prediction_task_manifest": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+    "prediction_task_progress_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_task_progress_agentkernel_swe_bench_live_official_score_feedback_r5_20260513.json",
+    "predictions_jsonl": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+    "queue_manifest": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+    "queue_root": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513",
+    "report_dir": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513",
+    "results_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json",
+    "run_spec_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/a8_run_spec_official_score_feedback_r5_20260513.json",
+    "summary_json": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json",
+    "workspace_prefix": "swe_patch_agentkernel_swe_bench_live_verif_official_score_feedback_r5_20260513_9e1d1f9ba813",
+    "workspace_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces"
+  },
+  "autonomy_contract": {
+    "countable_evidence": [
+      "official SWE harness resolved_instances/resolved_ids",
+      "verified a8_benchmark_result packet"
+    ],
+    "kernel_owned_phases": [
+      "prepare_prediction_tasks",
+      "prepare_queue_manifest",
+      "enqueue_patch_jobs",
+      "drain_patch_jobs",
+      "verify_patch_jobs",
+      "collect_predictions",
+      "repo_cache_apply_check",
+      "build_run_spec",
+      "official_harness",
+      "materialize_results",
+      "summarize_results",
+      "adapt_a8_packet"
+    ],
+    "operator_role": "launch_and_monitor_only",
+    "prohibited_manual_interventions": [
+      "manual per-instance patch authoring",
+      "manual prediction JSONL editing",
+      "new per-instance queue hook edits during the run",
+      "claiming local apply-checks as official benchmark results"
+    ],
+    "selection_mode": "operator_selected_instance_ids"
+  },
+  "benchmark": "swe_bench_live",
+  "created_at": "2026-05-13T01:47:48.168168+00:00",
+  "inputs": {
+    "dataset_json": "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+    "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+    "instance_ids": [
+      "pvlib__pvlib-python-2190",
+      "python-babel__babel-1131",
+      "pvlib__pvlib-python-2249",
+      "pytorch__torchtune-1697"
+    ],
+    "limit": 0,
+    "max_source_context_bytes": 30000,
+    "repo_cache_root": "/data/agentkernel/benchmarks/repo_cache",
+    "split": "verified"
+  },
+  "open_limits": [
+    "This retry harness was generated from failed SWE patch-job verifier output; it retries only retry_instance_ids.",
+    "This is selected-slice or limited-run evidence, not full benchmark evidence.",
+    "The harness is A8 evidence only after the official SWE harness completes and the adapter packet verifies.",
+    "Repo-cache apply-check and patch-generation success are not benchmark scores.",
+    "Do not add per-instance queue hooks or manually edit predictions after this harness starts."
+  ],
+  "phases": [
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_prediction_tasks.py",
+        "--dataset-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "--output-manifest-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+        "--output-patch-dir",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/patches_official_score_feedback_r5_20260513",
+        "--model-name-or-path",
+        "Qwen/Qwen3.5-9B",
+        "--repo-cache-root",
+        "/data/agentkernel/benchmarks/repo_cache",
+        "--max-source-context-bytes",
+        "30000",
+        "--progress-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_task_progress_agentkernel_swe_bench_live_official_score_feedback_r5_20260513.json",
+        "--instance-ids",
+        "pvlib__pvlib-python-2190",
+        "python-babel__babel-1131",
+        "pvlib__pvlib-python-2249",
+        "pytorch__torchtune-1697",
+        "--official-feedback-json",
+        "benchmarks/swe_bench_live/rolling_score/official_score_feedback_r4b_latest/official_retry_report_from_r4b.json"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_task_progress_agentkernel_swe_bench_live_official_score_feedback_r5_20260513.json"
+      ],
+      "kind": "command",
+      "name": "prepare_prediction_tasks",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "/data/agentkernel/benchmarks/repo_cache"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_queue_manifest.py",
+        "--prediction-task-manifest",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+        "--output-manifest-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+        "--workspace-prefix",
+        "swe_patch_agentkernel_swe_bench_live_verif_official_score_feedback_r5_20260513_9e1d1f9ba813"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json"
+      ],
+      "kind": "command",
+      "name": "prepare_queue_manifest",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/run_job_queue.py",
+        "enqueue-manifest",
+        "--manifest-path",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+        "--limit",
+        "0",
+        "--priority-start",
+        "100",
+        "--budget-group",
+        "swe_bench_live_agentkernel_swe_bench_live_official_score_feedback_r5_20260513",
+        "--max-queued-per-budget-group",
+        "12",
+        "--skip-existing-task-ids",
+        "--json"
+      ],
+      "env": {
+        "AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS": "2",
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json",
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/runtime_state.json",
+        "AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR": "12",
+        "AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS": "75",
+        "AGENT_KERNEL_LLM_HTTP_TRANSPORT": "curl",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_CANDIDATE_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v28_train_select_fullgate_v9/agentkernel_controller_manifest.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v64_source_1536_from_v63/agentkernel_controller_manifest.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "guarded",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE_PATH": "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/agentkernel.sqlite3",
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/checkpoints",
+        "AGENT_KERNEL_RUN_REPORTS_DIR": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/reports",
+        "AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS": "1000",
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS": "0",
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "1",
+        "AGENT_KERNEL_WORKSPACE_ROOT": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces"
+      },
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json"
+      ],
+      "kind": "command",
+      "name": "enqueue_patch_jobs",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/run_job_queue.py",
+        "drain",
+        "--limit",
+        "12",
+        "--job-timeout-seconds",
+        "240",
+        "--provider",
+        "vllm",
+        "--model",
+        "Qwen/Qwen3.5-9B",
+        "--enforce-preflight",
+        "0",
+        "--use-tolbert-context",
+        "0",
+        "--use-graph-memory",
+        "0",
+        "--use-world-model",
+        "0",
+        "--use-retrieval-proposals",
+        "0",
+        "--use-trust-proposals",
+        "0",
+        "--asi-coding-require-live-llm",
+        "1"
+      ],
+      "env": {
+        "AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS": "2",
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json",
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/runtime_state.json",
+        "AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR": "12",
+        "AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS": "75",
+        "AGENT_KERNEL_LLM_HTTP_TRANSPORT": "curl",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_CANDIDATE_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v28_train_select_fullgate_v9/agentkernel_controller_manifest.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MANIFEST_PATH": "artifacts/agentkernel_controller/seq2seq_controller_v64_source_1536_from_v63/agentkernel_controller_manifest.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "guarded",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SELECTOR_ACTIVATION_GATE_PATH": "trajectories/neural_controller/v64_guarded_rowwise_selector_contract_activation_gate.json",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/agentkernel.sqlite3",
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/checkpoints",
+        "AGENT_KERNEL_RUN_REPORTS_DIR": "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/reports",
+        "AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS": "1000",
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS": "0",
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "1",
+        "AGENT_KERNEL_WORKSPACE_ROOT": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces"
+      },
+      "kind": "command",
+      "name": "drain_patch_jobs",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/verify_swe_bench_patch_jobs.py",
+        "--queue-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json",
+        "--queue-manifest",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+        "--output-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/patch_jobs_verification.json"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/patch_jobs_verification.json"
+      ],
+      "gate": "nonterminal patch jobs must finish; terminal abstentions become no-op predictions",
+      "kind": "command",
+      "name": "verify_patch_jobs",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/collect_swe_bench_predictions.py",
+        "--prediction-task-manifest",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+        "--queue-manifest",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+        "--output-jsonl",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+        "--patch-job-verification-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/patch_jobs_verification.json"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl"
+      ],
+      "kind": "command",
+      "name": "collect_predictions",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/patch_jobs_verification.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/validate_swe_bench_predictions_against_repo_cache.py",
+        "--dataset-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "--predictions-jsonl",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+        "--repo-cache-root",
+        "/data/agentkernel/benchmarks/repo_cache",
+        "--output-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513_apply_check.json",
+        "--instance-ids",
+        "pvlib__pvlib-python-2190",
+        "python-babel__babel-1131",
+        "pvlib__pvlib-python-2249",
+        "pytorch__torchtune-1697"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513_apply_check.json"
+      ],
+      "gate": "all non-empty patches must apply; empty no-op predictions are valid abstentions",
+      "kind": "command",
+      "name": "repo_cache_apply_check",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+        "/data/agentkernel/benchmarks/repo_cache"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_a8_run.py",
+        "spec",
+        "--benchmark",
+        "swe_bench_live",
+        "--dataset-name",
+        "SWE-bench-Live/SWE-bench-Live",
+        "--split",
+        "verified",
+        "--predictions-path",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+        "--run-id",
+        "agentkernel_swe_bench_live_official_score_feedback_r5_20260513",
+        "--max-workers",
+        "4",
+        "--timeout",
+        "1800",
+        "--cache-level",
+        "env",
+        "--namespace",
+        "swebench_live",
+        "--report-dir",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513",
+        "--results-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json",
+        "--summary-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json",
+        "--output-packet-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/a8_benchmark_result.json",
+        "--swe-bench-root",
+        "/data/agentkernel/other_repos/SWE-bench-Live",
+        "--ready-to-run",
+        "auto",
+        "--output-spec-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/a8_run_spec_official_score_feedback_r5_20260513.json",
+        "--instance-ids",
+        "pvlib__pvlib-python-2190",
+        "python-babel__babel-1131",
+        "pvlib__pvlib-python-2249",
+        "pytorch__torchtune-1697"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/a8_run_spec_official_score_feedback_r5_20260513.json"
+      ],
+      "kind": "command",
+      "name": "build_run_spec",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "-m",
+        "swebench.harness.run_evaluation",
+        "--dataset_name",
+        "SWE-bench-Live/SWE-bench-Live",
+        "--split",
+        "verified",
+        "--predictions_path",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl",
+        "--max_workers",
+        "4",
+        "--timeout",
+        "1800",
+        "--cache_level",
+        "env",
+        "--run_id",
+        "agentkernel_swe_bench_live_official_score_feedback_r5_20260513",
+        "--namespace",
+        "swebench_live",
+        "--report_dir",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513",
+        "--instance_ids",
+        "pvlib__pvlib-python-2190",
+        "python-babel__babel-1131",
+        "pvlib__pvlib-python-2249",
+        "pytorch__torchtune-1697"
+      ],
+      "gate": "official SWE-bench harness must complete",
+      "kind": "command",
+      "name": "official_harness",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/predictions_official_score_feedback_r5_20260513.jsonl"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_a8_run.py",
+        "materialize-results",
+        "--run-id",
+        "agentkernel_swe_bench_live_official_score_feedback_r5_20260513",
+        "--namespace",
+        "swebench_live",
+        "--report-dir",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513",
+        "--output-results-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json"
+      ],
+      "kind": "command",
+      "name": "materialize_results"
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/prepare_swe_bench_a8_run.py",
+        "summarize",
+        "--results-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json",
+        "--output-summary-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json"
+      ],
+      "kind": "command",
+      "name": "summarize_results",
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/results.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "swe_bench_live",
+        "--summary-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json",
+        "--output-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/a8_benchmark_result.json",
+        "--conservative-comparison-report"
+      ],
+      "expected_outputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/a8_benchmark_result.json"
+      ],
+      "gate": "adapter verifies a8_benchmark_result packet",
+      "kind": "command",
+      "name": "adapt_a8_packet",
+      "preflight_argv": [
+        "/home/peyton/miniconda3/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "swe_bench_live",
+        "--summary-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json",
+        "--output-json",
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/a8_benchmark_result.json",
+        "--conservative-comparison-report",
+        "--validate-only"
+      ],
+      "required_inputs": [
+        "benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/evaluation_results_official_score_feedback_r5_20260513/summary.json"
+      ]
+    }
+  ],
+  "report_kind": "autonomous_benchmark_harness_spec",
+  "run_config": {
+    "cache_level": "env",
+    "drain_limit": 12,
+    "harness_root": "/data/agentkernel/other_repos/SWE-bench-Live",
+    "live_end_month": "",
+    "live_overwrite": 0,
+    "live_platform": "linux",
+    "live_start_month": "",
+    "live_submission_subset": "verified",
+    "max_workers": 4,
+    "model_name_or_path": "Qwen/Qwen3.5-9B",
+    "namespace": "swebench_live",
+    "official_harness_kind": "swebench",
+    "provider": "vllm",
+    "python_bin": "/home/peyton/miniconda3/bin/python",
+    "queue_max_queued_per_budget_group": 12,
+    "run_id": "agentkernel_swe_bench_live_official_score_feedback_r5_20260513",
+    "timeout": 1800
+  },
+  "source_retry": {
+    "output_harness_json": "config/autonomous_benchmark_harnesses/swe_bench_live_official_score_feedback_r5_20260513.json",
+    "patch_job_verification_json": "benchmarks/swe_bench_live/rolling_score/official_score_feedback_r4b_latest/official_retry_report_from_r4b.json",
+    "retry_instance_ids": [
+      "pvlib__pvlib-python-2190",
+      "python-babel__babel-1131",
+      "pvlib__pvlib-python-2249",
+      "pytorch__torchtune-1697"
+    ],
+    "retry_label": "official_score_feedback_r5_20260513",
+    "source_harness_json": "config/autonomous_benchmark_harnesses/swe_bench_live_official_score_feedback_r4b_20260513.json"
+  },
+  "spec_version": "asi_v1"
+}

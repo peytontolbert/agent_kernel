@@ -23,7 +23,7 @@ not as a second orchestration system.
 
 Current kernel strengths:
 
-- unattended controller already exists: [unattended_controller.py](/data/agentkernel/agent_kernel/unattended_controller.py)
+- unattended controller already exists: [unattended_controller.py](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
 - planner and cycle records already exist: [improvement.py](/data/agentkernel/agent_kernel/improvement.py)
 - bounded execution harness already exists: [harness.py](/data/agentkernel/evals/harness.py)
 - coding actor contract now exists: [coding.py](/data/agentkernel/agent_kernel/actors/coding.py)

@@ -445,14 +445,14 @@ Each lane below is claimable by one Codex terminal. The write scopes are intenti
   add discovered structural work classes so routing and reporting can generalize beyond authored
   benchmark families
 - owned_paths:
-  - [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
+  - [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
   - [`agent_kernel/modeling/policy/decoder.py`](/data/agentkernel/agent_kernel/modeling/policy/decoder.py)
   - [`scripts/run_job_queue.py`](/data/agentkernel/scripts/run_job_queue.py)
   - [`tests/test_unattended_controller.py`](/data/agentkernel/tests/test_unattended_controller.py)
 - explicitly_not_owned:
   - [`datasets/kernel_metadata.json`](/data/agentkernel/datasets/kernel_metadata.json)
-  - [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py)
-  - [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py)
+  - [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py)
+  - [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py)
 - required_outputs:
   - canonical `DiscoveredStructuralClass`
   - controller features that can consume discovered classes
@@ -462,7 +462,7 @@ Each lane below is claimable by one Codex terminal. The write scopes are intenti
   - add discovered classes to controller observations and task/run reports
   - let routing consume discovered classes without removing existing family logic
 - verification_plan:
-  - `python -m py_compile agent_kernel/unattended_controller.py agent_kernel/modeling/policy/decoder.py scripts/run_job_queue.py tests/test_unattended_controller.py`
+  - `python -m py_compile agent_kernel/ops/unattended_controller.py agent_kernel/modeling/policy/decoder.py scripts/run_job_queue.py tests/test_unattended_controller.py`
   - `pytest -q tests/test_unattended_controller.py -k "generalization or discovered_class or reward"`
 - done_when:
   - reports and controller state contain discovered classes alongside authored families
@@ -537,17 +537,17 @@ Each lane below is claimable by one Codex terminal. The write scopes are intenti
   convert family sampling into counted trusted breadth and make retrieval improvements survive as
   later repair behavior
 - owned_paths:
-  - [`agent_kernel/trust.py`](/data/agentkernel/agent_kernel/trust.py)
-  - [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py)
-  - [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py)
-  - [`agent_kernel/retrieval_improvement.py`](/data/agentkernel/agent_kernel/retrieval_improvement.py)
+  - [`agent_kernel/extensions/trust.py`](/data/agentkernel/agent_kernel/extensions/trust.py)
+  - [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py)
+  - [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py)
+  - [`agent_kernel/extensions/improvement/retrieval_improvement.py`](/data/agentkernel/agent_kernel/extensions/improvement/retrieval_improvement.py)
   - [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py)
-  - [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+  - [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
   - [`scripts/run_supervisor_loop.py`](/data/agentkernel/scripts/run_supervisor_loop.py)
   - [`scripts/run_autonomous_compounding_check.py`](/data/agentkernel/scripts/run_autonomous_compounding_check.py)
   - [`tests/test_curriculum.py`](/data/agentkernel/tests/test_curriculum.py)
 - explicitly_not_owned:
-  - [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
+  - [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
 - required_outputs:
   - counted trust summaries that distinguish sampled, verified, retained, and clean-root breadth
   - retrieval carryover metrics tied to later repair or verification behavior
@@ -557,7 +557,7 @@ Each lane below is claimable by one Codex terminal. The write scopes are intenti
   - add retrieval carryover accounting between intervention and later repair steps
   - feed missing-family and low-carryover pressure into supervision and compounding checks
 - verification_plan:
-  - `python -m py_compile agent_kernel/trust.py agent_kernel/task_bank.py agent_kernel/curriculum.py agent_kernel/retrieval_improvement.py agent_kernel/policy.py agent_kernel/context_budget.py scripts/run_supervisor_loop.py scripts/run_autonomous_compounding_check.py tests/test_curriculum.py`
+  - `python -m py_compile agent_kernel/extensions/trust.py agent_kernel/tasking/task_bank.py agent_kernel/tasking/curriculum.py agent_kernel/extensions/improvement/retrieval_improvement.py agent_kernel/policy.py agent_kernel/extensions/context_budget.py scripts/run_supervisor_loop.py scripts/run_autonomous_compounding_check.py tests/test_curriculum.py`
   - `pytest -q tests/test_curriculum.py -k "trust or carryover or priority_family or retrieval"`
 - done_when:
   - integration, project, repository, and repo_chore can be measured as counted trusted evidence
@@ -638,18 +638,18 @@ If a path is listed here, only the named lane may edit it during this wave.
 | `datasets/improvement_catalog.json` | `lane_strategy_invention` |
 | `agent_kernel/kernel_catalog.py` | `lane_ontology_expansion` |
 | `datasets/kernel_metadata.json` | `lane_ontology_expansion` |
-| `agent_kernel/unattended_controller.py` | `lane_repo_generalization` |
+| `agent_kernel/ops/unattended_controller.py` | `lane_repo_generalization` |
 | `agent_kernel/modeling/policy/decoder.py` | `lane_repo_generalization` |
 | `scripts/run_job_queue.py` | `lane_repo_generalization` |
 | `agent_kernel/strategy_memory/` | `lane_strategy_memory` |
 | `agent_kernel/actors/coding.py` | `lane_strategy_memory` |
 | `evals/harness.py` | `lane_strategy_memory` |
-| `agent_kernel/trust.py` | `lane_trust_and_carryover` |
-| `agent_kernel/task_bank.py` | `lane_trust_and_carryover` |
-| `agent_kernel/curriculum.py` | `lane_trust_and_carryover` |
-| `agent_kernel/retrieval_improvement.py` | `lane_trust_and_carryover` |
+| `agent_kernel/extensions/trust.py` | `lane_trust_and_carryover` |
+| `agent_kernel/tasking/task_bank.py` | `lane_trust_and_carryover` |
+| `agent_kernel/tasking/curriculum.py` | `lane_trust_and_carryover` |
+| `agent_kernel/extensions/improvement/retrieval_improvement.py` | `lane_trust_and_carryover` |
 | `agent_kernel/policy.py` | `lane_trust_and_carryover` |
-| `agent_kernel/context_budget.py` | `lane_trust_and_carryover` |
+| `agent_kernel/extensions/context_budget.py` | `lane_trust_and_carryover` |
 | `scripts/run_supervisor_loop.py` | `lane_trust_and_carryover` |
 | `scripts/run_autonomous_compounding_check.py` | `lane_trust_and_carryover` |
 | `docs/unattended_work_queue.md` | `lane_integration_steward` |

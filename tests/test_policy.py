@@ -15097,6 +15097,82 @@ def test_artifact_anchor_replacement_uses_candidate_after_repeated_context(tmp_p
     assert decision.proposal_metadata["artifact_anchor_candidate_suggestion"] is True
 
 
+def test_artifact_source_path_rewrite_repairs_patch_diff_as_source():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_source_path_rewrite_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_source_path_rewrite_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": (
+                        "1: def value():\n"
+                        "2:     total = 1\n"
+                        "3:     return total\n"
+                    ),
+                },
+            },
+        )
+    )
+
+    command = policy._artifact_rewrite_artifact_source_builder_command(
+        state,
+        "patch_builder --path patch.diff --replace-line 2 --with '    total = 2' > patch.diff",
+        artifact_path="patch.diff",
+        artifact_repair_context={
+            "preferred_source_path": "pkg/module.py",
+            "allowed_source_paths": ["pkg/module.py"],
+        },
+    )
+
+    assert command == "patch_builder --path pkg/module.py --replace-line 2 --with '    total = 2' > patch.diff"
+
+
+def test_artifact_source_path_rewrite_rejects_invalid_rewritten_command():
+    policy = LLMDecisionPolicy(MockLLMClient(), config=KernelConfig(asi_coding_require_live_llm=True))
+    state = AgentState(
+        task=TaskSpec(
+            task_id="artifact_source_path_rewrite_invalid_task",
+            prompt="write patch.diff",
+            workspace_subdir="artifact_source_path_rewrite_invalid_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "artifact_repair_contract": {
+                    "artifact_path": "patch.diff",
+                    "builder_commands": ["patch_builder"],
+                },
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": "def value():\n    total = 1\n    return total\n",
+                    "source_lines/pkg/module.py.lines": (
+                        "1: def value():\n"
+                        "2:     total = 1\n"
+                        "3:     return total\n"
+                    ),
+                },
+            },
+        )
+    )
+
+    command = policy._artifact_rewrite_artifact_source_builder_command(
+        state,
+        "patch_builder --path patch.diff --replace-line 99 --with '    total = 2' > patch.diff",
+        artifact_path="patch.diff",
+        artifact_repair_context={
+            "preferred_source_path": "pkg/module.py",
+            "allowed_source_paths": ["pkg/module.py"],
+        },
+    )
+
+    assert command == ""
+
+
 def test_artifact_anchor_candidate_skips_previously_failed_command(tmp_path):
     class ShouldNotRunClient:
         def create_decision(self, **kwargs):
@@ -17660,6 +17736,95 @@ def test_artifact_placeholder_candidate_retry_exposes_context_when_candidate_set
     assert decision.action == CODE_EXECUTE
     assert "candidate_set_exhausted_after_invalid_python_or_shape_failures" in decision.content
     assert decision.proposal_metadata["excluded_candidate_lines"] == [2, 3]
+
+
+def test_artifact_placeholder_candidate_retry_exposes_source_path_alias_context_without_issue_keywords():
+    class ArtifactPathClient:
+        def create_decision(self, *, system_prompt, decision_prompt, state_payload):
+            del system_prompt, decision_prompt, state_payload
+            return {
+                "thought": "still using artifact as source",
+                "action": CODE_EXECUTE,
+                "content": "patch_builder --path patch.diff --replace-line 2 --with '    value = 2' > patch.diff",
+                "done": False,
+            }
+
+    state = AgentState(
+        task=TaskSpec(
+            task_id="generic_source_path_alias_no_keywords_task",
+            prompt="write patch.diff",
+            workspace_subdir="generic_source_path_alias_no_keywords_task",
+            expected_files=["patch.diff"],
+            metadata={
+                "setup_file_contents": {
+                    "source_context/pkg/module.py": (
+                        "def run():\n"
+                        "    value = 1\n"
+                        "    result = value\n"
+                    ),
+                    "source_lines/pkg/module.py.lines": (
+                        "1: def run():\n"
+                        "2:     value = 1\n"
+                        "3:     result = value\n"
+                    ),
+                },
+            },
+        )
+    )
+    state.history.append(
+        StepRecord(
+            index=1,
+            thought="failed candidate packet already exposed",
+            action=CODE_EXECUTE,
+            content="printf '%s\\n' '{}'",
+            selected_skill_id=None,
+            command_result={"exit_code": 0},
+            verification={},
+            decision_source="artifact_placeholder_candidate_failed_context_read",
+        )
+    )
+    artifact_repair_context = {
+        "preferred_source_path": "pkg/module.py",
+        "valid_line_numbers_preview": [2, 3],
+        "candidate_edit_records": [
+            {
+                "path": "pkg/module.py",
+                "line": 2,
+                "current_source": "    value = 1",
+                "replacement_shape": "assignment line",
+                "required_prefix": "    value = ",
+            },
+            {
+                "path": "pkg/module.py",
+                "line": 3,
+                "current_source": "    result = value",
+                "replacement_shape": "assignment line",
+                "required_prefix": "    result = ",
+            },
+        ],
+    }
+    policy = LLMDecisionPolicy(ArtifactPathClient(), config=KernelConfig())
+
+    decision = policy._artifact_placeholder_candidate_retry_decision(
+        state=state,
+        system_prompt="system",
+        payload={},
+        artifact_path="patch.diff",
+        builder_command="patch_builder",
+        artifact_repair_context=artifact_repair_context,
+        rejected_command="patch_builder --path pkg/module.py --replace-line 2 --with new_code_here > patch.diff",
+        rejected_reason="placeholder_replacement",
+        retry_attempt=3,
+        context_compile_warning=None,
+    )
+
+    assert decision is not None
+    assert decision.decision_source == "artifact_source_path_alias_escape_context_read"
+    assert "source_path_alias_repair" in decision.content
+    assert "pkg/module.py" in decision.content
+    assert "Do not use patch.diff as --path" in decision.content
+    assert decision.proposal_metadata["retry_rejected_reason"] == "artifact_path_as_source"
+    assert decision.proposal_metadata["allowed_body_line_numbers"] == [2, 3]
 
 
 def test_candidate_set_exhausted_context_stays_inside_fail_to_pass_body():

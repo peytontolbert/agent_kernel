@@ -1,0 +1,30 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "swe_rebench",
+  "ready_to_run": false,
+  "runner": {
+    "kind": "swebench_harness",
+    "harness_root": "/data/agiattempt/agi_dw/third_party/swe-bench",
+    "dataset_name": "nebius/SWE-rebench-leaderboard",
+    "split": "test",
+    "predictions_path": "/data/agentkernel/benchmarks/predictions/swe_rebench_predictions.jsonl",
+    "run_id": "agentkernel_a8_swe_rebench",
+    "max_workers": 4,
+    "timeout": 1800,
+    "cache_level": "env",
+    "namespace": "swebench",
+    "report_dir": "/data/agentkernel/benchmarks/swe_rebench/evaluation_results",
+    "results_json": "/data/agentkernel/benchmarks/swe_rebench/evaluation_results/results.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/swe_rebench/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/swe_rebench/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "Dataset source is connected as nebius/SWE-rebench-leaderboard test split.",
+    "ready_to_run remains false until predictions_path exists and the local harness adapter is validated against the SWE-ReBench schema."
+  ]
+}

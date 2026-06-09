@@ -1,0 +1,20 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "sustained_coding_window",
+  "ready_to_run": false,
+  "runner": {
+    "kind": "summary_only",
+    "summary_source": "/data/agentkernel/benchmarks/sustained_coding_window/summary.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/sustained_coding_window/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/sustained_coding_window/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "This spec expects a sustained-window summary across at least 3 windows and 100 tasks.",
+    "It is not external benchmark evidence by itself; it supplies the sustained superhuman coding window gate."
+  ]
+}

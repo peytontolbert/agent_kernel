@@ -1,0 +1,159 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 2,
+  "purpose": "Second held-out coding-domain transfer rotation for testing repeated A6-to-A7 readiness without per-domain architecture changes.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true,
+    "rotation_id": "r2"
+  },
+  "tasks": [
+    {
+      "task_id": "a7_r2_unfamiliar_feature_flag_rollout_task",
+      "prompt": "In an unfamiliar feature-flag rollout workspace, create rollout/plan.json and rollout/operator_note.md. The JSON must record flag=adaptive-routing, cohort=beta, rollback_key=adaptive-routing.off, and guardrail=latency-p95.",
+      "workspace_subdir": "a7_r2_unfamiliar_feature_flag_rollout_task",
+      "suggested_commands": [
+        "mkdir -p rollout && printf '{\"flag\":\"adaptive-routing\",\"cohort\":\"beta\",\"rollback_key\":\"adaptive-routing.off\",\"guardrail\":\"latency-p95\"}\\n' > rollout/plan.json && printf '# Operator Note\\nadaptive-routing beta rollout guarded by latency-p95 with rollback adaptive-routing.off\\n' > rollout/operator_note.md"
+      ],
+      "success_command": "test -f rollout/plan.json && test -f rollout/operator_note.md && grep -q 'adaptive-routing.off' rollout/plan.json && grep -q 'latency-p95' rollout/operator_note.md",
+      "expected_files": [
+        "rollout/plan.json",
+        "rollout/operator_note.md"
+      ],
+      "expected_file_contents": {
+        "rollout/plan.json": "{\"flag\":\"adaptive-routing\",\"cohort\":\"beta\",\"rollback_key\":\"adaptive-routing.off\",\"guardrail\":\"latency-p95\"}\n",
+        "rollout/operator_note.md": "# Operator Note\nadaptive-routing beta rollout guarded by latency-p95 with rollback adaptive-routing.off\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "release_control_novelty",
+        "novelty_axes": [
+          "feature_flag_rollout",
+          "operator_guardrail"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_r2_unfamiliar_repository_schema_bridge_task",
+      "prompt": "In an unfamiliar repository schema-bridge workspace, create schema/bridge.yaml and docs/schema_bridge.md. The bridge must map source=user.v1, target=account.v2, field_map=id:account_id, email:contact.email.",
+      "workspace_subdir": "a7_r2_unfamiliar_repository_schema_bridge_task",
+      "suggested_commands": [
+        "mkdir -p schema docs && printf 'source: user.v1\\ntarget: account.v2\\nfield_map:\\n  id: account_id\\n  email: contact.email\\n' > schema/bridge.yaml && printf '# Schema Bridge\\nuser.v1 id maps to account_id and email maps to contact.email\\n' > docs/schema_bridge.md"
+      ],
+      "success_command": "test -f schema/bridge.yaml && test -f docs/schema_bridge.md && grep -q 'target: account.v2' schema/bridge.yaml && grep -q 'contact.email' docs/schema_bridge.md",
+      "expected_files": [
+        "schema/bridge.yaml",
+        "docs/schema_bridge.md"
+      ],
+      "expected_file_contents": {
+        "schema/bridge.yaml": "source: user.v1\ntarget: account.v2\nfield_map:\n  id: account_id\n  email: contact.email\n",
+        "docs/schema_bridge.md": "# Schema Bridge\nuser.v1 id maps to account_id and email maps to contact.email\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "schema_topology_novelty",
+        "novelty_axes": [
+          "schema_bridge",
+          "field_mapping"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_r2_unfamiliar_cross_service_quarantine_task",
+      "prompt": "In an unfamiliar cross-service quarantine workflow, create quarantine/rules.json and integration/recovery_path.md. The JSON must include service=search-indexer, trigger=checksum_mismatch, action=quarantine, and notify=oncall-search.",
+      "workspace_subdir": "a7_r2_unfamiliar_cross_service_quarantine_task",
+      "suggested_commands": [
+        "mkdir -p quarantine integration && printf '{\"service\":\"search-indexer\",\"trigger\":\"checksum_mismatch\",\"action\":\"quarantine\",\"notify\":\"oncall-search\"}\\n' > quarantine/rules.json && printf '# Recovery Path\\nQuarantine search-indexer on checksum_mismatch and notify oncall-search.\\n' > integration/recovery_path.md"
+      ],
+      "success_command": "test -f quarantine/rules.json && test -f integration/recovery_path.md && grep -q 'checksum_mismatch' quarantine/rules.json && grep -q 'oncall-search' integration/recovery_path.md",
+      "expected_files": [
+        "quarantine/rules.json",
+        "integration/recovery_path.md"
+      ],
+      "expected_file_contents": {
+        "quarantine/rules.json": "{\"service\":\"search-indexer\",\"trigger\":\"checksum_mismatch\",\"action\":\"quarantine\",\"notify\":\"oncall-search\"}\n",
+        "integration/recovery_path.md": "# Recovery Path\nQuarantine search-indexer on checksum_mismatch and notify oncall-search.\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "cross_service_recovery_novelty",
+        "novelty_axes": [
+          "quarantine_rule",
+          "cross_service_recovery"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_r2_unfamiliar_sandbox_patch_queue_task",
+      "prompt": "In an unfamiliar sandbox patch-queue workspace, create sandbox/patch_queue.json and sandbox/review.md. The queue must include patches=[\"docs-index\",\"api-timeout\"], base=main, isolation=true, and promote_after=reviewed.",
+      "workspace_subdir": "a7_r2_unfamiliar_sandbox_patch_queue_task",
+      "suggested_commands": [
+        "mkdir -p sandbox && printf '{\"patches\":[\"docs-index\",\"api-timeout\"],\"base\":\"main\",\"isolation\":true,\"promote_after\":\"reviewed\"}\\n' > sandbox/patch_queue.json && printf '# Sandbox Review\\nQueue docs-index and api-timeout from main; promote after reviewed with isolation enabled.\\n' > sandbox/review.md"
+      ],
+      "success_command": "test -f sandbox/patch_queue.json && test -f sandbox/review.md && grep -q '\"isolation\":true' sandbox/patch_queue.json && grep -q 'promote after reviewed' sandbox/review.md",
+      "expected_files": [
+        "sandbox/patch_queue.json",
+        "sandbox/review.md"
+      ],
+      "expected_file_contents": {
+        "sandbox/patch_queue.json": "{\"patches\":[\"docs-index\",\"api-timeout\"],\"base\":\"main\",\"isolation\":true,\"promote_after\":\"reviewed\"}\n",
+        "sandbox/review.md": "# Sandbox Review\nQueue docs-index and api-timeout from main; promote after reviewed with isolation enabled.\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "patch_queue_novelty",
+        "novelty_axes": [
+          "patch_queue",
+          "promotion_gate"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    },
+    {
+      "task_id": "a7_r2_unfamiliar_artifact_retention_exception_task",
+      "prompt": "In an unfamiliar artifact retention exception workspace, create retention/exception.json and retention/rationale.md. The exception must include artifact=debug-bundle, expires_days=7, approver=release-captain, and reason=customer-escalation.",
+      "workspace_subdir": "a7_r2_unfamiliar_artifact_retention_exception_task",
+      "suggested_commands": [
+        "mkdir -p retention && printf '{\"artifact\":\"debug-bundle\",\"expires_days\":7,\"approver\":\"release-captain\",\"reason\":\"customer-escalation\"}\\n' > retention/exception.json && printf '# Retention Exception\\ndebug-bundle retained for 7 days for customer-escalation with release-captain approval.\\n' > retention/rationale.md"
+      ],
+      "success_command": "test -f retention/exception.json && test -f retention/rationale.md && grep -q 'customer-escalation' retention/exception.json && grep -q 'release-captain approval' retention/rationale.md",
+      "expected_files": [
+        "retention/exception.json",
+        "retention/rationale.md"
+      ],
+      "expected_file_contents": {
+        "retention/exception.json": "{\"artifact\":\"debug-bundle\",\"expires_days\":7,\"approver\":\"release-captain\",\"reason\":\"customer-escalation\"}\n",
+        "retention/rationale.md": "# Retention Exception\ndebug-bundle retained for 7 days for customer-escalation with release-captain approval.\n"
+      },
+      "max_steps": 8,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer",
+        "frontier_slice": "retention_exception_novelty",
+        "novelty_axes": [
+          "artifact_retention_exception",
+          "approval_rationale"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest"
+      }
+    }
+  ]
+}

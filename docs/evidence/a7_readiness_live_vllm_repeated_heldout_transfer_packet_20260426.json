@@ -1,0 +1,83 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomy_evidence_packet",
+  "claim": {
+    "level": "A7_readiness",
+      "scope": "repeated_live_vllm_heldout_unfamiliar_transfer_with_hard_hintless_stateful_repair_and_diagnostic_synthesis",
+      "status": "supported",
+      "summary": "Six non-identical held-out unfamiliar-transfer rotations completed through the existing product-native queue and manifest path under live vLLM, including hard hintless exact-verifier, larger hard-scale, stateful repair, and diagnostic synthesis rotations."
+  },
+  "evidence": {
+    "a7_readiness": {
+      "rotation_count": 6,
+      "non_identical_manifests": true,
+      "total_held_out_frontier_reports": 35,
+      "total_held_out_frontier_clean_successes": 35,
+      "aggregate_clean_success_rate": 1.0,
+      "families_repeated_in_both_rotations": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repo_sandbox",
+        "repository"
+      ],
+      "families_repeated_across_all_rotations": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repo_sandbox",
+        "repository"
+      ],
+      "distinct_frontier_slice_count": 35,
+      "hard_hintless_rotation_count": 2,
+      "hard_hintless_clean_success_count": 15,
+      "hard_hintless_clean_success_rate": 1.0,
+      "stateful_repair_rotation_count": 1,
+      "stateful_repair_clean_success_count": 5,
+      "stateful_repair_clean_success_rate": 1.0,
+      "diagnostic_synthesis_rotation_count": 1,
+      "diagnostic_synthesis_clean_success_count": 5,
+      "diagnostic_synthesis_clean_success_rate": 1.0,
+      "existing_path_only": true,
+      "per_task_architecture_changes": false,
+      "provider": {
+        "provider": "vllm",
+        "model": "Qwen/Qwen3.5-9B",
+        "vllm_autostart": false,
+        "tolbert_context": false
+      },
+      "rotation_status_paths": [
+        "/tmp/agentkernel_a7_manifest_probe_20260426/status_with_frontier_fields.json",
+        "/tmp/agentkernel_a7_manifest_probe_r2_20260426/status_with_frontier_fields.json",
+        "/tmp/agentkernel_a7_manifest_probe_r3_hard_prompt_20260426/status_with_frontier_fields.json",
+        "/tmp/agentkernel_a7_manifest_probe_r4_hard_scale_20260426/status_with_frontier_fields.json",
+        "/tmp/agentkernel_a7_manifest_probe_r5_stateful_repair_20260426/status_with_frontier_fields.json",
+        "/tmp/agentkernel_a7_manifest_probe_r6_diagnostic_synthesis_replay3_20260426/status_with_frontier_fields.json"
+      ],
+      "manifest_paths": [
+        "config/a7_unfamiliar_transfer_manifest.json",
+        "config/a7_unfamiliar_transfer_manifest_r2.json",
+        "config/a7_unfamiliar_transfer_manifest_r3_hard.json",
+        "config/a7_unfamiliar_transfer_manifest_r4_hard_scale.json",
+        "config/a7_unfamiliar_transfer_manifest_r5_stateful_repair.json",
+        "config/a7_unfamiliar_transfer_manifest_r6_diagnostic_synthesis.json"
+      ],
+      "evidence_artifacts": [
+        "docs/evidence/a7_live_vllm_repeated_heldout_transfer_r1_r2_20260426.json",
+        "docs/evidence/a7_hard_hintless_transfer_r3_live_vllm_success_20260426.json",
+        "docs/evidence/a7_hard_scale_transfer_r4_live_vllm_success_20260426.json",
+        "docs/evidence/a7_stateful_repair_r5_live_vllm_success_20260426.json",
+        "docs/evidence/a7_diagnostic_synthesis_r6_live_vllm_success_20260426.json"
+      ]
+    }
+  },
+  "open_limits": [
+    "This supports A7-readiness, not a full A7 claim.",
+    "The tasks remain bounded coding-domain workspace tasks.",
+    "The packet does not establish strong human-level or better performance across the declared task universe.",
+    "The hard hintless rotations validate exact verifier-aligned repair on 15 held-out tasks, but still within compact workspace contract tasks.",
+    "The stateful repair rotation validates setup-state awareness and stale artifact removal, but still within bounded local workspace tasks.",
+    "The diagnostic synthesis rotation validates setup-evidence triage across five families, but still within bounded local workspace tasks.",
+    "model_stack was not used because its health endpoint was not serving at probe time."
+  ]
+}

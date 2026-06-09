@@ -1,0 +1,140 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 5,
+  "purpose": "Hard held-out stateful repair rotation with setup state, exact rewrites, and no suggested commands.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true,
+    "rotation_id": "r5_stateful_repair",
+    "suggested_commands_allowed": false
+  },
+  "tasks": [
+    {
+      "task_id": "a7_r5_stateful_project_rollout_repair_task",
+      "prompt": "Repair the existing rollout packet without using any prewritten command hint. Update project/rollout.env so phase=regional, owner=release-ops, and guard=error-budget. Update project/notes.md to state that regional rollout proceeds only while error-budget is healthy. Remove project/blocker.flag.",
+      "workspace_subdir": "a7_r5_stateful_project_rollout_repair_task",
+      "setup_commands": [
+        "mkdir -p project && printf 'phase=canary\\nowner=old-team\\nguard=manual\\n' > project/rollout.env && printf '# Rollout Notes\\ncanary only\\n' > project/notes.md && printf 'blocked\\n' > project/blocker.flag"
+      ],
+      "success_command": "test -f project/rollout.env && test -f project/notes.md && test ! -f project/blocker.flag && grep -q 'phase=regional' project/rollout.env && grep -q 'owner=release-ops' project/rollout.env && grep -q 'regional rollout proceeds only while error-budget is healthy' project/notes.md",
+      "expected_files": ["project/rollout.env", "project/notes.md"],
+      "expected_file_contents": {
+        "project/rollout.env": "phase=regional\nowner=release-ops\nguard=error-budget\n",
+        "project/notes.md": "# Rollout Notes\nregional rollout proceeds only while error-budget is healthy.\n"
+      },
+      "forbidden_files": ["project/blocker.flag"],
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer_stateful_hard",
+        "frontier_slice": "stateful_rollout_repair_novelty",
+        "novelty_axes": ["stateful_workspace_repair", "remove_forbidden_artifact"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r5_stateful_repository_policy_repair_task",
+      "prompt": "Repair the existing repository policy without using any prewritten command hint. Update repo/policy.toml so policy=\"branch-freeze\", target=\"release/2026.05\", approver=\"repo-captain\", and active=true. Update repo/readme.md to state that release/2026.05 is branch-frozen until repo-captain approval. Remove repo/legacy_policy.txt.",
+      "workspace_subdir": "a7_r5_stateful_repository_policy_repair_task",
+      "setup_commands": [
+        "mkdir -p repo && printf 'policy = \"open\"\\ntarget = \"main\"\\napprover = \"none\"\\nactive = false\\n' > repo/policy.toml && printf '# Repo Policy\\nopen main\\n' > repo/readme.md && printf 'legacy\\n' > repo/legacy_policy.txt"
+      ],
+      "success_command": "test -f repo/policy.toml && test -f repo/readme.md && test ! -f repo/legacy_policy.txt && grep -q 'policy = \"branch-freeze\"' repo/policy.toml && grep -q 'active = true' repo/policy.toml && grep -q 'release/2026.05 is branch-frozen until repo-captain approval' repo/readme.md",
+      "expected_files": ["repo/policy.toml", "repo/readme.md"],
+      "expected_file_contents": {
+        "repo/policy.toml": "policy = \"branch-freeze\"\ntarget = \"release/2026.05\"\napprover = \"repo-captain\"\nactive = true\n",
+        "repo/readme.md": "# Repo Policy\nrelease/2026.05 is branch-frozen until repo-captain approval.\n"
+      },
+      "forbidden_files": ["repo/legacy_policy.txt"],
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer_stateful_hard",
+        "frontier_slice": "stateful_repository_policy_repair_novelty",
+        "novelty_axes": ["stateful_workspace_repair", "policy_rewrite"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r5_stateful_integration_route_repair_task",
+      "prompt": "Repair the integration route files without using any prewritten command hint. Update integration/routes.json with service=\"ledger\", primary=\"route-b\", fallback=\"route-c\", and verifier=\"replay-ok\". Update integration/runbook.md to state that ledger moves to route-b with route-c fallback after replay-ok. Remove integration/quarantine.flag.",
+      "workspace_subdir": "a7_r5_stateful_integration_route_repair_task",
+      "setup_commands": [
+        "mkdir -p integration && printf '{\"service\":\"ledger\",\"primary\":\"route-a\",\"fallback\":\"none\",\"verifier\":\"manual\"}\\n' > integration/routes.json && printf '# Integration Runbook\\nmanual route-a\\n' > integration/runbook.md && printf 'quarantine\\n' > integration/quarantine.flag"
+      ],
+      "success_command": "test -f integration/routes.json && test -f integration/runbook.md && test ! -f integration/quarantine.flag && grep -q '\"primary\":\"route-b\"' integration/routes.json && grep -q '\"fallback\":\"route-c\"' integration/routes.json && grep -q 'ledger moves to route-b with route-c fallback after replay-ok' integration/runbook.md",
+      "expected_files": ["integration/routes.json", "integration/runbook.md"],
+      "expected_file_contents": {
+        "integration/routes.json": "{\"service\":\"ledger\",\"primary\":\"route-b\",\"fallback\":\"route-c\",\"verifier\":\"replay-ok\"}\n",
+        "integration/runbook.md": "# Integration Runbook\nledger moves to route-b with route-c fallback after replay-ok.\n"
+      },
+      "forbidden_files": ["integration/quarantine.flag"],
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer_stateful_hard",
+        "frontier_slice": "stateful_integration_route_repair_novelty",
+        "novelty_axes": ["stateful_workspace_repair", "route_repair"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r5_stateful_repo_sandbox_fixture_repair_task",
+      "prompt": "Repair the sandbox fixture gate without using any prewritten command hint. Update sandbox/gate.yaml with suite=payments-e2e, mode=isolated, reviewer=sandbox-owner, and unblock_after=flake-zero. Update sandbox/summary.md to state that payments-e2e remains isolated until flake-zero and sandbox-owner review. Remove sandbox/stale.lock.",
+      "workspace_subdir": "a7_r5_stateful_repo_sandbox_fixture_repair_task",
+      "setup_commands": [
+        "mkdir -p sandbox && printf 'suite: payments-e2e\\nmode: shared\\nreviewer: nobody\\nunblock_after: manual\\n' > sandbox/gate.yaml && printf '# Sandbox Gate\\nshared fixture\\n' > sandbox/summary.md && printf 'locked\\n' > sandbox/stale.lock"
+      ],
+      "success_command": "test -f sandbox/gate.yaml && test -f sandbox/summary.md && test ! -f sandbox/stale.lock && grep -q 'mode: isolated' sandbox/gate.yaml && grep -q 'reviewer: sandbox-owner' sandbox/gate.yaml && grep -q 'payments-e2e remains isolated until flake-zero' sandbox/summary.md",
+      "expected_files": ["sandbox/gate.yaml", "sandbox/summary.md"],
+      "expected_file_contents": {
+        "sandbox/gate.yaml": "suite: payments-e2e\nmode: isolated\nreviewer: sandbox-owner\nunblock_after: flake-zero\n",
+        "sandbox/summary.md": "# Sandbox Gate\npayments-e2e remains isolated until flake-zero and sandbox-owner review.\n"
+      },
+      "forbidden_files": ["sandbox/stale.lock"],
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer_stateful_hard",
+        "frontier_slice": "stateful_sandbox_fixture_repair_novelty",
+        "novelty_axes": ["stateful_workspace_repair", "sandbox_gate_repair"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r5_stateful_repo_chore_retention_repair_task",
+      "prompt": "Repair the retention chore without using any prewritten command hint. Update chore/retention.env with stream=exports, keep_days=180, exception=legal-hold, and owner=data-governance. Update chore/audit.md to state that exports keep 180 days except legal-hold under data-governance. Remove chore/old-retention.flag.",
+      "workspace_subdir": "a7_r5_stateful_repo_chore_retention_repair_task",
+      "setup_commands": [
+        "mkdir -p chore && printf 'stream=temp\\nkeep_days=30\\nexception=none\\nowner=unknown\\n' > chore/retention.env && printf '# Retention Audit\\ntemp keep 30\\n' > chore/audit.md && printf 'old\\n' > chore/old-retention.flag"
+      ],
+      "success_command": "test -f chore/retention.env && test -f chore/audit.md && test ! -f chore/old-retention.flag && grep -q 'stream=exports' chore/retention.env && grep -q 'keep_days=180' chore/retention.env && grep -q 'exports keep 180 days except legal-hold under data-governance' chore/audit.md",
+      "expected_files": ["chore/retention.env", "chore/audit.md"],
+      "expected_file_contents": {
+        "chore/retention.env": "stream=exports\nkeep_days=180\nexception=legal-hold\nowner=data-governance\n",
+        "chore/audit.md": "# Retention Audit\nexports keep 180 days except legal-hold under data-governance.\n"
+      },
+      "forbidden_files": ["chore/old-retention.flag"],
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer_stateful_hard",
+        "frontier_slice": "stateful_retention_repair_novelty",
+        "novelty_axes": ["stateful_workspace_repair", "retention_repair"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    }
+  ]
+}

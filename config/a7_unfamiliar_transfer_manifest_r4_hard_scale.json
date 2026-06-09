@@ -1,0 +1,225 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 4,
+  "purpose": "Larger hard held-out coding-domain transfer rotation with no suggested commands and exact verifier contracts.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true,
+    "rotation_id": "r4_hard_scale",
+    "suggested_commands_allowed": false
+  },
+  "tasks": [
+    {
+      "task_id": "a7_r4_hard_project_canary_budget_task",
+      "prompt": "Create a canary budget packet without using any prewritten command hint. Write rollout/budget.json with service=\"search\", max_error_rate=\"0.7%\", canary_minutes=45, and owner=\"release-ops\". Also write rollout/summary.md stating that search canary holds for 45 minutes while max error rate stays below 0.7%.",
+      "workspace_subdir": "a7_r4_hard_project_canary_budget_task",
+      "success_command": "test -f rollout/budget.json && test -f rollout/summary.md && grep -q '\"service\":\"search\"' rollout/budget.json && grep -q '\"max_error_rate\":\"0.7%\"' rollout/budget.json && grep -q 'search canary holds for 45 minutes' rollout/summary.md",
+      "expected_files": ["rollout/budget.json", "rollout/summary.md"],
+      "expected_file_contents": {
+        "rollout/budget.json": "{\"service\":\"search\",\"max_error_rate\":\"0.7%\",\"canary_minutes\":45,\"owner\":\"release-ops\"}\n",
+        "rollout/summary.md": "# Canary Budget\nsearch canary holds for 45 minutes while max error rate stays below 0.7%.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_canary_budget_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "canary_budget"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_project_capacity_cutover_task",
+      "prompt": "Create a capacity cutover packet without using any prewritten command hint. Write capacity/cutover.yaml with pool=blue, target=green, percent=30, and guard=latency-p95. Also write capacity/note.md stating that 30 percent moves from blue to green only while latency-p95 is healthy.",
+      "workspace_subdir": "a7_r4_hard_project_capacity_cutover_task",
+      "success_command": "test -f capacity/cutover.yaml && test -f capacity/note.md && grep -q 'pool: blue' capacity/cutover.yaml && grep -q 'guard: latency-p95' capacity/cutover.yaml && grep -q '30 percent moves from blue to green' capacity/note.md",
+      "expected_files": ["capacity/cutover.yaml", "capacity/note.md"],
+      "expected_file_contents": {
+        "capacity/cutover.yaml": "pool: blue\ntarget: green\npercent: 30\nguard: latency-p95\n",
+        "capacity/note.md": "# Capacity Cutover\n30 percent moves from blue to green only while latency-p95 is healthy.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_capacity_cutover_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "capacity_cutover"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repository_schema_redirect_task",
+      "prompt": "Create a schema redirect record without using any prewritten command hint. Write schema/redirect.json with from=\"orders_v1\", to=\"orders_v2\", mode=\"shadow-read\", and expires=\"2026-07-15\". Also write schema/readme.md stating that orders_v1 shadow-reads orders_v2 until 2026-07-15.",
+      "workspace_subdir": "a7_r4_hard_repository_schema_redirect_task",
+      "success_command": "test -f schema/redirect.json && test -f schema/readme.md && grep -q '\"from\":\"orders_v1\"' schema/redirect.json && grep -q '\"shadow-read\"' schema/redirect.json && grep -q 'orders_v1 shadow-reads orders_v2 until 2026-07-15' schema/readme.md",
+      "expected_files": ["schema/redirect.json", "schema/readme.md"],
+      "expected_file_contents": {
+        "schema/redirect.json": "{\"from\":\"orders_v1\",\"to\":\"orders_v2\",\"mode\":\"shadow-read\",\"expires\":\"2026-07-15\"}\n",
+        "schema/readme.md": "# Schema Redirect\norders_v1 shadow-reads orders_v2 until 2026-07-15.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_schema_redirect_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "schema_redirect"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repository_dependency_pin_task",
+      "prompt": "Create a dependency pin notice without using any prewritten command hint. Write deps/pin.toml with package=\"auth-client\", version=\"4.8.2\", reason=\"token-rotation\", and reviewer=\"platform-sec\". Also write deps/notice.md stating that auth-client stays pinned at 4.8.2 for token-rotation review by platform-sec.",
+      "workspace_subdir": "a7_r4_hard_repository_dependency_pin_task",
+      "success_command": "test -f deps/pin.toml && test -f deps/notice.md && grep -q 'package = \"auth-client\"' deps/pin.toml && grep -q 'reviewer = \"platform-sec\"' deps/pin.toml && grep -q 'auth-client stays pinned at 4.8.2' deps/notice.md",
+      "expected_files": ["deps/pin.toml", "deps/notice.md"],
+      "expected_file_contents": {
+        "deps/pin.toml": "package = \"auth-client\"\nversion = \"4.8.2\"\nreason = \"token-rotation\"\nreviewer = \"platform-sec\"\n",
+        "deps/notice.md": "# Dependency Pin\nauth-client stays pinned at 4.8.2 for token-rotation review by platform-sec.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_dependency_pin_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "dependency_pin"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_integration_webhook_failover_task",
+      "prompt": "Create a webhook failover packet without using any prewritten command hint. Write webhook/failover.json with source=\"billing\", primary=\"hook-east\", backup=\"hook-west\", and test=\"signature-replay\". Also write webhook/operator.md stating that billing moves from hook-east to hook-west after signature-replay passes.",
+      "workspace_subdir": "a7_r4_hard_integration_webhook_failover_task",
+      "success_command": "test -f webhook/failover.json && test -f webhook/operator.md && grep -q '\"source\":\"billing\"' webhook/failover.json && grep -q '\"signature-replay\"' webhook/failover.json && grep -q 'billing moves from hook-east to hook-west' webhook/operator.md",
+      "expected_files": ["webhook/failover.json", "webhook/operator.md"],
+      "expected_file_contents": {
+        "webhook/failover.json": "{\"source\":\"billing\",\"primary\":\"hook-east\",\"backup\":\"hook-west\",\"test\":\"signature-replay\"}\n",
+        "webhook/operator.md": "# Webhook Failover\nbilling moves from hook-east to hook-west after signature-replay passes.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_webhook_failover_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "webhook_failover"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_integration_cache_warmup_task",
+      "prompt": "Create a cache warmup packet without using any prewritten command hint. Write cache/warmup.yaml with cache=catalog, region=eu-west, strategy=staggered, and verifier=hit-rate. Also write cache/runbook.md stating that catalog cache warmup in eu-west uses staggered batches until hit-rate verifies.",
+      "workspace_subdir": "a7_r4_hard_integration_cache_warmup_task",
+      "success_command": "test -f cache/warmup.yaml && test -f cache/runbook.md && grep -q 'cache: catalog' cache/warmup.yaml && grep -q 'verifier: hit-rate' cache/warmup.yaml && grep -q 'catalog cache warmup in eu-west uses staggered batches' cache/runbook.md",
+      "expected_files": ["cache/warmup.yaml", "cache/runbook.md"],
+      "expected_file_contents": {
+        "cache/warmup.yaml": "cache: catalog\nregion: eu-west\nstrategy: staggered\nverifier: hit-rate\n",
+        "cache/runbook.md": "# Cache Warmup\ncatalog cache warmup in eu-west uses staggered batches until hit-rate verifies.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_cache_warmup_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "cache_warmup"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repo_sandbox_quarantine_task",
+      "prompt": "Create a sandbox quarantine record without using any prewritten command hint. Write sandbox/quarantine.json with branch=\"feature/payments\", reason=\"flake-burst\", owner=\"qa-sentinel\", and release_block=true. Also write sandbox/review.md stating that feature/payments is release-blocked for flake-burst until qa-sentinel clears it.",
+      "workspace_subdir": "a7_r4_hard_repo_sandbox_quarantine_task",
+      "success_command": "test -f sandbox/quarantine.json && test -f sandbox/review.md && grep -q '\"branch\":\"feature/payments\"' sandbox/quarantine.json && grep -q '\"release_block\":true' sandbox/quarantine.json && grep -q 'feature/payments is release-blocked for flake-burst' sandbox/review.md",
+      "expected_files": ["sandbox/quarantine.json", "sandbox/review.md"],
+      "expected_file_contents": {
+        "sandbox/quarantine.json": "{\"branch\":\"feature/payments\",\"reason\":\"flake-burst\",\"owner\":\"qa-sentinel\",\"release_block\":true}\n",
+        "sandbox/review.md": "# Sandbox Quarantine\nfeature/payments is release-blocked for flake-burst until qa-sentinel clears it.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_sandbox_quarantine_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "sandbox_quarantine"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repo_sandbox_fixture_refresh_task",
+      "prompt": "Create a sandbox fixture refresh note without using any prewritten command hint. Write fixtures/refresh.toml with suite=\"checkout-e2e\", snapshot=\"2026.04\", owner=\"test-platform\", and gated=true. Also write fixtures/summary.md stating that checkout-e2e refreshes snapshot 2026.04 only under test-platform gated approval.",
+      "workspace_subdir": "a7_r4_hard_repo_sandbox_fixture_refresh_task",
+      "success_command": "test -f fixtures/refresh.toml && test -f fixtures/summary.md && grep -q 'suite = \"checkout-e2e\"' fixtures/refresh.toml && grep -q 'gated = true' fixtures/refresh.toml && grep -q 'checkout-e2e refreshes snapshot 2026.04' fixtures/summary.md",
+      "expected_files": ["fixtures/refresh.toml", "fixtures/summary.md"],
+      "expected_file_contents": {
+        "fixtures/refresh.toml": "suite = \"checkout-e2e\"\nsnapshot = \"2026.04\"\nowner = \"test-platform\"\ngated = true\n",
+        "fixtures/summary.md": "# Fixture Refresh\ncheckout-e2e refreshes snapshot 2026.04 only under test-platform gated approval.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_fixture_refresh_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "fixture_refresh"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repo_chore_log_retention_task",
+      "prompt": "Create a log retention chore packet without using any prewritten command hint. Write retention/logs.yaml with stream=audit, keep_days=120, exception=fraud-review, and owner=compliance. Also write retention/note.md stating that audit logs keep 120 days except fraud-review under compliance ownership.",
+      "workspace_subdir": "a7_r4_hard_repo_chore_log_retention_task",
+      "success_command": "test -f retention/logs.yaml && test -f retention/note.md && grep -q 'stream: audit' retention/logs.yaml && grep -q 'keep_days: 120' retention/logs.yaml && grep -q 'audit logs keep 120 days except fraud-review' retention/note.md",
+      "expected_files": ["retention/logs.yaml", "retention/note.md"],
+      "expected_file_contents": {
+        "retention/logs.yaml": "stream: audit\nkeep_days: 120\nexception: fraud-review\nowner: compliance\n",
+        "retention/note.md": "# Log Retention\naudit logs keep 120 days except fraud-review under compliance ownership.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_log_retention_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "log_retention"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r4_hard_repo_chore_archive_exception_task",
+      "prompt": "Create an archive exception chore packet without using any prewritten command hint. Write archive/exception.json with bucket=\"exports-2025\", action=\"skip-archive\", until=\"2026-08-01\", and ticket=\"DATA-812\". Also write archive/owner.md stating that exports-2025 skips archive until 2026-08-01 for DATA-812.",
+      "workspace_subdir": "a7_r4_hard_repo_chore_archive_exception_task",
+      "success_command": "test -f archive/exception.json && test -f archive/owner.md && grep -q '\"bucket\":\"exports-2025\"' archive/exception.json && grep -q '\"skip-archive\"' archive/exception.json && grep -q 'exports-2025 skips archive until 2026-08-01' archive/owner.md",
+      "expected_files": ["archive/exception.json", "archive/owner.md"],
+      "expected_file_contents": {
+        "archive/exception.json": "{\"bucket\":\"exports-2025\",\"action\":\"skip-archive\",\"until\":\"2026-08-01\",\"ticket\":\"DATA-812\"}\n",
+        "archive/owner.md": "# Archive Exception\nexports-2025 skips archive until 2026-08-01 for DATA-812.\n"
+      },
+      "max_steps": 12,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_archive_exception_novelty",
+        "novelty_axes": ["hintless_workspace_edit", "archive_exception"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    }
+  ]
+}

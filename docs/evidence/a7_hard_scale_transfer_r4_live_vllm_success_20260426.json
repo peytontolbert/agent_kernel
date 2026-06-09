@@ -1,0 +1,53 @@
+{
+  "artifact": "a7_hard_scale_transfer_r4_live_vllm_success_20260426",
+  "created_at": "2026-04-26T05:25:00Z",
+  "claim_scope": "A7_readiness_larger_hard_hintless_transfer",
+  "manifest_path": "config/a7_unfamiliar_transfer_manifest_r4_hard_scale.json",
+  "run_root": "/tmp/agentkernel_a7_manifest_probe_r4_hard_scale_20260426",
+  "status_path": "/tmp/agentkernel_a7_manifest_probe_r4_hard_scale_20260426/status_with_frontier_fields.json",
+  "provider": {
+    "kind": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "live_provider": true,
+    "mock_provider": false,
+    "autostart": false
+  },
+  "result": {
+    "drained_jobs": 10,
+    "completed_success_jobs": 10,
+    "safe_stop_jobs": 0,
+    "closeout_ready": true,
+    "closeout_mode": "queue_empty_trusted",
+    "trust_status": "trusted",
+    "operator_steering_required": false,
+    "held_out_frontier_report_count": 10,
+    "held_out_frontier_clean_success_count": 10,
+    "held_out_frontier_clean_success_rate": 1.0,
+    "success_rate": 1.0,
+    "clean_success_rate": 1.0
+  },
+  "held_out_families": [
+    "integration",
+    "project",
+    "repo_chore",
+    "repo_sandbox",
+    "repository"
+  ],
+  "frontier_slices": [
+    "hintless_archive_exception_novelty",
+    "hintless_cache_warmup_novelty",
+    "hintless_canary_budget_novelty",
+    "hintless_capacity_cutover_novelty",
+    "hintless_dependency_pin_novelty",
+    "hintless_fixture_refresh_novelty",
+    "hintless_log_retention_novelty",
+    "hintless_sandbox_quarantine_novelty",
+    "hintless_schema_redirect_novelty",
+    "hintless_webhook_failover_novelty"
+  ],
+  "interpretation": {
+    "positive": "The existing queue and manifest path completed a larger 10-task hard hintless held-out rotation under live vLLM with exact verifier repair instrumentation.",
+    "limit": "This strengthens A7-readiness but still does not establish a full A7 crossing or strong-human-level performance across the declared task universe.",
+    "next_shortest_step": "Either repeat the hard scale rotation under model_stack when serving, or define the next A7 gate around broader unfamiliar transfer beyond compact workspace contract tasks."
+  }
+}

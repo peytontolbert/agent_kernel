@@ -1,0 +1,34 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "codeforces",
+  "ready_to_run": false,
+  "prerequisites": [
+    {
+      "blocking": true,
+      "kind": "account",
+      "name": "codeforces_account",
+      "proof_path": "/data/agentkernel/benchmarks/codeforces/account_gate.json",
+      "reason": "Codeforces benchmark execution and rating evidence require a real Codeforces account/session outside this repo.",
+      "required_env": [
+        "CODEFORCES_HANDLE"
+      ],
+      "satisfied_by": "env_or_proof"
+    }
+  ],
+  "runner": {
+    "kind": "summary_only",
+    "summary_source": "/data/agentkernel/benchmarks/codeforces/summary.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/codeforces/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/codeforces/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "Codeforces is account-gated: do not run or claim this benchmark until CODEFORCES_HANDLE is present or /data/agentkernel/benchmarks/codeforces/account_gate.json records an external account proof.",
+    "No local Codeforces harness was found; this spec expects an externally produced rating-equivalent summary.",
+    "A8 requires rating_equivalent >= 3000 and conservative comparison evidence."
+  ]
+}

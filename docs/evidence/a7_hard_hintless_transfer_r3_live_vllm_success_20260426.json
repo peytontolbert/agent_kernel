@@ -1,0 +1,62 @@
+{
+  "artifact": "a7_hard_hintless_transfer_r3_live_vllm_success_20260426",
+  "created_at": "2026-04-26T04:56:00Z",
+  "claim_scope": "A7_readiness_hard_hintless_transfer",
+  "manifest_path": "config/a7_unfamiliar_transfer_manifest_r3_hard.json",
+  "run_root": "/tmp/agentkernel_a7_manifest_probe_r3_hard_prompt_20260426",
+  "status_path": "/tmp/agentkernel_a7_manifest_probe_r3_hard_prompt_20260426/status_with_frontier_fields.json",
+  "provider": {
+    "kind": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "live_provider": true,
+    "mock_provider": false,
+    "autostart": false
+  },
+  "patches_required": [
+    {
+      "path": "agent_kernel/ops/loop_diagnostics_support.py",
+      "summary": "Verifier subgoal diagnoses now include exact expected content and a bounded JSON-escaped preview for unexpected expected-content mismatches."
+    },
+    {
+      "path": "agent_kernel/ops/loop_run_support.py",
+      "summary": "Stuckness safe-stop is deferred once when a newly diagnosed unexpected-file-content mismatch exposes exact expected bytes, allowing one additional live-model repair step."
+    },
+    {
+      "path": "agent_kernel/policy.py",
+      "summary": "The live decision prompt now includes an explicit exact verifier repair directive telling the model not to paraphrase, pretty-print, or alter spacing."
+    }
+  ],
+  "result": {
+    "drained_jobs": 5,
+    "completed_success_jobs": 5,
+    "safe_stop_jobs": 0,
+    "closeout_ready": true,
+    "closeout_mode": "queue_empty_trusted",
+    "trust_status": "trusted",
+    "operator_steering_required": false,
+    "held_out_frontier_report_count": 5,
+    "held_out_frontier_clean_success_count": 5,
+    "held_out_frontier_clean_success_rate": 1.0,
+    "success_rate": 1.0,
+    "clean_success_rate": 1.0
+  },
+  "held_out_families": [
+    "integration",
+    "project",
+    "repo_chore",
+    "repo_sandbox",
+    "repository"
+  ],
+  "frontier_slices": [
+    "hintless_api_migration_novelty",
+    "hintless_delivery_novelty",
+    "hintless_failback_novelty",
+    "hintless_legal_hold_novelty",
+    "hintless_sandbox_freeze_novelty"
+  ],
+  "interpretation": {
+    "positive": "The existing queue and manifest path completed a harder hintless held-out rotation under live vLLM after verifier-aligned repair feedback was made explicit.",
+    "limit": "This is strong A7-readiness evidence, not a full A7 crossing by itself. It covers five hard frontier tasks, not broad unfamiliar-domain transfer at scale or strong-human-level performance.",
+    "next_shortest_step": "Fold r1/r2/r3-hard into one A7 readiness packet, then either repeat the hard hintless rotation under model-stack or run a larger hard held-out rotation with the same exact-repair instrumentation."
+  }
+}

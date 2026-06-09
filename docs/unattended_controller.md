@@ -167,6 +167,6 @@ signal.
 
 ## Files
 
-- planner logic: [`unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
+- planner logic: [`unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
 - unattended orchestration entrypoint: [`run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py)
 - focused tests: [`test_unattended_controller.py`](/data/agentkernel/tests/test_unattended_controller.py)

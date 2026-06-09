@@ -1,0 +1,95 @@
+{
+  "artifacts": {
+    "adapter_spec_json": "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/sustained_coding_window/a8_benchmark_result.json",
+    "run_spec_json": "config/a8_benchmark_run_specs/sustained_coding_window_summary_template.json",
+    "summary_json": "/data/agentkernel/benchmarks/sustained_coding_window/summary.json",
+    "summary_source": "/data/agentkernel/benchmarks/sustained_coding_window/summary.json"
+  },
+  "autonomy_contract": {
+    "countable_evidence": [
+      "verified a8_benchmark_result packet"
+    ],
+    "kernel_owned_phases": [
+      "validate_adapter_spec",
+      "adapt_summary_packet"
+    ],
+    "operator_role": "launch_and_monitor_only",
+    "prohibited_manual_interventions": [
+      "manual benchmark summary editing",
+      "manual prediction JSONL editing",
+      "manual result packet editing",
+      "manual generated adapter spec editing after harness launch",
+      "claiming harness readiness as benchmark performance"
+    ],
+    "selection_mode": "run_spec_defined"
+  },
+  "benchmark": "sustained_coding_window",
+  "created_at": "2026-04-27T22:26:36.727289+00:00",
+  "open_limits": [
+    "This harness only makes benchmark execution reproducible; benchmark claims require verified output packets.",
+    "The operator should launch or monitor the harness, not hand-edit benchmark summaries or predictions."
+  ],
+  "phases": [
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/a8_benchmark_adapter_specs.py",
+        "validate",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json",
+        "--benchmark",
+        "sustained_coding_window"
+      ],
+      "gate": "generated benchmark adapter spec must be valid before benchmark adaptation",
+      "kind": "command",
+      "name": "validate_adapter_spec",
+      "required_inputs": [
+        "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "sustained_coding_window",
+        "--summary-json",
+        "/data/agentkernel/benchmarks/sustained_coding_window/summary.json",
+        "--output-json",
+        "/data/agentkernel/benchmarks/sustained_coding_window/a8_benchmark_result.json",
+        "--conservative-comparison-report",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/sustained_coding_window/a8_benchmark_result.json"
+      ],
+      "gate": "summary source must exist and adapter must verify the packet",
+      "kind": "command",
+      "name": "adapt_summary_packet",
+      "preflight_argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "sustained_coding_window",
+        "--summary-json",
+        "/data/agentkernel/benchmarks/sustained_coding_window/summary.json",
+        "--output-json",
+        "/data/agentkernel/benchmarks/sustained_coding_window/a8_benchmark_result.json",
+        "--conservative-comparison-report",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json",
+        "--validate-only"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/sustained_coding_window/summary.json",
+        "config/a8_benchmark_adapter_specs/sustained_coding_window_summary_template_adapter_spec.json"
+      ]
+    }
+  ],
+  "prerequisites": [],
+  "report_kind": "autonomous_benchmark_harness_spec",
+  "source_run_spec": "config/a8_benchmark_run_specs/sustained_coding_window_summary_template.json",
+  "spec_version": "asi_v1"
+}

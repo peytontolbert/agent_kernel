@@ -19,7 +19,7 @@ task policy, and it is not the supervised frontier runbook.
 - [`docs/scripts.md`](/data/agentkernel/docs/scripts.md)
 - [`scripts/run_unattended_campaign.py`](/data/agentkernel/scripts/run_unattended_campaign.py)
 - [`scripts/run_detached_unattended_campaign.py`](/data/agentkernel/scripts/run_detached_unattended_campaign.py)
-- [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
+- [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
 
 ## Operating Model
 
@@ -67,9 +67,9 @@ During the live wave rooted at
 
 - the Tolbert runtime lane landed a restart-required patch to reduce cold-start failures during
   preview/finalize startup in
-  [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+  [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py)
 - the controller-policy lane landed a restart-required patch in
-  [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
+  [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
   so repeated reject-only retrieval pressure counts more strongly against narrow policies and pushes
   the planner toward broader adaptive exploration sooner
 - fresh workers should read
@@ -140,13 +140,13 @@ Use these lanes as the default parallel split:
      timeout grace, child validation, recovery policy, phase transitions, status/event emission
 2. `controller_policy`
    - files:
-     [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py),
+     [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py),
      [`tests/test_unattended_controller.py`](/data/agentkernel/tests/test_unattended_controller.py)
    - scope:
      next-round policy selection, support-aware scoring, stop budgets, search adaptation
 3. `tolbert_runtime`
    - files:
-     [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py),
+     [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py),
      [`scripts/tolbert_service.py`](/data/agentkernel/scripts/tolbert_service.py),
      [`tests/test_tolbert.py`](/data/agentkernel/tests/test_tolbert.py)
    - scope:

@@ -32,10 +32,10 @@ The irreducible modules are:
 
 Support structure around that minimum includes:
 
-- [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py:40)
+- [`agent_kernel/extensions/strategy/subsystems.py`](/data/agentkernel/agent_kernel/extensions/strategy/subsystems.py:40)
 - [`agent_kernel/strategy_memory/`](/data/agentkernel/agent_kernel/strategy_memory)
-- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1)
-- [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1)
+- [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1)
+- [`agent_kernel/extensions/improvement/improvement_support_validation.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_support_validation.py:1)
 - [`agent_kernel/resource_registry.py`](/data/agentkernel/agent_kernel/resource_registry.py): RSPL-lite active-resource resolution for builtin artifacts and prompt templates
 
 Auxiliary work may still plug into this loop, but it is not the loop itself.
@@ -78,12 +78,12 @@ Primary subsystems are:
 
 Static improvement schema metadata and retained default surfaces now live in
 [`datasets/improvement_catalog.json`](/data/agentkernel/datasets/improvement_catalog.json),
-which is loaded by [`agent_kernel/improvement_catalog.py`](/data/agentkernel/agent_kernel/improvement_catalog.py).
+which is loaded by [`agent_kernel/extensions/improvement/improvement_catalog.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_catalog.py).
 That dataset currently backs subsystem schema keys and default catalogs for improvement compatibility,
 artifact-validation profiles, universe governance metadata, operator-policy defaults, transition-model parsing metadata,
 and task-budget floors. It now also carries the artifact contract registry and default retention-gate presets used by
 [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py)
-and [`agent_kernel/improvement_common.py`](/data/agentkernel/agent_kernel/improvement_common.py).
+and [`agent_kernel/extensions/improvement/improvement_common.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_common.py).
 Broader kernel registries that are not specific to the improvement planner now live in
 [`datasets/kernel_metadata.json`](/data/agentkernel/datasets/kernel_metadata.json),
 which backs subsystem registry entries, capability adapter catalogs, task-bank lineage filters,
@@ -97,8 +97,8 @@ The current split is:
 
 - [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1): shared engine dataclasses plus generic target projection, variant orchestration, retention-gate application, and artifact-application helpers
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1): planner orchestration, subsystem-scored experiment ranking, subsystem evidence shaping, compatibility policy, and cycle-record management
-- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1): plugin-layer adapters for subsystem registry access, default variants, external planner experiments, TOLBERT delta/checkpoint helpers, universe bundle helpers, and strategy-memory prior reads through `StrategyPriorStore`
-- [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1): support-side `TaskContractCatalog` wrapper for `TaskBank`-backed contract lookup during compatibility checks
+- [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1): plugin-layer adapters for subsystem registry access, default variants, external planner experiments, TOLBERT delta/checkpoint helpers, universe bundle helpers, and strategy-memory prior reads through `StrategyPriorStore`
+- [`agent_kernel/extensions/improvement/improvement_support_validation.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_support_validation.py:1): support-side `TaskContractCatalog` wrapper for `TaskBank`-backed contract lookup during compatibility checks
 
 This keeps the core/support boundary tighter:
 
@@ -112,7 +112,7 @@ The retain/reject path now has an explicit generic core plus subsystem hooks:
 
 - [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) owns generic ranking helpers, cycle-record persistence helpers, the generic retention-evaluation wrapper, and the generic artifact-application path
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1) still owns subsystem-specific evidence shaping and retention evaluators, but it now registers those evaluators through the plugin layer instead of hard-wiring the full retention protocol into one file-local path
-- [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1) now also owns subsystem post-apply lifecycle hooks, including retained retrieval bundle materialization and retained Tolbert liftoff report generation
+- [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1) now also owns subsystem post-apply lifecycle hooks, including retained retrieval bundle materialization and retained Tolbert liftoff report generation
 
 That means the minimum self-improving loop no longer depends on finalize-only branches for retained side effects. [`agent_kernel/cycle_runner.py`](/data/agentkernel/agent_kernel/cycle_runner.py:2797) still orchestrates comparison and finalization, but post-retain subsystem actions are emitted as generic `lifecycle_effects` from the engine apply path and then recorded back into cycle history.
 
@@ -167,7 +167,7 @@ Internally, that flow now crosses the split above: [`agent_kernel/cycle_runner.p
 The explicit `Reflect` and `Select` records are built in [`agent_kernel/reflection.py`](/data/agentkernel/agent_kernel/reflection.py) and [`agent_kernel/selection.py`](/data/agentkernel/agent_kernel/selection.py), then threaded through cycle history and candidate artifact `generation_context`.
 Candidate stamping, replay-verified tooling updates, retention finalize writes, rollback restores, rollback receipts, and Tolbert liftoff gate reports now all flow through the runtime supervision atomic helpers, so non-protected lanes can perform real governed retention and rollback actions instead of only compare-only bookkeeping. The supervisor now also consumes candidate-observed benchmark families from the frontier report and treats missing counted gated evidence, bootstrap-only family posture, and missing clean task-root breadth as machine-readable autonomy blockers for the affected retained candidates instead of only reporting those gaps in the trust ledger. Those candidate-family blockers now also feed sticky discovery priority: the next supervisor rounds bias `launch_discovery` toward `trust`/`recovery` work, widen the trust-remediation batch budget when family pressure is higher, and forward both `--priority-benchmark-family` hints and per-family weights so unattended evidence collection chases the exact missing proof instead of rerunning a fixed small probe.
 That closes an important control-path gap, but it does not mean broad coding autonomy is complete. The current kernel still gets a large share of its success from bounded task design, runtime guards, direct retained-vs-candidate paths, and family-specific recovery logic. The remaining product gap is broader unattended trust evidence and wider repeated proof on `repository`, `project`, and `integration`, so governed supervisor actions rest on deeper unattended evidence instead of narrow bootstrap-era coverage.
-The coding path now has parser-backed syntax-motor support in [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py), but it still does not have a fully syntax-native end-to-end coding loop. The larger unattended blocker is conversion into broad runtime-managed coding gains, not mere parser absence. For the current evidence-ranked gap order, see [`coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md).
+The coding path now has parser-backed syntax-motor support in [`agent_kernel/extensions/syntax_motor.py`](/data/agentkernel/agent_kernel/extensions/syntax_motor.py), but it still does not have a fully syntax-native end-to-end coding loop. The larger unattended blocker is conversion into broad runtime-managed coding gains, not mere parser absence. For the current evidence-ranked gap order, see [`coding_agi_gap_map.md`](/data/agentkernel/docs/coding_agi_gap_map.md).
 Use `--adaptive-search` to let retained-history and score concentration widen campaign or sibling-variant search up to the requested width caps.
 The recorded `campaign_budget` now reflects the actual selected portfolio campaign, not only the raw pre-selection recommendation, so cycle history matches the real subsystem pool that was allowed to generate candidates.
 Campaign selection also uses recent cycle history so near-tied subsystems can rotate instead of letting one recently saturated subsystem dominate repeated autonomous runs.

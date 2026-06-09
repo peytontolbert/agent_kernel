@@ -1,0 +1,153 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 3,
+  "purpose": "Harder held-out coding-domain transfer rotation with no suggested commands, forcing the live provider to infer workspace edits from task instructions.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true,
+    "rotation_id": "r3_hard",
+    "suggested_commands_allowed": false
+  },
+  "tasks": [
+    {
+      "task_id": "a7_r3_hard_progressive_delivery_matrix_task",
+      "prompt": "Create a progressive delivery matrix without using any prewritten command hint. Write delivery/matrix.json with service=\"checkout\", stages=[\"shadow\",\"canary\",\"regional\"], rollback=\"checkout.rollback\", and metric=\"error-rate\". Also write delivery/readme.md explaining that checkout advances shadow to canary to regional only while error-rate is healthy.",
+      "workspace_subdir": "a7_r3_hard_progressive_delivery_matrix_task",
+      "success_command": "test -f delivery/matrix.json && test -f delivery/readme.md && grep -q '\"service\":\"checkout\"' delivery/matrix.json && grep -q '\"checkout.rollback\"' delivery/matrix.json && grep -q 'shadow to canary to regional' delivery/readme.md && test ! -f command_hint.txt",
+      "expected_files": [
+        "delivery/matrix.json",
+        "delivery/readme.md"
+      ],
+      "expected_file_contents": {
+        "delivery/matrix.json": "{\"service\":\"checkout\",\"stages\":[\"shadow\",\"canary\",\"regional\"],\"rollback\":\"checkout.rollback\",\"metric\":\"error-rate\"}\n",
+        "delivery/readme.md": "# Progressive Delivery\ncheckout advances shadow to canary to regional only while error-rate is healthy.\n"
+      },
+      "forbidden_files": [
+        "command_hint.txt"
+      ],
+      "max_steps": 10,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_delivery_novelty",
+        "novelty_axes": [
+          "hintless_workspace_edit",
+          "progressive_delivery"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r3_hard_api_deprecation_bridge_task",
+      "prompt": "Create an API deprecation bridge without using any prewritten command hint. Write api/deprecation.yaml with old_endpoint=/v1/orders, new_endpoint=/v2/orders, sunset=2026-06-30, and compatibility=read-through. Also write docs/deprecation_bridge.md stating that /v1/orders reads through to /v2/orders until 2026-06-30.",
+      "workspace_subdir": "a7_r3_hard_api_deprecation_bridge_task",
+      "success_command": "test -f api/deprecation.yaml && test -f docs/deprecation_bridge.md && grep -q 'old_endpoint: /v1/orders' api/deprecation.yaml && grep -q 'compatibility: read-through' api/deprecation.yaml && grep -q '/v1/orders reads through to /v2/orders' docs/deprecation_bridge.md",
+      "expected_files": [
+        "api/deprecation.yaml",
+        "docs/deprecation_bridge.md"
+      ],
+      "expected_file_contents": {
+        "api/deprecation.yaml": "old_endpoint: /v1/orders\nnew_endpoint: /v2/orders\nsunset: 2026-06-30\ncompatibility: read-through\n",
+        "docs/deprecation_bridge.md": "# Deprecation Bridge\n/v1/orders reads through to /v2/orders until 2026-06-30.\n"
+      },
+      "max_steps": 10,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_api_migration_novelty",
+        "novelty_axes": [
+          "hintless_workspace_edit",
+          "api_deprecation_bridge"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r3_hard_integrated_failback_playbook_task",
+      "prompt": "Create an integrated failback playbook without using any prewritten command hint. Write failback/plan.json with primary=\"east\", secondary=\"west\", validation=\"dual-write-check\", and promote_after=\"replication-green\". Also write failback/operator.md stating that east resumes only after dual-write-check and replication-green pass.",
+      "workspace_subdir": "a7_r3_hard_integrated_failback_playbook_task",
+      "success_command": "test -f failback/plan.json && test -f failback/operator.md && grep -q '\"primary\":\"east\"' failback/plan.json && grep -q '\"dual-write-check\"' failback/plan.json && grep -q 'east resumes only after dual-write-check and replication-green pass' failback/operator.md",
+      "expected_files": [
+        "failback/plan.json",
+        "failback/operator.md"
+      ],
+      "expected_file_contents": {
+        "failback/plan.json": "{\"primary\":\"east\",\"secondary\":\"west\",\"validation\":\"dual-write-check\",\"promote_after\":\"replication-green\"}\n",
+        "failback/operator.md": "# Failback Operator Note\neast resumes only after dual-write-check and replication-green pass.\n"
+      },
+      "max_steps": 10,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_failback_novelty",
+        "novelty_axes": [
+          "hintless_workspace_edit",
+          "integrated_failback"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r3_hard_sandbox_release_freeze_task",
+      "prompt": "Create a sandbox release-freeze record without using any prewritten command hint. Write freeze/window.json with branch=\"release/2026.04\", frozen=true, exceptions=[\"hotfix-auth\"], and reviewer=\"sandbox-captain\". Also write freeze/review.md stating that only hotfix-auth may bypass the release/2026.04 freeze after sandbox-captain review.",
+      "workspace_subdir": "a7_r3_hard_sandbox_release_freeze_task",
+      "success_command": "test -f freeze/window.json && test -f freeze/review.md && grep -q '\"branch\":\"release/2026.04\"' freeze/window.json && grep -q '\"frozen\":true' freeze/window.json && grep -q 'hotfix-auth may bypass' freeze/review.md",
+      "expected_files": [
+        "freeze/window.json",
+        "freeze/review.md"
+      ],
+      "expected_file_contents": {
+        "freeze/window.json": "{\"branch\":\"release/2026.04\",\"frozen\":true,\"exceptions\":[\"hotfix-auth\"],\"reviewer\":\"sandbox-captain\"}\n",
+        "freeze/review.md": "# Release Freeze Review\nOnly hotfix-auth may bypass the release/2026.04 freeze after sandbox-captain review.\n"
+      },
+      "max_steps": 10,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_sandbox_freeze_novelty",
+        "novelty_axes": [
+          "hintless_workspace_edit",
+          "sandbox_release_freeze"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    },
+    {
+      "task_id": "a7_r3_hard_cleanup_legal_hold_task",
+      "prompt": "Create a cleanup legal-hold policy without using any prewritten command hint. Write cleanup/legal_hold.toml with dataset=\"billing-exports\", hold=true, expires=\"2026-05-31\", and owner=\"legal-ops\". Also write cleanup/audit.md stating that billing-exports is excluded from cleanup until 2026-05-31 under legal-ops ownership.",
+      "workspace_subdir": "a7_r3_hard_cleanup_legal_hold_task",
+      "success_command": "test -f cleanup/legal_hold.toml && test -f cleanup/audit.md && grep -q 'dataset = \"billing-exports\"' cleanup/legal_hold.toml && grep -q 'hold = true' cleanup/legal_hold.toml && grep -q 'excluded from cleanup until 2026-05-31' cleanup/audit.md",
+      "expected_files": [
+        "cleanup/legal_hold.toml",
+        "cleanup/audit.md"
+      ],
+      "expected_file_contents": {
+        "cleanup/legal_hold.toml": "dataset = \"billing-exports\"\nhold = true\nexpires = \"2026-05-31\"\nowner = \"legal-ops\"\n",
+        "cleanup/audit.md": "# Cleanup Legal Hold\nbilling-exports is excluded from cleanup until 2026-05-31 under legal-ops ownership.\n"
+      },
+      "max_steps": 10,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer_hard",
+        "frontier_slice": "hintless_legal_hold_novelty",
+        "novelty_axes": [
+          "hintless_workspace_edit",
+          "cleanup_legal_hold"
+        ],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true
+      }
+    }
+  ]
+}

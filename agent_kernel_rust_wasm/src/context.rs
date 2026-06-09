@@ -154,7 +154,7 @@ pub fn prompt_from_context_packet(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let context = if spans.is_empty() {
+    let ak_context = if spans.is_empty() {
         "No research context was retrieved.".to_string()
     } else {
         spans
@@ -167,19 +167,35 @@ pub fn prompt_from_context_packet(
                     .and_then(Value::as_str)
                     .unwrap_or("Untitled evidence");
                 let source = span.get("source_id").and_then(Value::as_str).unwrap_or("");
-                let score = span.get("score").and_then(Value::as_f64).unwrap_or(0.0);
                 let text = span.get("text").and_then(Value::as_str).unwrap_or("");
+                let metadata = span.get("metadata").cloned().unwrap_or(Value::Null);
+                let category = metadata
+                    .get("primary_category")
+                    .or_else(|| metadata.get("category"))
+                    .or_else(|| metadata.get("categories"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let year = metadata
+                    .get("year")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| value.to_string())
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "[{}] {} | {} | score {:.3}\n{}",
+                    "<AK_EVIDENCE> <AK_EVIDENCE_ID> P{}\n<AK_TITLE> {}\n<AK_PAPER_ID> {}\n<AK_CATEGORY> {}\n<AK_YEAR> {}\n<AK_ABSTRACT> {}",
                     index + 1,
                     title,
                     source,
-                    score,
-                    text
+                    category,
+                    year,
+                    compact_whitespace(text)
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n\n")
+            .join("\n")
     };
     let answer_scaffold = spans
         .first()
@@ -194,14 +210,42 @@ pub fn prompt_from_context_packet(
         "deep_research" => "Mode: Deep Research. Inspect every evidence item, cite evidence numbers when making supported claims, identify conflicts or gaps, and then give a careful final synthesis. This is the slow, highest-quality mode.".to_string(),
         _ => "Mode: Chat. Reply as a helpful assistant first. Use retrieved evidence as support, cite evidence numbers only when they improve clarity, and do not turn the answer into a paper list.".to_string(),
     };
+    let mode_token = match profile.normalized {
+        "think" => "<AK_THINK>",
+        "deep_research" => "<AK_DEEP_RESEARCH>",
+        _ => "<AK_CHAT>",
+    };
+    if spans.is_empty() {
+        return [
+            format!("{mode_token} <AK_RESPOND>"),
+            format!("<AK_LOOP> <AK_STATE> mode={} selected_context=0 retrieval=none", profile.normalized),
+            "Return exactly this decision format: Action: respond, then Content: your direct answer.".to_string(),
+            "You cannot execute, test, install, browse, or modify files from this environment.".to_string(),
+            format!(
+                "Agent loop: step {step_index} of {max_steps}; mode={}; code_execution=disabled; target_language={language}.",
+                profile.normalized
+            ),
+            mode_instruction,
+            format!("<AK_USER> {}", compact_whitespace(user_text)),
+            "Return a structured decision with action=respond.".to_string(),
+        ]
+        .join("\n");
+    }
     [
-        "System: You are Agent Kernel Lite running entirely in this browser.".to_string(),
+        format!("{mode_token} <AK_RESPOND> <AK_CONTEXT> <AK_ANSWER>"),
+        format!("<AK_LOOP> <AK_STATE> mode={} selected_context={} retrieval=ranked", profile.normalized, if spans.iter().any(|span| {
+            span.get("metadata")
+                .and_then(|meta| meta.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("selected")
+        }) { 1 } else { 0 }),
+        "Return exactly this decision format: Action: respond, then Content: your direct answer.".to_string(),
+        "You are Agent Kernel Lite running entirely in this browser.".to_string(),
         "You cannot execute, test, install, browse, or modify files from this environment."
             .to_string(),
-        "Use retrieved evidence when it is relevant, and say when it is not enough. Do not invent citations.".to_string(),
-        "Answer the user's question directly before mentioning sources. The interface displays paper titles and PDF links separately, so do not copy source metadata unless the user asks for it.".to_string(),
-        "Lite command contract: choose only respond or gather_context. Use gather_context when ranked papers/context would materially improve the answer; otherwise respond directly. After context is gathered, always produce a respond answer.".to_string(),
-        "When model output is structured, emit JSON with thought, action, content, done, and selected_retrieval_span_id.".to_string(),
+        "Use retrieved evidence when it is relevant, and say when it is not enough. Do not invent citations, paper titles, paper ids, or source claims.".to_string(),
+        "Answer the user's question directly. When using evidence, cite the evidence id such as [1] or [P1]; the interface renders the exact paper title and PDF link from that id.".to_string(),
         mode_instruction,
         format!(
             "Agent loop: step {step_index} of {max_steps}; mode={}; code_execution=disabled; target_language={language}.",
@@ -211,14 +255,14 @@ pub fn prompt_from_context_packet(
         "Context packet:".to_string(),
         serde_json::to_string(packet).unwrap_or_else(|_| "{}".to_string()),
         String::new(),
-        "Retrieved evidence:".to_string(),
-        context,
+        "<AK_CONTEXT> Retrieved evidence:".to_string(),
+        ak_context,
         String::new(),
-        "Answer scaffold:".to_string(),
+        "<AK_ANSWER> Answer scaffold:".to_string(),
         answer_scaffold,
         String::new(),
-        format!("User: {}", compact_whitespace(user_text)),
-        "Assistant:".to_string(),
+        format!("<AK_USER> {}", compact_whitespace(user_text)),
+        "Answer directly, cite evidence like [1] only for supported claims, and keep the response conversational.".to_string(),
     ]
     .join("\n")
 }

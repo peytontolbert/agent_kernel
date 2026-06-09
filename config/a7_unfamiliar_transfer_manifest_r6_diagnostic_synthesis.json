@@ -1,0 +1,150 @@
+{
+  "manifest_kind": "a7_unfamiliar_transfer_probe",
+  "manifest_version": 6,
+  "purpose": "Hard held-out diagnostic synthesis rotation with setup evidence, inferred remediation packets, and no suggested commands.",
+  "counting_policy": {
+    "held_out": true,
+    "not_training_input": true,
+    "requires_live_provider_for_lane_claim": true,
+    "a7_claim_requires_repeated_success": true,
+    "rotation_id": "r6_diagnostic_synthesis",
+    "suggested_commands_allowed": false
+  },
+  "tasks": [
+    {
+      "task_id": "a7_r6_diag_project_latency_synthesis_task",
+      "prompt": "Inspect the existing project telemetry without using any prewritten command hint. Produce diagnosis/summary.md identifying checkout latency-p95 as the failing signal, canary-east as the affected slice, and rollback-to-stable as the action. Also produce diagnosis/action.json with service=\"checkout\", signal=\"latency-p95\", slice=\"canary-east\", and action=\"rollback-to-stable\".",
+      "workspace_subdir": "a7_r6_diag_project_latency_synthesis_task",
+      "setup_commands": [
+        "mkdir -p telemetry diagnosis && printf 'service=checkout\\nslice=canary-east\\nlatency-p95=842ms\\nerror-rate=0.2%%\\nthreshold=500ms\\n' > telemetry/window.env && printf 'candidate actions: hold, rollback-to-stable, expand\\n' > telemetry/actions.txt"
+      ],
+      "success_command": "test -f diagnosis/summary.md && test -f diagnosis/action.json && grep -q 'checkout latency-p95 failed on canary-east' diagnosis/summary.md && grep -q 'rollback-to-stable' diagnosis/summary.md && grep -q '\"signal\":\"latency-p95\"' diagnosis/action.json",
+      "expected_files": ["diagnosis/summary.md", "diagnosis/action.json"],
+      "expected_file_contents": {
+        "diagnosis/summary.md": "# Diagnostic Summary\ncheckout latency-p95 failed on canary-east; action is rollback-to-stable.\n",
+        "diagnosis/action.json": "{\"service\":\"checkout\",\"signal\":\"latency-p95\",\"slice\":\"canary-east\",\"action\":\"rollback-to-stable\"}\n"
+      },
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "project",
+        "capability": "unfamiliar_environment_transfer_diagnostic_hard",
+        "frontier_slice": "diagnostic_latency_synthesis_novelty",
+        "novelty_axes": ["diagnostic_synthesis", "telemetry_triage"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true,
+        "workflow_guard": {
+          "managed_paths": ["telemetry/window.env", "telemetry/actions.txt"]
+        }
+      }
+    },
+    {
+      "task_id": "a7_r6_diag_repository_ownership_synthesis_task",
+      "prompt": "Inspect the existing repository ownership evidence without using any prewritten command hint. Produce ownership/decision.md identifying auth-client as orphaned, platform-sec as the replacement owner, and branch-freeze as the required policy. Also produce ownership/decision.toml with package=\"auth-client\", owner=\"platform-sec\", policy=\"branch-freeze\", and reason=\"orphaned-owner\".",
+      "workspace_subdir": "a7_r6_diag_repository_ownership_synthesis_task",
+      "setup_commands": [
+        "mkdir -p repo ownership && printf 'package=auth-client\\ncurrent_owner=deleted-team\\nlast_review=2025-11-02\\nrisk=token-rotation\\n' > repo/owners.env && printf 'replacement_owner=platform-sec\\nrequired_policy=branch-freeze\\nreason=orphaned-owner\\n' > repo/remediation.env"
+      ],
+      "success_command": "test -f ownership/decision.md && test -f ownership/decision.toml && grep -q 'auth-client is orphaned' ownership/decision.md && grep -q 'platform-sec' ownership/decision.md && grep -q 'policy = \"branch-freeze\"' ownership/decision.toml",
+      "expected_files": ["ownership/decision.md", "ownership/decision.toml"],
+      "expected_file_contents": {
+        "ownership/decision.md": "# Ownership Decision\nauth-client is orphaned; assign platform-sec and apply branch-freeze.\n",
+        "ownership/decision.toml": "package = \"auth-client\"\nowner = \"platform-sec\"\npolicy = \"branch-freeze\"\nreason = \"orphaned-owner\"\n"
+      },
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repository",
+        "capability": "unfamiliar_environment_transfer_diagnostic_hard",
+        "frontier_slice": "diagnostic_ownership_synthesis_novelty",
+        "novelty_axes": ["diagnostic_synthesis", "ownership_triage"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true,
+        "workflow_guard": {
+          "managed_paths": ["repo/owners.env", "repo/remediation.env"]
+        }
+      }
+    },
+    {
+      "task_id": "a7_r6_diag_integration_replay_synthesis_task",
+      "prompt": "Inspect the existing integration replay evidence without using any prewritten command hint. Produce replay/packet.json identifying source=\"billing\", failed_check=\"signature-replay\", fallback=\"hook-west\", and action=\"route-to-fallback\". Also produce replay/runbook.md stating that billing routes to hook-west because signature-replay failed on hook-east.",
+      "workspace_subdir": "a7_r6_diag_integration_replay_synthesis_task",
+      "setup_commands": [
+        "mkdir -p replay evidence && printf 'source=billing\\nprimary=hook-east\\nbackup=hook-west\\ncheck=signature-replay\\nresult=failed\\n' > evidence/replay.env && printf 'do not retry hook-east until replay passes\\n' > evidence/operator.txt"
+      ],
+      "success_command": "test -f replay/packet.json && test -f replay/runbook.md && grep -q '\"failed_check\":\"signature-replay\"' replay/packet.json && grep -q '\"fallback\":\"hook-west\"' replay/packet.json && grep -q 'billing routes to hook-west because signature-replay failed on hook-east' replay/runbook.md",
+      "expected_files": ["replay/packet.json", "replay/runbook.md"],
+      "expected_file_contents": {
+        "replay/packet.json": "{\"source\":\"billing\",\"failed_check\":\"signature-replay\",\"fallback\":\"hook-west\",\"action\":\"route-to-fallback\"}\n",
+        "replay/runbook.md": "# Replay Runbook\nbilling routes to hook-west because signature-replay failed on hook-east.\n"
+      },
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "integration",
+        "capability": "unfamiliar_environment_transfer_diagnostic_hard",
+        "frontier_slice": "diagnostic_replay_synthesis_novelty",
+        "novelty_axes": ["diagnostic_synthesis", "integration_replay"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true,
+        "workflow_guard": {
+          "managed_paths": ["evidence/replay.env", "evidence/operator.txt"]
+        }
+      }
+    },
+    {
+      "task_id": "a7_r6_diag_repo_sandbox_flake_synthesis_task",
+      "prompt": "Inspect the existing sandbox flake evidence without using any prewritten command hint. Produce flakes/decision.yaml with suite=payments-e2e, symptom=flake-burst, owner=qa-sentinel, and action=keep-isolated. Also produce flakes/summary.md stating that payments-e2e remains isolated because flake-burst persists under qa-sentinel review.",
+      "workspace_subdir": "a7_r6_diag_repo_sandbox_flake_synthesis_task",
+      "setup_commands": [
+        "mkdir -p flakes sandbox && printf 'suite=payments-e2e\\nfailures=17\\nwindow=20\\nsymptom=flake-burst\\nreviewer=qa-sentinel\\n' > sandbox/flake-window.env && printf 'candidate actions: merge, keep-isolated, delete-fixture\\n' > sandbox/actions.txt"
+      ],
+      "success_command": "test -f flakes/decision.yaml && test -f flakes/summary.md && grep -q 'suite: payments-e2e' flakes/decision.yaml && grep -q 'action: keep-isolated' flakes/decision.yaml && grep -q 'payments-e2e remains isolated because flake-burst persists' flakes/summary.md",
+      "expected_files": ["flakes/decision.yaml", "flakes/summary.md"],
+      "expected_file_contents": {
+        "flakes/decision.yaml": "suite: payments-e2e\nsymptom: flake-burst\nowner: qa-sentinel\naction: keep-isolated\n",
+        "flakes/summary.md": "# Flake Decision\npayments-e2e remains isolated because flake-burst persists under qa-sentinel review.\n"
+      },
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repo_sandbox",
+        "capability": "unfamiliar_environment_transfer_diagnostic_hard",
+        "frontier_slice": "diagnostic_flake_synthesis_novelty",
+        "novelty_axes": ["diagnostic_synthesis", "sandbox_flake_triage"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true,
+        "workflow_guard": {
+          "managed_paths": ["sandbox/flake-window.env", "sandbox/actions.txt"]
+        }
+      }
+    },
+    {
+      "task_id": "a7_r6_diag_repo_chore_storage_synthesis_task",
+      "prompt": "Inspect the existing storage evidence without using any prewritten command hint. Produce storage/decision.env with bucket=exports-2025, pressure=high, exception=DATA-812, and action=skip-archive. Also produce storage/summary.md stating that exports-2025 skips archive because DATA-812 is an active exception under high pressure.",
+      "workspace_subdir": "a7_r6_diag_repo_chore_storage_synthesis_task",
+      "setup_commands": [
+        "mkdir -p storage evidence && printf 'bucket=exports-2025\\nusage=94%%\\npressure=high\\nexception_ticket=DATA-812\\nexception_state=active\\n' > evidence/storage.env && printf 'actions: archive, skip-archive, delete\\n' > evidence/action-set.txt"
+      ],
+      "success_command": "test -f storage/decision.env && test -f storage/summary.md && grep -q 'bucket=exports-2025' storage/decision.env && grep -q 'action=skip-archive' storage/decision.env && grep -q 'exports-2025 skips archive because DATA-812 is an active exception' storage/summary.md",
+      "expected_files": ["storage/decision.env", "storage/summary.md"],
+      "expected_file_contents": {
+        "storage/decision.env": "bucket=exports-2025\npressure=high\nexception=DATA-812\naction=skip-archive\n",
+        "storage/summary.md": "# Storage Decision\nexports-2025 skips archive because DATA-812 is an active exception under high pressure.\n"
+      },
+      "max_steps": 14,
+      "metadata": {
+        "benchmark_family": "repo_chore",
+        "capability": "unfamiliar_environment_transfer_diagnostic_hard",
+        "frontier_slice": "diagnostic_storage_synthesis_novelty",
+        "novelty_axes": ["diagnostic_synthesis", "storage_triage"],
+        "held_out_frontier_task": true,
+        "task_origin": "external_manifest",
+        "suggested_commands_absent": true,
+        "workflow_guard": {
+          "managed_paths": ["evidence/storage.env", "evidence/action-set.txt"]
+        }
+      }
+    }
+  ]
+}

@@ -15,10 +15,13 @@ from .models import (
     select_trained_model_assets,
     trained_model_asset_catalog,
 )
+from .query import ResearchLibraryQueryClient, ResearchLibraryQueryLimits
 
 __all__ = [
     "DEFAULT_RESEARCH_LIBRARY_CONFIG",
     "DEFAULT_RESEARCH_LIBRARY_STATUS",
+    "ResearchLibraryQueryClient",
+    "ResearchLibraryQueryLimits",
     "build_research_library_status",
     "iter_trained_model_assets",
     "load_research_library_config",

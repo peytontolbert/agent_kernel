@@ -1,0 +1,114 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_dataset_sources",
+  "sources": [
+    {
+      "benchmark": "swe_bench_lite",
+      "label": "SWE-Bench Lite",
+      "kind": "huggingface_dataset",
+      "dataset_id": "princeton-nlp/SWE-bench_Lite",
+      "split": "test",
+      "local_path": "benchmarks/swe_bench_lite_probe/swe_bench_lite_test_dataset.json",
+      "required_for_a8": false,
+      "notes": "Iteration and sanity-check probe; not the formal A8 gate."
+    },
+    {
+      "benchmark": "swe_bench_verified",
+      "label": "SWE-Bench Verified",
+      "kind": "huggingface_dataset",
+      "dataset_id": "princeton-nlp/SWE-bench_Verified",
+      "split": "test",
+      "local_path": "benchmarks/swe_bench_verified/swe_bench_verified_test_dataset.json",
+      "required_for_a8": true,
+      "notes": "Formal A8 gate: resolve_rate >= 0.8, which is 400/500 on the local test dataset."
+    },
+    {
+      "benchmark": "swe_bench_live",
+      "label": "SWE-bench Live Verified",
+      "kind": "huggingface_dataset",
+      "dataset_id": "SWE-bench-Live/SWE-bench-Live",
+      "split": "verified",
+      "local_path": "benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+      "required_for_a8": false,
+      "benchmark_role": "standalone_leaderboard",
+      "notes": "Leaderboard-track live issue-resolving dataset. The autonomous harness packages preds.json/results.json/README.md for the official submission PR flow."
+    },
+    {
+      "benchmark": "swe_bench_live",
+      "label": "SWE-bench Live Evaluator",
+      "kind": "git_repo",
+      "repo_url": "https://github.com/microsoft/SWE-bench-Live.git",
+      "local_path": "other_repos/SWE-bench-Live",
+      "required_for_a8": false,
+      "benchmark_role": "standalone_leaderboard",
+      "notes": "Official SWE-bench Live evaluator repository used by the autonomous harness official_harness phase."
+    },
+    {
+      "benchmark": "swe_bench_full",
+      "label": "SWE-Bench Full",
+      "kind": "huggingface_dataset",
+      "dataset_id": "princeton-nlp/SWE-bench",
+      "split": "test",
+      "local_path": "benchmarks/swe_bench/swe_bench_test_dataset.json",
+      "required_for_a8": false,
+      "notes": "Comprehensive SWE-Bench test split for broader regression tracking."
+    },
+    {
+      "benchmark": "codeforces",
+      "label": "Codeforces / CodeContests",
+      "kind": "huggingface_metadata",
+      "dataset_id": "Imandra/code_contests",
+      "split": "test",
+      "local_path": "benchmarks/codeforces/code_contests_dataset_info.json",
+      "required_for_a8": true,
+      "large": true,
+      "notes": "The A8 gate is rating-equivalent >= 3000. CodeContests is connected as public competitive-programming data, but full raw download is large."
+    },
+    {
+      "benchmark": "mle_bench",
+      "label": "MLE-Bench",
+      "kind": "git_repo",
+      "repo_url": "https://github.com/openai/mle-bench.git",
+      "local_path": "benchmarks/mle_bench/repo",
+      "outline_path": "benchmarks/mle_bench/outline.md",
+      "required_for_a8": true,
+      "requires_credentials": true,
+      "notes": "Benchmark code is public. Raw competition data requires Kaggle credentials and per-competition downloads."
+    },
+    {
+      "benchmark": "re_bench",
+      "label": "RE-Bench",
+      "kind": "git_repo",
+      "repo_url": "https://github.com/METR/RE-Bench.git",
+      "local_path": "benchmarks/re_bench/repo",
+      "required_for_a8": true,
+      "notes": "Public METR task suite. Some protected files require the official extraction step."
+    },
+    {
+      "benchmark": "swe_rebench",
+      "label": "SWE-ReBench",
+      "kind": "huggingface_dataset",
+      "dataset_id": "nebius/SWE-rebench-leaderboard",
+      "split": "test",
+      "local_path": "benchmarks/swe_rebench/swe_rebench_leaderboard_test_dataset.json",
+      "required_for_a8": true,
+      "notes": "Curated public SWE-ReBench leaderboard task set from Nebius. The A8 gate remains resolve_rate >= 0.6."
+    },
+    {
+      "benchmark": "sustained_coding_window",
+      "label": "Sustained Coding Window",
+      "kind": "summary_only",
+      "local_path": "benchmarks/sustained_coding_window/summary.json",
+      "required_for_a8": true,
+      "notes": "Internal evidence gate: >= 100 tasks across >= 3 windows."
+    },
+    {
+      "benchmark": "recursive_compounding",
+      "label": "Recursive Compounding",
+      "kind": "summary_only",
+      "local_path": "benchmarks/recursive_compounding/summary.json",
+      "required_for_a8": true,
+      "notes": "Internal evidence gate: >= 5 retained-gain runs across >= 3 windows."
+    }
+  ]
+}

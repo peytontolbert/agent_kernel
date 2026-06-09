@@ -115,9 +115,9 @@ cd /data/agentkernel && AGENT_KERNEL_PROVIDER=mock AGENT_KERNEL_USE_TOLBERT_CONT
 
 - hypothesis: `The next queue-runtime gap is no longer synthetic worker-command breadth. If the delegated runner can execute real repo-backed jobs concurrently under the isolated mock posture, and if checkpoint export governance stops sweeping unrelated improvement roots on every checkpoint write, then two shared-repo worker branches plus an independent verifier-bearing repo review should hold live leases together long enough to capture non-empty in-flight kernel progress and terminal success outcomes.`
 - owned_paths:
-  - `agent_kernel/runtime_supervision.py`
-  - `agent_kernel/export_governance.py`
-  - `agent_kernel/job_queue.py`
+  - `agent_kernel/ops/runtime_supervision.py`
+  - `agent_kernel/ops/export_governance.py`
+  - `agent_kernel/ops/job_queue.py`
   - `tests/test_runtime_supervision.py`
   - `tests/test_job_queue.py`
   - `docs/ai_agent_status.md`
@@ -125,19 +125,19 @@ cd /data/agentkernel && AGENT_KERNEL_PROVIDER=mock AGENT_KERNEL_USE_TOLBERT_CONT
 - released_at: `2026-04-03T18:23:00Z`
 - result: `completed`
 - findings:
-  - `Patched agent_kernel/runtime_supervision.py and agent_kernel/export_governance.py so managed writes govern only the touched export root. This removed the delegated repo-backed stall where every checkpoint write under run_checkpoints was recursively sizing unrelated improvement candidate trees before step 1.`
-  - `Patched agent_kernel/job_queue.py so delegated kernel runs now write a per-job *.progress.json sidecar from the AgentKernel progress callback. That made mid-flight delegated progress visible without waiting for a full checkpoint step to finish.`
+  - `Patched agent_kernel/ops/runtime_supervision.py and agent_kernel/ops/export_governance.py so managed writes govern only the touched export root. This removed the delegated repo-backed stall where every checkpoint write under run_checkpoints was recursively sizing unrelated improvement candidate trees before step 1.`
+  - `Patched agent_kernel/ops/job_queue.py so delegated kernel runs now write a per-job *.progress.json sidecar from the AgentKernel progress callback. That made mid-flight delegated progress visible without waiting for a full checkpoint step to finish.`
   - `The fresh isolated bundle trajectories/improvement/reports/delegated_queue_repo_backed_execution_20260403T182235Z now shows real concurrent repo-backed execution: runtime_state_inflight.json records active_leases=3, queue_status_inflight.json and queue_list_inflight.json show the two shared-repo worker branches plus repo_cleanup_review_task live at once, and progress_snapshot_inflight.json plus checkpoint_snapshot_inflight.json capture non-empty progress for all three jobs before completion.`
   - `The same bundle closed the run with three clean outcomes. queue_status_completed.json, queue_list_completed.json, and the per-job inspect_*.json artifacts all show completed/success for git_parallel_worker_api_task, git_parallel_worker_docs_task, and repo_cleanup_review_task.`
 - artifacts:
-  - `agent_kernel/runtime_supervision.py`
-  - `agent_kernel/export_governance.py`
-  - `agent_kernel/job_queue.py`
+  - `agent_kernel/ops/runtime_supervision.py`
+  - `agent_kernel/ops/export_governance.py`
+  - `agent_kernel/ops/job_queue.py`
   - `tests/test_runtime_supervision.py`
   - `tests/test_job_queue.py`
   - `trajectories/improvement/reports/delegated_queue_repo_backed_execution_20260403T182235Z`
 - verification:
-  - `python -m py_compile agent_kernel/export_governance.py agent_kernel/runtime_supervision.py agent_kernel/job_queue.py tests/test_runtime_supervision.py tests/test_job_queue.py`
+  - `python -m py_compile agent_kernel/ops/export_governance.py agent_kernel/ops/runtime_supervision.py agent_kernel/ops/job_queue.py tests/test_runtime_supervision.py tests/test_job_queue.py`
   - `pytest -q tests/test_runtime_supervision.py -k "atomic_write_json_can_skip_governance or maybe_govern_improvement_exports_limits_checkpoint_scope or atomic_write_json_uses_explicit_config_instead_of_env_lookup"`
   - `pytest -q tests/test_job_queue.py -k "writes_progress_sidecar or duplicate_claim_live_in_progress or skips_live_leased_in_progress_job or runtime_controller_snapshot_tolerates_invalid_json_state"`
 - next_recommendation: `The queue lane now has real concurrent repo-backed worker/review evidence. The next runtime-evidence ROI is concurrent integrator/acceptance execution under the same queue surface, especially shared-repo merge/acceptance jobs that depend on live worker outputs rather than only worker/review tasks.`
@@ -161,7 +161,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 - owned_paths:
   - `scripts/evaluate_tolbert_liftoff.py`
   - `evals/harness.py`
-  - `agent_kernel/trust.py`
+  - `agent_kernel/extensions/trust.py`
   - `agent_kernel/modeling/evaluation/liftoff.py`
   - `tests/test_liftoff.py`
   - `tests/test_eval.py`
@@ -173,7 +173,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 - findings:
   - `Patched scripts/evaluate_tolbert_liftoff.py so takeover-drift runs inherit priority-family hints, low-cost selection, repo-sandbox operator-policy overrides, and the shadow-enrolled candidate artifact instead of evaluating an unscoped generic drift path.`
   - `Patched evals/harness.py so the two known unsafe repo-sandbox acceptance roots are ranked behind the current worker/status tail; low-cost required-family selection now reaches a clean task_limit=10 repo-sandbox slice before those acceptance roots re-enter.`
-  - `Patched agent_kernel/trust.py so dirty legacy executable reports without supervision metadata no longer count toward counted gated trust, while clean legacy executable reports still do. This repaired the repo-sandbox counted ledger without erasing older clean repository/project/repo_chore evidence.`
+  - `Patched agent_kernel/extensions/trust.py so dirty legacy executable reports without supervision metadata no longer count toward counted gated trust, while clean legacy executable reports still do. This repaired the repo-sandbox counted ledger without erasing older clean repository/project/repo_chore evidence.`
   - `Patched agent_kernel/modeling/evaluation/liftoff.py so trust non-regression compares counted_gated_summary before raw gated_summary, aligning the liftoff gate with the trust gate.`
   - `The fresh official report trajectories/tolbert_model/liftoff_gate_report_20260403_reposandbox_takeoverdrift_task10.json now contains real takeover-drift evidence: step_budget=20, wave_task_limit=4, max_waves=3, budget_reached=true, worst_pass_rate_delta=0.0, worst_unsafe_ambiguous_rate_delta=0.0, worst_hidden_side_effect_rate_delta=0.0, and family_takeover_evidence.repo_sandbox.decision=promoted.`
   - `The bounded repo-sandbox slice widened cleanly to task_limit=10: candidate/baseline both held pass_rate=0.9 on the main compare, the counted repo_sandbox summary stayed clean with unsafe_ambiguous_rate=0.0 and hidden_side_effect_risk_rate=0.0, and the unsafe acceptance roots were no longer in the selected task roots.`
@@ -181,14 +181,14 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 - artifacts:
   - `scripts/evaluate_tolbert_liftoff.py`
   - `evals/harness.py`
-  - `agent_kernel/trust.py`
+  - `agent_kernel/extensions/trust.py`
   - `agent_kernel/modeling/evaluation/liftoff.py`
   - `tests/test_liftoff.py`
   - `tests/test_eval.py`
   - `tests/test_trust.py`
   - `trajectories/tolbert_model/liftoff_gate_report_20260403_reposandbox_takeoverdrift_task10.json`
 - verification:
-  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py evals/harness.py agent_kernel/trust.py agent_kernel/modeling/evaluation/liftoff.py tests/test_liftoff.py tests/test_eval.py tests/test_trust.py`
+  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py evals/harness.py agent_kernel/extensions/trust.py agent_kernel/modeling/evaluation/liftoff.py tests/test_liftoff.py tests/test_eval.py tests/test_trust.py`
   - `pytest -q tests/test_liftoff.py -k "repo_sandbox_operator_policy_for_required_family or scopes_takeover_drift_to_shadow_candidate_and_priority_family or rejects_trust_ledger_regression or prefers_counted_trust_summary_over_gated_attempts"`
   - `pytest -q tests/test_eval.py -k "cleaner_repo_sandbox_primaries_before_known_unstable_roots or widens_repo_sandbox_before_acceptance_tail"`
   - `pytest -q tests/test_trust.py -k "counts_only_executable_gated_reports_for_assessment or excludes_legacy_unsupervised_reports_from_counted_summary"`
@@ -215,7 +215,7 @@ cd /data/agentkernel && AGENT_KERNEL_RUN_REPORTS_DIR=trajectories/reports/liftof
 - hypothesis: `Repo-sandbox trust breadth is no longer blocked on missing tasks; it is blocked on two runtime-accounting defects and then on early-slot selection quality. If the official evaluator admits git/generated-path sandbox tasks, ignores `.git` bootstrap churn as expected git state, and leads with the cleaner sandbox roots first, repo_sandbox should become counted trusted evidence instead of remaining the last missing required family.`
 - owned_paths:
   - `scripts/evaluate_tolbert_liftoff.py`
-  - `agent_kernel/preflight.py`
+  - `agent_kernel/ops/preflight.py`
   - `evals/harness.py`
   - `tests/test_liftoff.py`
   - `tests/test_preflight.py`
@@ -227,14 +227,14 @@ cd /data/agentkernel && AGENT_KERNEL_RUN_REPORTS_DIR=trajectories/reports/liftof
 - findings:
   - `The first official preserved-history rerun proved repo_sandbox was being filtered out before selection, not missing from the task bank: every repo-sandbox task had requires_git=True and the scoped liftoff configs still had unattended git disabled.`
   - `Patched scripts/evaluate_tolbert_liftoff.py so official liftoff configs enable unattended git commands plus generated-path mutations whenever repo_sandbox is in the required/requested family set, and added regression coverage in tests/test_liftoff.py.`
-  - `The next blocker was report accounting, not task quality: fresh repo-sandbox reports were marking `.git/*` clone/bootstrap state as unexpected workspace changes, which forced hidden_side_effect_risk=true and false_pass_risk=true on otherwise verified successes. Patched agent_kernel/preflight.py so git-enabled tasks treat `.git/*` as expected internal state, with coverage in tests/test_preflight.py.`
+  - `The next blocker was report accounting, not task quality: fresh repo-sandbox reports were marking `.git/*` clone/bootstrap state as unexpected workspace changes, which forced hidden_side_effect_risk=true and false_pass_risk=true on otherwise verified successes. Patched agent_kernel/ops/preflight.py so git-enabled tasks treat `.git/*` as expected internal state, with coverage in tests/test_preflight.py.`
   - `After the accounting repair, the fresh isolated task_limit=12 sandbox run in trajectories/tolbert_model/liftoff_gate_report_20260403_reposandbox_cleantrust_fresh.json became clean on side effects but still landed restricted because two unsafe acceptance roots kept unsafe_ambiguous_rate at 0.1667.`
   - `Patched evals/harness.py so low-cost required-family selection pushes the four currently unstable repo-sandbox roots behind the cleaner executable roots, with coverage in tests/test_eval.py.`
   - `The fresh isolated official task_limit=9 rerun in trajectories/tolbert_model/liftoff_gate_report_20260403_reposandbox_cleantrust_task9.json closed the family: candidate_trust.family_assessments.repo_sandbox is now status=trusted with counted_gated_family_summaries.repo_sandbox.total=9, success_rate=1.0, clean_success_streak=9, distinct_clean_success_task_roots=9, and zero hidden-side-effect / unsafe / false-pass risk.`
   - `The wider boundary is now explicit too: task_limit=12 is still too wide for a clean official sandbox breadth sweep because the next acceptance roots remain unsafe, so the active repo-sandbox ROI has narrowed to widening that clean envelope past 9 tasks, not family admission or report accounting.`
 - artifacts:
   - `scripts/evaluate_tolbert_liftoff.py`
-  - `agent_kernel/preflight.py`
+  - `agent_kernel/ops/preflight.py`
   - `evals/harness.py`
   - `tests/test_liftoff.py`
   - `tests/test_preflight.py`
@@ -245,7 +245,7 @@ cd /data/agentkernel && AGENT_KERNEL_RUN_REPORTS_DIR=trajectories/reports/liftof
   - `trajectories/reports/liftoff_repo_sandbox_clean`
   - `trajectories/reports/liftoff_repo_sandbox_clean9`
 - verification:
-  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py agent_kernel/preflight.py evals/harness.py tests/test_liftoff.py tests/test_preflight.py tests/test_eval.py`
+  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py agent_kernel/ops/preflight.py evals/harness.py tests/test_liftoff.py tests/test_preflight.py tests/test_eval.py`
   - `pytest -q tests/test_liftoff.py -k "shadow_enrolls_priority_families_for_candidate_probe or can_preserve_report_history or enables_repo_sandbox_operator_policy_for_required_family"`
   - `pytest -q tests/test_preflight.py -k "git_internal_changes_for_git_tasks or non_git_unexpected_changes_for_git_tasks or capture_workspace_snapshot_and_side_effect_summary_detect_changes"`
   - `pytest -q tests/test_eval.py -k "cleaner_repo_sandbox_primaries_before_known_unstable_roots or uses_five_low_cost_repo_chore_primaries_before_retrieval or uses_five_low_cost_repository_primaries_before_retrieval_or_long_horizon"`
@@ -321,12 +321,12 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
   - `A direct live task-bank probe now selects executable project tasks under the bounded trust recipe: ['report_rollup_task', 'deployment_manifest_task', 'release_packet_task'] instead of retrieval companions consuming those slots.`
   - `Fresh official evidence is in trajectories/tolbert_model/liftoff_gate_report_20260403_bounded_projectbreadth.json. The candidate trust ledger first moved project from 1 gated report to 3 gated clean successes, with task_roots=["deployment_manifest_task", "release_packet_task", "report_rollup_task"] and distinct_clean_success_task_roots=3.`
   - `Patched scripts/evaluate_tolbert_liftoff.py again with --preserve-report-history so official reruns can accumulate repeatable unattended evidence instead of deleting prior counted runs, and added regression coverage in tests/test_liftoff.py for preserved report markers.`
-  - `Patched agent_kernel/trust.py so counted unattended-trust assessment is now based on executable gated reports only. Raw gated attempts stay visible in gated_summary / gated_family_summaries, while family_assessments and overall_assessment now use counted_gated_summary / counted_gated_family_summaries to exclude zero-step policy_terminated runs from counted trust evidence.`
+  - `Patched agent_kernel/extensions/trust.py so counted unattended-trust assessment is now based on executable gated reports only. Raw gated attempts stay visible in gated_summary / gated_family_summaries, while family_assessments and overall_assessment now use counted_gated_summary / counted_gated_family_summaries to exclude zero-step policy_terminated runs from counted trust evidence.`
   - `Fresh official counted-evidence proof is now in trajectories/tolbert_model/liftoff_gate_report_20260403_project_counted_trust.json. The candidate trust ledger now shows family:project status=trusted with counted_gated_family_summaries.project.total=6, success_rate=1.0, clean_success_streak=6, and task_roots=["deployment_manifest_task", "release_packet_task", "report_rollup_task"], while the raw attempt history remains separately visible at gated_family_summaries.project.total=10 with safe_stop_count=4.`
 - artifacts:
   - `scripts/evaluate_tolbert_liftoff.py`
   - `scripts/run_tolbert_liftoff_loop.py`
-  - `agent_kernel/trust.py`
+  - `agent_kernel/extensions/trust.py`
   - `tests/test_eval.py`
   - `tests/test_liftoff.py`
   - `tests/test_trust.py`
@@ -334,7 +334,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
   - `trajectories/tolbert_model/liftoff_gate_report_20260403_project_counted_trust.json`
   - `trajectories/reports/tolbert_liftoff_candidate_unattended_trust_ledger.json`
 - verification:
-  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py scripts/run_tolbert_liftoff_loop.py agent_kernel/trust.py tests/test_eval.py tests/test_liftoff.py tests/test_trust.py`
+  - `python -m py_compile scripts/evaluate_tolbert_liftoff.py scripts/run_tolbert_liftoff_loop.py agent_kernel/extensions/trust.py tests/test_eval.py tests/test_liftoff.py tests/test_trust.py`
   - `pytest -q tests/test_eval.py -k "prefers_executable_project_tasks_over_retrieval_companions or can_prefer_low_cost_tasks_within_family" --cache-clear`
   - `pytest -q tests/test_liftoff.py -k "shadow_enrolls_priority_families_for_candidate_probe or can_preserve_report_history" --cache-clear`
   - `pytest -q tests/test_trust.py -k "coverage_only_retrieval_reports_from_gated_summary or counts_only_executable_gated_reports_for_assessment or trusts_required_family_after_clean_task_root_breadth or bootstraps_required_family_with_narrow_clean_task_roots" --cache-clear`
@@ -405,7 +405,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 
 - hypothesis: `The late-wave integrator realism is proven only in generated-only seed probes today. A fresh bounded live long-horizon cycle should either carry the mixed integrator tail deeper through the real runtime envelope or expose the first concrete runtime/scheduling bottleneck to patch.`
 - owned_paths:
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `datasets/curriculum_templates.json`
   - `evals/harness.py`
   - `scripts/run_human_guided_improvement_cycle.py`
@@ -457,12 +457,12 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 - command:
 
 ```bash
-cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py tests/test_eval.py && pytest -q tests/test_curriculum.py -k 'integrator_lineage_into_governance_family or integrator_lineage_into_oversight_family or retargets_validation_cleanup_adjacent_to_governance_family or retargets_governance_cleanup_adjacent_to_oversight_family or preserves_integrator_audit_lineage_into_governance_family or preserves_integrator_audit_lineage_into_oversight_family' --cache-clear && pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear && pytest -q tests/test_eval.py -k 'generated_success_bridges_validation_integrator_into_governance or generated_success_bridges_governance_integrator_into_oversight' --cache-clear
+cd /data/agentkernel && python -m py_compile agent_kernel/tasking/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py tests/test_eval.py && pytest -q tests/test_curriculum.py -k 'integrator_lineage_into_governance_family or integrator_lineage_into_oversight_family or retargets_validation_cleanup_adjacent_to_governance_family or retargets_governance_cleanup_adjacent_to_oversight_family or preserves_integrator_audit_lineage_into_governance_family or preserves_integrator_audit_lineage_into_oversight_family' --cache-clear && pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear && pytest -q tests/test_eval.py -k 'generated_success_bridges_validation_integrator_into_governance or generated_success_bridges_governance_integrator_into_oversight' --cache-clear
 ```
 
 - hypothesis: `The validation-stage realism fix still flattens one hop later. If governance and oversight preserve integrator lineage too, the late-wave tail can keep multi-repo control structure deeper into the chain, and a generated-only probe should emit those harder tasks instead of generic review/crosscheck bundles.`
 - owned_paths:
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `datasets/curriculum_templates.json`
   - `tests/test_curriculum.py`
   - `tests/test_curriculum_catalog.py`
@@ -473,10 +473,10 @@ cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/te
 - result: `completed`
 - findings:
   - `Patched datasets/curriculum_templates.json with four harder late-wave integrator bundles: governance_integrator_cleanup_review_bundle, governance_integrator_audit_review_bundle, oversight_integrator_cleanup_crosscheck_bundle, and oversight_integrator_audit_crosscheck_bundle. Each carries a 14-step synthetic edit plan and explicit multi-repo mirror artifacts.`
-  - `Patched agent_kernel/curriculum.py so governance and oversight preserve downstream integrator realism via lineage_surface_variants when the incoming tail already carries validation_integrator_* or governance_integrator_* lineage, while ordinary cleanup/audit tails still use the generic governance/oversight variants.`
+  - `Patched agent_kernel/tasking/curriculum.py so governance and oversight preserve downstream integrator realism via lineage_surface_variants when the incoming tail already carries validation_integrator_* or governance_integrator_* lineage, while ordinary cleanup/audit tails still use the generic governance/oversight variants.`
   - `Validated the new path at two levels: focused curriculum/eval tests passed, and a generated-only harness probe under trajectories/improvement/reports/late_wave_governance_oversight_integrator_probe emitted wave7 governance integrator surfaces followed by wave8 oversight integrator surfaces from realistic validation-integrator seed bundles.`
 - artifacts:
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `datasets/curriculum_templates.json`
   - `tests/test_curriculum.py`
   - `tests/test_curriculum_catalog.py`
@@ -485,7 +485,7 @@ cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/te
   - `trajectories/improvement/reports/late_wave_governance_oversight_integrator_probe/generated_success_wave7_integrator_seeds.json`
   - `trajectories/improvement/reports/late_wave_governance_oversight_integrator_probe/generated_success_wave8_integrator_seeds.json`
 - verification:
-  - `python -m py_compile agent_kernel/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py tests/test_eval.py`
+  - `python -m py_compile agent_kernel/tasking/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py tests/test_eval.py`
   - `pytest -q tests/test_curriculum.py -k 'integrator_lineage_into_governance_family or integrator_lineage_into_oversight_family or retargets_validation_cleanup_adjacent_to_governance_family or retargets_governance_cleanup_adjacent_to_oversight_family or preserves_integrator_audit_lineage_into_governance_family or preserves_integrator_audit_lineage_into_oversight_family' --cache-clear`
   - `pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear`
   - `pytest -q tests/test_eval.py -k 'generated_success_bridges_validation_integrator_into_governance or generated_success_bridges_governance_integrator_into_oversight' --cache-clear`
@@ -504,12 +504,12 @@ cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/te
 - command:
 
 ```bash
-cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py && pytest -q tests/test_curriculum.py -k 'retargets_repo_chore_cleanup_adjacent_to_validation_family or preserves_integrator_cleanup_lineage_into_validation_family or retargets_repo_chore_audit_adjacent_to_validation_family or preserves_integrator_audit_lineage_into_validation_family or retargets_validation_cleanup_adjacent_to_governance_family or rotates_adjudication_to_validation_after_saturated_late_wave or rotates_validation_to_governance_from_late_wave_cycle_without_origin_match or keeps_late_wave_family_when_rotation_coverage_is_balanced or branches_assurance_to_adjudication_when_late_wave_signal_is_saturated or keeps_assurance_when_late_wave_signal_is_not_saturated' --cache-clear && pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear
+cd /data/agentkernel && python -m py_compile agent_kernel/tasking/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py && pytest -q tests/test_curriculum.py -k 'retargets_repo_chore_cleanup_adjacent_to_validation_family or preserves_integrator_cleanup_lineage_into_validation_family or retargets_repo_chore_audit_adjacent_to_validation_family or preserves_integrator_audit_lineage_into_validation_family or retargets_validation_cleanup_adjacent_to_governance_family or rotates_adjudication_to_validation_after_saturated_late_wave or rotates_validation_to_governance_from_late_wave_cycle_without_origin_match or keeps_late_wave_family_when_rotation_coverage_is_balanced or branches_assurance_to_adjudication_when_late_wave_signal_is_saturated or keeps_assurance_when_late_wave_signal_is_not_saturated' --cache-clear && pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear
 ```
 
 - hypothesis: `Later-wave long-horizon tasks are already deep, but they collapse away from shared-repo/integrator structure into generic packet families. If validation-stage variant selection preserves earlier integrator lineage, the kernel can generate a harder multi-repo validation gate instead of flattening the tail.`
 - owned_paths:
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `datasets/curriculum_templates.json`
   - `tests/test_curriculum.py`
   - `tests/test_curriculum_catalog.py`
@@ -518,16 +518,16 @@ cd /data/agentkernel && python -m py_compile agent_kernel/curriculum.py tests/te
 - released_at: `2026-04-03T00:02:00Z`
 - result: `completed`
 - findings:
-  - `Patched agent_kernel/curriculum.py so long-horizon adjacent variant selection can preserve deeper integrator lineage through new lineage-surface-aware variant rules, and so the branch law distinguishes explicit pre-saturation bridges from the saturation-gated late-wave tail.`
+  - `Patched agent_kernel/tasking/curriculum.py so long-horizon adjacent variant selection can preserve deeper integrator lineage through new lineage-surface-aware variant rules, and so the branch law distinguishes explicit pre-saturation bridges from the saturation-gated late-wave tail.`
   - `Added two harder validation-stage long-horizon templates in datasets/curriculum_templates.json: validation_integrator_cleanup_gate_bundle and validation_integrator_audit_gate_bundle. Both carry 14-step synthetic edit plans and explicit multi-repo mirror artifacts instead of the older generic validation packet surface.`
   - `Kept the long-horizon chain coherent while doing it: repo_chore->validation and validation->governance still branch on the normal chain, assurance->adjudication stays saturation-gated, and saturated adjudication can now rotate back to validation instead of dead-ending once coverage is balanced.`
 - artifacts:
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `datasets/curriculum_templates.json`
   - `tests/test_curriculum.py`
   - `tests/test_curriculum_catalog.py`
 - verification:
-  - `python -m py_compile agent_kernel/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py`
+  - `python -m py_compile agent_kernel/tasking/curriculum.py tests/test_curriculum.py tests/test_curriculum_catalog.py`
   - `pytest -q tests/test_curriculum.py -k 'retargets_repo_chore_cleanup_adjacent_to_validation_family or preserves_integrator_cleanup_lineage_into_validation_family or retargets_repo_chore_audit_adjacent_to_validation_family or preserves_integrator_audit_lineage_into_validation_family or retargets_validation_cleanup_adjacent_to_governance_family or rotates_adjudication_to_validation_after_saturated_late_wave or rotates_validation_to_governance_from_late_wave_cycle_without_origin_match or keeps_late_wave_family_when_rotation_coverage_is_balanced or branches_assurance_to_adjudication_when_late_wave_signal_is_saturated or keeps_assurance_when_late_wave_signal_is_not_saturated' --cache-clear`
   - `pytest -q tests/test_curriculum_catalog.py -k 'validation_long_horizon_templates or long_horizon_metadata_catalogs' --cache-clear`
   - `direct CurriculumEngine probes confirmed cleanup and audit repo_chore seeds with integrator lineage now emit validation_integrator_* bundles with 14-step plans`
@@ -573,16 +573,16 @@ Use the current wave to attack the measured blockers in [`docs/ai_agent_status.m
 
 | dispatch_id | target | preferred surfaces | success signal |
 | --- | --- | --- | --- |
-| `trust_repository` | deepen unattended trust evidence on `repository` | `agent_kernel/trust.py`, `agent_kernel/preflight.py`, `agent_kernel/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | counted executable `repository` evidence increases and stops being shallow bootstrap-only |
-| `trust_project` | deepen unattended trust evidence on `project` | `agent_kernel/trust.py`, `agent_kernel/preflight.py`, `agent_kernel/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | counted executable `project` evidence increases and survives gate accounting |
-| `trust_integration` | deepen unattended trust evidence on `integration` | `agent_kernel/trust.py`, `agent_kernel/preflight.py`, `agent_kernel/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | `integration` stops being the obvious missing required-family evidence lane |
-| `supervisor_rollout` | make non-protected supervisor action real | `scripts/run_supervisor_loop.py`, `agent_kernel/runtime_supervision.py`, `agent_kernel/improvement.py`, `tests/test_runtime_supervision.py` | canary/finalize/rollback moves beyond dry-run-only posture on eligible lanes |
+| `trust_repository` | deepen unattended trust evidence on `repository` | `agent_kernel/extensions/trust.py`, `agent_kernel/ops/preflight.py`, `agent_kernel/ops/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | counted executable `repository` evidence increases and stops being shallow bootstrap-only |
+| `trust_project` | deepen unattended trust evidence on `project` | `agent_kernel/extensions/trust.py`, `agent_kernel/ops/preflight.py`, `agent_kernel/ops/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | counted executable `project` evidence increases and survives gate accounting |
+| `trust_integration` | deepen unattended trust evidence on `integration` | `agent_kernel/extensions/trust.py`, `agent_kernel/ops/preflight.py`, `agent_kernel/ops/runtime_supervision.py`, `tests/test_trust.py`, `tests/test_preflight.py` | `integration` stops being the obvious missing required-family evidence lane |
+| `supervisor_rollout` | make non-protected supervisor action real | `scripts/run_supervisor_loop.py`, `agent_kernel/ops/runtime_supervision.py`, `agent_kernel/improvement.py`, `tests/test_runtime_supervision.py` | canary/finalize/rollback moves beyond dry-run-only posture on eligible lanes |
 | `runtime_stability` | remove long-horizon timeout and bookkeeping loss | `scripts/run_human_guided_improvement_cycle.py`, `agent_kernel/cycle_runner.py`, `tests/test_protocol_comparison.py` | long-horizon followups stop dying after verifier success and preserve generated metrics cleanly |
 | `world_state` | improve learned hotspot detection and recovery state | `agent_kernel/world_model.py`, `agent_kernel/state.py`, `agent_kernel/loop.py`, `tests/test_modeling_world.py`, `tests/test_loop.py` | long-horizon hotspot detection becomes earlier and more specific |
-| `planner_recovery` | reduce low-yield executor repetition and widen staged long-horizon software control | `agent_kernel/policy.py`, `agent_kernel/loop.py`, `agent_kernel/multi_agent.py`, `agent_kernel/context_budget.py`, `agent_kernel/state.py`, `agent_kernel/modeling/tolbert/runtime.py`, `agent_kernel/modeling/training/universal_dataset.py`, `tests/test_policy.py`, `tests/test_loop.py`, `tests/test_multi_agent.py`, `tests/test_hybrid_tolbert_model.py`, `tests/test_universal_dataset.py` | planner/critic recovery triggers sooner, chooses more specific repair actions, critic stops deterministically when task-contract recovery is exhausted, and planner only rewrites the subgoal/contract after critic-proven exhaustion instead of reworking the same stale repair surface; the rewritten recovery objective is now persisted in loop state and checkpoints as a planner artifact that can bundle related workflow/report/test obligations, score/order those obligations into an explicit staged plan update, and feed that staged agenda into model-facing planner payloads plus retained Tolbert hybrid scoring. Outside strict recovery mode, long-horizon tasks now also derive a software-work agenda from pending implementation/edit/report/test obligations and expose that agenda to both planner payloads and retained decoder/runtime training surfaces. That broader software-work lane is now outcome-conditioned too: retained state tracks whether each staged objective advanced, stalled, regressed, or completed, reorders the agenda accordingly, exposes recent stage outcomes to planner payloads, derives a phase-state handoff summary across implementation, migration, test, and follow-up-fix work, and teaches retained Tolbert/runtime plus universal decoder training to react to both stage transitions and phase handoff boundaries instead of only matching static obligation names. It now also derives an explicit software-work phase gate so unresolved merge/migration obligations can block later test/report moves in both deterministic routing and retained Tolbert scoring instead of relying only on soft agenda order. |
-| `task_ecology` | deepen repo/workflow/integration task realism | `agent_kernel/curriculum.py`, `agent_kernel/curriculum_catalog.py`, `datasets/curriculum_templates.json`, `tests/test_curriculum.py` | harder long-horizon tasks are generated without losing verifier clarity |
-| `memory_retrieval` | make prior evidence influence later coding steps | `agent_kernel/memory.py`, `agent_kernel/retrieval_improvement.py`, `agent_kernel/context_budget.py`, `tests/test_memory.py` | retrieval influence widens beyond selected-only metadata |
-| `tolbert_runtime` | get model-native retained wins | `agent_kernel/modeling/`, `agent_kernel/tolbert_model_improvement.py`, `scripts/evaluate_tolbert_liftoff.py`, `tests/test_liftoff.py` | retained checkpoint evidence improves liftoff-relevant surfaces, not just wrappers |
+| `planner_recovery` | reduce low-yield executor repetition and widen staged long-horizon software control | `agent_kernel/policy.py`, `agent_kernel/loop.py`, `agent_kernel/extensions/multi_agent.py`, `agent_kernel/extensions/context_budget.py`, `agent_kernel/state.py`, `agent_kernel/modeling/tolbert/runtime.py`, `agent_kernel/modeling/training/universal_dataset.py`, `tests/test_policy.py`, `tests/test_loop.py`, `tests/test_multi_agent.py`, `tests/test_hybrid_tolbert_model.py`, `tests/test_universal_dataset.py` | planner/critic recovery triggers sooner, chooses more specific repair actions, critic stops deterministically when task-contract recovery is exhausted, and planner only rewrites the subgoal/contract after critic-proven exhaustion instead of reworking the same stale repair surface; the rewritten recovery objective is now persisted in loop state and checkpoints as a planner artifact that can bundle related workflow/report/test obligations, score/order those obligations into an explicit staged plan update, and feed that staged agenda into model-facing planner payloads plus retained Tolbert hybrid scoring. Outside strict recovery mode, long-horizon tasks now also derive a software-work agenda from pending implementation/edit/report/test obligations and expose that agenda to both planner payloads and retained decoder/runtime training surfaces. That broader software-work lane is now outcome-conditioned too: retained state tracks whether each staged objective advanced, stalled, regressed, or completed, reorders the agenda accordingly, exposes recent stage outcomes to planner payloads, derives a phase-state handoff summary across implementation, migration, test, and follow-up-fix work, and teaches retained Tolbert/runtime plus universal decoder training to react to both stage transitions and phase handoff boundaries instead of only matching static obligation names. It now also derives an explicit software-work phase gate so unresolved merge/migration obligations can block later test/report moves in both deterministic routing and retained Tolbert scoring instead of relying only on soft agenda order. |
+| `task_ecology` | deepen repo/workflow/integration task realism | `agent_kernel/tasking/curriculum.py`, `agent_kernel/tasking/curriculum_catalog.py`, `datasets/curriculum_templates.json`, `tests/test_curriculum.py` | harder long-horizon tasks are generated without losing verifier clarity |
+| `memory_retrieval` | make prior evidence influence later coding steps | `agent_kernel/memory.py`, `agent_kernel/extensions/improvement/retrieval_improvement.py`, `agent_kernel/extensions/context_budget.py`, `tests/test_memory.py` | retrieval influence widens beyond selected-only metadata |
+| `tolbert_runtime` | get model-native retained wins | `agent_kernel/modeling/`, `agent_kernel/extensions/improvement/tolbert_model_improvement.py`, `scripts/evaluate_tolbert_liftoff.py`, `tests/test_liftoff.py` | retained checkpoint evidence improves liftoff-relevant surfaces, not just wrappers |
 
 ## Runner Slots
 
@@ -843,7 +843,7 @@ cd /data/agentkernel && pytest -q tests/test_policy.py -k "workspace_preview_ran
 
 - hypothesis: `When a large file has multiple distant localized edits, retaining and exposing all viable preview windows should improve coding quality more than forcing the stack to pick only one window per file.`
 - owned_paths:
-  - `agent_kernel/context_budget.py`
+  - `agent_kernel/extensions/context_budget.py`
   - `agent_kernel/policy.py`
   - `agent_kernel/modeling/policy/decoder.py`
   - `tests/test_loop.py`
@@ -854,18 +854,18 @@ cd /data/agentkernel && pytest -q tests/test_policy.py -k "workspace_preview_ran
 - result: `completed`
 - findings:
   - `The world model already emitted multiple targeted preview windows under workspace_file_previews[path].edit_windows for distant edits, but downstream compaction and decoder logic still collapsed them to one retained window.`
-  - `Patched agent_kernel/context_budget.py so each retained preview window becomes its own context chunk and selected windows are re-grouped back into workspace_file_previews[path].edit_windows; single-window paths keep the old chunk key for compatibility.`
+  - `Patched agent_kernel/extensions/context_budget.py so each retained preview window becomes its own context chunk and selected windows are re-grouped back into workspace_file_previews[path].edit_windows; single-window paths keep the old chunk key for compatibility.`
   - `Patched agent_kernel/policy.py so compacted world_model_summary now preserves edit_windows in the LLM-facing payload instead of truncating each file preview to one visible window.`
   - `Patched agent_kernel/modeling/policy/decoder.py so TolBERT no longer picks only the single best retained window. It now emits per-window structured-edit proposals plus a bundled multi-window structured edit when non-overlapping windows can be applied safely in one command.`
   - `Fresh coverage now proves all three layers: tests/test_loop.py validates two retained world-model windows for one large file, tests/test_policy.py validates multi-window payload exposure, and TolBERT now selects a bundled multi-edit command for two distant localized replacements in one file.`
 - artifacts:
-  - `agent_kernel/context_budget.py`
+  - `agent_kernel/extensions/context_budget.py`
   - `agent_kernel/policy.py`
   - `agent_kernel/modeling/policy/decoder.py`
   - `tests/test_loop.py`
   - `tests/test_policy.py`
 - verification:
-  - `python -m py_compile agent_kernel/context_budget.py agent_kernel/policy.py agent_kernel/modeling/policy/decoder.py tests/test_loop.py tests/test_policy.py`
+  - `python -m py_compile agent_kernel/extensions/context_budget.py agent_kernel/policy.py agent_kernel/modeling/policy/decoder.py tests/test_loop.py tests/test_policy.py`
   - `pytest -q tests/test_policy.py -k "workspace_preview_range or multi_window_workspace_preview or includes_multi_window_workspace_file_previews_in_payload or includes_workspace_file_previews_in_payload"`
   - `pytest -q tests/test_loop.py -k "workspace_file_previews or preview_window or multi_window_preview_task"`
 - next_recommendation: `Use the new multi-window context surface to push on higher-order edit planning, especially when more than two retained windows exist or when bundled edits should be ranked against full-file rewrites under tighter budgets.`
@@ -1871,9 +1871,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `The staged generated_success followup already emits a current-cycle seed bundle, but evals/harness.py only supports directory-style episode loading. Teaching the loader to consume the bundle file should let repository/project successes from the current scoped run produce at least one adjacent-success followup task for Qwen to execute.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-02T00:16:23Z`
@@ -1916,9 +1916,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `After repairing generated_success bootstrap, the remaining zero-task result may be caused by the staged followup explicitly disabling fallback success-seed loading from trajectories/episodes.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-01T23:50:49Z`
@@ -1955,9 +1955,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `The remaining generated_success bottleneck is still pre-execution bootstrap inside the followup schedule path, so deferring unused generated-kernel initialization should let the staged followup complete and emit its true task count.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-01T23:48:23Z`
@@ -1997,9 +1997,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `With generated_failure startup waste already reduced elsewhere, the highest-ROI ecology probe is to give generated_success a dedicated staged budget and see whether it can get past generated_success_schedule and actually emit scheduled followup work.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-01T23:41:04Z`
@@ -2082,9 +2082,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - owned_paths:
   - `agent_kernel/episode_store.py`
   - `agent_kernel/memory.py`
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `agent_kernel/learning_compiler.py`
-  - `agent_kernel/tolbert.py`
+  - `agent_kernel/extensions/tolbert.py`
   - `tests/test_memory.py`
   - `tests/test_tolbert.py`
 - released_at: `2026-03-30T20:31:00Z`
@@ -2120,9 +2120,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `The frontier is over-concentrated on transition_model and observation, so a curriculum- and failure-aware ecology loop should surface a more revealing task family or candidate than another repeated context-compile branch.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-03-31T02:47:08Z`
@@ -2239,9 +2239,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `With observation stalls repaired and planner selection broadened, a fresh repository/project-weighted ecology run should reveal whether task-family mix can now generate a non-transition-model candidate instead of timing out before the useful part of the loop.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-01T21:15:00Z`
@@ -2272,9 +2272,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `Now that stale prestep observation aborts are fixed, the next high-ROI move is to rerun the previously blocked repository/project-scoped ecology lane and see whether the frontier can diversify beyond transition_model-heavy candidates.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
+  - `agent_kernel/tasking/task_bank.py`
   - `agent_kernel/benchmark_synthesis.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
 - released_at: `2026-04-01T22:28:30Z`
@@ -2312,8 +2312,8 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `If explicit family priorities survive scheduling and staged curriculum gets a real fallback budget, ecology-weighted observe passes should surface repository/project families instead of silently dropping the curriculum path.`
 - owned_paths:
   - `evals/harness.py`
-  - `agent_kernel/task_bank.py`
-  - `agent_kernel/curriculum.py`
+  - `agent_kernel/tasking/task_bank.py`
+  - `agent_kernel/tasking/curriculum.py`
   - `scripts/run_human_guided_improvement_cycle.py`
   - `tests/test_eval.py`
   - `tests/test_protocol_comparison.py`
@@ -2477,7 +2477,7 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 
 - hypothesis: `With tooling and transition_model already dominating the frontier, the highest-ROI free lane is to improve structured runtime failure evidence so the next round can learn from richer diagnostics instead of replaying the same narrow candidate families.`
 - owned_paths:
-  - `agent_kernel/job_queue.py`
+  - `agent_kernel/ops/job_queue.py`
   - `scripts/run_selfplay.py`
   - `scripts/report_failure_recovery.py`
   - `tests/test_failure_recovery_report.py`
@@ -2739,28 +2739,28 @@ cd /data/agentkernel && python scripts/compare_retained_baseline.py --subsystem 
 
 ```bash
 cd /data/agentkernel && pytest -q tests/test_improvement.py -k 'transition_model_proposal_artifact or regression_guard_requires_regression_evidence or regression_guard_uses_regression_evidence'
-cd /data/agentkernel && python -m py_compile agent_kernel/transition_model_improvement.py tests/test_improvement.py
+cd /data/agentkernel && python -m py_compile agent_kernel/extensions/improvement/transition_model_improvement.py tests/test_improvement.py
 ```
 
 - hypothesis: `The queued transition_model regression_guard candidate may be overstating regression evidence, so the right ROI move is to fix generation logic if focus-only variants can force unsupported regression penalties or proposal text.`
 - owned_paths:
-  - `agent_kernel/transition_model_improvement.py`
+  - `agent_kernel/extensions/improvement/transition_model_improvement.py`
   - `tests/test_improvement.py`
   - `docs/ai_agent_status.md`
   - `docs/supervised_work_queue.md`
 - released_at: `2026-04-02T00:16:29Z`
 - result: `completed`
 - findings:
-  - `Found and fixed an upstream generation bug in agent_kernel/transition_model_improvement.py: focus=regression_guard was forcing regressed_path_command_penalty>=5 and a regression_guard proposal even when the transition summary had no state_regression signal and regression_path_count=0.`
+  - `Found and fixed an upstream generation bug in agent_kernel/extensions/improvement/transition_model_improvement.py: focus=regression_guard was forcing regressed_path_command_penalty>=5 and a regression_guard proposal even when the transition summary had no state_regression signal and regression_path_count=0.`
   - `Added targeted regressions in tests/test_improvement.py so regression_guard now requires actual regression evidence before it strengthens the regression penalty or emits regression-claiming proposal text, while still preserving the focused behavior when regressions are present.`
   - `A live non-mutating rebuild against trajectories/episodes confirms the queued first-retain candidate is now stale under corrected logic: the fixed generator still emits generation_focus=regression_guard, but it keeps regressed_path_command_penalty at 3 and proposal_areas=['repeat_avoidance', 'recovery_bias'] instead of the older penalty=5 plus regression_guard proposal.`
 - artifacts:
-  - `agent_kernel/transition_model_improvement.py`
+  - `agent_kernel/extensions/improvement/transition_model_improvement.py`
   - `tests/test_improvement.py`
   - `comparison against stale candidate: old_penalty=5 old_areas=['repeat_avoidance', 'regression_guard', 'recovery_bias']; rebuilt_penalty=3 new_areas=['repeat_avoidance', 'recovery_bias']`
 - verification:
   - `pytest -q tests/test_improvement.py -k 'transition_model_proposal_artifact or regression_guard_requires_regression_evidence or regression_guard_uses_regression_evidence'`
-  - `python -m py_compile agent_kernel/transition_model_improvement.py tests/test_improvement.py`
+  - `python -m py_compile agent_kernel/extensions/improvement/transition_model_improvement.py tests/test_improvement.py`
   - `python - <<'PY' ... build_transition_model_proposal_artifact(KernelConfig().trajectories_root, focus='regression_guard', current_payload=...) ... PY`
 - next_recommendation: `Do not finalize the old codex_high_roi_20260330T2056Z transition_model candidate as-is. Regenerate or refresh the transition_model candidate set under the corrected generator first, then re-run frontier/supervisor review on the refreshed artifact.`
 
@@ -2984,7 +2984,7 @@ cd /data/agentkernel && python scripts/report_frontier_promotion_plan.py --front
 
 ```bash
 cd /data/agentkernel && pytest -q tests/test_memory.py -k 'tool_candidate_extractor'
-cd /data/agentkernel && python -m py_compile agent_kernel/extractors.py tests/test_memory.py
+cd /data/agentkernel && python -m py_compile agent_kernel/extensions/extractors.py tests/test_memory.py
 cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --max-observation-seconds 60 --generate-only --scope-id supervised_coordination_codex_apr02_toolbridge_refresh --priority-benchmark-family repository --priority-benchmark-family project --include-curriculum --generated-curriculum-budget-seconds 20 --progress-label supervised_coordination_codex_apr02_toolbridge_refresh --notes "tooling extractor now seeds from learning artifacts and admits compact repository/project procedures"
 cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=45 python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --max-observation-seconds 60 --generate-only --scope-id supervised_coordination_codex_apr02_toolbridge_retry --priority-benchmark-family repository --priority-benchmark-family project --include-curriculum --generated-curriculum-budget-seconds 20 --progress-label supervised_coordination_codex_apr02_toolbridge_retry --notes "tooling extractor learning-artifact bridge retry with extended Tolbert startup timeout"
 cd /data/agentkernel && python scripts/report_supervised_frontier.py
@@ -3002,7 +3002,7 @@ PY
 
 - hypothesis: `The coding lane now has strong repository/project wins, but tooling promotion still collapses because tool candidate extraction ignores fresh learning artifacts and emits empty or incompatible payloads. If tooling extraction bridges the learning candidates and stays TaskBank-anchored, the kernel can surface promotable coding procedures again without another ranking change.`
 - owned_paths:
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `tests/test_memory.py`
   - `docs/ai_agent_status.md`
   - `docs/supervised_work_queue.md`
@@ -3012,20 +3012,20 @@ PY
 - released_at: `2026-04-02T01:09:55Z`
 - result: `completed`
 - findings:
-  - `Patched agent_kernel/extractors.py so extract_tool_candidates now seeds from persisted success_skill_candidate learning artifacts, accepts compact repository/project procedures, and filters both learning-derived and episode-derived candidates through the current TaskBank.`
+  - `Patched agent_kernel/extensions/extractors.py so extract_tool_candidates now seeds from persisted success_skill_candidate learning artifacts, accepts compact repository/project procedures, and filters both learning-derived and episode-derived candidates through the current TaskBank.`
   - `Added extractor regressions in tests/test_memory.py covering single-command repository episodes, learning-artifact seeding, and rejection of unknown adjacent-task ids.`
   - `The direct live probe is now healthy. Against the current repo, extract_tool_candidates emits 43 tool candidates and assess_artifact_compatibility(subsystem='tooling', payload=...) returns compatible=true. The fresh repository/project wins for service_release_task, schema_alignment_task, report_rollup_task, repo_sync_matrix_task, and deployment_manifest_task are all present as compatible local_shell_procedure candidates.`
   - `Two fresh scoped refresh attempts still failed before generate, but for runtime reasons upstream of tooling extraction. supervised_coordination_codex_apr02_toolbridge_refresh died on TolBERT readiness after 15s, while supervised_coordination_codex_apr02_toolbridge_retry got past startup with a 45s service timeout and then exhausted the 60s observe window before candidate generation.`
   - `After refreshing trajectories/improvement/reports/supervised_parallel_frontier.json, both toolbridge scopes are now recorded explicitly as failed observation scopes under selected_subsystem=observation, which keeps the machine-readable evidence honest about the current blocker.`
 - artifacts:
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `tests/test_memory.py`
   - `failed scope record: trajectories/improvement/cycles_supervised_coordination_codex_apr02_toolbridge_refresh.jsonl`
   - `failed scope record: trajectories/improvement/cycles_supervised_coordination_codex_apr02_toolbridge_retry.jsonl`
   - `frontier: trajectories/improvement/reports/supervised_parallel_frontier.json`
 - verification:
   - `pytest -q tests/test_memory.py -k 'tool_candidate_extractor'`
-  - `python -m py_compile agent_kernel/extractors.py tests/test_memory.py`
+  - `python -m py_compile agent_kernel/extensions/extractors.py tests/test_memory.py`
   - `python scripts/report_supervised_frontier.py`
   - `python - <<'PY' ... extract_tool_candidates(Path('trajectories/episodes'), out) ... assess_artifact_compatibility(subsystem='tooling', payload=payload) ... PY`
 - next_recommendation: `Do not spend another cycle on tooling extractor logic. The next ROI is runtime/orchestration work that gets one repository/project tooling scope through bounded observation now that candidate generation is fixed, or otherwise an operator review of the existing transition-model bootstrap target while TolBERT contention is being reduced.`
@@ -3451,16 +3451,16 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - owned_paths:
   - `agent_kernel/episode_store.py`
   - `agent_kernel/memory.py`
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `agent_kernel/learning_compiler.py`
-  - `agent_kernel/tolbert.py`
+  - `agent_kernel/extensions/tolbert.py`
   - `tests/test_memory.py`
   - `tests/test_tolbert.py`
 - released_at: `2026-04-02T02:16:13Z`
 - result: `completed`
 - findings:
   - `Patched the learning-memory path in agent_kernel/memory.py so EpisodeMemory now surfaces synthetic failure/recovery documents from compiled learning artifacts. Successful recovery cases now re-enter memory as curriculum-visible recovery documents, and negative command patterns re-enter memory as failure documents instead of remaining dead logs.`
-  - `Patched agent_kernel/extractors.py so tooling extraction can promote successful recovery_case artifacts through source-task aliases such as parent_task/source_task instead of requiring the synthetic recovery task id itself to exist in the TaskBank.`
+  - `Patched agent_kernel/extensions/extractors.py so tooling extraction can promote successful recovery_case artifacts through source-task aliases such as parent_task/source_task instead of requiring the synthetic recovery task id itself to exist in the TaskBank.`
   - `Added focused regression coverage in tests/test_memory.py for both behaviors: failure/recovery learning documents now appear in EpisodeMemory.list_documents(), and a successful recovery_case can now emit a reusable tool candidate via its canonical source task.`
   - `The first fresh memory-heavy scoped run completed cleanly inside the bounded observation window and held the repository/project-focused primary pass at 5/5 success, but still routed to tooling/procedure_promotion, scheduled generated_failure with total=0 under the reduced one-task shape, and emitted an empty tool candidate artifact.`
   - `After the lane-local memory/extractor patch, rerunning the same scope changed the live outcome materially: the scope retried at 4/5 after timeout pressure, selected tooling/script_hardening, and emitted a non-empty tooling artifact with 64 candidates at trajectories/improvement/candidates/supervised_memory_codex_apr02_failure_reentry/tooling/cycle_tooling_20260402T021547106918Z_797e7c11_script_hardening/tool_candidates.json.`
@@ -3468,13 +3468,13 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - artifacts:
   - `docs/supervised_work_queue.md`
   - `agent_kernel/memory.py`
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `tests/test_memory.py`
   - `trajectories/improvement/cycles_supervised_memory_codex_apr02_failure_reentry.jsonl`
   - `trajectories/improvement/candidates/supervised_memory_codex_apr02_failure_reentry/tooling/cycle_tooling_20260402T020152214959Z_444e1a30_procedure_promotion/tool_candidates.json`
   - `trajectories/improvement/candidates/supervised_memory_codex_apr02_failure_reentry/tooling/cycle_tooling_20260402T021547106918Z_797e7c11_script_hardening/tool_candidates.json`
 - verification:
-  - `python -m py_compile agent_kernel/memory.py agent_kernel/extractors.py tests/test_memory.py`
+  - `python -m py_compile agent_kernel/memory.py agent_kernel/extensions/extractors.py tests/test_memory.py`
   - `pytest -q tests/test_memory.py -k 'includes_failure_recovery_learning_documents or uses_successful_recovery_case_via_source_task_alias or uses_learning_success_candidates or recurses_into_generated_phase_directories'`
   - `python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --max-observation-seconds 60 --generate-only --scope-id supervised_memory_codex_apr02_failure_reentry --priority-benchmark-family repository --priority-benchmark-family project --include-episode-memory --include-skill-memory --include-tool-memory --include-verifier-memory --include-failure-curriculum --progress-label supervised_memory_codex_apr02_failure_reentry --notes "strengthen failure and recovery memory re-entry for repository/project coding decisions"`
 - next_recommendation: `The learning-memory lane no longer has the same flatten-to-zero extractor problem; the rerun proved that by emitting 64 tool candidates. The next ROI is outside this lane: fix the supervised wrapper/runtime path that drops generated_failure after a reduced-slice retry with no separate curriculum budget configured, then rerun this same scope to measure whether the repaired memory surface also restores nonzero failure-followup scheduling.`
@@ -3498,9 +3498,9 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - hypothesis: `Recovery and negative-pattern artifacts still compile under synthetic or retrieval-specific task ids, so learning guidance under-matches future coding tasks unless the matcher resolves canonical source-task aliases like parent_task and task_metadata.source_task.`
 - owned_paths:
   - `agent_kernel/memory.py`
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `agent_kernel/learning_compiler.py`
-  - `agent_kernel/tolbert.py`
+  - `agent_kernel/extensions/tolbert.py`
   - `tests/test_memory.py`
   - `tests/test_tolbert.py`
 - released_at: `2026-04-02T02:33:58Z`
@@ -3508,21 +3508,21 @@ cd /data/agentkernel && python scripts/run_supervised_improvement_cycle.py --pro
 - findings:
   - `Patched agent_kernel/learning_compiler.py so learning candidates now carry and match through canonical source-task aliases derived from parent_task, task_metadata.source_task, and task_contract metadata instead of relying only on exact source_task_id or prefilled applicable_tasks. Retrieval-style and recovery-style artifacts can now re-enter later matching even when they were compiled under synthetic or retrieval-specific task ids.`
   - `Patched agent_kernel/learning_compiler.py path resolution so an explicit learning-artifacts path under sqlite-backed configs no longer gets polluted by the global sqlite candidate store unless the path actually matches config.learning_artifacts_path.`
-  - `Patched agent_kernel/tolbert.py so learned negative-command-pattern notes are prioritized ahead of generic retrieval avoidance notes when the avoidance budget is capped, preventing learned failure guidance from being trimmed out of the final control packet.`
+  - `Patched agent_kernel/extensions/tolbert.py so learned negative-command-pattern notes are prioritized ahead of generic retrieval avoidance notes when the avoidance budget is capped, preventing learned failure guidance from being trimmed out of the final control packet.`
   - `Added focused regressions in tests/test_memory.py and tests/test_tolbert.py covering alias-aware matching, explicit-path isolation under sqlite config, and TolBERT guidance recovery through source-task aliases.`
   - `The first live scope for supervised_memory_codex_apr02_alias_reentry was blocked by runtime readiness rather than memory logic: the observe pass retried without TolBERT context after startup failure, retried again at reduced 4/5 primary after timeout pressure, then closed with RuntimeError: TOLBERT service failed to become ready after 15.000 seconds. It emitted only an observation record and no candidate artifact.`
   - `A clean control rerun with AGENT_KERNEL_USE_TOLBERT_CONTEXT=0 validated the lane-local memory changes without service variance. Scope supervised_memory_codex_apr02_alias_reentry_notolbert completed in 60.0967 seconds, executed generated_failure with a tiny 1.1-second/1-task budget, and selected retrieval/confidence_gating rather than falling back to the older tooling path. The emitted artifact is trajectories/improvement/candidates/supervised_memory_codex_apr02_alias_reentry_notolbert/retrieval/cycle_retrieval_20260402T023340403154Z_8bda24d9_confidence_gating/retrieval_proposals.json with one retrieval proposal explaining that low-confidence retrieval remains common relative to trusted retrieval usage.`
 - artifacts:
   - `docs/supervised_work_queue.md`
   - `agent_kernel/learning_compiler.py`
-  - `agent_kernel/tolbert.py`
+  - `agent_kernel/extensions/tolbert.py`
   - `tests/test_memory.py`
   - `tests/test_tolbert.py`
   - `trajectories/improvement/cycles_supervised_memory_codex_apr02_alias_reentry.jsonl`
   - `trajectories/improvement/cycles_supervised_memory_codex_apr02_alias_reentry_notolbert.jsonl`
   - `trajectories/improvement/candidates/supervised_memory_codex_apr02_alias_reentry_notolbert/retrieval/cycle_retrieval_20260402T023340403154Z_8bda24d9_confidence_gating/retrieval_proposals.json`
 - verification:
-  - `python -m py_compile agent_kernel/learning_compiler.py agent_kernel/tolbert.py tests/test_memory.py tests/test_tolbert.py`
+  - `python -m py_compile agent_kernel/learning_compiler.py agent_kernel/extensions/tolbert.py tests/test_memory.py tests/test_tolbert.py`
   - `pytest -q tests/test_memory.py -k 'respects_explicit_path_under_sqlite_config or match_source_task_aliases_from_metadata or match_replay_task_lineage or includes_failure_recovery_learning_documents'`
   - `pytest -q tests/test_tolbert.py -k 'matches_learning_guidance_via_source_task_alias or preserves_adjacent_success_task_contract_while_merging_learning_guidance'`
   - `python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --max-observation-seconds 60 --generate-only --scope-id supervised_memory_codex_apr02_alias_reentry --priority-benchmark-family repository --priority-benchmark-family project --include-episode-memory --include-skill-memory --include-tool-memory --include-verifier-memory --include-failure-curriculum --progress-label supervised_memory_codex_apr02_alias_reentry --notes "strengthen alias-aware learning-memory retrieval for repository/project coding decisions"`
@@ -3547,26 +3547,26 @@ cd /data/agentkernel && AGENT_KERNEL_USE_TOLBERT_CONTEXT=0 python scripts/run_su
 
 - hypothesis: `Recovery procedures now re-enter tool extraction and TolBERT guidance, but they still bypass skill-memory promotion. If successful recovery_case artifacts can promote into canonical postrun skills via source-task aliases, the skill-memory lane should reuse more failure-repair procedures and shift bounded live scopes toward stronger retrieval/skill selection without TolBERT variance.`
 - owned_paths:
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `tests/test_memory.py`
   - `docs/ai_agent_status.md`
   - `docs/supervised_work_queue.md`
 - released_at: `2026-04-02T02:39:41Z`
 - result: `completed`
 - findings:
-  - `Patched agent_kernel/extractors.py so skill extraction now promotes successful recovery_case artifacts through canonical source-task aliases instead of only accepting success_skill_candidate records with exact source_task_id matches. Recovery procedures can now feed the skill-memory replay path the same way they already fed tool extraction and TolBERT guidance.`
+  - `Patched agent_kernel/extensions/extractors.py so skill extraction now promotes successful recovery_case artifacts through canonical source-task aliases instead of only accepting success_skill_candidate records with exact source_task_id matches. Recovery procedures can now feed the skill-memory replay path the same way they already fed tool extraction and TolBERT guidance.`
   - `Added focused regression coverage in tests/test_memory.py proving extract_successful_command_skills(...) emits a canonical postrun skill from a successful recovery_case that only resolves through parent_task/task_metadata.source_task.`
   - `A fresh bounded no-TolBERT scope validated the broader memory path live. Scope supervised_memory_codex_apr02_recovery_skill_reentry completed cleanly under the widened shared-repo 80-second observation budget, executed generated_failure with a real 18.0-second/1-task supplemental window, and selected retrieval/confidence_gating again instead of collapsing back to the earlier empty tooling path.`
   - `The live retrieval artifact remained a single confidence-focused proposal rather than a skill artifact, so the memory lane is now re-entering recovery knowledge more broadly but the top bounded repository/project pressure is still retrieval-confidence quality rather than missing skill extraction.`
 - artifacts:
   - `docs/ai_agent_status.md`
   - `docs/supervised_work_queue.md`
-  - `agent_kernel/extractors.py`
+  - `agent_kernel/extensions/extractors.py`
   - `tests/test_memory.py`
   - `trajectories/improvement/cycles_supervised_memory_codex_apr02_recovery_skill_reentry.jsonl`
   - `trajectories/improvement/candidates/supervised_memory_codex_apr02_recovery_skill_reentry/retrieval/cycle_retrieval_20260402T023900435453Z_7d402ffb_confidence_gating/retrieval_proposals.json`
 - verification:
-  - `python -m py_compile agent_kernel/extractors.py tests/test_memory.py`
+  - `python -m py_compile agent_kernel/extensions/extractors.py tests/test_memory.py`
   - `pytest -q tests/test_memory.py -k 'skill_extractor_includes_postrun_learning_candidates or skill_extractor_uses_successful_recovery_case_via_source_task_alias or tool_candidate_extractor_uses_successful_recovery_case_via_source_task_alias'`
   - `AGENT_KERNEL_USE_TOLBERT_CONTEXT=0 python scripts/run_supervised_improvement_cycle.py --provider vllm --task-limit 5 --max-observation-seconds 60 --generate-only --scope-id supervised_memory_codex_apr02_recovery_skill_reentry --priority-benchmark-family repository --priority-benchmark-family project --include-episode-memory --include-skill-memory --include-tool-memory --include-verifier-memory --include-failure-curriculum --progress-label supervised_memory_codex_apr02_recovery_skill_reentry --notes "promote successful recovery-case memory into reusable skill replay for repository/project coding decisions"`
 - next_recommendation: `The next ROI inside learning_memory is no longer basic recovery-case visibility. The lane now reaches tools, TolBERT guidance, and skill extraction. The best next step is either improving retrieval-confidence learning itself or threading the same canonical alias preference into any remaining memory consumers that still rank only exact source_task_id matches.`
@@ -3901,7 +3901,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 
 - hypothesis: `When repository/project coding runs keep selecting retrieval without converting it into trusted execution, retrieval/confidence_gating should stay in a stronger bootstrap-activation profile instead of de-escalating after the first trusted hit; the guided wrapper must preserve that per-task activation-gap evidence into candidate generation.`
 - owned_paths:
-  - `agent_kernel/retrieval_improvement.py`
+  - `agent_kernel/extensions/improvement/retrieval_improvement.py`
   - `scripts/run_human_guided_improvement_cycle.py`
   - `tests/test_improvement.py`
   - `tests/test_protocol_comparison.py`
@@ -3910,7 +3910,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
 - released_at: `2026-04-02T19:31:25Z`
 - result: `completed`
 - findings:
-  - `Patched agent_kernel/retrieval_improvement.py so confidence_gating now distinguishes successful runs that merely select retrieval from runs that actually convert retrieval into trusted/influential execution. Activation-gap runs now stay on a stronger bootstrap profile with lower confidence gates and wider routing/context limits instead of falling back to the weaker generic bootstrap path.`
+  - `Patched agent_kernel/extensions/improvement/retrieval_improvement.py so confidence_gating now distinguishes successful runs that merely select retrieval from runs that actually convert retrieval into trusted/influential execution. Activation-gap runs now stay on a stronger bootstrap profile with lower confidence gates and wider routing/context limits instead of falling back to the weaker generic bootstrap path.`
   - `Patched scripts/run_human_guided_improvement_cycle.py so the parent process backfills metrics.task_outcomes from observation partial summaries before candidate generation. That makes live retrieval proposal generation see per-task retrieval_selected_steps / retrieval_influenced_steps even when the child-process metrics object drops them.`
   - `Fresh live scope trajectories/improvement/cycles_supervised_memory_codex_apr02_confidencegating_activationcarry_v3.jsonl stayed healthy at 5/5 primary success with the real coding-lane activation-gap signature intact: retrieval_selected_steps=4, retrieval_influenced_steps=1, trusted_retrieval_steps=1.`
   - `The emitted retrieval candidate now shows the intended stronger activation-gap profile in trajectories/improvement/candidates/supervised_memory_codex_apr02_confidencegating_activationcarry_v3/retrieval/cycle_retrieval_20260402T193020766549Z_61326e87_confidence_gating/retrieval_proposals.json: confidence_threshold=0.22, skill_ranking_min_confidence=0.4, branch_results=4, context_max_chunks=7, top_branches=6, ancestor_branch_levels=5, and max_episode_step_spans_per_task=3.`
@@ -3920,7 +3920,7 @@ cd /data/agentkernel && AGENT_KERNEL_TOLBERT_SERVICE_TIMEOUT_SECONDS=30 python s
   - `trajectories/improvement/reports/supervised_parallel_frontier.json`
   - `trajectories/improvement/reports/supervised_frontier_promotion_plan.json`
 - verification:
-  - `python -m py_compile agent_kernel/retrieval_improvement.py scripts/run_human_guided_improvement_cycle.py tests/test_improvement.py tests/test_protocol_comparison.py`
+  - `python -m py_compile agent_kernel/extensions/improvement/retrieval_improvement.py scripts/run_human_guided_improvement_cycle.py tests/test_improvement.py tests/test_protocol_comparison.py`
   - `pytest -q tests/test_improvement.py -k "retrieval_confidence_gating_hardens_from_stalled_untrusted_tasks or retrieval_confidence_gating_bootstraps_from_success_without_guidance or retrieval_confidence_gating_bootstraps_after_successful_blind_high_low_confidence_run or retrieval_confidence_gating_keeps_bootstrap_profile_when_only_one_task_uses_retrieval or retrieval_confidence_gating_keeps_activation_bootstrap_when_selection_outpaces_influence"`
   - `pytest -q tests/test_protocol_comparison.py -k "backfills_task_outcomes_from_partial_summary"`
   - `python scripts/report_supervised_frontier.py`
@@ -4070,7 +4070,7 @@ cd /data/agentkernel && pytest -q tests/test_loop.py -k 'partial_hidden_gap_curr
   - `python - <<'PY' ... WorldModel._hidden_gap_current_proof_regions(...) ... PY`
   - `python - <<'PY' ... WorldModel._sparse_hidden_gap_current_proof_regions(...) ... PY`
   - `python - <<'PY' ... decoder._resolve_workspace_preview_current_proof_region(...) / decoder._workspace_preview_risk_summary(...) ... PY`
-  - `local compile sanity is green again, including python -m py_compile agent_kernel/task_bank.py`
+  - `local compile sanity is green again, including python -m py_compile agent_kernel/tasking/task_bank.py`
 - next_recommendation_update: `The next upstream ROI is evidence that is not expressible as adjacent-pair bridges at all: multiple partial subspans inferred inside one bounded local block where proof spans are sparse and some hidden lines remain unknown even after zero-gap closure.`
 - findings_update:
   - `Extended agent_kernel/modeling/policy/decoder.py so a partial current-proof region can still synthesize a localized block_replace when exactly one opaque span is strictly interior to an otherwise exact bounded region. The opaque span now contributes line-span coverage for region assembly without pretending the current content itself is known.`

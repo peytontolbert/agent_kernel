@@ -18,7 +18,21 @@ Useful flags:
 - `--use-prompt-proposals {0,1}`
 - `--use-curriculum-proposals {0,1}`
 - `--use-retrieval-proposals {0,1}`
+- `--use-state-estimation-proposals {0,1}`
+- `--use-trust-proposals {0,1}`
+- `--use-recovery-proposals {0,1}`
+- `--use-delegation-proposals {0,1}`
+- `--use-operator-policy-proposals {0,1}`
+- `--use-transition-model-proposals {0,1}`
+- `--allow-git-commands {0,1}`
+- `--allow-http-requests {0,1}`
+- `--allow-generated-path-mutations {0,1}`
 - `--tolbert-cache` can be passed multiple times
+- `--external-task-manifest`
+- `--enforce-preflight {0,1}`
+- `--report-path`
+- `--checkpoint-path`
+- `--resume`
 
 [`scripts/run_minimal_asi.py`](/data/agentkernel/scripts/run_minimal_asi.py)
 
@@ -36,8 +50,12 @@ Useful flags:
 - `--use-universe-model {0,1}`
 - `--persist-episode-memory {0,1}`
 - `--persist-learning-candidates {0,1}`
+- `--max-steps`
 - `--tolbert-cache` can be passed multiple times
 - `--tolbert-source-spans` can be passed multiple times
+- `--external-task-manifest`
+- `--checkpoint-path`
+- `--resume`
 - `--print-profile`
 
 [`scripts/run_eval.py`](/data/agentkernel/scripts/run_eval.py)
@@ -50,6 +68,7 @@ Important flags:
 
 - `--include-curriculum`
 - `--include-failure-curriculum`
+- `--include-discovered-tasks`
 - `--include-episode-memory`
 - `--include-skill-memory`
 - `--include-skill-transfer`
@@ -58,12 +77,32 @@ Important flags:
 - `--include-verifier-memory`
 - `--include-benchmark-candidates`
 - `--include-verifier-candidates`
+- `--task-limit`
+- `--priority-benchmark-family`
+- `--restrict-to-priority-benchmark-families`
+- `--prefer-retrieval-tasks`
+- `--prefer-low-cost-tasks`
+- `--prefer-long-horizon-tasks`
 - `--use-prompt-proposals {0,1}`
 - `--use-curriculum-proposals {0,1}`
 - `--use-retrieval-proposals {0,1}`
+- `--use-state-estimation-proposals {0,1}`
+- `--use-tolbert-model-artifacts {0,1}`
+- `--use-trust-proposals {0,1}`
+- `--use-recovery-proposals {0,1}`
+- `--use-delegation-proposals {0,1}`
+- `--use-operator-policy-proposals {0,1}`
+- `--use-transition-model-proposals {0,1}`
+- `--allow-git-commands {0,1}`
+- `--allow-http-requests {0,1}`
+- `--allow-generated-path-mutations {0,1}`
+- `--use-research-library-context {0,1}`
+- `--research-library-standalone-context {0,1}`
+- `--require-live-llm-coding-control {0,1}`
 - `--compare-skills`
 - `--compare-abstractions`
 - `--compare-tolbert`
+- `--compare-research-library`
 - `--compare-tolbert-features`
 - `--tolbert-mode {full,path_only,retrieval_only,deterministic_command,skill_ranking}`
 

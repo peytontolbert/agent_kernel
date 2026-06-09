@@ -1,0 +1,100 @@
+{
+  "evidence_id": "a7_live_vllm_repeated_heldout_transfer_r1_r2_20260426",
+  "generated_at": "2026-04-26T03:38:00Z",
+  "lane": "A7_readiness",
+  "claim": "two non-identical held-out unfamiliar-transfer rotations completed through the existing product-native queue and manifest path under live vLLM",
+  "provider": {
+    "provider": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "vllm_autostart": false,
+    "tolbert_context": false
+  },
+  "important_limits": [
+    "This is A7-readiness evidence, not a full A7 claim.",
+    "The tasks are still bounded coding-domain workspace tasks.",
+    "The evidence does not establish strong human-level or better breadth across the declared task universe.",
+    "model_stack was not used because http://127.0.0.1:8001/healthz was connection refused at probe time."
+  ],
+  "rotations": [
+    {
+      "rotation_id": "r1",
+      "manifest_path": "config/a7_unfamiliar_transfer_manifest.json",
+      "status_path": "/tmp/agentkernel_a7_manifest_probe_20260426/status_with_frontier_fields.json",
+      "run_root": "/tmp/agentkernel_a7_manifest_probe_20260426",
+      "total_jobs": 5,
+      "completed_success_jobs": 5,
+      "closeout_ready": true,
+      "closeout_mode": "queue_empty_trusted",
+      "trust_status": "trusted",
+      "operator_steering_required": false,
+      "held_out_frontier_report_count": 5,
+      "held_out_frontier_clean_success_count": 5,
+      "held_out_frontier_clean_success_rate": 1.0,
+      "held_out_frontier_benchmark_families": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repo_sandbox",
+        "repository"
+      ],
+      "frontier_slices": [
+        "environment_novelty",
+        "policy_novelty",
+        "repo_sandbox_novelty",
+        "repo_topology_novelty",
+        "workflow_novelty"
+      ]
+    },
+    {
+      "rotation_id": "r2",
+      "manifest_path": "config/a7_unfamiliar_transfer_manifest_r2.json",
+      "status_path": "/tmp/agentkernel_a7_manifest_probe_r2_20260426/status_with_frontier_fields.json",
+      "run_root": "/tmp/agentkernel_a7_manifest_probe_r2_20260426",
+      "total_jobs": 5,
+      "completed_success_jobs": 5,
+      "closeout_ready": true,
+      "closeout_mode": "queue_empty_trusted",
+      "trust_status": "trusted",
+      "operator_steering_required": false,
+      "held_out_frontier_report_count": 5,
+      "held_out_frontier_clean_success_count": 5,
+      "held_out_frontier_clean_success_rate": 1.0,
+      "held_out_frontier_benchmark_families": [
+        "integration",
+        "project",
+        "repo_chore",
+        "repo_sandbox",
+        "repository"
+      ],
+      "frontier_slices": [
+        "cross_service_recovery_novelty",
+        "patch_queue_novelty",
+        "release_control_novelty",
+        "retention_exception_novelty",
+        "schema_topology_novelty"
+      ]
+    }
+  ],
+  "aggregate": {
+    "rotation_count": 2,
+    "non_identical_manifests": true,
+    "total_held_out_frontier_reports": 10,
+    "total_held_out_frontier_clean_successes": 10,
+    "aggregate_clean_success_rate": 1.0,
+    "families_repeated_in_both_rotations": [
+      "integration",
+      "project",
+      "repo_chore",
+      "repo_sandbox",
+      "repository"
+    ],
+    "distinct_frontier_slice_count": 10,
+    "existing_path_only": true,
+    "per_task_architecture_changes": false
+  },
+  "next_gate": {
+    "goal": "Convert A7 readiness into a stronger A7 transfer gate.",
+    "minimum_next_step": "Run a larger or more structurally varied held-out rotation with harder acceptance contracts and conservative confidence accounting.",
+    "preferred_provider_step": "Use model_stack once its health endpoint and tokenizer/model-dir configuration are available; otherwise continue live-vLLM rotations."
+  }
+}

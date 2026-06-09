@@ -1,0 +1,53 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "autonomous_benchmark_harness_spec",
+  "benchmark": "swe_bench_live",
+  "created_at": "2026-05-13T02:27:00+00:00",
+  "autonomy_contract": {
+    "operator_role": "launch_and_monitor_only",
+    "selection_mode": "official_score_feedback_r5_completed_success_patch_jobs",
+    "kernel_owned_phases": [
+      "select_completed_success_patch_jobs",
+      "collect_r5_predictions",
+      "build_live_predictions_json",
+      "official_r5_subset_harness",
+      "summarize_official_r5_results"
+    ],
+    "prohibited_manual_interventions": [
+      "manual per-instance patch authoring",
+      "manual prediction JSON editing",
+      "claiming queue completed/success as official resolution"
+    ],
+    "countable_evidence": [
+      "official SWE-bench Live evaluator reports over r5 completed patches",
+      "r5 official score separated from raw local artifact completion"
+    ]
+  },
+  "inputs": {
+    "source_harness_log": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/harness_official_score_feedback_r5_20260513_log.json",
+    "source_queue_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_official_score_feedback_r5_20260513/queue.json",
+    "source_queue_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/queue_manifest_official_score_feedback_r5_20260513.json",
+    "source_prediction_task_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/official_score_feedback_r5_20260513/prediction_tasks_official_score_feedback_r5_20260513.json",
+    "workspace_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/verified_leaderboard/workspaces",
+    "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+    "split": "verified",
+    "platform": "linux"
+  },
+  "run_config": {
+    "run_id": "agentkernel_swe_bench_live_official_score_feedback_r5_latest",
+    "harness_root": "/data/agentkernel/other_repos/SWE-bench-Live",
+    "workers": 2,
+    "overwrite": 1,
+    "score_kind": "official_score_feedback_r5_subset",
+    "score_mode": "raw_completed_success_official_feedback_retry"
+  },
+  "artifacts": {
+    "rolling_root": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest",
+    "patch_job_verification_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/patch_jobs_selection.json",
+    "predictions_jsonl": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/predictions.jsonl",
+    "predictions_patch_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/preds.json",
+    "report_dir": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/evaluation_results",
+    "results_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/evaluation_results/results.json",
+    "summary_json": "/data/agentkernel/benchmarks/swe_bench_live/rolling_score/official_score_feedback_r5_latest/summary.json"
+  }
+}

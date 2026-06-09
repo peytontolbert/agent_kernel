@@ -1,0 +1,54 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a7_unfamiliar_transfer_rotation_evidence",
+  "rotation_id": "r6_diagnostic_synthesis",
+  "created_at": "2026-04-26T05:56:00Z",
+  "provider": {
+    "provider": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "vllm_autostart": false,
+    "tolbert_context": false
+  },
+  "manifest_path": "config/a7_unfamiliar_transfer_manifest_r6_diagnostic_synthesis.json",
+  "status_path": "/tmp/agentkernel_a7_manifest_probe_r6_diagnostic_synthesis_replay3_20260426/status_with_frontier_fields.json",
+  "workspace_root": "/tmp/agentkernel_a7_manifest_probe_r6_diagnostic_synthesis_replay3_20260426/workspace",
+  "trajectory_root": "/tmp/agentkernel_a7_manifest_probe_r6_diagnostic_synthesis_replay3_20260426/trajectories",
+  "result": {
+    "total_jobs": 5,
+    "completed_success_jobs": 5,
+    "terminal_non_success_jobs": 0,
+    "closeout_mode": "queue_empty_trusted",
+    "trust_status": "trusted",
+    "held_out_frontier_report_count": 5,
+    "held_out_frontier_clean_success_count": 5,
+    "held_out_frontier_clean_success_rate": 1.0,
+    "clean_success_rate": 1.0,
+    "success_rate": 1.0
+  },
+  "families": [
+    "integration",
+    "project",
+    "repo_chore",
+    "repo_sandbox",
+    "repository"
+  ],
+  "frontier_slices": [
+    "diagnostic_flake_synthesis_novelty",
+    "diagnostic_latency_synthesis_novelty",
+    "diagnostic_ownership_synthesis_novelty",
+    "diagnostic_replay_synthesis_novelty",
+    "diagnostic_storage_synthesis_novelty"
+  ],
+  "task_ids": [
+    "a7_r6_diag_integration_replay_synthesis_task",
+    "a7_r6_diag_project_latency_synthesis_task",
+    "a7_r6_diag_repo_chore_storage_synthesis_task",
+    "a7_r6_diag_repo_sandbox_flake_synthesis_task",
+    "a7_r6_diag_repository_ownership_synthesis_task"
+  ],
+  "notes": [
+    "This is a diagnostic-synthesis held-out rotation using setup evidence and no suggested commands.",
+    "Two invalid setup-contract attempts failed before model execution; replay3 is the counted clean run after declaring setup evidence files through workflow_guard.managed_paths.",
+    "This strengthens A7-readiness only and does not establish a full A7 claim."
+  ]
+}

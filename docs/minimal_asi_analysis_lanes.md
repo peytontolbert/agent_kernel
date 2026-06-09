@@ -197,14 +197,14 @@ Audit whether the codebase actually respects the minimum boundaries defined in [
 ### Primary surfaces
 
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:247)
-- [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py:40)
+- [`agent_kernel/extensions/strategy/subsystems.py`](/data/agentkernel/agent_kernel/extensions/strategy/subsystems.py:40)
 - [`agent_kernel/strategy_memory/`](/data/agentkernel/agent_kernel/strategy_memory)
-- [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+- [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py)
 - [`agent_kernel/modeling/`](/data/agentkernel/agent_kernel/modeling)
-- [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py)
-- [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py)
-- [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py)
-- [`agent_kernel/job_queue.py`](/data/agentkernel/agent_kernel/job_queue.py)
+- [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py)
+- [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py)
+- [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py)
+- [`agent_kernel/ops/job_queue.py`](/data/agentkernel/agent_kernel/ops/job_queue.py)
 
 ### Contract to verify
 

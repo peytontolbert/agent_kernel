@@ -3,16 +3,16 @@
 ## Scope Reviewed
 
 - [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:16)
-- [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py:39)
+- [`agent_kernel/extensions/strategy/subsystems.py`](/data/agentkernel/agent_kernel/extensions/strategy/subsystems.py:39)
 - [`agent_kernel/strategy_memory/__init__.py`](/data/agentkernel/agent_kernel/strategy_memory/__init__.py:1)
 - [`agent_kernel/strategy_memory/store.py`](/data/agentkernel/agent_kernel/strategy_memory/store.py:120)
 - [`agent_kernel/strategy_memory/sampler.py`](/data/agentkernel/agent_kernel/strategy_memory/sampler.py:128)
-- [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py:1)
+- [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py:1)
 - [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py:19)
 - [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py:17)
-- [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py:320)
-- [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py:52)
-- [`agent_kernel/job_queue.py`](/data/agentkernel/agent_kernel/job_queue.py:16)
+- [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py:320)
+- [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py:52)
+- [`agent_kernel/ops/job_queue.py`](/data/agentkernel/agent_kernel/ops/job_queue.py:16)
 - [`docs/asi_core.md`](/data/agentkernel/docs/asi_core.md:1)
 - [`docs/architecture.md`](/data/agentkernel/docs/architecture.md:22)
 - [`docs/index.md`](/data/agentkernel/docs/index.md:1)
@@ -33,8 +33,8 @@ The repo mostly classifies the boundary correctly in docs, and the highest-ROI c
 The self-improvement layer now has a real engine/plugin/support split:
 
 - generic engine dataclasses plus target projection, variant orchestration, retention-gate application, and artifact lifecycle helpers live in [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1)
-- subsystem registry, strategy-memory priors, TOLBERT delta helpers, and universe bundle helpers are reached through [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1)
-- task-supply-backed compatibility lookup is now wrapped by [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1)
+- subsystem registry, strategy-memory priors, TOLBERT delta helpers, and universe bundle helpers are reached through [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1)
+- task-supply-backed compatibility lookup is now wrapped by [`agent_kernel/extensions/improvement/improvement_support_validation.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_support_validation.py:1)
 
 The runtime minimum now also has an adapter seam for optional learned/modeling packages:
 
@@ -49,8 +49,8 @@ Residual boundary issue:
 
 - The canonical docs now separate core from support explicitly. [`asi_core.md`](/data/agentkernel/docs/asi_core.md:81) classifies `subsystems.py`, `strategy_memory/`, learned execution packages, task supply, and controller machinery as auxiliary/support, and [`architecture.md`](/data/agentkernel/docs/architecture.md:93) repeats that split.
 - Strategy memory is support that pressures planning, not a hard prerequisite for the meta-loop. When runtime config is absent, the planner returns an empty strategy-memory summary instead of failing in [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1832); only when config is present does it load nodes and summarize priors in [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1847).
-- Task supply and controller machinery are still downstream of the runtime core rather than upstream of it. [`agent_kernel/job_queue.py`](/data/agentkernel/agent_kernel/job_queue.py:19) imports `AgentKernel`, and delegated execution calls `kernel.run_task(...)` in [`agent_kernel/job_queue.py`](/data/agentkernel/agent_kernel/job_queue.py:2110), so the queue wraps the kernel instead of defining it.
-- Curriculum remains a support layer around episode generation rather than part of the executor minimum. [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py:58) synthesizes followup tasks from episode records, and [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py:320) annotates task contracts and manifests rather than shaping the executor loop directly.
+- Task supply and controller machinery are still downstream of the runtime core rather than upstream of it. [`agent_kernel/ops/job_queue.py`](/data/agentkernel/agent_kernel/ops/job_queue.py:19) imports `AgentKernel`, and delegated execution calls `kernel.run_task(...)` in [`agent_kernel/ops/job_queue.py`](/data/agentkernel/agent_kernel/ops/job_queue.py:2110), so the queue wraps the kernel instead of defining it.
+- Curriculum remains a support layer around episode generation rather than part of the executor minimum. [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py:58) synthesizes followup tasks from episode records, and [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py:320) annotates task contracts and manifests rather than shaping the executor loop directly.
 
 ## What Is Only Partial Or Optional
 
@@ -60,9 +60,9 @@ Residual boundary issue:
 
 ## What Was Missing And Is Now Present
 
-- A real engine/plugin seam inside the self-improvement layer now exists through [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) and [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1).
+- A real engine/plugin seam inside the self-improvement layer now exists through [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) and [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1).
 - A clean runtime adapter seam for learned execution/modeling packages now exists in [`agent_kernel/runtime_modeling_adapter.py`](/data/agentkernel/agent_kernel/runtime_modeling_adapter.py:1).
-- A stricter separation between core retention logic and support-side compatibility/task-supply logic now exists through [`agent_kernel/improvement_support_validation.py`](/data/agentkernel/agent_kernel/improvement_support_validation.py:1), which provides `TaskContractCatalog` instead of constructing `TaskBank` in the core retention path.
+- A stricter separation between core retention logic and support-side compatibility/task-supply logic now exists through [`agent_kernel/extensions/improvement/improvement_support_validation.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_support_validation.py:1), which provides `TaskContractCatalog` instead of constructing `TaskBank` in the core retention path.
 
 ## What Still Remains
 
@@ -76,7 +76,7 @@ Residual boundary issue:
    Evidence: the extracted engine now owns generic target projection, variant orchestration, retention-gate application, and artifact lifecycle application in [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1), but subsystem-specific ranking/evidence logic still lives in [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1).
 
 2. The plugin seam is adapter-oriented rather than fully package-split by subsystem family.
-   Evidence: [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1) centralizes support bridges, but subsystem-specific ranking/evidence logic has not been pushed into independently owned plugin modules.
+   Evidence: [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1) centralizes support bridges, but subsystem-specific ranking/evidence logic has not been pushed into independently owned plugin modules.
 
 3. Docs needed to be updated after the seam landed.
    Evidence: older versions of this page and nearby architecture docs still described the engine/plugin/adapter/support-validator seams as missing even after they were implemented.
@@ -91,14 +91,14 @@ Residual boundary issue:
 
 ### Reclassify As Support Around The Minimums
 
-- subsystem registry and proposal-family construction: [`agent_kernel/subsystems.py`](/data/agentkernel/agent_kernel/subsystems.py:39)
+- subsystem registry and proposal-family construction: [`agent_kernel/extensions/strategy/subsystems.py`](/data/agentkernel/agent_kernel/extensions/strategy/subsystems.py:39)
 - strategy-memory storage, lessons, priors, and snapshots: [`agent_kernel/strategy_memory/store.py`](/data/agentkernel/agent_kernel/strategy_memory/store.py:120), [`agent_kernel/strategy_memory/sampler.py`](/data/agentkernel/agent_kernel/strategy_memory/sampler.py:128)
-- learned execution/modeling stack: [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py:1), [`agent_kernel/modeling/`](/data/agentkernel/agent_kernel/modeling)
-- task supply and curriculum: [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py:320), [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py:52)
-- unattended operations and job orchestration: [`agent_kernel/job_queue.py`](/data/agentkernel/agent_kernel/job_queue.py:16), [`agent_kernel/unattended_controller.py`](/data/agentkernel/agent_kernel/unattended_controller.py:1)
+- learned execution/modeling stack: [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py:1), [`agent_kernel/modeling/`](/data/agentkernel/agent_kernel/modeling)
+- task supply and curriculum: [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py:320), [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py:52)
+- unattended operations and job orchestration: [`agent_kernel/ops/job_queue.py`](/data/agentkernel/agent_kernel/ops/job_queue.py:16), [`agent_kernel/ops/unattended_controller.py`](/data/agentkernel/agent_kernel/ops/unattended_controller.py:1)
 
 ## Highest-ROI Next Patches
 
 1. Continue shrinking [`agent_kernel/improvement.py`](/data/agentkernel/agent_kernel/improvement.py:1) by moving more experiment-ranking and evidence-collation logic into [`agent_kernel/improvement_engine.py`](/data/agentkernel/agent_kernel/improvement_engine.py:1) or clearer subsystem-owned adapters.
-2. Decide whether the current adapter-style [`agent_kernel/improvement_plugins.py`](/data/agentkernel/agent_kernel/improvement_plugins.py:1) is sufficient, or whether subsystem-owned plugin modules should replace the centralized bridge.
+2. Decide whether the current adapter-style [`agent_kernel/extensions/improvement/improvement_plugins.py`](/data/agentkernel/agent_kernel/extensions/improvement/improvement_plugins.py:1) is sufficient, or whether subsystem-owned plugin modules should replace the centralized bridge.
 3. Keep future learned/runtime integration behind [`agent_kernel/runtime_modeling_adapter.py`](/data/agentkernel/agent_kernel/runtime_modeling_adapter.py:1) so optional modeling support does not re-expand into direct loop/policy imports.

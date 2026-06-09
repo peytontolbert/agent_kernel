@@ -1,0 +1,20 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "recursive_compounding",
+  "ready_to_run": false,
+  "runner": {
+    "kind": "summary_only",
+    "summary_source": "/data/agentkernel/benchmarks/recursive_compounding/summary.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/recursive_compounding/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/recursive_compounding/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "This spec expects verified recursive compounding with at least 5 retained gain runs across 3 windows.",
+    "The adapter rejects recursive compounding summaries unless verified_recursive_compounding is true."
+  ]
+}

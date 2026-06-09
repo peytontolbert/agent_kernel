@@ -47,11 +47,10 @@ export AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000
 
 Important `KernelConfig` defaults from [`agent_kernel/config.py`](/data/agentkernel/agent_kernel/config.py):
 
-- provider: `ollama`
 - provider: `vllm`
 - model: `Qwen/Qwen3.5-9B`
-- host: `http://127.0.0.1:8000`
-- host: `http://127.0.0.1:11434`
+- vLLM host: `http://127.0.0.1:8000`
+- Ollama host, when explicitly selected: `http://127.0.0.1:11434`
 - `use_tolbert_context=1`
 - `tolbert_mode=full`
 - `use_skills=1`
@@ -113,7 +112,7 @@ The loop in [`agent_kernel/loop.py`](/data/agentkernel/agent_kernel/loop.py) enr
 - [`agent_kernel/extensions/planner_recovery.py`](/data/agentkernel/agent_kernel/extensions/planner_recovery.py:1) for planner-recovery artifact synthesis and ranking helpers
 
 The runtime no longer reaches most learned/modeling surfaces directly from the loop and policy modules.
-[`agent_kernel/runtime_modeling_adapter.py`](/data/agentkernel/agent_kernel/runtime_modeling_adapter.py:1)
+[`agent_kernel/extensions/runtime_modeling_adapter.py`](/data/agentkernel/agent_kernel/extensions/runtime_modeling_adapter.py:1)
 now provides the lazy seam for:
 
 - context-provider construction
@@ -153,7 +152,7 @@ coding runtime.
 
 - The live coding path is mostly built around retained text previews, command execution, verifier feedback, workflow state, and bounded structured-edit proposals.
 - [`agent_kernel/modeling/policy/decoder.py`](/data/agentkernel/agent_kernel/modeling/policy/decoder.py) can assemble localized `structured_edit:*` actions from retained preview windows, including multi-window and bridge-backed repairs, but much of that path is still text-region control rather than full AST/CST-native transformation.
-- [`agent_kernel/syntax_motor.py`](/data/agentkernel/agent_kernel/syntax_motor.py) provides parser-backed edit targeting and syntax checks for structured edits, but it remains a motor aid rather than the whole software-work reasoning stack.
+- [`agent_kernel/extensions/syntax_motor.py`](/data/agentkernel/agent_kernel/extensions/syntax_motor.py) provides parser-backed edit targeting and syntax checks for structured edits, but it remains a motor aid rather than the whole software-work reasoning stack.
 - The repo also contains Python AST usage in [`scripts/report_prompt_diagnostics.py`](/data/agentkernel/scripts/report_prompt_diagnostics.py), though that path is diagnostic rather than the main edit/execution loop.
 
 This boundary matters, but it should be described precisely. Syntax-aware tooling is not the same thing as software understanding; human engineers mostly operate through broader semantic context, repo traversal, and workflow reasoning rather than explicit AST manipulation. For a digital agent, though, syntax-aware structure is still a useful motor aid. It can make symbol-targeted edits, import propagation, signature-aware repair, edited-region accounting, and pre-execution syntax validation cheaper and more reliable than repeated text traversal alone.
@@ -181,22 +180,22 @@ That keeps seed tasks short by default while giving frontier tasks a real path t
 
 Unattended task reports now also expose a first-class `supervision` summary for
 the bridge between bounded competence and real delegated software work.
-[`agent_kernel/preflight.py`](/data/agentkernel/agent_kernel/preflight.py) now
+[`agent_kernel/ops/preflight.py`](/data/agentkernel/agent_kernel/ops/preflight.py) now
 records `mode`, `operator_turns`, `independent_execution`, and
 `light_supervision_*` outcomes per task report, and
-[`agent_kernel/trust.py`](/data/agentkernel/agent_kernel/trust.py) aggregates
+[`agent_kernel/extensions/trust.py`](/data/agentkernel/agent_kernel/extensions/trust.py) aggregates
 those counts into family and overall trust summaries. That lets the kernel
 measure whether a family is succeeding under objective-only or near-objective-only
 guidance instead of treating all gated evidence as equally autonomous.
 The task-selection path now uses the same bridge target proactively instead of
 only measuring it after execution:
-[`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py)
+[`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py)
 annotates verifier-clean primary contracts as `light_supervision_candidate`,
 and [`evals/harness.py`](/data/agentkernel/evals/harness.py) biases bounded
 compare selection toward those contract-clean tasks before retrieval or replay
 tails when slots are scarce.
 That same contract bias now continues into generated follow-ons too:
-[`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py)
+[`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py)
 now gives adjacent-success seed priority to episodes that came from
 `light_supervision_candidate` primaries, and the generated curriculum tasks are
 re-annotated with the same contract metadata so later generated waves and
@@ -322,7 +321,7 @@ Long-horizon software work now has a broader model-facing agenda even before
 critic-proven recovery: [`agent_kernel/state.py`](/data/agentkernel/agent_kernel/state.py)
 derives a `software_work_plan_update` from remaining subgoals, pending
 synthetic edit-plan paths, and delayed verifier obligations such as reports,
-generated artifacts, merges, and tests; [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+generated artifacts, merges, and tests; [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
 threads that agenda into planner payloads and state-context chunks; and
 [`agent_kernel/modeling/tolbert/runtime.py`](/data/agentkernel/agent_kernel/modeling/tolbert/runtime.py)
 adds a software-work alignment term so retained Tolbert scoring can favor
@@ -334,7 +333,7 @@ retained software-work stage outcomes across attempts and checkpoints,
 including whether the current long-horizon objective advanced, stalled,
 regressed, or completed; the agenda reorder now uses those retained outcomes so
 repeatedly stalled implementation work yields priority to other verifier-visible
-obligations such as reports or tests; [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+obligations such as reports or tests; [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
 surfaces the same stage-state and recent outcomes in planner payloads; and
 [`agent_kernel/modeling/tolbert/runtime.py`](/data/agentkernel/agent_kernel/modeling/tolbert/runtime.py)
 adds an explicit software-work transition term so retained model-side ranking
@@ -343,7 +342,7 @@ that continue an advanced stage.
 The same retained lane now also derives explicit phase handoff boundaries across
 implementation, migration, test, and follow-up-fix work: [`agent_kernel/state.py`](/data/agentkernel/agent_kernel/state.py)
 compacts staged objectives into a `software_work_phase_state` with
-`current_phase`, `suggested_phase`, and `handoff_ready`; [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+`current_phase`, `suggested_phase`, and `handoff_ready`; [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
 surfaces that phase state and phase chunks to planner payloads; [`agent_kernel/modeling/tolbert/runtime.py`](/data/agentkernel/agent_kernel/modeling/tolbert/runtime.py)
 adds a software-work phase-handoff alignment term so retained scoring can
 penalize premature jumps into later phases and reward test/follow-up commands
@@ -354,7 +353,7 @@ Unresolved earlier phases can now also act as an explicit phase gate instead of
 just a weak ordering hint. [`agent_kernel/state.py`](/data/agentkernel/agent_kernel/state.py)
 derives a `software_work_phase_gate_state` that names the unresolved gate phase,
 the concrete gate objectives, and the later phases that should stay blocked;
-[`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+[`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
 promotes that gate state into planner payloads and context chunks;
 [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py) uses the
 same gate to filter task-contract direct-path candidates toward unresolved
@@ -368,7 +367,7 @@ The same long-horizon lane now also carries a compact
 campaign objective from the most recent subgoal. [`agent_kernel/state.py`](/data/agentkernel/agent_kernel/state.py)
 derives unresolved anchor obligations, regressed or stalled objectives,
 required paths, and aggregate drift pressure from retained plan, world, and
-stage state; [`agent_kernel/context_budget.py`](/data/agentkernel/agent_kernel/context_budget.py)
+stage state; [`agent_kernel/extensions/context_budget.py`](/data/agentkernel/agent_kernel/extensions/context_budget.py)
 surfaces those anchors as planner-visible context chunks and payload state;
 [`agent_kernel/policy.py`](/data/agentkernel/agent_kernel/policy.py) adds a
 campaign-contract command bias so planner and critic turns reward commands that
@@ -567,7 +566,7 @@ encoder/retrieval/compiler path. The retained modeled runtime lane is the
 - world-model surface for transition and risk forecasting
 - policy/value/stop/risk heads that plug into kernel routing and acceptance
 
-The current live service path in [`agent_kernel/tolbert.py`](/data/agentkernel/agent_kernel/tolbert.py)
+The current live service path in [`agent_kernel/extensions/tolbert.py`](/data/agentkernel/agent_kernel/extensions/tolbert.py)
 is the seeded compiler path. The hybrid runtime under
 [`agent_kernel/modeling/tolbert/`](/data/agentkernel/agent_kernel/modeling/tolbert)
 is the first retained latent/runtime member. The seed `vllm` stack remains

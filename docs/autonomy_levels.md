@@ -352,6 +352,8 @@ Repo note:
 
 ASI begins when the system is decisively beyond the human frontier across the declared task
 universe and the recursive-improvement machinery compounds that advantage under verification.
+For this repo, that should be interpreted as sustained superhuman coding capability, not merely a
+single strong held-out packet or a short retained-gain streak.
 
 Human ownership:
 
@@ -367,15 +369,26 @@ System ownership:
 
 Required evidence:
 
-- decisive outperformance versus strong human or team baselines across the declared task universe
-- recursive improvement that compounds rather than merely fluctuates
-- strategically superior abstractions, plans, or inventions that survive verification
+- sustained outperformance versus strong human or strong team coding baselines across the declared
+  task universe
+- benchmark-specific coding-superhuman anchors, including Codeforces-equivalent rating near 3000,
+  MLE-bench gold-level performance, strong SWE-bench Verified and SWE-Rebench repo repair, and
+  RE-Bench wins against human experts
+- enough task volume and repeated windows to rule out one-off luck, benchmark overfit, or a narrow
+  local harness advantage
+- broad unfamiliar-domain and long-horizon transfer, not only compact workspace contracts
+- recursive improvement that compounds across retained runs over time rather than merely fluctuating
+- low regression under conservative comparison reports
+- strategically superior abstractions, plans, or inventions that survive verification and later use
 
 Disqualifiers:
 
 - broad architecture without superhuman benchmark evidence
 - autonomy without superhuman cognition
 - local wins in one benchmark family treated as universal superiority
+- A7-readiness evidence promoted directly to A8 without strong-human baseline comparison
+- a short burst of retained gains that has not trained or operated long enough in the coding-AGI
+  regime to show sustained superhuman coding capability
 
 ## Prompt Test
 

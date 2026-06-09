@@ -1,0 +1,20 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "mle_bench",
+  "ready_to_run": false,
+  "runner": {
+    "kind": "summary_only",
+    "summary_source": "/data/agentkernel/benchmarks/mle_bench/summary.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/mle_bench/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/mle_bench/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "No local MLE-bench harness was found; this spec expects an externally produced medal summary.",
+    "A8 requires gold_medal_rate >= 0.2 and conservative comparison evidence."
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "artifact": "a7_stateful_repair_r5_live_vllm_success_20260426",
+  "created_at": "2026-04-26T05:39:00Z",
+  "claim_scope": "A7_readiness_stateful_repair_transfer",
+  "manifest_path": "config/a7_unfamiliar_transfer_manifest_r5_stateful_repair.json",
+  "run_root": "/tmp/agentkernel_a7_manifest_probe_r5_stateful_repair_20260426",
+  "status_path": "/tmp/agentkernel_a7_manifest_probe_r5_stateful_repair_20260426/status_with_frontier_fields.json",
+  "provider": {
+    "kind": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "live_provider": true,
+    "mock_provider": false,
+    "autostart": false
+  },
+  "result": {
+    "drained_jobs": 5,
+    "completed_success_jobs": 5,
+    "safe_stop_jobs": 0,
+    "closeout_ready": true,
+    "closeout_mode": "queue_empty_trusted",
+    "trust_status": "trusted",
+    "operator_steering_required": false,
+    "held_out_frontier_report_count": 5,
+    "held_out_frontier_clean_success_count": 5,
+    "held_out_frontier_clean_success_rate": 1.0,
+    "success_rate": 1.0,
+    "clean_success_rate": 1.0
+  },
+  "held_out_families": [
+    "integration",
+    "project",
+    "repo_chore",
+    "repo_sandbox",
+    "repository"
+  ],
+  "frontier_slices": [
+    "stateful_integration_route_repair_novelty",
+    "stateful_repository_policy_repair_novelty",
+    "stateful_retention_repair_novelty",
+    "stateful_rollout_repair_novelty",
+    "stateful_sandbox_fixture_repair_novelty"
+  ],
+  "stateful_repair_properties": {
+    "setup_state_required": true,
+    "exact_rewrites_required": true,
+    "forbidden_stale_artifact_removal_required": true,
+    "suggested_commands_absent": true
+  },
+  "interpretation": {
+    "positive": "The existing queue and manifest path completed stateful held-out repair tasks under live vLLM, including setup-state awareness, exact rewrites, and stale artifact removal.",
+    "limit": "This remains A7-readiness evidence within bounded workspace-contract tasks, not a full A7 crossing.",
+    "next_shortest_step": "Promote stateful repair into the verified A7-readiness packet and then target either model_stack provider independence or broader unfamiliar task shapes."
+  }
+}

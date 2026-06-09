@@ -1,0 +1,51 @@
+{
+  "evidence_id": "a7_hard_hintless_transfer_r3_negative_20260426",
+  "generated_at": "2026-04-26T04:24:00Z",
+  "lane": "A7_readiness_hardening",
+  "claim": "hard hintless held-out transfer exposed the next A7 blocker",
+  "provider": {
+    "provider": "vllm",
+    "model": "Qwen/Qwen3.5-9B",
+    "vllm_autostart": false,
+    "tolbert_context": false
+  },
+  "manifest_path": "config/a7_unfamiliar_transfer_manifest_r3_hard.json",
+  "first_run": {
+    "status_path": "/tmp/agentkernel_a7_manifest_probe_r3_hard_20260426/status_with_frontier_fields.json",
+    "total_jobs": 5,
+    "safe_stop_jobs": 5,
+    "completed_success_jobs": 0,
+    "held_out_frontier_clean_success_rate": 0.0,
+    "primary_failure_modes": [
+      "blocked simple heredoc commands",
+      "near-miss content that did not satisfy exact verifier contracts"
+    ]
+  },
+  "retry_after_simple_heredoc_patch": {
+    "status_path": "/tmp/agentkernel_a7_manifest_probe_r3_hard_retry_20260426/status_with_frontier_fields.json",
+    "total_jobs": 5,
+    "safe_stop_jobs": 5,
+    "completed_success_jobs": 0,
+    "held_out_frontier_clean_success_rate": 0.0,
+    "primary_failure_modes": [
+      "mkdir-and-cat heredocs still blocked before the second sandbox patch",
+      "files were usually created but failed exact verifier-aligned content repair",
+      "termination reasons were repeated_failed_action or no_state_progress"
+    ]
+  },
+  "patch_applied": {
+    "file": "agent_kernel/sandbox.py",
+    "summary": "Normalize narrow cat heredoc commands into bounded printf redirection for both cat > path << EOF and mkdir -p dir && cat > path << EOF.",
+    "tests": [
+      "tests/test_verifier.py::test_sandbox_normalizes_simple_cat_heredoc_to_bounded_redirection",
+      "tests/test_verifier.py::test_sandbox_normalizes_mkdir_cat_heredoc_to_bounded_redirection"
+    ],
+    "focused_result": "5 passed, 46 deselected"
+  },
+  "remaining_blocker": {
+    "name": "hintless verifier-aligned repair",
+    "description": "The live provider can infer plausible files without suggested commands, but it does not reliably repair exact verifier mismatches after near-miss writes.",
+    "next_patch": "Improve verifier-failure feedback or repair prompting so expected content/path mismatches are transformed into exact corrective commands before repeated_failed_action/no_state_progress termination."
+  },
+  "honest_lane_reading": "This is negative hardening evidence, not an A7-readiness success. It is useful because it isolates the next hard-transfer gap after easy held-out rotations passed."
+}

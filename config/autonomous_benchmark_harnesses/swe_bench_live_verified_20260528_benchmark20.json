@@ -1,0 +1,569 @@
+{
+  "artifacts": {
+    "adapter_spec_json": "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json",
+    "apply_check_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20_apply_check.json",
+    "leaderboard_submission_dir": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/submission",
+    "live_predictions_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/a8_benchmark_result.json",
+    "patch_dir": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/patches_agentkernel_swe_bench_live_verified_20260528_benchmark20",
+    "patch_jobs_verification_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/patch_jobs_verification.json",
+    "prediction_task_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+    "prediction_task_progress_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_task_progress_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+    "predictions_jsonl": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+    "queue_manifest": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+    "queue_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20",
+    "repo_cache_manifest_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/repo_cache_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+    "report_dir": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results",
+    "results_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json",
+    "run_spec_json": "config/standalone_benchmark_run_specs/swe_bench_live_verified_20260528_benchmark20.json",
+    "summary_json": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json",
+    "workspace_prefix": "swe_patch_agentkernel_swe_bench_live_verified_20260528_benchmark20",
+    "workspace_root": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces"
+  },
+  "autonomy_contract": {
+    "countable_evidence": [
+      "official SWE harness resolved_instances/resolved_ids",
+      "verified a8_benchmark_result packet",
+      "SWE-bench Live leaderboard submission package"
+    ],
+    "kernel_owned_phases": [
+      "validate_adapter_spec",
+      "prepare_repo_cache",
+      "prepare_prediction_tasks",
+      "prepare_queue_manifest",
+      "enqueue_patch_jobs",
+      "drain_patch_jobs",
+      "verify_patch_jobs",
+      "collect_predictions",
+      "repo_cache_apply_check",
+      "build_live_predictions_json",
+      "official_harness",
+      "apply_official_results_to_queue",
+      "summarize_results",
+      "adapt_a8_packet",
+      "package_live_leaderboard_submission"
+    ],
+    "operator_role": "launch_and_monitor_only",
+    "prohibited_manual_interventions": [
+      "manual per-instance patch authoring",
+      "manual prediction JSONL editing",
+      "new per-instance queue hook edits during the run",
+      "claiming local apply-checks as official benchmark results"
+    ],
+    "selection_mode": "dataset_limit"
+  },
+  "benchmark": "swe_bench_live",
+  "created_at": "2026-05-28T01:04:07.466484+00:00",
+  "inputs": {
+    "dataset_json": "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+    "dataset_name": "SWE-bench-Live/SWE-bench-Live",
+    "instance_ids": [],
+    "limit": 20,
+    "max_source_context_bytes": 30000,
+    "repo_cache_root": "/data/agentkernel/benchmarks/repo_cache",
+    "split": "verified"
+  },
+  "open_limits": [
+    "This is selected-slice or limited-run evidence, not full benchmark evidence.",
+    "The harness is A8 evidence only after the official SWE harness completes and the adapter packet verifies.",
+    "Repo-cache apply-check and patch-generation success are not benchmark scores.",
+    "Do not add per-instance queue hooks or manually edit predictions after this harness starts.",
+    "SWE-bench Live leaderboard ranking requires packaging preds.json/results.json/README.md and submitting them through the official PR flow."
+  ],
+  "phases": [
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/a8_benchmark_adapter_specs.py",
+        "validate",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json",
+        "--benchmark",
+        "swe_bench_live"
+      ],
+      "gate": "generated benchmark adapter spec must be valid before benchmark adaptation",
+      "kind": "command",
+      "name": "validate_adapter_spec",
+      "required_inputs": [
+        "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_repo_cache.py",
+        "--dataset-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "--repo-cache-root",
+        "/data/agentkernel/benchmarks/repo_cache",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/repo_cache_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--limit",
+        "20"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/repo_cache_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ],
+      "gate": "repository cache must contain the dataset repositories before prediction tasks are built",
+      "kind": "command",
+      "name": "prepare_repo_cache",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_prediction_tasks.py",
+        "--dataset-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "--output-manifest-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--output-patch-dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/patches_agentkernel_swe_bench_live_verified_20260528_benchmark20",
+        "--model-name-or-path",
+        "qwen3.5:9b",
+        "--repo-cache-root",
+        "/data/agentkernel/benchmarks/repo_cache",
+        "--max-source-context-bytes",
+        "30000",
+        "--progress-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_task_progress_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--limit",
+        "20"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_task_progress_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ],
+      "kind": "command",
+      "name": "prepare_prediction_tasks",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "/data/agentkernel/benchmarks/repo_cache"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_queue_manifest.py",
+        "--prediction-task-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--output-manifest-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--workspace-prefix",
+        "swe_patch_agentkernel_swe_bench_live_verified_20260528_benchmark20"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ],
+      "kind": "command",
+      "name": "prepare_queue_manifest",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_job_queue.py",
+        "enqueue-manifest",
+        "--manifest-path",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--limit",
+        "20",
+        "--priority-start",
+        "100",
+        "--budget-group",
+        "swe_bench_live_agentkernel_swe_bench_live_verified_20260528_benchmark20",
+        "--max-queued-per-budget-group",
+        "20",
+        "--skip-existing-task-ids",
+        "--json"
+      ],
+      "env": {
+        "AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS": "2",
+        "AGENT_KERNEL_COMMAND_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/runtime_state.json",
+        "AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR": "20",
+        "AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS": "120",
+        "AGENT_KERNEL_LLM_HTTP_TRANSPORT": "curl",
+        "AGENT_KERNEL_LLM_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_MAX_STEPS": "20",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "disabled",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_OLLAMA_HOST": "http://127.0.0.1:11434",
+        "AGENT_KERNEL_PROVIDER": "ollama",
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/agentkernel.sqlite3",
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/checkpoints",
+        "AGENT_KERNEL_RUN_REPORTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/reports",
+        "AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS": "1000",
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS": "0",
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "0",
+        "AGENT_KERNEL_WORKSPACE_ROOT": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces"
+      },
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json"
+      ],
+      "kind": "command",
+      "name": "enqueue_patch_jobs",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_job_queue.py",
+        "drain",
+        "--limit",
+        "20",
+        "--job-timeout-seconds",
+        "900",
+        "--provider",
+        "ollama",
+        "--model",
+        "qwen3:8b",
+        "--enforce-preflight",
+        "0",
+        "--use-tolbert-context",
+        "0",
+        "--use-graph-memory",
+        "0",
+        "--use-world-model",
+        "0",
+        "--use-retrieval-proposals",
+        "0",
+        "--use-trust-proposals",
+        "0",
+        "--asi-coding-require-live-llm",
+        "1"
+      ],
+      "env": {
+        "AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS": "2",
+        "AGENT_KERNEL_COMMAND_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/runtime_state.json",
+        "AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR": "20",
+        "AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS": "120",
+        "AGENT_KERNEL_LLM_HTTP_TRANSPORT": "curl",
+        "AGENT_KERNEL_LLM_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_MAX_STEPS": "20",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "disabled",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_OLLAMA_HOST": "http://127.0.0.1:11434",
+        "AGENT_KERNEL_PROVIDER": "ollama",
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/agentkernel.sqlite3",
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/checkpoints",
+        "AGENT_KERNEL_RUN_REPORTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/reports",
+        "AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS": "1000",
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS": "0",
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "0",
+        "AGENT_KERNEL_WORKSPACE_ROOT": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces"
+      },
+      "kind": "command",
+      "name": "drain_patch_jobs",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/verify_swe_bench_patch_jobs.py",
+        "--queue-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "--queue-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/patch_jobs_verification.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/patch_jobs_verification.json"
+      ],
+      "gate": "nonterminal patch jobs must finish; terminal abstentions become no-op predictions",
+      "kind": "command",
+      "name": "verify_patch_jobs",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/collect_swe_bench_predictions.py",
+        "--prediction-task-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--queue-manifest",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--workspace-root",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces",
+        "--output-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "--patch-job-verification-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/patch_jobs_verification.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl"
+      ],
+      "kind": "command",
+      "name": "collect_predictions",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/prediction_tasks_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_manifest_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/patch_jobs_verification.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/validate_swe_bench_predictions_against_repo_cache.py",
+        "--dataset-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "--predictions-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "--repo-cache-root",
+        "/data/agentkernel/benchmarks/repo_cache",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20_apply_check.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20_apply_check.json"
+      ],
+      "gate": "all non-empty patches must apply; empty no-op predictions are valid abstentions",
+      "kind": "command",
+      "name": "repo_cache_apply_check",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/swe_bench_live_verified_dataset.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "/data/agentkernel/benchmarks/repo_cache"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_live_submission.py",
+        "preds",
+        "--predictions-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ],
+      "gate": "SWE-bench Live predictions must use the official instance-id keyed object format",
+      "kind": "command",
+      "name": "build_live_predictions_json",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "-m",
+        "evaluation.evaluation",
+        "--dataset",
+        "SWE-bench-Live/SWE-bench-Live",
+        "--split",
+        "verified",
+        "--platform",
+        "linux",
+        "--patch_dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json",
+        "--output_dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results",
+        "--workers",
+        "2",
+        "--overwrite",
+        "0"
+      ],
+      "cwd": "/data/agentkernel/other_repos/SWE-bench-Live",
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json"
+      ],
+      "gate": "official SWE-bench Live evaluator must complete",
+      "kind": "command",
+      "name": "official_harness",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/apply_swe_live_official_results_to_queue.py",
+        "--queue-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "--results-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json"
+      ],
+      "env": {
+        "AGENT_KERNEL_ARTIFACT_MATERIALIZATION_MAX_RETRY_ATTEMPTS": "2",
+        "AGENT_KERNEL_COMMAND_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_DELEGATED_JOB_QUEUE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "AGENT_KERNEL_DELEGATED_JOB_RUNTIME_STATE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/runtime_state.json",
+        "AGENT_KERNEL_FRONTIER_TASK_STEP_FLOOR": "20",
+        "AGENT_KERNEL_LLM_DECISION_TOTAL_TIMEOUT_SECONDS": "120",
+        "AGENT_KERNEL_LLM_HTTP_TRANSPORT": "curl",
+        "AGENT_KERNEL_LLM_TIMEOUT_SECONDS": "45",
+        "AGENT_KERNEL_MAX_STEPS": "20",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_DEVICE": "cpu",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_COMPARE": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_SWITCH": "1",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_DRY_RUN_WORKSPACE_BUDGET_BYTES": "200000000",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_GUARDED_SELECTOR_POLICY": "candidate_contract_improves",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_MODE": "disabled",
+        "AGENT_KERNEL_NEURAL_CONTROLLER_SHADOW_GENERATE": "0",
+        "AGENT_KERNEL_OLLAMA_HOST": "http://127.0.0.1:11434",
+        "AGENT_KERNEL_PROVIDER": "ollama",
+        "AGENT_KERNEL_RUNTIME_DATABASE_PATH": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/agentkernel.sqlite3",
+        "AGENT_KERNEL_RUN_CHECKPOINTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/checkpoints",
+        "AGENT_KERNEL_RUN_REPORTS_DIR": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/reports",
+        "AGENT_KERNEL_STORAGE_KEEP_TERMINAL_JOB_RECORDS": "1000",
+        "AGENT_KERNEL_STORAGE_PRUNE_TERMINAL_JOB_ARTIFACTS": "0",
+        "AGENT_KERNEL_USE_NEURAL_CONTROLLER": "0",
+        "AGENT_KERNEL_WORKSPACE_ROOT": "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/workspaces"
+      },
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json"
+      ],
+      "gate": "official SWE-bench Live results must update the same delegated queue storage used by patch jobs",
+      "kind": "command",
+      "name": "apply_official_results_to_queue",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/queue_agentkernel_swe_bench_live_verified_20260528_benchmark20/queue.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_a8_run.py",
+        "summarize",
+        "--results-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json",
+        "--output-summary-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json"
+      ],
+      "kind": "command",
+      "name": "summarize_results",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "swe_bench_live",
+        "--summary-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/a8_benchmark_result.json",
+        "--conservative-comparison-report",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/a8_benchmark_result.json"
+      ],
+      "gate": "adapter verifies a8_benchmark_result packet",
+      "kind": "command",
+      "name": "adapt_a8_packet",
+      "preflight_argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/run_a8_benchmark_adapter.py",
+        "--benchmark",
+        "swe_bench_live",
+        "--summary-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json",
+        "--output-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/a8_benchmark_result.json",
+        "--conservative-comparison-report",
+        "--validate-only",
+        "--adapter-spec-json",
+        "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json"
+      ],
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/summary.json",
+        "config/a8_benchmark_adapter_specs/swe_bench_live_verified_template_adapter_spec.json"
+      ]
+    },
+    {
+      "argv": [
+        "/home/peyton/miniconda3/envs/ai/bin/python",
+        "scripts/prepare_swe_bench_live_submission.py",
+        "package",
+        "--predictions-jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "--results-json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json",
+        "--output-dir",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/submission",
+        "--model-name",
+        "qwen3.5:9b",
+        "--system-name",
+        "Agent Kernel",
+        "--subset",
+        "verified",
+        "--run-command",
+        "/home/peyton/miniconda3/envs/ai/bin/python -m evaluation.evaluation --dataset SWE-bench-Live/SWE-bench-Live --split verified --platform linux --patch_dir /data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/preds_agentkernel_swe_bench_live_verified_20260528_benchmark20.json --output_dir /data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results --workers 2 --overwrite 0"
+      ],
+      "expected_outputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/submission/preds.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/submission/results.json",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/submission/README.md"
+      ],
+      "gate": "leaderboard submission package must include predictions, results, and system README",
+      "kind": "command",
+      "name": "package_live_leaderboard_submission",
+      "required_inputs": [
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/predictions_agentkernel_swe_bench_live_verified_20260528_benchmark20.jsonl",
+        "/data/agentkernel/benchmarks/swe_bench_live/autonomous_harness_runs/agentkernel_swe_bench_live_verified_20260528_benchmark20/evaluation_results/results.json"
+      ]
+    }
+  ],
+  "prerequisites": [],
+  "report_kind": "autonomous_benchmark_harness_spec",
+  "run_config": {
+    "cache_level": "env",
+    "drain_limit": 20,
+    "harness_root": "/data/agentkernel/other_repos/SWE-bench-Live",
+    "live_end_month": "",
+    "live_overwrite": 0,
+    "live_platform": "linux",
+    "live_start_month": "",
+    "live_submission_subset": "verified",
+    "max_workers": 2,
+    "model_name_or_path": "qwen3.5:9b",
+    "namespace": "swebench_live",
+    "official_harness_kind": "swebench_live",
+    "provider": "ollama",
+    "python_bin": "/home/peyton/miniconda3/envs/ai/bin/python",
+    "queue_max_queued_per_budget_group": 20,
+    "run_id": "agentkernel_swe_bench_live_verified_20260528_benchmark20",
+    "timeout": 1800
+  },
+  "source_run_spec": "config/standalone_benchmark_run_specs/swe_bench_live_verified_20260528_benchmark20.json",
+  "spec_version": "asi_v1"
+}

@@ -89,8 +89,9 @@ Expected phases:
 
 ## Common failure points
 
-- Ollama not running on `http://127.0.0.1:11434`
+- `vllm` not running or not reachable on `http://127.0.0.1:8000`
 - `Qwen/Qwen3.5-9B` not available from the configured `vllm` server
+- Ollama not running on `http://127.0.0.1:11434` when `AGENT_KERNEL_PROVIDER=ollama` is explicitly selected
 - stale or missing TOLBERT asset paths
 - CUDA requested in the TOLBERT env but not actually available
 - artifact format drift between extractor/proposal output and replay loaders or retention logic

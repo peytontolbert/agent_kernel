@@ -57,7 +57,7 @@ export AGENT_KERNEL_MODEL=Qwen/Qwen3.5-9B
 export AGENT_KERNEL_VLLM_HOST=http://127.0.0.1:8000
 ```
 
-The current code defaults in `KernelConfig` and the shell wrappers still use `ollama` unless those variables are overridden.
+The current code defaults in `KernelConfig` use `vllm`, `Qwen/Qwen3.5-9B`, and `http://127.0.0.1:8000`. Set those variables only when you need to pin or override the runtime explicitly.
 
 ## Build native agent-kernel TOLBERT assets
 

@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "paper_text_1m",
+      "label": "Full 1M Paper Text",
+      "kind": "paper_parquet_dataset",
+      "role": "source_of_truth",
+      "path": "/arxiv/huggingface/paper_text_1m_dedup_v1",
+      "stats_path": "stats.json",
+      "expected_rows": 1000000,
+      "row_metric": "merged_rows",
+      "file_glob": "train_*.parquet",
+      "notes": "Source-of-truth full paper text parquet. Runtime retrieval should index chunks and metadata, while TOLBERT training can stream over the full text."
+    },
+    {
+      "id": "paper_chunks_p1",
+      "label": "P1 Full-Paper Chunks",
+      "kind": "paper_chunk_parquet_dataset",
+      "role": "derived_training_chunks",
+      "path": "/data/tmp/p1_full_paper_lm_hf_all_chunks",
+      "stats_path": "dataset_stats.json",
+      "row_metric": "examples",
+      "file_glob": "train-*.parquet",
+      "notes": "Derived full-paper chunk examples for contrastive, language-model, and retrieval training."
+    },
+    {
+      "id": "paper_universe",
+      "label": "Paper Universe",
+      "kind": "paper_graph",
+      "role": "retrieval_backbone",
+      "path": "/data/repository_library/exports/_paper_universe",
+      "manifest_path": "manifest.json",
+      "expected_rows": 1000000,
+      "row_metric": "paper_count",
+      "file_glob": "*.parquet",
+      "notes": "Paper graph and embedding backbone for retrieval over the 1M paper corpus."
+    },
+    {
+      "id": "repository_exports",
+      "label": "Repository Library Exports",
+      "kind": "repo_graph_exports",
+      "role": "code_source_of_truth",
+      "path": "/data/repository_library/exports",
+      "manifest_path": "_manifest.json",
+      "notes": "Incremental repository graph exports. The exporter can add or refresh repositories as the kernel learns new codebases."
+    },
+    {
+      "id": "tolbert_joint_v2",
+      "label": "TOLBERT Joint v2 Projection",
+      "kind": "tolbert_projection",
+      "role": "derived_projection",
+      "path": "/data/TOLBERT_BRAIN/data/joint_v2",
+      "required_files": [
+        "code_spans_joint_v2_mapped.jsonl",
+        "paper_spans_paragraphs_joint_v2_mapped.jsonl",
+        "nodes_joint_v2.jsonl",
+        "label_map_joint_v2.json",
+        "level_sizes_train_joint_v2.json"
+      ],
+      "notes": "Derived TOLBERT projection. It should be regenerated from the full paper and repository source layers, not treated as the full corpus."
+    },
+    {
+      "id": "algorithms",
+      "label": "Algorithm Catalog",
+      "kind": "jsonl_catalog",
+      "role": "algorithm_retrieval",
+      "path": "/data/algorithms",
+      "jsonl_counts": {
+        "algorithms": "algorithms.jsonl",
+        "problems": "problems.jsonl"
+      },
+      "notes": "Structured algorithm and problem catalog for coding retrieval."
+    },
+    {
+      "id": "algorithms_library",
+      "label": "Algorithm Implementations",
+      "kind": "source_tree",
+      "role": "algorithm_implementations",
+      "path": "/data/algorithms_library/Python",
+      "file_glob": "**/*.py",
+      "notes": "Concrete algorithm implementations for code retrieval and solution synthesis."
+    },
+    {
+      "id": "repository_models",
+      "label": "Repository/Paper Model Checkpoints",
+      "kind": "checkpoint_tree",
+      "role": "trained_repository_paper_models",
+      "path": "/data/repository_library/models/checkpoints",
+      "file_glob": "**/*",
+      "notes": "Available trained LoRA/full-model checkpoints produced from the repository and paper libraries. Prefer these for runtime adapters before scheduling retraining."
+    },
+    {
+      "id": "repository_model_specs",
+      "label": "Repository/Paper Model Experiment Specs",
+      "kind": "source_tree",
+      "role": "model_training_specs",
+      "path": "/data/repository_library/models/experiments",
+      "file_glob": "*.json",
+      "notes": "Experiment specs for the 32-model paper/repository substrate. These map stored checkpoints back to intended model roles."
+    },
+    {
+      "id": "digital_world_model_checkpoints",
+      "label": "Digital World Model Checkpoints",
+      "kind": "checkpoint_tree",
+      "role": "trained_planner_verifier_coder_memory_models",
+      "path": "/data/checkpoints/digital_world_model",
+      "file_glob": "**/*",
+      "notes": "Trained planner, verifier, actuator, coder, memory, router, calibration, and world-model assets available for adapter use."
+    },
+    {
+      "id": "tolbert_checkpoints",
+      "label": "TOLBERT Checkpoints",
+      "kind": "checkpoint_tree",
+      "role": "trained_hierarchical_retrieval_model",
+      "path": "/data/TOLBERT_BRAIN/checkpoints/tolbert_brain",
+      "file_glob": "**/*",
+      "notes": "Existing TOLBERT model epochs and retrieval cache. These should be mounted as current trained retrieval assets unless superseded by a full-corpus refresh."
+    }
+  ]
+}

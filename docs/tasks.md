@@ -24,7 +24,7 @@ The verifier uses the contract, not the model’s self-report, to decide success
 
 ## Built-in task bank
 
-[`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py) currently defines more than sixty built-in tasks.
+[`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py) currently defines more than sixty built-in tasks.
 
 They include:
 
@@ -94,7 +94,7 @@ Each task gets an isolated directory under the configured workspace root. By def
 
 ## Curriculum behavior
 
-[`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py) now supports two paths:
+[`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py) now supports two paths:
 
 - success-adjacent followups
 - failure-recovery followups
@@ -105,7 +105,7 @@ Generated tasks vary by benchmark family. For example:
 - project/repository/tooling/integration tasks produce family-specific handoff tasks
 - certain failure patterns produce targeted recovery tasks
 
-Curriculum task bodies are data-backed now: [`agent_kernel/curriculum.py`](/data/agentkernel/agent_kernel/curriculum.py) keeps routing and lineage logic, while adjacent, recovery, and long-horizon templates plus long-horizon family/variant metadata live in [`datasets/curriculum_templates.json`](/data/agentkernel/datasets/curriculum_templates.json). That catalog now covers later-wave `validation` gates too, so `repo_chore` lineage can widen into harder cleanup, audit, and release validation bundles without adding more router-specific task bodies to the curriculum engine.
+Curriculum task bodies are data-backed now: [`agent_kernel/tasking/curriculum.py`](/data/agentkernel/agent_kernel/tasking/curriculum.py) keeps routing and lineage logic, while adjacent, recovery, and long-horizon templates plus long-horizon family/variant metadata live in [`datasets/curriculum_templates.json`](/data/agentkernel/datasets/curriculum_templates.json). That catalog now covers later-wave `validation` gates too, so `repo_chore` lineage can widen into harder cleanup, audit, and release validation bundles without adding more router-specific task bodies to the curriculum engine.
 
 Promotion-facing reporting now also surfaces later-wave `validation` evidence through the frontier scripts, so generated validation bundles can influence promotion pressure before the coordinator-owned eval router changes again.
 
@@ -118,7 +118,7 @@ Generated task metadata includes fields such as:
 
 ## Adding a task
 
-The simplest way to add a new built-in task is to extend [`agent_kernel/task_bank.py`](/data/agentkernel/agent_kernel/task_bank.py) with another `TaskSpec`.
+The simplest way to add a new built-in task is to extend [`agent_kernel/tasking/task_bank.py`](/data/agentkernel/agent_kernel/tasking/task_bank.py) with another `TaskSpec`.
 
 Good tasks for this harness are:
 

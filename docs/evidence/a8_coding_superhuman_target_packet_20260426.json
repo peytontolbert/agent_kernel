@@ -1,0 +1,65 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_coding_superhuman_target_packet",
+  "created_at": "2026-04-26T06:25:00Z",
+  "purpose": "Durable benchmark target contract for a future coding-superhuman A8 claim. This is a target packet, not evidence that the target has been met.",
+  "target": {
+    "level": "A8",
+    "domain": "coding",
+    "thresholds": {
+      "codeforces_rating_equivalent": 3000,
+      "mle_bench_gold_medal_rate": 0.2,
+      "swe_bench_verified_resolve_rate": 0.8,
+      "swe_rebench_resolve_rate": 0.6,
+      "re_bench_human_expert_win_rate": 0.5,
+      "strong_baseline_comparison_slice_count": 5,
+      "superhuman_coding_window_count": 3,
+      "superhuman_coding_task_count": 100,
+      "strong_human_baseline_win_rate": 0.8,
+      "strong_human_baseline_win_rate_lower_bound": 0.6,
+      "unfamiliar_domain_slice_count": 5,
+      "long_horizon_transfer_slice_count": 3,
+      "recursive_compounding_retained_gain_runs": 5,
+      "recursive_compounding_window_count": 3,
+      "max_regression_rate": 0.02
+    },
+    "benchmark_sources": {
+      "codeforces": {
+        "evidence_metric": "rating_equivalent",
+        "target": "rating >= 3000",
+        "role": "algorithmic and competitive-programming human ranking anchor"
+      },
+      "mle_bench": {
+        "evidence_metric": "gold_medal_rate",
+        "target": "gold medal rate >= 0.2",
+        "role": "machine-learning engineering and Kaggle-style human leaderboard anchor"
+      },
+      "swe_bench_verified": {
+        "evidence_metric": "resolve_rate",
+        "target": "resolve rate >= 0.8",
+        "role": "human-validated real GitHub issue repair anchor"
+      },
+      "swe_rebench": {
+        "evidence_metric": "resolve_rate",
+        "target": "resolve rate >= 0.6",
+        "role": "fresh issue repair and contamination-resistance anchor"
+      },
+      "re_bench": {
+        "evidence_metric": "human_expert_win_rate",
+        "target": "human expert win rate >= 0.5",
+        "role": "AI R&D and research-engineering expert-human comparison anchor"
+      }
+    },
+    "acceptance_policy": {
+      "requires_sustained_windows": true,
+      "requires_conservative_comparison": true,
+      "requires_recursive_compounding": true,
+      "forbids_readiness_only_promotion": true
+    }
+  },
+  "current_status": {
+    "claim_ready": false,
+    "current_highest_supported_packet": "docs/evidence/a7_readiness_live_vllm_repeated_heldout_transfer_packet_20260426.json",
+    "reason_not_met": "No Codeforces-equivalent, MLE-bench, SWE-bench Verified, SWE-Rebench, or RE-Bench result packet has been produced for agent-kernel under this target contract."
+  }
+}

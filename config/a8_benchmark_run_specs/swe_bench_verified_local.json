@@ -1,0 +1,36 @@
+{
+  "spec_version": "asi_v1",
+  "report_kind": "a8_benchmark_run_spec",
+  "benchmark": "swe_bench_verified",
+  "ready_to_run": false,
+  "runner": {
+    "kind": "swebench_autonomous_queue",
+    "harness_root": "/data/agiattempt/agi_dw/third_party/swe-bench",
+    "dataset_json": "/data/agentkernel/benchmarks/swe_bench_verified/swe_bench_verified_test_dataset.json",
+    "dataset_name": "princeton-nlp/SWE-bench_Verified",
+    "split": "test",
+    "repo_cache_root": "/data/agentkernel/benchmarks/repo_cache",
+    "artifact_root": "/data/agentkernel/benchmarks/swe_bench_verified/autonomous_harness_runs/full_verified_a8",
+    "provider": "vllm",
+    "model_name_or_path": "Qwen/Qwen3.5-9B",
+    "drain_limit": 0,
+    "predictions_path": "/data/agentkernel/benchmarks/predictions/swe_bench_verified_predictions.jsonl",
+    "run_id": "agentkernel_a8_swe_bench_verified",
+    "max_workers": 4,
+    "timeout": 1800,
+    "cache_level": "env",
+    "namespace": "swebench",
+    "report_dir": "/data/agentkernel/benchmarks/swe_bench_verified/evaluation_results",
+    "results_json": "/data/agentkernel/benchmarks/swe_bench_verified/evaluation_results/results.json"
+  },
+  "adapter": {
+    "script": "scripts/run_a8_benchmark_adapter.py",
+    "summary_json": "/data/agentkernel/benchmarks/swe_bench_verified/summary.json",
+    "output_packet_json": "/data/agentkernel/benchmarks/swe_bench_verified/a8_benchmark_result.json",
+    "conservative_comparison_report": true
+  },
+  "open_limits": [
+    "ready_to_run remains false until the generated autonomous harness completes.",
+    "This spec prepares official SWE-bench Verified evaluation; it is not evidence until the harness has generated predictions, run the official evaluator, and produced a verified packet."
+  ]
+}

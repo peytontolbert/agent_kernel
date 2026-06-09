@@ -751,6 +751,13 @@ fn plan_lite_action(
         );
     }
 
+    if normalized.split_whitespace().count() >= 5 {
+        return (
+            ActionKind::GatherContext,
+            "substantive topic can benefit from ranked context".to_string(),
+        );
+    }
+
     (
         ActionKind::Respond,
         "general chat prompt; respond without adding new papers".to_string(),
@@ -852,6 +859,11 @@ mod tests {
         );
         assert!(packet.contains("Paper A"));
         assert!(packet.contains("https://arxiv.org/pdf/1001.5047"));
+        assert!(packet.contains("<AK_THINK> <AK_RESPOND> <AK_CONTEXT> <AK_ANSWER>"));
+        assert!(packet.contains("<AK_EVIDENCE> <AK_EVIDENCE_ID> P1"));
+        assert!(packet.contains("<AK_TITLE> Paper A"));
+        assert!(packet.contains("<AK_LOOP> <AK_STATE>"));
+        assert!(!packet.contains("<AK_USE_CONTEXT>"));
         assert!(packet.contains("mode=think"));
         assert!(packet.contains("target_language=Rust"));
     }
@@ -892,6 +904,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             research.get("action").and_then(Value::as_str),
+            Some("gather_context")
+        );
+
+        let substantive_topic = ["explain", "topic", "with", "several", "terms"].join(" ");
+        let topic = serde_json::from_str::<Value>(&core.plan_lite_turn(
+            substantive_topic,
+            "[]".to_string(),
+            "{}".to_string(),
+        ))
+        .unwrap();
+        assert_eq!(
+            topic.get("action").and_then(Value::as_str),
             Some("gather_context")
         );
     }
